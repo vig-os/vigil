@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve healthy batch records with diagnostic stubs for unshrinkable records, truncate the largest string by the exact overflow, and pack scopes without copying whole batches ([#30](https://github.com/vig-os/vigil/issues/30))
+
 - Bound OTLP/JSON log lines to the Collector limit, split large batches, and mark truncated oversized records; exercise large tracing records in Collector conformance ([#30](https://github.com/vig-os/vigil/issues/30))
 
 ### Added

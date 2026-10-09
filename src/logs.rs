@@ -81,8 +81,7 @@ pub const NON_FINITE: [&str; 3] = ["NaN", "Infinity", "-Infinity"];
 /// [`LineSink`].
 ///
 /// See the [module documentation](self) for the format guarantees and an
-/// example. Oversized records shorten body strings first, then largest
-/// attribute strings, and carry `vigil.truncated` and `vigil.original_size`
+/// example. Oversized records shorten their largest strings first, and carry `vigil.truncated` and `vigil.original_size`
 /// (original single-record line bytes, including the envelope).
 /// The exporter needs no async runtime: the SDK's batch processor
 /// calls it from its own thread and the future it returns is already complete.
@@ -182,8 +181,8 @@ fn encode_line(request: &ExportLogsServiceRequest) -> Result<String, String> {
     Ok(line)
 }
 
-// Work on the patched JSON so byte counts include escaping and non-finite
-// spellings. Preserve the original encoding verbatim for small batches.
+// Work on patched JSON: budgets include escaping and non-finite spellings.
+// Small batches retain their original bytes, including the golden layout.
 fn bounded_lines(line: &str, limit: usize) -> Result<Vec<String>, String> {
     if line.len() <= limit {
         return Ok(vec![line.to_owned()]);
@@ -191,119 +190,254 @@ fn bounded_lines(line: &str, limit: usize) -> Result<Vec<String>, String> {
     let request: Json = serde_json::from_str(line).map_err(|e| e.to_string())?;
     let mut lines = Vec::new();
     for resource in request["resourceLogs"].as_array().into_iter().flatten() {
+        let resource_prefix = format!(
+            "{{\"resourceLogs\":[{}",
+            array_prefix(resource, "scopeLogs")
+        );
+        let mut current = resource_prefix.clone();
+        let mut has_scopes = false;
         for scope in resource["scopeLogs"].as_array().into_iter().flatten() {
-            let mut envelope = request.clone();
-            envelope["resourceLogs"] = serde_json::json!([resource]);
-            envelope["resourceLogs"][0]["scopeLogs"] = serde_json::json!([scope]);
-            let slot = &mut envelope["resourceLogs"][0]["scopeLogs"][0]["logRecords"];
-            *slot = serde_json::json!([]);
-            let overhead = envelope.to_string().len();
-            let mut encoded = Vec::<String>::new();
-            let mut size = overhead;
+            let scope_prefix = array_prefix(scope, "logRecords");
+            // Closing the record array, scope, scope array, resource, resource
+            // array and request takes exactly six ASCII bytes.
+            let overhead = resource_prefix.len() + scope_prefix.len() + 6;
+            let mut open = false;
             for record in scope["logRecords"].as_array().into_iter().flatten() {
-                let mut record = record.clone();
-                let original_size = overhead + record.to_string().len();
-                if original_size > limit {
-                    let attrs = record["attributes"]
-                        .as_array_mut()
-                        .ok_or("record attributes missing")?;
-                    attrs.retain(|a| {
-                        a["key"] != "vigil.truncated" && a["key"] != "vigil.original_size"
-                    });
-                    attrs.push(
-                        serde_json::json!({"key":"vigil.truncated","value":{"boolValue":true}}),
-                    );
-                    attrs.push(serde_json::json!({"key":"vigil.original_size","value":{"intValue":original_size.to_string()}}));
-                    attrs.sort_by_key(|a| a["key"].as_str().unwrap_or_default().to_owned());
-                    while overhead + record.to_string().len() > limit {
-                        if !shrink_largest_string(&mut record["body"])
-                            && !shrink_largest_string(&mut record["attributes"])
-                        {
-                            return Err(format!(
-                                "log envelope or non-string fields exceed max_line_bytes={limit}"
-                            ));
-                        }
+                let text = fit_record(record, overhead, limit)?;
+                let extra = if open {
+                    1
+                } else {
+                    scope_prefix.len() + usize::from(has_scopes)
+                };
+                if current.len() + extra + text.len() + 6 > limit && has_scopes {
+                    if open {
+                        current.push_str("]}");
                     }
+                    current.push_str("]}]}");
+                    lines.push(current);
+                    current = resource_prefix.clone();
+                    has_scopes = false;
+                    open = false;
                 }
-                let text = record.to_string();
-                let extra = text.len() + usize::from(!encoded.is_empty());
-                if size + extra > limit && !encoded.is_empty() {
-                    lines.push(fill_records(&envelope, &encoded));
-                    encoded.clear();
-                    size = overhead;
+                if !open {
+                    if has_scopes {
+                        current.push(',');
+                    }
+                    current.push_str(&scope_prefix);
+                    open = true;
+                    has_scopes = true;
+                } else {
+                    current.push(',');
                 }
-                size += text.len() + usize::from(!encoded.is_empty());
-                encoded.push(text);
+                current.push_str(&text);
             }
-            if !encoded.is_empty() {
-                lines.push(fill_records(&envelope, &encoded));
+            if open {
+                current.push_str("]}");
             }
+        }
+        if has_scopes {
+            current.push_str("]}]}");
+            lines.push(current);
         }
     }
     Ok(lines)
 }
 
-fn fill_records(envelope: &Json, records: &[String]) -> String {
-    // Serialize only the small envelope repeatedly, never the growing batch.
-    envelope.to_string().replacen(
-        "\"logRecords\":[]",
-        &format!("\"logRecords\":[{}]", records.join(",")),
-        1,
-    )
+// Copy only metadata, never the batch or a scope's records. Appending the
+// array field also avoids serializing any growing output more than once.
+fn array_prefix(value: &Json, field: &str) -> String {
+    let metadata: serde_json::Map<String, Json> = value
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| key.as_str() != field)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let mut prefix = Json::Object(metadata).to_string();
+    prefix.pop();
+    if prefix.len() > 1 {
+        prefix.push(',');
+    }
+    prefix.push_str(&format!("\"{field}\":["));
+    prefix
 }
 
-fn shrink_largest_string(value: &mut Json) -> bool {
-    fn largest(value: &Json) -> usize {
-        match value {
-            Json::String(s) => s.len(),
-            Json::Array(a) => a.iter().map(largest).max().unwrap_or(0),
-            Json::Object(o) => o
-                .iter()
-                .filter(|(k, _)| {
-                    k.as_str() != "key" && k.as_str() != "intValue" && k.as_str() != "doubleValue"
-                })
-                .map(|(_, v)| largest(v))
-                .max()
-                .unwrap_or(0),
-            _ => 0,
-        }
+fn markers(original_size: usize, dropped: bool) -> Vec<Json> {
+    let mut attributes = vec![
+        serde_json::json!({"key":"vigil.original_size","value":{"intValue":original_size.to_string()}}),
+        serde_json::json!({"key":"vigil.truncated","value":{"boolValue":true}}),
+    ];
+    if dropped {
+        attributes.push(serde_json::json!({"key":"vigil.dropped","value":{"boolValue":true}}));
     }
-    let length = largest(value);
-    if length == 0 {
-        return false;
+    attributes.sort_by_key(|a| a["key"].as_str().unwrap_or_default().to_owned());
+    attributes
+}
+
+fn fit_record(record: &Json, overhead: usize, limit: usize) -> Result<String, String> {
+    let original = record.to_string();
+    let original_size = overhead + original.len();
+    if original_size <= limit {
+        return Ok(original);
     }
-    match value {
-        Json::String(s) => {
-            let mut end = s.len() / 2;
-            while !s.is_char_boundary(end) {
-                end -= 1;
+    let mut shortened = record.clone();
+    let mut attributes = shortened["attributes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    attributes.retain(|a| {
+        !matches!(
+            a["key"].as_str(),
+            Some("vigil.truncated" | "vigil.dropped" | "vigil.original_size")
+        )
+    });
+    attributes.extend(markers(original_size, false));
+    attributes.sort_by_key(|a| a["key"].as_str().unwrap_or_default().to_owned());
+    shortened["attributes"] = Json::Array(attributes);
+    let mut size = overhead + shortened.to_string().len();
+    let mut candidates = Vec::new();
+    string_candidates(&shortened, &mut Vec::new(), &mut candidates);
+    // Largest payload strings first; keys and eventName only as a last resort.
+    candidates.sort_by_key(|c| (c.last_resort, std::cmp::Reverse(c.bytes)));
+    let capacity: usize = candidates.iter().map(|c| c.bytes).sum();
+    if size.saturating_sub(capacity) <= limit {
+        for candidate in candidates {
+            if size <= limit {
+                break;
             }
-            s.truncate(end);
-            true
+            if let Some(Json::String(text)) = shortened.pointer_mut(&candidate.pointer) {
+                let before = string_bytes(text);
+                cut_string(text, size - limit, candidate.base64);
+                size -= before - string_bytes(text);
+            }
         }
-        Json::Array(a) => a
-            .iter_mut()
-            .find(|v| largest(v) == length)
-            .is_some_and(shrink_largest_string),
-        Json::Object(o) => o
-            .iter_mut()
-            .find(|(k, v)| {
-                k.as_str() != "key"
-                    && k.as_str() != "intValue"
-                    && k.as_str() != "doubleValue"
-                    && largest(v) == length
-            })
-            .is_some_and(|(key, v)| {
-                if key == "bytesValue"
-                    && let Json::String(s) = v
-                {
-                    s.truncate((s.len() / 2) / 4 * 4);
-                    return true;
-                }
-                shrink_largest_string(v)
-            }),
-        _ => false,
+        if size <= limit {
+            sort_json_attributes(&mut shortened);
+            return Ok(shortened.to_string());
+        }
     }
+    // A record with excessive structural/non-string data becomes one explicit
+    // diagnostic, without discarding its healthy batch neighbors or identity.
+    let mut stub = serde_json::Map::new();
+    for key in [
+        "timeUnixNano",
+        "observedTimeUnixNano",
+        "severityNumber",
+        "severityText",
+        "traceId",
+        "spanId",
+        "flags",
+    ] {
+        if let Some(value) = record.get(key) {
+            stub.insert(key.to_owned(), value.clone());
+        }
+    }
+    stub.insert("body".into(), serde_json::json!({"stringValue":format!("vigil: record dropped: {original_size} bytes exceeds max_line_bytes {limit}")}));
+    stub.insert(
+        "attributes".into(),
+        Json::Array(markers(original_size, true)),
+    );
+    let text = Json::Object(stub).to_string();
+    if overhead + text.len() > limit {
+        return Err(format!(
+            "log envelope and diagnostic identity exceed max_line_bytes={limit}"
+        ));
+    }
+    Ok(text)
+}
+
+fn sort_json_attributes(value: &mut Json) {
+    match value {
+        Json::Object(values) => {
+            for (key, value) in values {
+                if matches!(key.as_str(), "attributes" | "values")
+                    && let Json::Array(attributes) = value
+                    && attributes.iter().all(|a| a.get("key").is_some())
+                {
+                    attributes.sort_by_key(|a| a["key"].as_str().unwrap_or_default().to_owned());
+                }
+                sort_json_attributes(value);
+            }
+        }
+        Json::Array(values) => values.iter_mut().for_each(sort_json_attributes),
+        _ => {}
+    }
+}
+
+struct StringCandidate {
+    pointer: String,
+    bytes: usize,
+    last_resort: bool,
+    base64: bool,
+}
+
+fn string_candidates(value: &Json, path: &mut Vec<String>, result: &mut Vec<StringCandidate>) {
+    match value {
+        Json::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                path.push(index.to_string());
+                string_candidates(value, path, result);
+                path.pop();
+            }
+        }
+        Json::Object(values) => {
+            if matches!(
+                value.get("key").and_then(Json::as_str),
+                Some("vigil.truncated" | "vigil.dropped" | "vigil.original_size")
+            ) {
+                return;
+            }
+            for (key, value) in values {
+                path.push(key.replace('~', "~0").replace('/', "~1"));
+                if let Json::String(text) = value {
+                    if matches!(
+                        key.as_str(),
+                        "stringValue" | "bytesValue" | "key" | "eventName"
+                    ) && !text.is_empty()
+                    {
+                        result.push(StringCandidate {
+                            pointer: format!("/{}", path.join("/")),
+                            bytes: string_bytes(text),
+                            last_resort: matches!(key.as_str(), "key" | "eventName"),
+                            base64: key == "bytesValue",
+                        });
+                    }
+                } else {
+                    string_candidates(value, path, result);
+                }
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn escaped_bytes(c: char) -> usize {
+    match c {
+        '\"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+        c if c < '\u{20}' => 6,
+        c => c.len_utf8(),
+    }
+}
+
+fn string_bytes(text: &str) -> usize {
+    text.chars().map(escaped_bytes).sum()
+}
+
+fn cut_string(text: &mut String, overflow: usize, base64: bool) {
+    let mut removed = 0;
+    let mut end = text.len();
+    for (index, c) in text.char_indices().rev() {
+        removed += escaped_bytes(c);
+        end = index;
+        if removed >= overflow {
+            break;
+        }
+    }
+    if base64 {
+        end = end / 4 * 4;
+    }
+    text.truncate(end);
 }
 
 // ---- grouping and normalization -------------------------------------------
@@ -470,6 +604,235 @@ fn patch_any_value(value: &AnyValue, json: &mut Json) {
 #[cfg(test)]
 mod size_tests {
     use super::*;
+
+    #[test]
+    fn r2_many_scopes_pack_without_copying_batch() {
+        let scopes: Vec<_> = (0..512).map(|i| {
+            let records: Vec<_> = (0..20).map(|j| serde_json::json!({"body":{"stringValue":"x".repeat(128)},"attributes":[],"eventName":j.to_string()})).collect();
+            serde_json::json!({"scope":{"name":format!("scope-{i:03}")},"logRecords":records})
+        }).collect();
+        let input =
+            serde_json::json!({"resourceLogs":[{"resource":{},"scopeLogs":scopes}]}).to_string();
+        let start = std::time::Instant::now();
+        let lines = bounded_lines(&input, 1_000_000).unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            lines.len() <= 3,
+            "{} lines: scopes were not packed",
+            lines.len()
+        );
+        assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+        assert!(lines.iter().all(|s| s.len() <= 1_000_000));
+        let mut count = 0;
+        for line in &lines {
+            let value: Json = serde_json::from_str(line).unwrap();
+            for scope in value["resourceLogs"][0]["scopeLogs"].as_array().unwrap() {
+                assert!(
+                    scope["scope"]["name"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("scope-")
+                );
+                count += scope["logRecords"].as_array().unwrap().len();
+            }
+        }
+        assert_eq!(count, 10_240);
+        assert_eq!(lines, bounded_lines(&input, 1_000_000).unwrap());
+    }
+
+    fn fixture(records: Vec<Json>) -> String {
+        serde_json::json!({"resourceLogs":[{"resource":{},"scopeLogs":[{"scope":{"name":"test"},"logRecords":records}]}]}).to_string()
+    }
+
+    fn output_records(lines: &[String]) -> Vec<Json> {
+        lines
+            .iter()
+            .flat_map(|line| {
+                let json: Json = serde_json::from_str(line).unwrap();
+                json["resourceLogs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|r| {
+                        r["scopeLogs"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .flat_map(|s| s["logRecords"].as_array().unwrap().clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn review_unshrinkable_record_preserves_healthy_neighbors() {
+        let attrs: Vec<_> = (0..60_000)
+            .map(|n| serde_json::json!({"key":n.to_string(),"value":{"intValue":"1"}}))
+            .collect();
+        let bad = serde_json::json!({"attributes":attrs,"body":{"stringValue":"bad"},"timeUnixNano":"123","observedTimeUnixNano":"124","severityNumber":17,"severityText":"ERROR","traceId":"00112233445566778899aabbccddeeff","spanId":"0011223344556677","flags":1});
+        let mut records =
+            vec![serde_json::json!({"attributes":[],"body":{"stringValue":"healthy"}}); 511];
+        records.insert(200, bad.clone());
+        let input = fixture(records);
+        let lines =
+            bounded_lines(&input, 1_000_000).expect("one bad record must not fail the batch");
+        assert!(lines.iter().all(|l| l.len() <= 1_000_000));
+        let records = output_records(&lines);
+        assert_eq!(records.len(), 512);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r["body"]["stringValue"] == "healthy")
+                .count(),
+            511
+        );
+        let stub = &records[200];
+        for key in [
+            "timeUnixNano",
+            "observedTimeUnixNano",
+            "severityNumber",
+            "severityText",
+            "traceId",
+            "spanId",
+            "flags",
+        ] {
+            assert_eq!(stub[key], bad[key]);
+        }
+        assert!(
+            stub["body"]["stringValue"]
+                .as_str()
+                .unwrap()
+                .starts_with("vigil: record dropped:")
+        );
+        for key in ["vigil.truncated", "vigil.dropped"] {
+            assert!(
+                stub["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a["key"] == key && a["value"]["boolValue"] == true)
+            );
+        }
+        assert!(stub["attributes"].as_array().unwrap().iter().any(|a| {
+            a["key"] == "vigil.original_size"
+                && a["value"]["intValue"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+                    > 1_000_000
+        }));
+    }
+
+    #[test]
+    fn review_largest_string_preserves_message() {
+        let input = fixture(vec![
+            serde_json::json!({"body":{"stringValue":"the important message"},"attributes":[{"key":"payload","value":{"arrayValue":{"values":[{"kvlistValue":{"values":[{"key":"nested","value":{"stringValue":"x".repeat(2_000_000)}}]}}]}}} ]}),
+        ]);
+        let lines = bounded_lines(&input, 1_000_000).unwrap();
+        assert_eq!(
+            output_records(&lines)[0]["body"]["stringValue"],
+            "the important message"
+        );
+    }
+
+    #[test]
+    fn review_truncation_uses_available_budget() {
+        for text in ["x".repeat(7_800_000), "💣\n\"".repeat(1_000_000)] {
+            let input = fixture(vec![
+                serde_json::json!({"body":{"stringValue":text},"attributes":[]}),
+            ]);
+            let lines = bounded_lines(&input, 1_000_000).unwrap();
+            assert_eq!(lines.len(), 1);
+            assert!(
+                (950_000..=1_000_000).contains(&lines[0].len()),
+                "line size {}",
+                lines[0].len()
+            );
+        }
+    }
+
+    #[test]
+    fn review_keys_event_names_and_base64_are_bounded() {
+        for record in [
+            serde_json::json!({"body":{"stringValue":"message"},"attributes":[{"key":"z".repeat(1_200_000),"value":{"intValue":"42"}}]}),
+            serde_json::json!({"body":{"stringValue":"message"},"attributes":[],"eventName":"event".repeat(300_000)}),
+            serde_json::json!({"body":{"bytesValue":"AQID".repeat(400_000)},"attributes":[]}),
+        ] {
+            let lines = bounded_lines(&fixture(vec![record]), 1_000_000).unwrap();
+            assert_eq!(lines.len(), 1);
+            assert!((950_000..=1_000_000).contains(&lines[0].len()));
+            let records = output_records(&lines);
+            let record = &records[0];
+            assert!(
+                !record["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a["key"] == "vigil.dropped")
+            );
+            if let Some(bytes) = record["body"]["bytesValue"].as_str() {
+                assert_eq!(bytes.len() % 4, 0);
+                assert!(
+                    bytes
+                        .as_bytes()
+                        .chunks_exact(4)
+                        .all(|chunk| chunk == b"AQID")
+                );
+            }
+        }
+    }
+
+    fn many_scopes() -> String {
+        let scopes: Vec<_> = (0..512).map(|scope| {
+            let records: Vec<_> = (0..(if scope < 272 {20} else {19})).map(|n| serde_json::json!({"body":{"stringValue":"x".repeat(256)},"attributes":[{"key":"index","value":{"intValue":n.to_string()}}]})).collect();
+            serde_json::json!({"scope":{"name":format!("scope-{scope:03}")},"logRecords":records})
+        }).collect();
+        serde_json::json!({"resourceLogs":[{"resource":{},"scopeLogs":scopes}]}).to_string()
+    }
+
+    #[test]
+    fn review_packs_scopes_without_copying_batch() {
+        let input = many_scopes();
+        let lines = bounded_lines(&input, 1_000_000).unwrap();
+        assert!(lines.len() < 10, "must pack scopes: {} lines", lines.len());
+        assert!(lines.iter().all(|l| l.len() <= 1_000_000));
+        assert_eq!(output_records(&lines).len(), 10_000);
+        assert_eq!(lines, bounded_lines(&input, 1_000_000).unwrap());
+        let original: Json = serde_json::from_str(&input).unwrap();
+        let mut grouped = BTreeMap::<String, Vec<Json>>::new();
+        for line in &lines {
+            let json: Json = serde_json::from_str(line).unwrap();
+            for scope in json["resourceLogs"][0]["scopeLogs"].as_array().unwrap() {
+                grouped
+                    .entry(scope["scope"]["name"].as_str().unwrap().to_owned())
+                    .or_default()
+                    .extend(scope["logRecords"].as_array().unwrap().clone());
+            }
+        }
+        for scope in original["resourceLogs"][0]["scopeLogs"].as_array().unwrap() {
+            assert_eq!(
+                &grouped[scope["scope"]["name"].as_str().unwrap()],
+                scope["logRecords"].as_array().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "run explicitly in release to measure 10k records across 512 scopes"]
+    fn review_many_scopes_release_benchmark() {
+        let input = many_scopes();
+        let start = std::time::Instant::now();
+        let lines = bounded_lines(&input, 1_000_000).unwrap();
+        let elapsed = start.elapsed();
+        eprintln!(
+            "10k records / 512 scopes: {elapsed:?}, {} lines",
+            lines.len()
+        );
+        assert!(elapsed < Duration::from_secs(1));
+    }
 
     #[test]
     fn configured_limit_and_impossible_envelope() {
