@@ -20,14 +20,20 @@ tracing::info!(user = "alice", "opened study");
 ```
 
 Logs are available now; metrics, traces and audit are planned. Keep the guard
-alive until shutdown to flush queued logs. The batch queue holds 2048 records
-and can drop records when full; `std::process::exit` skips flushing. Tracing
+alive until shutdown to flush queued logs. The batch queue holds 65,536 records by default (512 per export, every second).
+Memory is bounded by queue size times record size; overflow drops records with
+a stderr warning. `VIGIL_QUEUE_SIZE` or `Config::queue_size` changes the bound
+(minimum 1). Guard drop waits up to five seconds, including directory-lock waits,
+then warns that remaining records may be lost; the SDK worker may continue
+until the lock is released. `std::process::exit` skips flushing. Tracing
 spans alone do not currently populate OTLP trace/span IDs.
 
 Use `vigil::init("my-service")` for defaults. `RUST_LOG` defaults to `info`.
 `VIGIL_DIR` selects the full state directory; otherwise vigil uses
 `$XDG_STATE_HOME/<service>` or `$HOME/.local/state/<service>`.
-`VIGIL_MAX_BYTES` defaults to 50 MiB and `VIGIL_RETENTION_DAYS` to 90
+Invalid numeric environment values emit a warning naming the variable and value
+and use the default. Empty `VIGIL_DIR` is unset; relative `XDG_STATE_HOME` is
+ignored. `VIGIL_MAX_BYTES` has a minimum of 1 byte and defaults to 50 MiB and `VIGIL_RETENTION_DAYS` to 90
 (`0` keeps everything). Explicit `Config` values override environment values.
 `Config::revision` or `VIGIL_VCS_REVISION` supplies the producer commit.
 Storage initialization failures emit one warning and fall back to stderr;
