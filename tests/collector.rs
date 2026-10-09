@@ -73,7 +73,16 @@ fn collector_ingests_the_golden_file() {
     child.wait().unwrap();
 
     assert_eq!(got, expected, "Collector dropped records; output:\n{text}");
-    for spelling in ["\"NaN\"", "\"Infinity\"", "\"-Infinity\""] {
+    // Includes the resource attributes (`res_inf`, `res_nan`) and the scope
+    // attributes (`scope_nan`, `scope_neg_inf`) of the golden set.
+    for spelling in [
+        "\"NaN\"",
+        "\"Infinity\"",
+        "\"-Infinity\"",
+        "res_inf",
+        "scope_nan",
+        "scope_neg_inf",
+    ] {
         assert!(text.contains(spelling), "{spelling} lost in:\n{text}");
     }
     std::fs::remove_dir_all(dir).unwrap();

@@ -44,6 +44,17 @@ pub fn scope(name: &'static str, version: &'static str) -> InstrumentationScope 
         .build()
 }
 
+pub fn scope_with(
+    name: &'static str,
+    version: &'static str,
+    attributes: Vec<KeyValue>,
+) -> InstrumentationScope {
+    InstrumentationScope::builder(name)
+        .with_version(version)
+        .with_attributes(attributes)
+        .build()
+}
+
 pub fn resource(attributes: Vec<KeyValue>) -> Resource {
     Resource::builder_empty()
         .with_attributes(attributes)
@@ -94,7 +105,19 @@ pub fn golden_records() -> (Resource, Vec<Rec>) {
         KeyValue::new("service.name", "vigil-golden"),
         KeyValue::new("host.name", "test-host"),
         KeyValue::new("deployment.environment", "ci"),
+        KeyValue::new("res_inf", f64::INFINITY),
+        KeyValue::new("res_nan", f64::NAN),
     ]);
+    // A NaN scope attribute: NaN != NaN, so the SDK puts every record of this
+    // scope into its own group.
+    let nan_scope = scope_with(
+        "gamma",
+        "3.0.0",
+        vec![
+            KeyValue::new("scope_nan", f64::NAN),
+            KeyValue::new("scope_neg_inf", f64::NEG_INFINITY),
+        ],
+    );
 
     let records = vec![
         // beta first on purpose: output must be sorted by scope.
@@ -156,5 +179,12 @@ pub fn golden_records() -> (Resource, Vec<Rec>) {
             ]));
         }),
     ];
+    let mut records = records;
+    for i in 0..4_i64 {
+        records.push(rec(&nan_scope, |r| {
+            r.set_timestamp(at(1_700_000_010 + i as u64, 0));
+            r.set_body(format!("nan scope {i}").into());
+        }));
+    }
     (resource, records)
 }

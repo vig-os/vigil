@@ -96,26 +96,41 @@ impl AppendFile {
 
 impl LineSink for AppendFile {
     fn write_line(&self, line: &[u8]) -> io::Result<()> {
-        let mut buf = Vec::with_capacity(line.len() + 1);
-        buf.extend_from_slice(line);
-        buf.push(b'\n');
-        // `&File` implements `Write`, so no lock is needed: the kernel orders
-        // concurrent `O_APPEND` writes.
-        let written = (&self.file).write(&buf)?;
-        if written != buf.len() {
-            // Retrying the tail would be a second write(2) that other writers
-            // can slip in front of, producing an interleaved line. Fail loudly.
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                format!(
-                    "short write to {}: {written} of {} bytes; the line may be truncated",
-                    self.path.display(),
-                    buf.len()
-                ),
-            ));
-        }
-        Ok(())
+        append_line(&self.file, line, &self.path)
     }
+}
+
+/// One `write` of `line + '\n'` to `out`.
+///
+/// On a short write (disk full, file-size limit) the tail is **not** retried:
+/// that would be a second `write(2)` another writer can slip in front of. The
+/// file now ends in an unterminated fragment, though, and the next line would
+/// glue onto it, corrupting that one too. So a single `\n` is appended on a
+/// best-effort basis, which leaves the fragment as its own (unparseable) line,
+/// and the original error is still returned.
+fn append_line<W>(out: &W, line: &[u8], path: &Path) -> io::Result<()>
+where
+    for<'a> &'a W: Write,
+{
+    let mut buf = Vec::with_capacity(line.len() + 1);
+    buf.extend_from_slice(line);
+    buf.push(b'\n');
+    // `&File` implements `Write`, so no lock is needed: the kernel orders
+    // concurrent `O_APPEND` writes.
+    let written = (&*out).write(&buf)?;
+    if written != buf.len() {
+        let _ = (&*out).write(b"\n");
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!(
+                "short write to {}: {written} of {} bytes; the fragment was terminated \
+                 with a newline and is an unparseable line",
+                path.display(),
+                buf.len()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Collects lines in memory. Cheap to clone; clones share the same buffer, so a
@@ -186,6 +201,44 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A writer whose first `write` accepts only `limit` bytes.
+    #[derive(Default)]
+    struct Truncating {
+        limit: usize,
+        data: Mutex<Vec<u8>>,
+    }
+
+    impl Write for &Truncating {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut data = self.data.lock().unwrap();
+            let n = if data.is_empty() {
+                buf.len().min(self.limit)
+            } else {
+                buf.len()
+            };
+            data.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn short_write_terminates_the_fragment_and_errors() {
+        let out = Truncating {
+            limit: 4,
+            ..Default::default()
+        };
+        let err = append_line(&out, b"0123456789", Path::new("x")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(*out.data.lock().unwrap(), b"0123\n");
+        // The next line starts on its own line.
+        append_line(&out, b"next", Path::new("x")).unwrap();
+        assert_eq!(*out.data.lock().unwrap(), b"0123\nnext\n");
     }
 
     #[test]

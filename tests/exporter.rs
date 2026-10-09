@@ -69,7 +69,9 @@ fn wire_format_matches_otlp_json() {
         // Drop the NaN-bearing kinds so the line also deserializes via proto.
         recs.retain(|r| r.record.severity_number() != Some(Severity::Error));
         recs.retain(|r| !matches!(r.record.body(), Some(AnyValue::Map(_))));
-        (r, recs)
+        recs.retain(|r| r.scope.name() != "gamma");
+        let _ = r;
+        (resource(vec![KeyValue::new("service.name", "wire")]), recs)
     };
     let sink = MemorySink::new();
     export(sink.clone(), &resource, &records);
@@ -216,7 +218,12 @@ fn output_is_sorted_and_stable_across_runs() {
         .collect();
     assert_eq!(
         names,
-        [("alpha", "1.0.0"), ("alpha", "1.1.0"), ("beta", "2.1.0")]
+        [
+            ("alpha", "1.0.0"),
+            ("alpha", "1.1.0"),
+            ("beta", "2.1.0"),
+            ("gamma", "3.0.0")
+        ]
     );
     let keys: Vec<_> = line["resourceLogs"][0]["resource"]["attributes"]
         .as_array()
@@ -226,7 +233,13 @@ fn output_is_sorted_and_stable_across_runs() {
         .collect();
     assert_eq!(
         keys,
-        ["deployment.environment", "host.name", "service.name"]
+        [
+            "deployment.environment",
+            "host.name",
+            "res_inf",
+            "res_nan",
+            "service.name"
+        ]
     );
 }
 
@@ -350,4 +363,48 @@ fn concurrent_batches_never_interleave() {
     assert_eq!(lines, THREADS * BATCHES);
     assert!(per_thread.iter().all(|&n| n == BATCHES), "{per_thread:?}");
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn non_finite_doubles_in_resource_and_scope_attributes_are_sanitized() {
+    let (resource, records) = golden_records();
+    let sink = MemorySink::new();
+    export(sink.clone(), &resource, &records);
+    let raw = &sink.lines()[0];
+    assert!(!raw.contains(r#""doubleValue":null"#), "{raw}");
+    let line = one_line(&sink);
+
+    let res_attr = |key: &str| {
+        line["resourceLogs"][0]["resource"]["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|kv| kv["key"] == key)
+            .unwrap()["value"]["doubleValue"]
+            .clone()
+    };
+    assert_eq!(res_attr("res_inf"), "Infinity");
+    assert_eq!(res_attr("res_nan"), "NaN");
+
+    let scopes = line["resourceLogs"][0]["scopeLogs"].as_array().unwrap();
+    let gamma: Vec<_> = scopes
+        .iter()
+        .filter(|s| s["scope"]["name"] == "gamma")
+        .collect();
+    // Merged into one scope holding all four records, in a stable order.
+    assert_eq!(gamma.len(), 1);
+    let bodies: Vec<_> = gamma[0]["logRecords"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["body"]["stringValue"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        bodies,
+        ["nan scope 0", "nan scope 1", "nan scope 2", "nan scope 3"]
+    );
+    let attrs = &gamma[0]["scope"]["attributes"];
+    assert_eq!(attrs[0]["key"], "scope_nan");
+    assert_eq!(attrs[0]["value"]["doubleValue"], "NaN");
+    assert_eq!(attrs[1]["value"]["doubleValue"], "-Infinity");
 }

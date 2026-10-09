@@ -144,8 +144,8 @@ impl<S: LineSink + 'static> LogExporter for OtlpJsonLogExporter<S> {
 ///
 /// `ExportLogsServiceRequest` and `LogsData` share their wire shape (a repeated
 /// `resourceLogs` field 1), so the JSON is identical.
-fn encode_line(request: &ExportLogsServiceRequest) -> serde_json::Result<String> {
-    let mut json = serde_json::to_value(request)?;
+fn encode_line(request: &ExportLogsServiceRequest) -> Result<String, String> {
+    let mut json = serde_json::to_value(request).map_err(|e| e.to_string())?;
     for (resource, json_resource) in request
         .resource_logs
         .iter()
@@ -153,7 +153,13 @@ fn encode_line(request: &ExportLogsServiceRequest) -> serde_json::Result<String>
     {
         patch_resource_logs(resource, json_resource);
     }
-    serde_json::to_string(&json)
+    let line = serde_json::to_string(&json).map_err(|e| e.to_string())?;
+    // Safety net: a non-finite double the patching missed would serialize as
+    // `null` and make the Collector drop the whole line. Refuse to write it.
+    if line.contains(r#""doubleValue":null"#) {
+        return Err("a non-finite doubleValue was not sanitized".to_owned());
+    }
+    Ok(line)
 }
 
 // ---- normalization (deterministic order, timestamps) ----------------------
@@ -169,6 +175,40 @@ fn normalize_resource_logs(resource_logs: &mut ResourceLogs) {
         scope_logs.log_records.iter_mut().for_each(normalize_record);
     }
     resource_logs.scope_logs.sort_by_cached_key(sort_key_scope);
+    merge_equal_scopes(&mut resource_logs.scope_logs);
+}
+
+/// Merge scope groups that describe the same scope.
+///
+/// The SDK groups by scope through a `HashMap`, and a scope attribute holding
+/// NaN is never equal to itself, so every record of such a scope lands in its
+/// own group, in `HashMap` order. Merging them gives one scope with many
+/// records; the records are then sorted (their emission order is already lost)
+/// so the output bytes do not depend on that order.
+fn merge_equal_scopes(scope_logs: &mut Vec<ScopeLogs>) {
+    let mut merged: Vec<ScopeLogs> = Vec::with_capacity(scope_logs.len());
+    let mut combined = false;
+    for next in scope_logs.drain(..) {
+        match merged.last_mut() {
+            Some(last) if sort_key_scope(last) == sort_key_scope(&next) => {
+                last.log_records.extend(next.log_records);
+                combined = true;
+            }
+            _ => merged.push(next),
+        }
+    }
+    if combined {
+        for group in &mut merged {
+            group.log_records.sort_by_cached_key(|r| {
+                (
+                    r.time_unix_nano,
+                    r.observed_time_unix_nano,
+                    format!("{r:?}"),
+                )
+            });
+        }
+    }
+    *scope_logs = merged;
 }
 
 fn normalize_record(record: &mut LogRecord) {
@@ -202,7 +242,7 @@ fn sort_key_resource(resource_logs: &ResourceLogs) -> String {
     let attributes = resource_logs
         .resource
         .as_ref()
-        .map(|r| serde_json::to_string(&r.attributes).unwrap_or_default())
+        .map(|r| format!("{:?}", r.attributes))
         .unwrap_or_default();
     format!("{attributes}\u{0}{}", resource_logs.schema_url)
 }
@@ -216,7 +256,8 @@ fn sort_key_scope(scope_logs: &ScopeLogs) -> (String, String, String, String) {
                 (
                     s.name.clone(),
                     s.version.clone(),
-                    serde_json::to_string(&s.attributes).unwrap_or_default(),
+                    // Debug, not JSON: JSON writes NaN and ±Inf all as `null`.
+                    format!("{:?}", s.attributes),
                 )
             });
     (name, version, scope_logs.schema_url.clone(), attributes)
@@ -228,8 +269,14 @@ fn sort_key_scope(scope_logs: &ScopeLogs) -> (String, String, String, String) {
 /// the JSON in parallel, replacing the `null` that serde writes for a
 /// non-finite `doubleValue` with its [`NON_FINITE`] spelling.
 fn patch_resource_logs(resource_logs: &ResourceLogs, json: &mut Json) {
+    if let Some(resource) = &resource_logs.resource {
+        patch_key_values(&resource.attributes, &mut json["resource"]["attributes"]);
+    }
     let scopes = json["scopeLogs"].as_array_mut().into_iter().flatten();
     for (scope_logs, json_scope) in resource_logs.scope_logs.iter().zip(scopes) {
+        if let Some(scope) = &scope_logs.scope {
+            patch_key_values(&scope.attributes, &mut json_scope["scope"]["attributes"]);
+        }
         let records = json_scope["logRecords"]
             .as_array_mut()
             .into_iter()
