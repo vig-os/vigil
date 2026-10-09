@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Collector reference-reader conformance in CI compares complete rich log records across two resources, rotation, empty lines, garbage input and unterminated valid/garbage lines ([#6](https://github.com/vig-os/vigil/issues/6))
+
 - `vigil::init` and `Config` bridge tracing into rotating OTLP/JSON logs, attach producer resources, honor XDG and environment settings, flush on guard drop, and fall back to stderr on storage failures ([#5](https://github.com/vig-os/vigil/issues/5))
 
 - **Multi-process-safe size rotation and age retention** ([#4](https://github.com/vig-os/vigil/issues/4))
