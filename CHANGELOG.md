@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve tracing when a `log` logger already exists, install the subscriber before storage side effects, cap queue allocations at 1,048,576 slots, ignore empty overrides and relative HOME paths with clear diagnostics, and isolate the short-write child's output from redirected files ([#5](https://github.com/vig-os/vigil/issues/5))
+
 - Initialization tolerates failed stderr writes, routes SDK warnings to stderr, preserves 10,000-event bursts with a configurable 65,536-record queue, warns on invalid environment settings and shutdown timeouts, honors XDG path rules, and rejects duplicate subscribers before creating storage ([#5](https://github.com/vig-os/vigil/issues/5))
 
 ### Security

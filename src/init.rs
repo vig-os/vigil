@@ -7,7 +7,7 @@ use opentelemetry_sdk::{
     Resource,
     logs::{BatchConfigBuilder, BatchLogProcessor, SdkLogger, SdkLoggerProvider},
 };
-use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, registry::Registry, reload};
 
 use crate::{
     logs::OtlpJsonLogExporter,
@@ -17,6 +17,11 @@ use crate::{
 /// A programming error: invalid service name or an already installed subscriber.
 #[derive(Debug)]
 pub struct InitError(String);
+
+const MAX_QUEUE_SIZE: usize = 1_048_576;
+type LogLayer = Box<dyn Layer<Registry> + Send + Sync>;
+type BaseSubscriber = tracing_subscriber::layer::Layered<LogLayer, Registry>;
+type DestinationLayer = Box<dyn Layer<BaseSubscriber> + Send + Sync>;
 impl fmt::Display for InitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -105,11 +110,20 @@ impl Config {
         self
     }
     /// Maximum queued records (default 65,536); overrides `VIGIL_QUEUE_SIZE`.
-    /// Minimum 1. Memory is bounded by queue size times record size; overflow
+    /// Minimum 1; maximum 1,048,576. Oversized values clamp with a stderr warning.
+    /// Measured memory is approximately 16 bytes per reserved slot (16 MiB at
+    /// the cap) plus 0.4 KB per queued small record; larger fields need more.
+    /// Memory is bounded by queue size times record size; overflow
     /// drops records and emits a warning to stderr.
     #[must_use]
     pub fn queue_size(mut self, size: usize) -> Self {
-        self.queue_size = Some(size.max(1));
+        if size > MAX_QUEUE_SIZE {
+            let _ = writeln!(
+                std::io::stderr(),
+                "vigil: queue_size={size} exceeds {MAX_QUEUE_SIZE}; clamping to {MAX_QUEUE_SIZE}"
+            );
+        }
+        self.queue_size = Some(size.clamp(1, MAX_QUEUE_SIZE));
         self
     }
     /// Retention in days; zero keeps everything. Overrides `VIGIL_RETENTION_DAYS`.
@@ -152,6 +166,25 @@ impl Config {
                 "invalid service name: expected ASCII letters, digits, '-', '_' or '.'".into(),
             ));
         }
+        // Reserve the global subscriber before storage or provider side effects.
+        // The reload handle attaches the destination once storage is ready.
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let (layer, handle) = reload::Layer::new(None::<DestinationLayer>);
+        let subscriber = tracing_subscriber::registry().with(diagnostics()).with(
+            layer
+                .with_filter(filter)
+                .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                    !meta.target().starts_with("opentelemetry")
+                })),
+        );
+        tracing::subscriber::set_global_default(subscriber)
+            .map_err(|e| InitError(format!("cannot install global tracing subscriber: {e}")))?;
+        if tracing_log::LogTracer::init().is_err() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "vigil: a `log` logger is already installed; `log` records won't reach vigil"
+            );
+        }
         let dir = self
             .dir
             .or_else(|| {
@@ -166,7 +199,7 @@ impl Config {
             })
             .or_else(|| {
                 env::var_os("HOME")
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| std::path::Path::new(s).is_absolute())
                     .map(|s| PathBuf::from(s).join(".local/state").join(&self.service))
             });
         let mut rotation = RotationConfig::default();
@@ -182,22 +215,20 @@ impl Config {
         }
         let queue_size = self
             .queue_size
-            .or_else(|| number("VIGIL_QUEUE_SIZE", 1).and_then(|n| usize::try_from(n).ok()))
+            .or_else(|| number("VIGIL_QUEUE_SIZE", 1).map(|n| {
+                if n > MAX_QUEUE_SIZE as u64 {
+                    let _ = writeln!(std::io::stderr(), "vigil: VIGIL_QUEUE_SIZE={n} exceeds {MAX_QUEUE_SIZE}; clamping to {MAX_QUEUE_SIZE}");
+                }
+                n.min(MAX_QUEUE_SIZE as u64) as usize
+            }))
             .unwrap_or(65_536);
         let path_description = dir.as_ref().map_or_else(
             || "<unresolved state directory>".into(),
             |p| p.display().to_string(),
         );
         let file = dir
-            .ok_or_else(|| std::io::Error::other("neither XDG_STATE_HOME nor HOME is set"))
+            .ok_or_else(|| std::io::Error::other(format!("neither XDG_STATE_HOME nor HOME provides an absolute path; rejected XDG_STATE_HOME={:?}, HOME={:?}", env::var_os("XDG_STATE_HOME"), env::var_os("HOME"))))
             .and_then(|dir| RotatingFile::open(&dir, "logs", rotation));
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-        let diagnostics = tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
-            .with_ansi(false)
-            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
-                meta.target().starts_with("opentelemetry") && *meta.level() <= tracing::Level::WARN
-            }));
         match file {
             Ok(file) => {
                 let mut attrs = vec![
@@ -210,10 +241,11 @@ impl Config {
                 if let Some(version) = self.version {
                     attrs.push(KeyValue::new("service.version", version));
                 }
-                if let Some(revision) = self
-                    .revision
-                    .or_else(|| env::var("VIGIL_VCS_REVISION").ok())
-                {
+                if let Some(revision) = self.revision.or_else(|| {
+                    env::var("VIGIL_VCS_REVISION")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                }) {
                     attrs.push(KeyValue::new("vcs.ref.head.revision", revision));
                 }
                 let provider = SdkLoggerProvider::builder()
@@ -230,38 +262,23 @@ impl Config {
                             .build(),
                     )
                     .build();
-                let bridge = OpenTelemetryTracingBridge::new(&NamedProvider(provider.clone()))
-                    .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
-                        !meta.target().starts_with("opentelemetry")
-                    }));
+                let bridge = OpenTelemetryTracingBridge::new(&NamedProvider(provider.clone()));
                 let guard = Guard {
                     provider: Some(provider),
                 };
-                tracing_subscriber::registry()
-                    .with(diagnostics)
-                    .with(bridge.with_filter(filter))
-                    .try_init()
-                    .map_err(|e| {
-                        InitError(format!("cannot install global tracing subscriber: {e}"))
-                    })?;
+                handle
+                    .reload(Some(bridge.boxed()))
+                    .map_err(|e| InitError(format!("cannot configure tracing subscriber: {e}")))?;
                 Ok(guard)
             }
             Err(error) => {
-                tracing_subscriber::registry()
-                    .with(diagnostics)
-                    .with(
-                        tracing_subscriber::fmt::layer()
-                            .with_writer(std::io::stderr)
-                            .with_ansi(false)
-                            .with_filter(filter)
-                            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
-                                !meta.target().starts_with("opentelemetry")
-                            })),
-                    )
-                    .try_init()
-                    .map_err(|e| {
-                        InitError(format!("cannot install global tracing subscriber: {e}"))
-                    })?;
+                let fallback = tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(false)
+                    .boxed();
+                handle
+                    .reload(Some(fallback))
+                    .map_err(|e| InitError(format!("cannot configure tracing subscriber: {e}")))?;
                 let _ = writeln!(
                     std::io::stderr(),
                     "vigil: cannot open log storage at {path_description}: {error}; falling back to stderr"
@@ -281,7 +298,7 @@ impl LoggerProvider for NamedProvider {
     }
 }
 fn number(key: &str, minimum: u64) -> Option<u64> {
-    let value = env::var_os(key)?;
+    let value = env::var_os(key).filter(|s| !s.is_empty())?;
     if let Some(number) = value
         .to_str()
         .and_then(|s| s.parse::<u64>().ok())
@@ -306,4 +323,14 @@ fn hostname() -> Option<String> {
                 .filter(|s| !s.is_empty())
         })
         .or_else(|| env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+}
+
+fn diagnostics() -> LogLayer {
+    tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+            meta.target().starts_with("opentelemetry") && *meta.level() <= tracing::Level::WARN
+        }))
+        .boxed()
 }
