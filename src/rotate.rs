@@ -57,7 +57,8 @@
 //! * Segments whose mtime is in the future are not pruned until that time has
 //!   passed.
 //! * Read helpers take a shared directory lock for a consistent snapshot.
-//!   Lock acquisition times out after ten seconds if another process is hung.
+//!   Writers wait in the kernel; a wait over ten seconds emits one warning
+//!   per process after acquiring, naming the directory.
 //!   A line is written with a single `write(2)` to an
 //!   `O_APPEND` file, and rotation never replaces an existing segment. Atomic
 //!   rename publishes one name; the link/unlink fallback can briefly expose two
@@ -88,6 +89,7 @@ use std::fs::{self, DirBuilder, File};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -187,12 +189,14 @@ impl DirLock {
     }
 
     fn lock_current(&self, path: &Path) -> io::Result<(MutexGuard<'_, File>, Unlock)> {
+        let start = Instant::now();
         let mut dir = lock_ignore_poison(&self.gate);
         // A directory can be renamed away while we wait for its lock. Retry
         // with the replacement, but do not spin forever under repeated swaps.
         for _ in 0..8 {
             let unlock = Unlock(dir.try_clone()?);
-            lock_bounded(&dir, false)?;
+            dir.lock()?;
+            warn_slow_lock(path, start.elapsed(), &SLOW_LOCK_WARNED, &mut io::stderr());
             let locked = dir.metadata()?;
             match fs::metadata(path) {
                 Ok(current) if (locked.dev(), locked.ino()) == (current.dev(), current.ino()) => {
@@ -214,6 +218,19 @@ impl DirLock {
         Err(io::Error::other(
             "state directory changed repeatedly while locking",
         ))
+    }
+}
+
+const LOCK_WARNING_AFTER: Duration = Duration::from_secs(10);
+static SLOW_LOCK_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn warn_slow_lock(path: &Path, elapsed: Duration, warned: &AtomicBool, out: &mut impl Write) {
+    if elapsed > LOCK_WARNING_AFTER && !warned.swap(true, Ordering::Relaxed) {
+        let _ = writeln!(
+            out,
+            "vigil: waited over 10 seconds for state directory lock at {}",
+            path.display()
+        );
     }
 }
 
@@ -926,19 +943,19 @@ mod tests {
     }
 
     #[test]
-    fn held_directory_lock_times_out() {
+    fn held_directory_lock_eventually_succeeds() {
         let d = tmp("timeout");
         let log = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
         let held = File::open(&d).unwrap();
         held.lock().unwrap();
         // Release even on the original blocking implementation, bounding this test.
         let release = std::thread::spawn(move || {
-            std::thread::sleep(LOCK_TIMEOUT + Duration::from_secs(1));
+            std::thread::sleep(LOCK_WARNING_AFTER + Duration::from_secs(1));
             held.unlock().unwrap();
         });
         let result = log.append(b"{}");
         release.join().unwrap();
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(result.is_ok(), "{result:?}");
         fs::remove_dir_all(d).unwrap();
     }
 
@@ -985,6 +1002,89 @@ mod tests {
             1
         );
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn contention_child_role() {
+        let Ok(d) = std::env::var("VIGIL_CONTENTION_CHILD") else {
+            return;
+        };
+        let id = std::env::var("VIGIL_CONTENTION_ID").unwrap();
+        let d = PathBuf::from(d);
+        let log = RotatingFile::open(&d, "s", cfg(300)).unwrap();
+        let mut slowest = Duration::ZERO;
+        for i in 0..5000 {
+            let start = Instant::now();
+            log.append(format!("{id}:{i:04}").as_bytes()).unwrap();
+            slowest = slowest.max(start.elapsed());
+        }
+        fs::write(
+            d.join(format!("latency-{id}")),
+            slowest.as_secs_f64().to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn three_writers_complete_without_starvation() {
+        let d = tmp("contention");
+        fs::create_dir_all(&d).unwrap();
+        let mut children: Vec<_> = (0..3)
+            .map(|id| {
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "rotate::tests::contention_child_role"])
+                    .env("VIGIL_CONTENTION_CHILD", &d)
+                    .env("VIGIL_CONTENTION_ID", id.to_string())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut success = true;
+        for child in &mut children {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    success &= status.success();
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    success = false;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        for child in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(success, "contention child failed or exceeded 90 seconds");
+        let lines = all_lines(&d, "s");
+        assert_eq!(lines.len(), 15_000);
+        assert_eq!(lines.iter().collect::<HashSet<_>>().len(), 15_000);
+        for id in 0..3 {
+            let slowest: f64 = fs::read_to_string(d.join(format!("latency-{id}")))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(slowest < 5.0, "writer {id} max latency {slowest}s");
+        }
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn slow_lock_diagnostic_is_once_and_names_directory() {
+        let warned = AtomicBool::new(false);
+        let mut out = Vec::new();
+        let path = Path::new("/state/example");
+        warn_slow_lock(path, Duration::from_secs(10), &warned, &mut out);
+        assert!(out.is_empty());
+        for _ in 0..2 {
+            warn_slow_lock(path, Duration::from_secs(11), &warned, &mut out);
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains("/state/example"));
     }
 
     #[test]
