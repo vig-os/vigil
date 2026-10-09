@@ -16,6 +16,10 @@ categories = ["development-tools::debugging"]
 name = "vigil"
 
 [dependencies]
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["logs"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["logs", "gen-tonic-messages", "with-serde"] }
+serde_json = "1"
 
 [profile.release]
 lto = "thin"
