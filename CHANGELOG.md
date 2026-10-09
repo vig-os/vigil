@@ -27,4 +27,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Recheck and refresh the shared directory lock after state-directory replacement, recreate missing directories, and undo rotation links when unlinking the live file fails ([#25](https://github.com/vig-os/vigil/issues/25)).
+
 ### Security

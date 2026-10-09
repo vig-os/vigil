@@ -12,8 +12,10 @@
 //! (`std::fs::File::lock`) on the **directory** itself. A lock *file* would be
 //! open to a check-then-act race (one process verifies the lock file, it is
 //! unlinked, another creates and locks a fresh one, and both enter the critical
-//! section); a non-empty directory cannot be unlinked, so the race cannot
-//! happen. Locking the live data file is no option either: it is renamed away
+//! section). After locking, the directory handle's `(dev, ino)` is checked
+//! against the path; a replaced or missing directory is reopened (recreated
+//! `0700` if needed), re-locked and checked again, with bounded retries.
+//! Locking the live data file is no option either: it is renamed away
 //! on rotation, and a waiter would lock the renamed inode. After taking the lock
 //! the writer compares the live path's `(dev, ino)` with its cached handle and
 //! reopens when another process rotated in the meantime, so a record never
@@ -25,6 +27,9 @@
 //!
 //! * Safe across processes and threads on **local filesystems**. NFS (and
 //!   other filesystems with weak `flock` semantics) is **not supported**.
+//! * Rotation requires **hard-link support** (a local POSIX filesystem). If
+//!   linking is unsupported, appends past the size limit return the link error;
+//!   the live file stays intact and no data is lost.
 //! * Open **one** [`RotatingFile`] per signal per process and share it (for
 //!   example in an `Arc`). Two `flock`s taken through different file
 //!   descriptors block each other even inside one process, so every
@@ -124,19 +129,46 @@ impl Live {
 /// The directory lock shared by every [`RotatingFile`] of one directory in
 /// this process.
 struct DirLock {
-    /// Read-only handle on the directory; `flock`ed for every append.
-    dir: File,
-    /// Serialises threads (a `flock` does not exclude threads sharing one
-    /// descriptor).
-    gate: Mutex<()>,
+    /// Serialises threads and holds the current directory handle. Replacing
+    /// it updates the registry entry and every writer sharing this lock.
+    gate: Mutex<File>,
 }
 
 impl DirLock {
     fn open(dir: &Path) -> io::Result<Self> {
         Ok(Self {
-            dir: File::open(dir)?,
-            gate: Mutex::new(()),
+            gate: Mutex::new(File::open(dir)?),
         })
+    }
+
+    fn lock_current(&self, path: &Path) -> io::Result<(MutexGuard<'_, File>, Unlock)> {
+        let mut dir = lock_ignore_poison(&self.gate);
+        // A directory can be renamed away while we wait for its lock. Retry
+        // with the replacement, but do not spin forever under repeated swaps.
+        for _ in 0..8 {
+            let unlock = Unlock(dir.try_clone()?);
+            dir.lock()?;
+            let locked = dir.metadata()?;
+            match fs::metadata(path) {
+                Ok(current) if (locked.dev(), locked.ino()) == (current.dev(), current.ino()) => {
+                    return Ok((dir, unlock));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            drop(unlock);
+            DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+            tighten(path, 0o700)?;
+            match File::open(path) {
+                Ok(current) => *dir = current,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::other(
+            "state directory changed repeatedly while locking",
+        ))
     }
 }
 
@@ -271,9 +303,7 @@ impl RotatingFile {
         buf.push(b'\n');
         let need = buf.len() as u64;
 
-        let _gate = lock_ignore_poison(&self.lock.gate);
-        self.lock.dir.lock()?;
-        let _unlock = Unlock(self.lock.dir.try_clone()?);
+        let (_gate, _unlock) = self.lock.lock_current(&self.dir)?;
         let mut live = lock_ignore_poison(&self.live);
 
         // Another process may have rotated (or removed) the file since our
@@ -456,6 +486,16 @@ fn next_segment_name(signal: &str, now: &str, newest: Option<&str>) -> String {
 /// `hard_link` fails with `AlreadyExists`, then the next name is tried. Called
 /// under the lock.
 fn rotate(dir: &Path, signal: &str, live_path: &Path) -> io::Result<()> {
+    rotate_with(dir, signal, live_path, |p| fs::remove_file(p))
+}
+
+/// Injectable unlink step, like the partial-write seam in `append_with`.
+fn rotate_with(
+    dir: &Path,
+    signal: &str,
+    live_path: &Path,
+    remove_live: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let now = stamp(SystemTime::now());
     let mut newest = rotated_segments(dir, signal)?
         .pop()
@@ -463,7 +503,15 @@ fn rotate(dir: &Path, signal: &str, live_path: &Path) -> io::Result<()> {
     loop {
         let name = next_segment_name(signal, &now, newest.as_deref());
         match fs::hard_link(live_path, dir.join(&name)) {
-            Ok(()) => return fs::remove_file(live_path),
+            Ok(()) => {
+                if let Err(e) = remove_live(live_path) {
+                    // The two names still share an inode: undo the segment so
+                    // readers do not see the same records twice.
+                    let _ = fs::remove_file(dir.join(&name));
+                    return Err(e);
+                }
+                return Ok(());
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => newest = Some(name),
             Err(e) => return Err(e),
         }
@@ -1126,6 +1174,149 @@ mod tests {
         let hit = find_newest(&d, "s", |l| l.starts_with("rec").then(|| l.to_owned())).unwrap();
         assert_eq!(hit.as_deref(), Some("rec3aaa"));
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn failed_live_unlink_undoes_segment() {
+        let d = tmp("unlink-failure");
+        let log = RotatingFile::open(&d, "s", cfg(10)).unwrap();
+        log.append(b"original").unwrap();
+        let live = d.join("s.jsonl");
+        let err =
+            rotate_with(&d, "s", &live, |_| Err(io::Error::from_raw_os_error(13))).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(13));
+        assert_eq!(fs::read_to_string(&live).unwrap(), "original\n");
+        assert_eq!(segments(&d, "s").unwrap(), [live]);
+        log.append(b"next").unwrap();
+        assert_eq!(all_lines(&d, "s"), ["original", "next"]);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn missing_directory_is_recreated_and_registry_stays_shared() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("missing-dir");
+        let a = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        let b = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        a.append(b"before").unwrap();
+        fs::remove_dir_all(&d).unwrap();
+        a.append(b"after-a").unwrap();
+        b.append(b"after-b").unwrap();
+        let c = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        assert!(Arc::ptr_eq(&a.lock, &b.lock));
+        assert!(Arc::ptr_eq(&a.lock, &c.lock));
+        c.append(b"after-c").unwrap();
+        assert_eq!(
+            fs::metadata(&d).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(all_lines(&d, "s"), ["after-a", "after-b", "after-c"]);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    fn wait_for(path: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !path.exists() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {path:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn replaced_directory_child_role() {
+        let Some(root) = std::env::var_os("VIGIL_REPLACED_DIR") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let id = std::env::var("VIGIL_REPLACED_ID").unwrap();
+        let dir = root.join("state");
+        let a = RotatingFile::open(&dir, "s", cfg(300)).unwrap();
+        let b = RotatingFile::open(&dir, "s", cfg(300)).unwrap();
+        a.append(format!("before-{id}").as_bytes()).unwrap();
+        fs::write(root.join(format!("ready-{id}")), "").unwrap();
+        wait_for(&root.join("go"));
+        fs::write(root.join(format!("attempt-{id}")), "").unwrap();
+        for i in 0..500 {
+            let log = if i % 2 == 0 { &a } else { &b };
+            log.append(format!("{id}-{i:03}-pad-pad-pad").as_bytes())
+                .unwrap();
+            if i == 0 {
+                fs::write(root.join(format!("entered-{id}")), "").unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn replaced_directory_processes_relock_and_preserve_records() {
+        let root = tmp("replace-dir");
+        fs::create_dir_all(&root).unwrap();
+        let dir = root.join("state");
+        let old = root.join("old");
+        let exe = std::env::current_exe().unwrap();
+        let mut children: Vec<_> = (0..4)
+            .map(|id| {
+                Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "rotate::tests::replaced_directory_child_role",
+                        "--test-threads=1",
+                    ])
+                    .env("VIGIL_REPLACED_DIR", &root)
+                    .env("VIGIL_REPLACED_ID", id.to_string())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for id in 0..4 {
+            wait_for(&root.join(format!("ready-{id}")));
+        }
+        fs::rename(&dir, &old).unwrap();
+        fs::create_dir(&dir).unwrap();
+        let lock = File::open(&dir).unwrap();
+        lock.lock().unwrap();
+        fs::write(root.join("go"), "").unwrap();
+        for id in 0..4 {
+            wait_for(&root.join(format!("attempt-{id}")));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let excluded = (0..4).all(|id| !root.join(format!("entered-{id}")).exists());
+        lock.unlock().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        for child in &mut children {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    for child in &mut children {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    panic!("child timed out");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(excluded, "writers bypassed the replacement directory lock");
+        let before = all_lines(&old, "s");
+        assert_eq!(before.len(), 4, "nothing appended to the old directory");
+        assert_eq!(
+            before.into_iter().collect::<HashSet<_>>(),
+            (0..4).map(|id| format!("before-{id}")).collect()
+        );
+        for path in segments(&dir, "s").unwrap() {
+            let bytes = fs::read(&path).unwrap();
+            assert!(bytes.ends_with(b"\n"), "torn final line: {path:?}");
+            assert!(bytes.len() <= 300, "segment exceeded size limit: {path:?}");
+        }
+        let lines = all_lines(&dir, "s");
+        assert_eq!(lines.len(), 2000);
+        let expected: HashSet<_> = (0..4)
+            .flat_map(|id| (0..500).map(move |i| format!("{id}-{i:03}-pad-pad-pad")))
+            .collect();
+        assert_eq!(lines.into_iter().collect::<HashSet<_>>(), expected);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

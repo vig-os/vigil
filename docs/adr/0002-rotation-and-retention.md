@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-09
+- **Amended:** 2026-10-09 — hard-link support requirement ([#25](https://github.com/vig-os/vigil/issues/25))
 - **Issues:** [#1](https://github.com/vig-os/vigil/issues/1), [#4](https://github.com/vig-os/vigil/issues/4)
 
 ## Context
@@ -31,6 +32,8 @@ Rotation lives in the crate, std only (`File::lock`, stable since Rust 1.89), Un
 The acceptance test is a **multi-process** test, not a thread test: the test binary re-executes itself as N ≥ 4 children, each writing M records with a tiny `max_bytes` that forces many rotations. It asserts every record appears exactly once across all segments, every line is whole, no segment exceeds the limit except single oversize lines, and no segment name collides. It sits beside targeted tests for each probe above (same-second rotation, name order, stale-inode reopen, retention with set mtimes, `None` keeps, partial-write rollback via a test seam, second `open` not deadlocking). Tests write only under `std::env::temp_dir()`, since `HOME` is unwritable in the Nix sandbox.
 
 ## Consequences
+
+- Rotation requires hard-link support on a local POSIX filesystem. Without it, appends past the size limit fail with the link error; the live file stays intact and no data is lost.
 
 - Any number of local processes may share a state directory safely; the cost is one `flock` and one `stat` per write.
 - The lock file (`<signal>.jsonl.lock`) sits beside the data and must be ignored by readers and shipping agents; segment listing matches only `<signal>.jsonl` and `<signal>-*.jsonl`.
