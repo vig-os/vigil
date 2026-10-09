@@ -44,7 +44,8 @@
         #   ];
         # ────────────────────────────────────────────────────────────────────
         extraPackages = pkgs: [
-          # add project tools here (the Rust toolchain comes from `rust`)
+          pkgs.opentelemetry-collector-contrib
+          pkgs.python3
         ];
 
         # The Rust pack (vigos.lib.mkRustProject): the toolchain pinned by
