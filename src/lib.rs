@@ -1,8 +1,8 @@
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 
-pub mod rotate;
 pub mod logs;
+pub mod rotate;
 pub mod sink;
 
 /// The version of this crate, stamped into every resource it describes.
