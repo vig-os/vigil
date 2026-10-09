@@ -46,6 +46,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
@@ -90,6 +91,7 @@ pub struct OtlpJsonLogExporter<S: LineSink> {
     sink: S,
     resource: ResourceAttributesWithSchema,
     max_line_bytes: usize,
+    dropped_records: AtomicUsize,
 }
 
 impl<S: LineSink> OtlpJsonLogExporter<S> {
@@ -101,6 +103,7 @@ impl<S: LineSink> OtlpJsonLogExporter<S> {
             sink,
             resource: ResourceAttributesWithSchema::default(),
             max_line_bytes: 1_000_000,
+            dropped_records: AtomicUsize::new(0),
         }
     }
 
@@ -119,6 +122,12 @@ impl<S: LineSink> OtlpJsonLogExporter<S> {
         &self.sink
     }
 
+    // The initialization wrapper combines replacements and failed exports in
+    // its bounded cumulative runtime-loss diagnostics.
+    pub(crate) fn take_dropped_records(&self) -> usize {
+        self.dropped_records.swap(0, Ordering::Relaxed)
+    }
+
     fn export_batch(&self, batch: &LogBatch<'_>) -> OTelSdkResult {
         let Some(resource_logs) = group_batch(batch, &self.resource) else {
             return Ok(());
@@ -127,8 +136,14 @@ impl<S: LineSink> OtlpJsonLogExporter<S> {
             resource_logs: vec![resource_logs],
         })
         .map_err(|e| OTelSdkError::InternalFailure(format!("encoding log batch: {e}")))?;
-        let lines =
-            bounded_lines(&line, self.max_line_bytes).map_err(OTelSdkError::InternalFailure)?;
+        let mut dropped = 0;
+        let lines = bounded_lines_counted(&line, self.max_line_bytes, &mut dropped)
+            .map_err(OTelSdkError::InternalFailure)?;
+        let _ = self
+            .dropped_records
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_add(dropped))
+            });
         for line in lines {
             self.sink
                 .write_line(line.as_bytes())
@@ -183,7 +198,16 @@ fn encode_line(request: &ExportLogsServiceRequest) -> Result<String, String> {
 
 // Work on patched JSON: budgets include escaping and non-finite spellings.
 // Small batches retain their original bytes, including the golden layout.
+#[cfg(test)]
 fn bounded_lines(line: &str, limit: usize) -> Result<Vec<String>, String> {
+    bounded_lines_counted(line, limit, &mut 0)
+}
+
+fn bounded_lines_counted(
+    line: &str,
+    limit: usize,
+    dropped: &mut usize,
+) -> Result<Vec<String>, String> {
     if line.len() <= limit {
         return Ok(vec![line.to_owned()]);
     }
@@ -203,7 +227,8 @@ fn bounded_lines(line: &str, limit: usize) -> Result<Vec<String>, String> {
             let overhead = resource_prefix.len() + scope_prefix.len() + 6;
             let mut open = false;
             for record in scope["logRecords"].as_array().into_iter().flatten() {
-                let text = fit_record(record, overhead, limit)?;
+                let (text, replaced) = fit_record(record, overhead, limit)?;
+                *dropped = dropped.saturating_add(usize::from(replaced));
                 let extra = if open {
                     1
                 } else {
@@ -274,11 +299,11 @@ fn markers(original_size: usize, dropped: bool) -> Vec<Json> {
     attributes
 }
 
-fn fit_record(record: &Json, overhead: usize, limit: usize) -> Result<String, String> {
+fn fit_record(record: &Json, overhead: usize, limit: usize) -> Result<(String, bool), String> {
     let original = record.to_string();
     let original_size = overhead + original.len();
     if original_size <= limit {
-        return Ok(original);
+        return Ok((original, false));
     }
     let mut shortened = record.clone();
     let mut attributes = shortened["attributes"]
@@ -313,7 +338,7 @@ fn fit_record(record: &Json, overhead: usize, limit: usize) -> Result<String, St
         }
         if size <= limit {
             sort_json_attributes(&mut shortened);
-            return Ok(shortened.to_string());
+            return Ok((shortened.to_string(), false));
         }
     }
     // A record with excessive structural/non-string data becomes one explicit
@@ -343,7 +368,7 @@ fn fit_record(record: &Json, overhead: usize, limit: usize) -> Result<String, St
             "log envelope and diagnostic identity exceed max_line_bytes={limit}"
         ));
     }
-    Ok(text)
+    Ok((text, true))
 }
 
 fn sort_json_attributes(value: &mut Json) {
