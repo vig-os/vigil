@@ -15,7 +15,7 @@ fn child() {
     let cfg = vigil::Config::new("test-service")
         .version("1.2.3")
         .revision("abc123");
-    let cfg = if matches!(mode.as_str(), "env" | "xdg" | "home") {
+    let cfg = if matches!(mode.as_str(), "env" | "xdg" | "home" | "relative") {
         cfg
     } else {
         cfg.dir(&dir).max_bytes(1_000_000).retention_days(0)
@@ -39,7 +39,21 @@ fn child() {
     if mode == "nan" {
         tracing::info!(nan = f64::NAN, "non-finite");
     }
+    if mode == "runtime" {
+        std::thread::sleep(Duration::from_millis(1200));
+        fs::remove_file(dir.join("logs.jsonl")).unwrap();
+        fs::create_dir(dir.join("logs.jsonl")).unwrap();
+        for _ in 0..3 {
+            tracing::info!("lost record");
+            std::thread::sleep(Duration::from_millis(1200));
+        }
+    }
     drop(guard);
+    if mode == "shutdown" {
+        for _ in 0..1000 {
+            tracing::info!("after shutdown");
+        }
+    }
 }
 
 fn run(mode: &str, dir: &std::path::Path, extra: &[(&str, &str)]) -> std::process::Output {
@@ -222,5 +236,57 @@ fn read_only_directory_falls_back() {
             .count(),
         1
     );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn shutdown_warns_once() {
+    let dir = temp("shutdown");
+    let output = run("shutdown", &dir, &[]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("after shutdown"));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn runtime_errors_are_counted_and_limited() {
+    let dir = temp("runtime");
+    let output = run("runtime", &dir, &[]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 2, "{stderr}");
+    assert!(stderr.contains("dropped records: 1"), "{stderr}");
+    assert!(stderr.contains("dropped records: 3"), "{stderr}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn invalid_filter_warns_once() {
+    let dir = temp("filter");
+    let output = run("builder", &dir, &[("RUST_LOG", "info,[")]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.matches("invalid RUST_LOG").count(), 1, "{stderr}");
+    assert!(
+        fs::read_to_string(dir.join("logs.jsonl"))
+            .unwrap()
+            .contains("visible info")
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn relative_override_warns_and_uses_default() {
+    let dir = temp("relative");
+    let output = run(
+        "relative",
+        &dir,
+        &[
+            ("VIGIL_DIR", "rel"),
+            ("XDG_STATE_HOME", dir.to_str().unwrap()),
+        ],
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.matches("invalid VIGIL_DIR").count(), 1, "{stderr}");
+    assert!(dir.join("test-service/logs.jsonl").exists());
     fs::remove_dir_all(dir).unwrap();
 }

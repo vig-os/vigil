@@ -45,6 +45,17 @@ a second initialization returns an error before creating storage. An existing
 `log` logger is preserved: initialization succeeds with one warning that `log`
 records cannot reach vigil; tracing events continue to be written.
 
+Call `init` **after forking**. A child forked after initialization inherits the
+parent's directory lock and subscriber but has no batch worker; it cannot safely
+continue using that logging instance.
+
+Storage-open failures fall back to stderr. Runtime export failures drop the affected
+records: the first error is reported on stderr, followed by cumulative dropped-record
+summaries at most once per minute during failing exports and at shutdown if needed.
+After the guard drops, events are discarded with one stderr warning.
+`VIGIL_DIR` must be absolute; relative values warn and use the default resolution.
+Invalid `RUST_LOG` values warn once and use `info`.
+
 ## Why not an existing crate
 
 `tracing`, `opentelemetry` and `opentelemetry-proto` are the foundation and are used as-is. What's missing upstream: opentelemetry-rust has **no OTLP file exporter**, and every rotating-file crate (`file-rotate`, `logroller`, `log2`, `flexi_logger`, …) is thread-safe but not **multi-process** safe.

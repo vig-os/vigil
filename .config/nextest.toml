@@ -1,0 +1,3 @@
+[profile.default]
+# Some tests launch four child writers; serialize cases on shared hosts.
+test-threads = 1
