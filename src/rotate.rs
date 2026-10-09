@@ -12,8 +12,13 @@
 //! (`std::fs::File::lock`) on the **directory** itself. A lock *file* would be
 //! open to a check-then-act race (one process verifies the lock file, it is
 //! unlinked, another creates and locks a fresh one, and both enter the critical
-//! section); a non-empty directory cannot be unlinked, so the race cannot
-//! happen. Locking the live data file is no option either: it is renamed away
+//! section). After locking, the directory handle's `(dev, ino)` is checked
+//! against the path; a replaced or missing directory is reopened (recreated
+//! `0700` if needed), re-locked and checked again, with bounded retries. All
+//! critical-section file operations are relative to that locked descriptor.
+//! A swap during an append therefore leaves that append in the old directory;
+//! the next lock acquisition moves the writer to the replacement directory.
+//! Locking the live data file is no option either: it is renamed away
 //! on rotation, and a waiter would lock the renamed inode. After taking the lock
 //! the writer compares the live path's `(dev, ino)` with its cached handle and
 //! reopens when another process rotated in the meantime, so a record never
@@ -25,6 +30,16 @@
 //!
 //! * Safe across processes and threads on **local filesystems**. NFS (and
 //!   other filesystems with weak `flock` semantics) is **not supported**.
+//! * Rotation uses an **atomic no-replace rename**, relative to the locked
+//!   directory descriptor (Linux `RENAME_NOREPLACE`, macOS `RENAME_EXCL`). Only
+//!   when unsupported (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`, `ENOTSUP`) does it fall back to
+//!   directory-relative link/unlink, which requires hard-link support. If
+//!   linking fails, the live file stays intact and the append returns the error.
+//!   If both the live unlink and its undo fail, the error reports both failures;
+//!   the next lock acquisition heals the live file only if a segment of the
+//!   same signal in the locked directory shares its device and inode. It then
+//!   unlinks the live name and creates a fresh file, preserving the segment's
+//!   data. External backup links alone never trigger healing.
 //! * Open **one** [`RotatingFile`] per signal per process and share it (for
 //!   example in an `Arc`). Two `flock`s taken through different file
 //!   descriptors block each other even inside one process, so every
@@ -42,8 +57,10 @@
 //! * Segments whose mtime is in the future are not pruned until that time has
 //!   passed.
 //! * Readers need no lock: a line is written with a single `write(2)` to an
-//!   `O_APPEND` file, and rotation never replaces an existing file (it
-//!   hard-links the live file to the new name, then unlinks the old one).
+//!   `O_APPEND` file, and rotation never replaces an existing segment. Atomic
+//!   rename publishes one name; the link/unlink fallback can briefly expose two
+//!   names for the same inode, including after a reported undo failure until
+//!   the next lock acquisition heals it.
 //!
 //! # Layout
 //!
@@ -62,10 +79,12 @@
 //! directory or live file with looser permissions is tightened (never
 //! loosened).
 
+use rustix::fs::{self as rfs, AtFlags, Mode, OFlags};
+use rustix::io::Errno;
 use std::collections::HashMap;
-use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::fs::{self, DirBuilder, File};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -101,42 +120,98 @@ impl Default for RotationConfig {
     }
 }
 
-/// `(dev, ino)` of an open file.
-type FileId = (u64, u64);
-
-/// The cached live handle, replaced whenever the file at the live path changes.
+/// The cached live handle, replaced whenever the file at the live name changes.
 struct Live {
     file: File,
-    id: FileId,
 }
 
 impl Live {
-    fn open(live_path: &Path) -> io::Result<Self> {
-        let file = open_private(live_path)?;
-        let m = file.metadata()?;
-        Ok(Self {
-            id: (m.dev(), m.ino()),
-            file,
-        })
+    fn open(dir: &File, name: &Path, signal: &str) -> io::Result<Self> {
+        let mut file = open_private(dir, name)?;
+        // A failed fallback undo may have left both the live and segment names
+        // on this inode. Verify that the extra name is our segment, rather
+        // than an external backup link, before starting a fresh live file.
+        if has_segment_link(dir, signal, &rfs::fstat(&file)?)? {
+            unlink_name(dir, name)?;
+            file = open_private(dir, name)?;
+        }
+        Ok(Self { file })
     }
+
+    fn refresh(&mut self, dir: &File, name: &Path, signal: &str) -> io::Result<()> {
+        let cached = rfs::fstat(&self.file)?;
+        match rfs::statat(dir, name, AtFlags::empty()) {
+            Ok(current)
+                if (current.st_dev, current.st_ino) == (cached.st_dev, cached.st_ino)
+                    && !has_segment_link(dir, signal, &current)? => {}
+            Ok(_) | Err(Errno::NOENT) => *self = Self::open(dir, name, signal)?,
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+}
+
+/// Only an extra link under this signal's segment name proves that rotation
+/// left a duplicate. External backups must keep their live name and records.
+fn has_segment_link(dir: &File, signal: &str, live: &rfs::Stat) -> io::Result<bool> {
+    if live.st_nlink <= 1 {
+        return Ok(false);
+    }
+    for name in rotated_names_at(dir, signal)? {
+        match rfs::statat(dir, name, AtFlags::empty()) {
+            Ok(segment) if (segment.st_dev, segment.st_ino) == (live.st_dev, live.st_ino) => {
+                return Ok(true);
+            }
+            Ok(_) | Err(Errno::NOENT) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(false)
 }
 
 /// The directory lock shared by every [`RotatingFile`] of one directory in
 /// this process.
 struct DirLock {
-    /// Read-only handle on the directory; `flock`ed for every append.
-    dir: File,
-    /// Serialises threads (a `flock` does not exclude threads sharing one
-    /// descriptor).
-    gate: Mutex<()>,
+    /// Serialises threads and holds the current directory handle. Replacing
+    /// it updates the registry entry and every writer sharing this lock.
+    gate: Mutex<File>,
 }
 
 impl DirLock {
     fn open(dir: &Path) -> io::Result<Self> {
         Ok(Self {
-            dir: File::open(dir)?,
-            gate: Mutex::new(()),
+            gate: Mutex::new(File::open(dir)?),
         })
+    }
+
+    fn lock_current(&self, path: &Path) -> io::Result<(MutexGuard<'_, File>, Unlock)> {
+        let mut dir = lock_ignore_poison(&self.gate);
+        // A directory can be renamed away while we wait for its lock. Retry
+        // with the replacement, but do not spin forever under repeated swaps.
+        for _ in 0..8 {
+            let unlock = Unlock(dir.try_clone()?);
+            dir.lock()?;
+            let locked = dir.metadata()?;
+            match fs::metadata(path) {
+                Ok(current) if (locked.dev(), locked.ino()) == (current.dev(), current.ino()) => {
+                    return Ok((dir, unlock));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            drop(unlock);
+            DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+            tighten(path, 0o700)?;
+            match File::open(path) {
+                Ok(current) => *dir = current,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::other(
+            "state directory changed repeatedly while locking",
+        ))
     }
 }
 
@@ -224,16 +299,14 @@ impl RotatingFile {
         cfg: RotationConfig,
     ) -> io::Result<Self> {
         let live_path = dir.join(format!("{signal}.jsonl"));
-        // Before opening: another process may rotate the live file away at any
-        // moment, so a file that vanished is simply skipped.
-        match tighten(&live_path, 0o600) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            r => r?,
-        }
-        let live = Live::open(&live_path)?;
-        if let Some(keep) = cfg.retention {
-            prune(&dir, signal, keep);
-        }
+        let live = {
+            let (handle, _unlock) = lock.lock_current(&dir)?;
+            let live = Live::open(&handle, Path::new(&format!("{signal}.jsonl")), signal)?;
+            if let Some(keep) = cfg.retention {
+                prune_at(&handle, signal, keep);
+            }
+            live
+        };
         Ok(Self {
             lock,
             dir,
@@ -271,23 +344,18 @@ impl RotatingFile {
         buf.push(b'\n');
         let need = buf.len() as u64;
 
-        let _gate = lock_ignore_poison(&self.lock.gate);
-        self.lock.dir.lock()?;
-        let _unlock = Unlock(self.lock.dir.try_clone()?);
+        let (dir, _unlock) = self.lock.lock_current(&self.dir)?;
+        let name = PathBuf::from(format!("{}.jsonl", self.signal));
         let mut live = lock_ignore_poison(&self.live);
 
-        // Another process may have rotated (or removed) the file since our
-        // last append: the cached handle then points at a renamed inode.
-        if disk_id(&self.live_path) != Some(live.id) {
-            *live = Live::open(&self.live_path)?;
-        }
+        live.refresh(&dir, &name, &self.signal)?;
 
         let len = live.file.metadata()?.len();
         if len > 0 && len.checked_add(need).is_none_or(|n| n > self.cfg.max_bytes) {
-            rotate(&self.dir, &self.signal, &self.live_path)?;
-            *live = Live::open(&self.live_path)?;
+            rotate(&dir, &self.signal, &name)?;
+            *live = Live::open(&dir, &name, &self.signal)?;
             if let Some(keep) = self.cfg.retention {
-                prune(&self.dir, &self.signal, keep);
+                prune_at(&dir, &self.signal, keep);
             }
         }
 
@@ -333,12 +401,18 @@ fn validate_signal(signal: &str) -> io::Result<()> {
 }
 
 /// Open (creating as needed) an `O_APPEND` data file, `0600`.
-fn open_private(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
+fn open_private(dir: &File, name: &Path) -> io::Result<File> {
+    let file = File::from(rfs::openat(
+        dir,
+        name,
+        OFlags::CREATE | OFlags::APPEND | OFlags::WRONLY | OFlags::CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    )?);
+    let mode = rfs::fstat(&file)?.st_mode & 0o7777;
+    if mode & !0o600 != 0 {
+        rfs::fchmod(&file, Mode::from_bits_truncate(mode & 0o600))?;
+    }
+    Ok(file)
 }
 
 /// Tighten (never loosen) `path` to at most `mask` permission bits, so a
@@ -369,10 +443,6 @@ fn write_once(w: &mut impl Write, buf: &[u8]) -> io::Result<()> {
             format!("short write: {n} of {} bytes", buf.len()),
         ))
     }
-}
-
-fn disk_id(path: &Path) -> Option<FileId> {
-    fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
 /// `YYYYMMDDTHHMMSS.nnnnnnnnnZ`: fixed width, so it sorts chronologically.
@@ -452,22 +522,108 @@ fn next_segment_name(signal: &str, now: &str, newest: Option<&str>) -> String {
     }
 }
 
-/// Move the live file to a new segment name without ever replacing a file:
-/// `hard_link` fails with `AlreadyExists`, then the next name is tried. Called
-/// under the lock.
-fn rotate(dir: &Path, signal: &str, live_path: &Path) -> io::Result<()> {
+/// Rotate relative to the locked directory, atomically and without replacing
+/// an existing segment. Fall back only when the no-replace operation is absent.
+fn rotate(dir: &File, signal: &str, live_name: &Path) -> io::Result<()> {
+    rotate_with(dir, signal, live_name, rename_new, unlink_name)
+}
+
+fn rename_new(dir: &File, old: &Path, new: &Path) -> io::Result<()> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox"
+    ))]
+    {
+        // On Apple targets rustix maps NOREPLACE to RENAME_EXCL.
+        rfs::renameat_with(dir, old, dir, new, rfs::RenameFlags::NOREPLACE)?;
+        Ok(())
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox"
+    )))]
+    {
+        let _ = (dir, old, new);
+        Err(Errno::NOSYS.into())
+    }
+}
+
+fn unlink_name(dir: &File, name: &Path) -> io::Result<()> {
+    rfs::unlinkat(dir, name, AtFlags::empty())?;
+    Ok(())
+}
+
+fn rename_unsupported(error: &io::Error) -> bool {
+    let raw = error.raw_os_error();
+    // macOS ENOTSUP (45) differs from EOPNOTSUPP (102). Linux aliases them.
+    // rustix does not expose NOTSUP on Redox.
+    #[cfg(not(target_os = "redox"))]
+    if raw == Some(Errno::NOTSUP.raw_os_error()) {
+        return true;
+    }
+    [Errno::INVAL, Errno::NOSYS, Errno::OPNOTSUPP]
+        .iter()
+        .any(|code| raw == Some(code.raw_os_error()))
+}
+
+/// Injectable rename/unlink steps, like the partial-write seam in `append_with`.
+fn rotate_with(
+    dir: &File,
+    signal: &str,
+    live_name: &Path,
+    mut rename: impl FnMut(&File, &Path, &Path) -> io::Result<()>,
+    mut unlink: impl FnMut(&File, &Path) -> io::Result<()>,
+) -> io::Result<()> {
     let now = stamp(SystemTime::now());
-    let mut newest = rotated_segments(dir, signal)?
+    let mut newest = rotated_names_at(dir, signal)?
         .pop()
-        .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_owned));
+        .and_then(|p| p.to_str().map(str::to_owned));
     loop {
         let name = next_segment_name(signal, &now, newest.as_deref());
-        match fs::hard_link(live_path, dir.join(&name)) {
-            Ok(()) => return fs::remove_file(live_path),
+        let target = Path::new(&name);
+        let result = match rename(dir, live_name, target) {
+            Err(e) if rename_unsupported(&e) => {
+                match rfs::linkat(dir, live_name, dir, target, AtFlags::empty()) {
+                    Ok(()) => {
+                        if let Err(original) = unlink(dir, live_name) {
+                            if let Err(undo) = unlink(dir, target) {
+                                return Err(io::Error::other(format!(
+                                    "unlink live {live_name:?} failed: {original}; undo segment {target:?} failed: {undo}"
+                                )));
+                            }
+                            return Err(original);
+                        }
+                        Ok(())
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+            result => result,
+        };
+        match result {
+            Ok(()) => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => newest = Some(name),
             Err(e) => return Err(e),
         }
     }
+}
+
+fn rotated_names_at(dir: &File, signal: &str) -> io::Result<Vec<PathBuf>> {
+    let mut names = Vec::new();
+    for entry in rfs::Dir::read_from(dir)? {
+        let entry = entry?;
+        if let Ok(name) = entry.file_name().to_str()
+            && is_segment_name(name, signal)
+        {
+            names.push(PathBuf::from(name));
+        }
+    }
+    names.sort_by_key(|p| segment_key(p, signal));
+    Ok(names)
 }
 
 /// Whether `name` is a rotated segment of `signal`.
@@ -503,17 +659,27 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 
 /// Delete rotated segments last written more than `keep` ago. Never touches
 /// the live or lock file; errors are ignored.
-fn prune(dir: &Path, signal: &str, keep: Duration) {
-    let Ok(segs) = rotated_segments(dir, signal) else {
+fn prune_at(dir: &File, signal: &str, keep: Duration) {
+    let Ok(names) = rotated_names_at(dir, signal) else {
         return;
     };
     let now = SystemTime::now();
-    for p in segs {
-        let expired = mtime(&p)
-            .and_then(|t| now.duration_since(t).ok())
+    for name in names {
+        let expired = rfs::statat(dir, &name, AtFlags::empty())
+            .ok()
+            .and_then(|m| {
+                let secs = Duration::from_secs(m.st_mtime.unsigned_abs());
+                let base = if m.st_mtime >= 0 {
+                    UNIX_EPOCH.checked_add(secs)
+                } else {
+                    UNIX_EPOCH.checked_sub(secs)
+                }?;
+                base.checked_add(Duration::new(0, u32::try_from(m.st_mtime_nsec).ok()?))
+            })
+            .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age > keep);
         if expired {
-            let _ = fs::remove_file(&p);
+            let _ = unlink_name(dir, &name);
         }
     }
 }
@@ -1129,6 +1295,496 @@ mod tests {
     }
 
     #[test]
+    fn failed_live_unlink_undoes_segment() {
+        let d = tmp("unlink-failure");
+        let log = RotatingFile::open(&d, "s", cfg(10)).unwrap();
+        log.append(b"original").unwrap();
+        let live = d.join("s.jsonl");
+        let err = rotate_with(
+            &File::open(&d).unwrap(),
+            "s",
+            Path::new("s.jsonl"),
+            |_, _, _| Err(Errno::NOSYS.into()),
+            |dir, name| {
+                if name == Path::new("s.jsonl") {
+                    Err(io::Error::from_raw_os_error(13))
+                } else {
+                    unlink_name(dir, name)
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(13));
+        assert_eq!(fs::read_to_string(&live).unwrap(), "original\n");
+        assert_eq!(segments(&d, "s").unwrap(), [live]);
+        log.append(b"next").unwrap();
+        assert_eq!(all_lines(&d, "s"), ["original", "next"]);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn atomic_rename_retries_collision_without_unlinking() {
+        let d = tmp("atomic-collision");
+        let log = RotatingFile::open(&d, "s", cfg(10)).unwrap();
+        log.append(b"original").unwrap();
+        let dir = File::open(&d).unwrap();
+        let mut planted = false;
+        rotate_with(
+            &dir,
+            "s",
+            Path::new("s.jsonl"),
+            |dir, old, new| {
+                if !planted {
+                    open_private(dir, new)?.write_all(b"squat\n")?;
+                    planted = true;
+                }
+                rename_new(dir, old, new)
+            },
+            |_, _| panic!("atomic rename must not call unlink"),
+        )
+        .unwrap();
+        assert_eq!(all_lines(&d, "s"), ["squat", "original"]);
+        assert!(!d.join("s.jsonl").exists());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn unsupported_rename_classification_includes_notsup() {
+        for code in [Errno::INVAL, Errno::NOSYS, Errno::OPNOTSUPP] {
+            assert!(rename_unsupported(&io::Error::from(code)));
+        }
+        #[cfg(not(target_os = "redox"))]
+        assert!(rename_unsupported(&io::Error::from(Errno::NOTSUP)));
+        #[cfg(target_os = "macos")]
+        {
+            // This catches omission of NOTSUP on the platform where it is
+            // distinct; Linux cannot exercise that omission because of aliasing.
+            assert_eq!(Errno::NOTSUP.raw_os_error(), 45);
+            assert_eq!(Errno::OPNOTSUPP.raw_os_error(), 102);
+            assert!(rename_unsupported(&io::Error::from_raw_os_error(45)));
+            assert!(rename_unsupported(&io::Error::from_raw_os_error(102)));
+        }
+        assert!(!rename_unsupported(&io::Error::from(Errno::ACCESS)));
+        assert!(!rename_unsupported(&io::Error::other("ordinary failure")));
+    }
+
+    #[test]
+    fn fallback_is_limited_to_unsupported_rename_errors() {
+        for code in [
+            Errno::INVAL,
+            Errno::NOSYS,
+            Errno::OPNOTSUPP,
+            Errno::ACCESS,
+            Errno::IO,
+        ] {
+            let d = tmp("fallback-errors");
+            let log = RotatingFile::open(&d, "s", cfg(10)).unwrap();
+            log.append(b"original").unwrap();
+            let dir = File::open(&d).unwrap();
+            let result = rotate_with(
+                &dir,
+                "s",
+                Path::new("s.jsonl"),
+                |_, _, _| Err(code.into()),
+                unlink_name,
+            );
+            if [Errno::INVAL, Errno::NOSYS, Errno::OPNOTSUPP].contains(&code) {
+                result.unwrap();
+                assert!(!d.join("s.jsonl").exists());
+            } else {
+                assert_eq!(
+                    result.unwrap_err().raw_os_error(),
+                    Some(code.raw_os_error())
+                );
+                assert_eq!(segments(&d, "s").unwrap(), [d.join("s.jsonl")]);
+            }
+            assert_eq!(all_lines(&d, "s"), ["original"]);
+            fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    #[test]
+    fn external_hard_links_preserve_live_records_on_refresh_and_open() {
+        let root = tmp("external-links");
+        let d = root.join("state");
+        let backup = root.join("backup");
+        fs::create_dir_all(&backup).unwrap();
+        let log = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        for line in [b"one".as_slice(), b"two", b"three"] {
+            log.append(line).unwrap();
+        }
+        let live = d.join("s.jsonl");
+        let original = fs::metadata(&live).unwrap().ino();
+        fs::hard_link(&live, backup.join("s.jsonl")).unwrap();
+        // A segment-looking file of another signal must not justify healing.
+        fs::hard_link(&live, d.join("other-20260101T000000.000000000Z.jsonl")).unwrap();
+        // Nor may a segment of this signal on a different inode justify it.
+        let unrelated = d.join("s-20260101T000000.000000000Z.jsonl");
+        fs::write(&unrelated, "unrelated\n").unwrap();
+        log.append(b"four").unwrap();
+        assert_eq!(fs::metadata(&live).unwrap().ino(), original);
+        assert_eq!(
+            all_lines(&d, "s"),
+            ["unrelated", "one", "two", "three", "four"]
+        );
+        let reopened = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        reopened.append(b"five").unwrap();
+        assert_eq!(fs::metadata(&live).unwrap().ino(), original);
+        assert_eq!(
+            all_lines(&d, "s"),
+            ["unrelated", "one", "two", "three", "four", "five"]
+        );
+        assert_eq!(
+            fs::read_to_string(backup.join("s.jsonl")).unwrap(),
+            "one\ntwo\nthree\nfour\nfive\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn matching_segment_link_is_healed_on_open() {
+        let d = tmp("heal-on-open");
+        let log = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        log.append(b"original").unwrap();
+        let segment = d.join("s-20260101T000000.000000000Z.jsonl");
+        fs::hard_link(d.join("s.jsonl"), &segment).unwrap();
+        let reopened = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        reopened.append(b"next").unwrap();
+        assert_eq!(all_lines(&d, "s"), ["original", "next"]);
+        assert_eq!(fs::metadata(segment).unwrap().nlink(), 1);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn failed_fallback_undo_reports_both_errors_and_next_append_heals() {
+        let d = tmp("undo-failure");
+        let a = RotatingFile::open(&d, "s", cfg(10)).unwrap();
+        let b = RotatingFile::open(&d, "s", cfg(10)).unwrap();
+        a.append(b"original").unwrap();
+        let dir = File::open(&d).unwrap();
+        let err = rotate_with(
+            &dir,
+            "s",
+            Path::new("s.jsonl"),
+            |_, _, _| Err(Errno::NOSYS.into()),
+            |_, name| {
+                Err(io::Error::other(if name == Path::new("s.jsonl") {
+                    "live unlink denied"
+                } else {
+                    "undo denied"
+                }))
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("live unlink denied"));
+        assert!(err.to_string().contains("undo denied"));
+        assert_eq!(fs::metadata(d.join("s.jsonl")).unwrap().nlink(), 2);
+        b.append(b"next").unwrap();
+        a.append(b"last").unwrap();
+        assert_eq!(all_lines(&d, "s"), ["original", "next", "last"]);
+        for path in segments(&d, "s").unwrap() {
+            assert_eq!(fs::metadata(path).unwrap().nlink(), 1);
+        }
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn read_only_directory_rotation_leaves_one_name_per_inode() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("readonly-rotate");
+        let log = RotatingFile::open(&d, "s", cfg(10)).unwrap();
+        log.append(b"original").unwrap();
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = log.append(b"next");
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        let paths = segments(&d, "s").unwrap();
+        assert_eq!(paths, [d.join("s.jsonl")]);
+        assert_eq!(fs::metadata(&paths[0]).unwrap().nlink(), 1);
+        assert_eq!(all_lines(&d, "s"), ["original"]);
+        log.append(b"next").unwrap();
+        assert_eq!(all_lines(&d, "s"), ["original", "next"]);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn fallback_unlink_stays_relative_after_directory_swap() {
+        let root = tmp("fallback-swap");
+        let d = root.join("state");
+        let old = root.join("old");
+        let log = RotatingFile::open(&d, "s", cfg(10)).unwrap();
+        log.append(b"original").unwrap();
+        let dir = File::open(&d).unwrap();
+        rotate_with(
+            &dir,
+            "s",
+            Path::new("s.jsonl"),
+            |_, _, _| Err(Errno::NOSYS.into()),
+            |dir, name| {
+                fs::rename(&d, &old)?;
+                fs::create_dir(&d)?;
+                unlink_name(dir, name)
+            },
+        )
+        .unwrap();
+        assert_eq!(all_lines(&old, "s"), ["original"]);
+        assert!(!old.join("s.jsonl").exists());
+        assert!(segments(&d, "s").unwrap().is_empty());
+        log.append(b"next").unwrap();
+        assert_eq!(all_lines(&d, "s"), ["next"]);
+        for path in segments(&old, "s").unwrap() {
+            assert_eq!(fs::metadata(path).unwrap().nlink(), 1);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn swap_storm_child_role() {
+        let Some(root) = std::env::var_os("VIGIL_STORM_DIR") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let id = std::env::var("VIGIL_STORM_ID").unwrap();
+        let log = RotatingFile::open(&root.join("state"), "s", cfg(256)).unwrap();
+        fs::write(root.join(format!("ready-{id}")), "").unwrap();
+        wait_for(&root.join("go"));
+        let mut outcomes = String::new();
+        let mut i = 0;
+        while !root.join("stop").exists() {
+            let record = format!("{id}-{i:06}-{}", "z".repeat(100));
+            let status = if log.append(record.as_bytes()).is_ok() {
+                "ok"
+            } else {
+                "err"
+            };
+            outcomes.push_str(&format!("{status} {record}\n"));
+            i += 1;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        fs::write(root.join(format!("outcomes-{id}")), outcomes).unwrap();
+    }
+
+    #[test]
+    fn swap_storm_has_no_duplicates_and_accounts_for_every_record() {
+        let root = tmp("swap-storm");
+        let d = root.join("state");
+        fs::create_dir_all(&d).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let mut children: Vec<_> = (0..4)
+            .map(|id| {
+                Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "rotate::tests::swap_storm_child_role",
+                        "--test-threads=1",
+                    ])
+                    .env("VIGIL_STORM_DIR", &root)
+                    .env("VIGIL_STORM_ID", id.to_string())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for id in 0..4 {
+            wait_for(&root.join(format!("ready-{id}")));
+        }
+        fs::write(root.join("go"), "").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut swaps = 0;
+        while std::time::Instant::now() < deadline {
+            fs::rename(&d, root.join(format!("old-{swaps}"))).unwrap();
+            // Writers may recreate the missing directory before we do.
+            fs::create_dir_all(&d).unwrap();
+            swaps += 1;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        fs::write(root.join("stop"), "").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        for child in &mut children {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    for child in &mut children {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    panic!("storm child timed out");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(swaps > 100, "insufficient swaps: {swaps}");
+        let mut successes = HashSet::new();
+        let mut errors = HashSet::new();
+        for id in 0..4 {
+            let outcomes = fs::read_to_string(root.join(format!("outcomes-{id}"))).unwrap();
+            for line in outcomes.lines() {
+                let (status, record) = line.split_once(' ').unwrap();
+                if status == "ok" {
+                    successes.insert(record.to_owned());
+                } else {
+                    errors.insert(record.to_owned());
+                }
+            }
+        }
+        assert!(successes.len() > 100, "insufficient successful writes");
+        let mut seen = HashSet::new();
+        let mut inodes = HashSet::new();
+        for dir in std::iter::once(d).chain((0..swaps).map(|i| root.join(format!("old-{i}")))) {
+            for path in segments(&dir, "s").unwrap() {
+                let m = fs::metadata(&path).unwrap();
+                assert_eq!(m.nlink(), 1, "duplicate inode names: {path:?}");
+                assert!(
+                    inodes.insert((m.dev(), m.ino())),
+                    "duplicate inode: {path:?}"
+                );
+                let bytes = fs::read(&path).unwrap();
+                assert!(
+                    bytes.is_empty() || bytes.ends_with(b"\n"),
+                    "torn line: {path:?}"
+                );
+                for line in String::from_utf8(bytes).unwrap().lines() {
+                    assert!(seen.insert(line.to_owned()), "duplicate: {line}");
+                }
+            }
+        }
+        // Every missing attempt must have returned an error; successful writes
+        // must survive in either the old or current directory exactly once.
+        assert_eq!(seen, successes);
+        assert!(errors.is_disjoint(&seen));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_directory_is_recreated_and_registry_stays_shared() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("missing-dir");
+        let a = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        let b = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        a.append(b"before").unwrap();
+        fs::remove_dir_all(&d).unwrap();
+        a.append(b"after-a").unwrap();
+        b.append(b"after-b").unwrap();
+        let c = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        assert!(Arc::ptr_eq(&a.lock, &b.lock));
+        assert!(Arc::ptr_eq(&a.lock, &c.lock));
+        c.append(b"after-c").unwrap();
+        assert_eq!(
+            fs::metadata(&d).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(all_lines(&d, "s"), ["after-a", "after-b", "after-c"]);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    fn wait_for(path: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !path.exists() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {path:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn replaced_directory_child_role() {
+        let Some(root) = std::env::var_os("VIGIL_REPLACED_DIR") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let id = std::env::var("VIGIL_REPLACED_ID").unwrap();
+        let dir = root.join("state");
+        let a = RotatingFile::open(&dir, "s", cfg(300)).unwrap();
+        let b = RotatingFile::open(&dir, "s", cfg(300)).unwrap();
+        a.append(format!("before-{id}").as_bytes()).unwrap();
+        fs::write(root.join(format!("ready-{id}")), "").unwrap();
+        wait_for(&root.join("go"));
+        fs::write(root.join(format!("attempt-{id}")), "").unwrap();
+        for i in 0..500 {
+            let log = if i % 2 == 0 { &a } else { &b };
+            log.append(format!("{id}-{i:03}-pad-pad-pad").as_bytes())
+                .unwrap();
+            if i == 0 {
+                fs::write(root.join(format!("entered-{id}")), "").unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn replaced_directory_processes_relock_and_preserve_records() {
+        let root = tmp("replace-dir");
+        fs::create_dir_all(&root).unwrap();
+        let dir = root.join("state");
+        let old = root.join("old");
+        let exe = std::env::current_exe().unwrap();
+        let mut children: Vec<_> = (0..4)
+            .map(|id| {
+                Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "rotate::tests::replaced_directory_child_role",
+                        "--test-threads=1",
+                    ])
+                    .env("VIGIL_REPLACED_DIR", &root)
+                    .env("VIGIL_REPLACED_ID", id.to_string())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for id in 0..4 {
+            wait_for(&root.join(format!("ready-{id}")));
+        }
+        fs::rename(&dir, &old).unwrap();
+        fs::create_dir(&dir).unwrap();
+        let lock = File::open(&dir).unwrap();
+        lock.lock().unwrap();
+        fs::write(root.join("go"), "").unwrap();
+        for id in 0..4 {
+            wait_for(&root.join(format!("attempt-{id}")));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let excluded = (0..4).all(|id| !root.join(format!("entered-{id}")).exists());
+        lock.unlock().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        for child in &mut children {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    for child in &mut children {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    panic!("child timed out");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(excluded, "writers bypassed the replacement directory lock");
+        let before = all_lines(&old, "s");
+        assert_eq!(before.len(), 4, "nothing appended to the old directory");
+        assert_eq!(
+            before.into_iter().collect::<HashSet<_>>(),
+            (0..4).map(|id| format!("before-{id}")).collect()
+        );
+        for path in segments(&dir, "s").unwrap() {
+            let bytes = fs::read(&path).unwrap();
+            assert!(bytes.ends_with(b"\n"), "torn final line: {path:?}");
+            assert!(bytes.len() <= 300, "segment exceeded size limit: {path:?}");
+        }
+        let lines = all_lines(&dir, "s");
+        assert_eq!(lines.len(), 2000);
+        let expected: HashSet<_> = (0..4)
+            .flat_map(|id| (0..500).map(move |i| format!("{id}-{i:03}-pad-pad-pad")))
+            .collect();
+        assert_eq!(lines.into_iter().collect::<HashSet<_>>(), expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rotation_never_replaces_an_existing_file() {
         let d = tmp("norepl");
         fs::create_dir_all(&d).unwrap();
@@ -1137,7 +1793,7 @@ mod tests {
         // `rotate` picks a free name; a file squatting on a candidate survives.
         let squat = d.join("s-29990101T000000.000000000Z.jsonl");
         fs::write(&squat, "squat\n").unwrap();
-        rotate(&d, "s", &live).unwrap();
+        rotate(&File::open(&d).unwrap(), "s", Path::new("s.jsonl")).unwrap();
         assert_eq!(fs::read_to_string(&squat).unwrap(), "squat\n");
         assert!(!live.exists());
         let all = all_lines(&d, "s");
@@ -1338,6 +1994,23 @@ mod tests {
         assert!(fresh.exists());
         assert!(d.join("s.jsonl").exists() && d.join("s.jsonl.lock").exists());
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn directory_relative_pruning_handles_pre_epoch_mtime() {
+        let d = tmp("prune-pre-epoch");
+        fs::create_dir_all(&d).unwrap();
+        let old = d.join("s-19600101T000000.000000000Z.jsonl");
+        fs::write(&old, "old\n").unwrap();
+        File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(UNIX_EPOCH - Duration::from_secs(1))
+            .unwrap();
+        let _log = RotatingFile::open(&d, "s", RotationConfig::default()).unwrap();
+        assert!(!old.exists());
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

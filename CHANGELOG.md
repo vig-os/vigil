@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Refresh replaced or missing state-directory locks and use directory-relative atomic no-replace rotation; report both fallback unlink failures and recover live files linked to matching signal segments on the next lock acquisition while preserving external backup links, and recognize macOS `ENOTSUP` for the fallback ([#25](https://github.com/vig-os/vigil/issues/25)).
 - Preserve tracing when a `log` logger already exists, install the subscriber before storage side effects, cap queue allocations at 1,048,576 slots, ignore empty overrides and relative HOME paths with clear diagnostics, and isolate the short-write child's output from redirected files ([#5](https://github.com/vig-os/vigil/issues/5))
 
 - Initialization tolerates failed stderr writes, routes SDK warnings to stderr, preserves 10,000-event bursts with a configurable 65,536-record queue, warns on invalid environment settings and shutdown timeouts, honors XDG path rules, and rejects duplicate subscribers before creating storage ([#5](https://github.com/vig-os/vigil/issues/5))
