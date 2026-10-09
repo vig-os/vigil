@@ -2,6 +2,7 @@
 #[path = "../tests/common/mod.rs"]
 mod common;
 
+use opentelemetry::{KeyValue, logs::LogRecord as _};
 use std::{path::PathBuf, sync::Arc};
 use vigil::{
     rotate::{RotatingFile, RotationConfig},
@@ -24,12 +25,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?);
     let memory = MemorySink::new();
     let (resource, records) = common::golden_records();
-    for batch in records.chunks(3) {
-        common::export(memory.clone(), &resource, batch);
-        common::export(file.clone(), &resource, batch);
+    let second_resource = common::resource(vec![
+        KeyValue::new("service.name", "vigil-golden"),
+        KeyValue::new("process.pid", 2002_i64),
+        KeyValue::new("service.version", "2.0.0"),
+    ]);
+    for (index, batch) in records.chunks(3).enumerate() {
+        let resource = if index % 2 == 0 {
+            &resource
+        } else {
+            &second_resource
+        };
+        common::export(memory.clone(), resource, batch);
+        common::export(file.clone(), resource, batch);
     }
-    let manifest: Vec<serde_json::Value> = memory
-        .lines()
+    // The reference reader delivers valid EOF fragments and drops garbage EOF
+    // fragments. Include only the valid record in the expected manifest.
+    let eof_record = common::rec(&common::scope("eof", "1"), |record| {
+        record.set_body("unterminated valid record".into());
+    });
+    let eof = MemorySink::new();
+    common::export(eof.clone(), &second_resource, &[eof_record]);
+    let eof_line = eof.lines().pop().ok_or("missing EOF record")?;
+    std::fs::write(dir.join("logs-unterminated-valid.jsonl"), &eof_line)?;
+    std::fs::write(dir.join("logs-unterminated-garbage.jsonl"), "garbage")?;
+    let mut lines = memory.lines();
+    lines.push(eof_line);
+    let manifest: Vec<serde_json::Value> = lines
         .iter()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();

@@ -3,7 +3,7 @@
 import copy
 import unittest
 
-from conformance import normalize, records
+from conformance import normalize, records, require
 
 
 class ComparisonTests(unittest.TestCase):
@@ -15,6 +15,36 @@ class ComparisonTests(unittest.TestCase):
         self.assertNotEqual(normalize({"intValue": 0}), normalize({"boolValue": False}))
         self.assertNotEqual(normalize({"stringValue": ""}), {})
         self.assertNotEqual(normalize({"arrayValue": {}}), {})
+
+    def test_resource_swaps_fail(self):
+        message = {
+            "resourceLogs": [
+                {
+                    "resource": {
+                        "attributes": [
+                            {"key": "process.pid", "value": {"intValue": pid}}
+                        ]
+                    },
+                    "scopeLogs": [
+                        {
+                            "scope": {"name": "same"},
+                            "logRecords": [{"body": {"stringValue": body}}],
+                        }
+                    ],
+                }
+                for pid, body in [(1001, "first"), (2002, "second")]
+            ]
+        }
+        swapped = copy.deepcopy(message)
+        first, second = [
+            r["scopeLogs"][0]["logRecords"] for r in swapped["resourceLogs"]
+        ]
+        first[0], second[0] = second[0], first[0]
+        self.assertNotEqual(records([message]), records([swapped]))
+
+    def test_explicit_checks(self):
+        with self.assertRaises(AssertionError):
+            require(False, "empty manifest")
 
     def test_loss_duplicates_and_changed_fields(self):
         record = {

@@ -68,6 +68,8 @@ Collector-contrib through `flake.lock` and prints its version. On every PR, the
 Collector reads rich, rotated logs from `examples/conformance.rs`, skips empty
 and garbage lines, and exports JSON for a multiset comparison with the manifest.
 The comparison checks complete resources, scopes and records, including nested
-attributes, bodies, severity, timestamps and trace/span IDs, allowing protobuf
-default omission and integer spelling changes. Metrics (#7) and traces (#8) are
+attributes, bodies, severity, timestamps and trace/span IDs across two resources,
+allowing protobuf
+default omission and integer spelling changes. Valid unterminated final records
+are delivered; unterminated garbage is dropped. Metrics (#7) and traces (#8) are
 planned extensions.

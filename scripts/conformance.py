@@ -8,6 +8,12 @@ import tempfile
 import time
 
 
+def require(condition, message):
+    """Checks remain active under python -O."""
+    if not condition:
+        raise AssertionError(message)
+
+
 def normalize(value):
     """Preserve AnyValue tags; only protobuf message defaults may disappear."""
     if isinstance(value, list):
@@ -21,8 +27,13 @@ def normalize(value):
         if key == "doubleValue" and isinstance(item, (int, float)):
             item = float(item) if item != 0 else 0.0
         if key in ("traceId", "spanId") and item:
-            assert len(item) == {"traceId": 32, "spanId": 16}[key]
-            assert all(char in "0123456789abcdefABCDEF" for char in item)
+            require(
+                len(item) == {"traceId": 32, "spanId": 16}[key], f"Invalid {key} length"
+            )
+            require(
+                all(char in "0123456789abcdefABCDEF" for char in item),
+                f"Invalid {key} hex",
+            )
             item = item.lower()
         # AnyValue scalar defaults retain their type and must never be erased.
         if (
@@ -62,15 +73,22 @@ def main():
             ["cargo", "run", "--locked", "--example", "conformance", "--", temporary],
             check=True,
         )
-        inputs = sorted(directory.glob("logs*.jsonl"))
-        assert len(inputs) > 1, "rotation did not happen"
+        inputs = sorted(
+            path
+            for path in directory.glob("logs-*.jsonl")
+            if not path.name.startswith("logs-unterminated-")
+        )
+        require(len(inputs) > 1, "rotation did not happen")
         # Empty lines and terminated garbage between valid neighbouring batches.
         lines = inputs[0].read_text().splitlines()
-        assert lines
+        require(lines, "first rotated file is empty")
         neighbour = inputs[1].read_text()
         inputs[0].write_text("\n" + "\n".join(lines) + "\n\ngarbage\n\n" + neighbour)
         inputs[1].write_text("")
         expected = records(json.loads((directory / "manifest.json").read_text()))
+        require(expected, "manifest must contain records")
+        resources = {json.dumps(json.loads(key)[0], sort_keys=True) for key in expected}
+        require(len(resources) >= 2, "fixture must contain at least two resources")
         output = directory / "output.jsonl"
         config = directory / "collector.yaml"
         config.write_text(f"""receivers:
@@ -96,7 +114,7 @@ service:
                 stable_since = time.monotonic()
                 previous = -1
                 while time.monotonic() < deadline:
-                    assert child.poll() is None, "Collector exited early"
+                    require(child.poll() is None, "Collector exited early")
                     text = output.read_text() if output.exists() else ""
                     count = len(text.splitlines())
                     if count != previous:
@@ -116,11 +134,12 @@ service:
                 log.seek(0)
                 print(log.read())
         actual = records(json.loads(line) for line in output.read_text().splitlines())
-        assert actual == expected, (
-            f"Lost/changed: {expected - actual}\nUnexpected: {actual - expected}"
+        require(
+            actual == expected,
+            f"Lost/changed: {expected - actual}\nUnexpected: {actual - expected}",
         )
         print(
-            f"Conformant: {sum(actual.values())} records across {len(inputs)} rotated files"
+            f"Conformant: {sum(actual.values())} records across {len(list(directory.glob('logs*.jsonl')))} input files; valid EOF delivered, garbage EOF dropped"
         )
     # TODO: extend reference-reader conformance to metrics (#7) and traces (#8).
 
