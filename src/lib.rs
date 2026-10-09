@@ -11,11 +11,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(test)]
 mod tests {
     #[test]
-    fn deliberately_failing_gate_probe() {
-        assert_eq!(1, 2);
-    }
-
-    #[test]
     fn version_is_the_package_version() {
         assert_eq!(super::VERSION, env!("CARGO_PKG_VERSION"));
     }
