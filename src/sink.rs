@@ -66,7 +66,7 @@ impl<T: LineSink + ?Sized> LineSink for Arc<T> {
 /// is not `\n`, prefixes the line with a `\n` **in the same single `write`**,
 /// so the fragment stays on its own line and the new line starts cleanly. Two
 /// writers can both add that prefix, which leaves an empty line.
-/// **Readers must skip empty and unparseable lines.**
+/// **Readers must skip empty and unparsable lines.**
 ///
 /// ```
 /// use vigil::sink::{AppendFile, LineSink};
