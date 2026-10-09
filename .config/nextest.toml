@@ -1,3 +1,3 @@
-# Process tests spawn up to four children; serialize tests on shared hosts.
+# Process tests launch child writers; serialize cases on shared hosts.
 [profile.default]
 test-threads = 1
