@@ -1,0 +1,22 @@
+[package]
+name = "vigil-telemetry"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+description = "vigil — Verifiable Integrity-Guarded Instrumentation & Logging: opinionated OpenTelemetry (OTLP/JSON Lines) logs, metrics and traces for Rust, plus an opt-in hash-chained, signed audit trail"
+license = "Apache-2.0"
+repository = "https://github.com/vig-os/vigil"
+readme = "README.md"
+keywords = ["opentelemetry", "otlp", "logging", "audit-trail", "tracing"]
+categories = ["development-tools::debugging"]
+
+[lib]
+# The crates.io name `vigil` is taken (an unrelated deadlock watchdog), so the
+# package is `vigil-telemetry` while code still writes `vigil::init(...)`.
+name = "vigil"
+
+[dependencies]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
