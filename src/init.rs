@@ -1,11 +1,22 @@
 //! Process-wide tracing initialization.
-use std::{env, fmt, io::Write, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    env, fmt,
+    io::Write,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use opentelemetry::{InstrumentationScope, KeyValue, logs::LoggerProvider};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_sdk::{
     Resource,
-    logs::{BatchConfigBuilder, BatchLogProcessor, SdkLogger, SdkLoggerProvider},
+    logs::{
+        BatchConfigBuilder, BatchLogProcessor, LogBatch, LogExporter, SdkLogger, SdkLoggerProvider,
+    },
 };
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, registry::Registry, reload};
 
@@ -33,12 +44,15 @@ impl std::error::Error for InitError {}
 /// Drop waits up to five seconds, including time blocked on the directory lock.
 /// On timeout it warns on stderr; remaining records may be lost. The SDK worker
 /// may continue in the background until the lock is released.
+#[must_use = "dropping the guard flushes and shuts down logging; bind it: let _guard = vigil::init(..)"]
 #[derive(Debug)]
 pub struct Guard {
     provider: Option<SdkLoggerProvider>,
+    stopped: Arc<AtomicBool>,
 }
 impl Drop for Guard {
     fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
         if let Some(provider) = &self.provider
             && let Err(error) = provider.shutdown_with_timeout(Duration::from_secs(5))
         {
@@ -58,7 +72,15 @@ impl Drop for Guard {
 /// Drop waits up to five seconds for shutdown (including directory-lock waits),
 /// then warns that remaining records may be lost. Calling
 /// `std::process::exit` skips drop and loses queued records. No async runtime
-/// is needed. I/O failures fall back to stderr with one warning.
+/// is needed. Storage-open failures fall back to stderr with one warning.
+/// Runtime export failures lose the affected records: stderr reports the first
+/// failure, then cumulative dropped-record summaries at most once per minute
+/// during failing exports, and any unreported losses at shutdown.
+///
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// vigil::init("example").unwrap();
+/// ```
 ///
 /// Tracing spans alone do not populate OTLP trace/span IDs; distributed trace
 /// context integration is planned for the metrics and traces release.
@@ -168,10 +190,35 @@ impl Config {
         }
         // Reserve the global subscriber before storage or provider side effects.
         // The reload handle attaches the destination once storage is ready.
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = match env::var_os("RUST_LOG") {
+            None => EnvFilter::new("info"),
+            Some(value) => EnvFilter::try_new(value.to_string_lossy()).unwrap_or_else(|error| {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "vigil: invalid RUST_LOG={value:?}: {error}; using info"
+                );
+                EnvFilter::new("info")
+            }),
+        };
+        let stopped = Arc::new(AtomicBool::new(false));
+        let warned = AtomicBool::new(false);
+        let active = stopped.clone();
+        let shutdown_filter = tracing_subscriber::filter::dynamic_filter_fn(move |_, _| {
+            if !active.load(Ordering::Acquire) {
+                return true;
+            }
+            if !warned.swap(true, Ordering::Relaxed) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "vigil: event after shutdown; further events will be dropped silently"
+                );
+            }
+            false
+        });
         let (layer, handle) = reload::Layer::new(None::<DestinationLayer>);
         let subscriber = tracing_subscriber::registry().with(diagnostics()).with(
             layer
+                .with_filter(shutdown_filter)
                 .with_filter(filter)
                 .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
                     !meta.target().starts_with("opentelemetry")
@@ -188,9 +235,15 @@ impl Config {
         let dir = self
             .dir
             .or_else(|| {
-                env::var_os("VIGIL_DIR")
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from)
+                env::var_os("VIGIL_DIR").filter(|s| !s.is_empty()).and_then(|value| {
+                    let path = PathBuf::from(&value);
+                    if path.is_absolute() {
+                        Some(path)
+                    } else {
+                        let _ = writeln!(std::io::stderr(), "vigil: invalid VIGIL_DIR={value:?}; expected an absolute path; using default");
+                        None
+                    }
+                })
             })
             .or_else(|| {
                 env::var_os("XDG_STATE_HOME")
@@ -251,20 +304,24 @@ impl Config {
                 let provider = SdkLoggerProvider::builder()
                     .with_resource(Resource::builder_empty().with_attributes(attrs).build())
                     .with_log_processor(
-                        BatchLogProcessor::builder(OtlpJsonLogExporter::new(Arc::new(file)))
-                            .with_batch_config(
-                                BatchConfigBuilder::default()
-                                    .with_max_queue_size(queue_size)
-                                    .with_max_export_batch_size(512)
-                                    .with_scheduled_delay(Duration::from_secs(1))
-                                    .build(),
-                            )
-                            .build(),
+                        BatchLogProcessor::builder(ReportingExporter {
+                            inner: OtlpJsonLogExporter::new(Arc::new(file)),
+                            failures: Mutex::new(Failures::default()),
+                        })
+                        .with_batch_config(
+                            BatchConfigBuilder::default()
+                                .with_max_queue_size(queue_size)
+                                .with_max_export_batch_size(512)
+                                .with_scheduled_delay(Duration::from_secs(1))
+                                .build(),
+                        )
+                        .build(),
                     )
                     .build();
                 let bridge = OpenTelemetryTracingBridge::new(&NamedProvider(provider.clone()));
                 let guard = Guard {
                     provider: Some(provider),
+                    stopped: stopped.clone(),
                 };
                 handle
                     .reload(Some(bridge.boxed()))
@@ -283,7 +340,10 @@ impl Config {
                     std::io::stderr(),
                     "vigil: cannot open log storage at {path_description}: {error}; falling back to stderr"
                 );
-                Ok(Guard { provider: None })
+                Ok(Guard {
+                    provider: None,
+                    stopped,
+                })
             }
         }
     }
@@ -314,15 +374,74 @@ fn number(key: &str, minimum: u64) -> Option<u64> {
     }
 }
 fn hostname() -> Option<String> {
-    ["/proc/sys/kernel/hostname", "/etc/hostname"]
-        .into_iter()
-        .find_map(|p| {
-            std::fs::read_to_string(p)
-                .ok()
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+    let host = rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .into_owned();
+    (!host.is_empty()).then_some(host)
+}
+
+#[derive(Debug, Default)]
+struct Failures {
+    dropped: usize,
+    reported: usize,
+    last_report: Option<Instant>,
+}
+impl Failures {
+    fn report(&mut self) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "vigil: runtime log export losses; dropped records: {}",
+            self.dropped
+        );
+        self.reported = self.dropped;
+        self.last_report = Some(Instant::now());
+    }
+}
+
+// Handle failed batches here so the SDK does not emit an ExportError per batch.
+#[derive(Debug)]
+struct ReportingExporter {
+    inner: OtlpJsonLogExporter<Arc<RotatingFile>>,
+    failures: Mutex<Failures>,
+}
+impl LogExporter for ReportingExporter {
+    async fn export(&self, batch: LogBatch<'_>) -> opentelemetry_sdk::error::OTelSdkResult {
+        let count = batch.iter().count();
+        if let Err(error) = self.inner.export(batch).await {
+            let mut failures = self
+                .failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            failures.dropped = failures.dropped.saturating_add(count);
+            if failures
+                .last_report
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(60))
+            {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "vigil: runtime log export failed: {error}; dropped records: {}",
+                    failures.dropped
+                );
+                failures.reported = failures.dropped;
+                failures.last_report = Some(Instant::now());
+            }
+        }
+        Ok(())
+    }
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
+    }
+    fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+        let mut failures = self
+            .failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if failures.dropped != failures.reported {
+            failures.report();
+        }
+        self.inner.shutdown_with_timeout(timeout)
+    }
 }
 
 fn diagnostics() -> LogLayer {
