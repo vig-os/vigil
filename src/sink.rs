@@ -215,6 +215,12 @@ impl LineSink for MemorySink {
     }
 }
 
+impl LineSink for crate::rotate::RotatingFile {
+    fn write_line(&self, line: &[u8]) -> io::Result<()> {
+        self.append(line)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
