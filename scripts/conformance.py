@@ -68,7 +68,6 @@ def main():
         neighbour = inputs[1].read_text()
         inputs[0].write_text("\n" + "\n".join(lines) + "\n\ngarbage\n\n" + neighbour)
         inputs[1].write_text("")
-        inputs[-1].write_text("")  # Temporary record-loss demonstration.
         expected = records(json.loads((directory / "manifest.json").read_text()))
         output = directory / "output.jsonl"
         config = directory / "collector.yaml"
