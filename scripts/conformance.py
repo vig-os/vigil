@@ -25,7 +25,9 @@ def normalize(value):
             assert all(char in "0123456789abcdefABCDEF" for char in item)
             item = item.lower()
         # AnyValue scalar defaults retain their type and must never be erased.
-        if not key.endswith("Value") and item in (0, "0", "", [], {}, None):
+        if (
+            not key.endswith("Value") and (item in ("", [], {}, None) or item == 0)
+        ) or (key in ("timeUnixNano", "observedTimeUnixNano") and item == "0"):
             continue
         item = normalize(item)
         if key in ("attributes", "values") and isinstance(item, list):

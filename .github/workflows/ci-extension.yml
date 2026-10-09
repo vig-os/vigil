@@ -92,4 +92,6 @@ jobs:
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
           dev-profile-path: ${{ inputs.dev-profile-path }}
       - name: Compare rotated logs through the reference Collector
-        run: nix develop -c python3 scripts/conformance.py
+        run: |
+          nix develop -c python3 -m unittest discover -s scripts
+          nix develop -c python3 scripts/conformance.py
