@@ -32,7 +32,7 @@
 //!   other filesystems with weak `flock` semantics) is **not supported**.
 //! * Rotation uses an **atomic no-replace rename**, relative to the locked
 //!   directory descriptor (Linux `RENAME_NOREPLACE`, macOS `RENAME_EXCL`). Only
-//!   when unsupported (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`) does it fall back to
+//!   when unsupported (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`, `ENOTSUP`) does it fall back to
 //!   directory-relative link/unlink, which requires hard-link support. If
 //!   linking fails, the live file stays intact and the append returns the error.
 //!   If both the live unlink and its undo fail, the error reports both failures;
@@ -557,6 +557,19 @@ fn unlink_name(dir: &File, name: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn rename_unsupported(error: &io::Error) -> bool {
+    let raw = error.raw_os_error();
+    // macOS ENOTSUP (45) differs from EOPNOTSUPP (102). Linux aliases them.
+    // rustix does not expose NOTSUP on Redox.
+    #[cfg(not(target_os = "redox"))]
+    if raw == Some(Errno::NOTSUP.raw_os_error()) {
+        return true;
+    }
+    [Errno::INVAL, Errno::NOSYS, Errno::OPNOTSUPP]
+        .iter()
+        .any(|code| raw == Some(code.raw_os_error()))
+}
+
 /// Injectable rename/unlink steps, like the partial-write seam in `append_with`.
 fn rotate_with(
     dir: &File,
@@ -573,11 +586,7 @@ fn rotate_with(
         let name = next_segment_name(signal, &now, newest.as_deref());
         let target = Path::new(&name);
         let result = match rename(dir, live_name, target) {
-            Err(e)
-                if [Errno::INVAL, Errno::NOSYS, Errno::OPNOTSUPP]
-                    .iter()
-                    .any(|code| e.raw_os_error() == Some(code.raw_os_error())) =>
-            {
+            Err(e) if rename_unsupported(&e) => {
                 match rfs::linkat(dir, live_name, dir, target, AtFlags::empty()) {
                     Ok(()) => {
                         if let Err(original) = unlink(dir, live_name) {
@@ -1337,6 +1346,26 @@ mod tests {
         assert_eq!(all_lines(&d, "s"), ["squat", "original"]);
         assert!(!d.join("s.jsonl").exists());
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn unsupported_rename_classification_includes_notsup() {
+        for code in [Errno::INVAL, Errno::NOSYS, Errno::OPNOTSUPP] {
+            assert!(rename_unsupported(&io::Error::from(code)));
+        }
+        #[cfg(not(target_os = "redox"))]
+        assert!(rename_unsupported(&io::Error::from(Errno::NOTSUP)));
+        #[cfg(target_os = "macos")]
+        {
+            // This catches omission of NOTSUP on the platform where it is
+            // distinct; Linux cannot exercise that omission because of aliasing.
+            assert_eq!(Errno::NOTSUP.raw_os_error(), 45);
+            assert_eq!(Errno::OPNOTSUPP.raw_os_error(), 102);
+            assert!(rename_unsupported(&io::Error::from_raw_os_error(45)));
+            assert!(rename_unsupported(&io::Error::from_raw_os_error(102)));
+        }
+        assert!(!rename_unsupported(&io::Error::from(Errno::ACCESS)));
+        assert!(!rename_unsupported(&io::Error::other("ordinary failure")));
     }
 
     #[test]
