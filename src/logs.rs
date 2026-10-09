@@ -322,8 +322,8 @@ fn fit_record(record: &Json, overhead: usize, limit: usize) -> Result<(String, b
     let mut size = overhead + shortened.to_string().len();
     let mut candidates = Vec::new();
     string_candidates(&shortened, &mut Vec::new(), &mut candidates);
-    // Largest payload strings first; keys and eventName only as a last resort.
-    candidates.sort_by_key(|c| (c.last_resort, std::cmp::Reverse(c.bytes)));
+    // Metadata and keys are immutable; only values contribute shrink capacity.
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.bytes));
     let capacity: usize = candidates.iter().map(|c| c.bytes).sum();
     if size.saturating_sub(capacity) <= limit {
         for candidate in candidates {
@@ -362,12 +362,37 @@ fn fit_record(record: &Json, overhead: usize, limit: usize) -> Result<(String, b
         "attributes".into(),
         Json::Array(markers(original_size, true)),
     );
-    let text = Json::Object(stub).to_string();
-    if overhead + text.len() > limit {
+    let mut stub = Json::Object(stub);
+    let base_size = overhead + stub.to_string().len();
+    if base_size > limit {
         return Err(format!(
             "log envelope and diagnostic identity exceed max_line_bytes={limit}"
         ));
     }
+    // Preserve a small original message even when immutable record metadata
+    // forces replacement. A large original body uses only the remaining budget.
+    if let Some(body) = record["body"]["stringValue"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
+        let mut reason =
+            serde_json::json!({"key":"vigil.dropped_reason","value":{"stringValue":""}});
+        let extra = reason.to_string().len() + 1; // attribute plus comma
+        if base_size + extra <= limit {
+            let mut message = format!("unshrinkable record; original body: {body}");
+            let available = limit - base_size - extra;
+            let bytes = string_bytes(&message);
+            if bytes > available {
+                cut_string(&mut message, bytes - available, false);
+            }
+            reason["value"]["stringValue"] = Json::String(message);
+            if let Some(attributes) = stub["attributes"].as_array_mut() {
+                attributes.push(reason);
+            }
+            sort_json_attributes(&mut stub);
+        }
+    }
+    let text = stub.to_string();
     Ok((text, true))
 }
 
@@ -392,7 +417,6 @@ fn sort_json_attributes(value: &mut Json) {
 struct StringCandidate {
     pointer: String,
     bytes: usize,
-    last_resort: bool,
     base64: bool,
 }
 
@@ -415,15 +439,10 @@ fn string_candidates(value: &Json, path: &mut Vec<String>, result: &mut Vec<Stri
             for (key, value) in values {
                 path.push(key.replace('~', "~0").replace('/', "~1"));
                 if let Json::String(text) = value {
-                    if matches!(
-                        key.as_str(),
-                        "stringValue" | "bytesValue" | "key" | "eventName"
-                    ) && !text.is_empty()
-                    {
+                    if matches!(key.as_str(), "stringValue" | "bytesValue") && !text.is_empty() {
                         result.push(StringCandidate {
                             pointer: format!("/{}", path.join("/")),
                             bytes: string_bytes(text),
-                            last_resort: matches!(key.as_str(), "key" | "eventName"),
                             base64: key == "bytesValue",
                         });
                     }
@@ -780,34 +799,133 @@ mod size_tests {
     }
 
     #[test]
-    fn review_keys_event_names_and_base64_are_bounded() {
-        for record in [
-            serde_json::json!({"body":{"stringValue":"message"},"attributes":[{"key":"z".repeat(1_200_000),"value":{"intValue":"42"}}]}),
-            serde_json::json!({"body":{"stringValue":"message"},"attributes":[],"eventName":"event".repeat(300_000)}),
-            serde_json::json!({"body":{"bytesValue":"AQID".repeat(400_000)},"attributes":[]}),
-        ] {
-            let lines = bounded_lines(&fixture(vec![record]), 1_000_000).unwrap();
-            assert_eq!(lines.len(), 1);
-            assert!((950_000..=1_000_000).contains(&lines[0].len()));
-            let records = output_records(&lines);
-            let record = &records[0];
-            assert!(
-                !record["attributes"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|a| a["key"] == "vigil.dropped")
-            );
-            if let Some(bytes) = record["body"]["bytesValue"].as_str() {
-                assert_eq!(bytes.len() % 4, 0);
-                assert!(
-                    bytes
-                        .as_bytes()
-                        .chunks_exact(4)
-                        .all(|chunk| chunk == b"AQID")
-                );
+    fn review_base64_is_bounded() {
+        let record =
+            serde_json::json!({"body":{"bytesValue":"AQID".repeat(400_000)},"attributes":[]});
+        let lines = bounded_lines(&fixture(vec![record]), 1_000_000).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!((950_000..=1_000_000).contains(&lines[0].len()));
+        let records = output_records(&lines);
+        let record = &records[0];
+        assert!(
+            !record["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["key"] == "vigil.dropped")
+        );
+        let bytes = record["body"]["bytesValue"].as_str().unwrap();
+        assert_eq!(bytes.len() % 4, 0);
+        assert!(
+            bytes
+                .as_bytes()
+                .chunks_exact(4)
+                .all(|chunk| chunk == b"AQID")
+        );
+    }
+
+    fn assert_unique_keys(value: &Json) {
+        match value {
+            Json::Object(values) => {
+                for (key, value) in values {
+                    if matches!(key.as_str(), "attributes" | "values")
+                        && let Json::Array(attributes) = value
+                        && attributes.iter().all(|a| a.get("key").is_some())
+                    {
+                        let mut keys = std::collections::BTreeSet::new();
+                        for attribute in attributes {
+                            let key = attribute["key"].as_str().unwrap();
+                            assert!(!key.is_empty(), "truncation must not create empty keys");
+                            assert!(
+                                keys.insert(key),
+                                "truncation must not create duplicate keys"
+                            );
+                        }
+                    }
+                    assert_unique_keys(value);
+                }
             }
+            Json::Array(values) => values.iter().for_each(assert_unique_keys),
+            _ => {}
         }
+    }
+
+    fn assert_structural_stub(record: Json, preserve_body: bool) {
+        let healthy = serde_json::json!({"body":{"stringValue":"healthy"},"attributes":[]});
+        let mut dropped = 0;
+        let input = fixture(vec![healthy.clone(), record, healthy.clone()]);
+        let lines = bounded_lines_counted(&input, 1_000_000, &mut dropped).unwrap();
+        assert!(lines.iter().all(|l| l.len() <= 1_000_000));
+        let records = output_records(&lines);
+        assert_eq!(records.len(), 3);
+        for record in &records {
+            assert_unique_keys(record);
+        }
+        assert_eq!(records[0], healthy);
+        assert_eq!(records[2], healthy);
+        let stub = &records[1];
+        assert!(
+            stub["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["key"] == "vigil.dropped" && a["value"]["boolValue"] == true),
+            "structural oversize must produce a stub"
+        );
+        assert_eq!(dropped, 1);
+        if preserve_body {
+            assert!(
+                stub["body"]["stringValue"]
+                    .as_str()
+                    .unwrap()
+                    .contains("bad")
+                    || stub["attributes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|a| a["key"] == "vigil.dropped_reason"
+                            && a["value"]["stringValue"].as_str().unwrap().contains("bad")),
+                "stub must preserve the small original message"
+            );
+        }
+    }
+
+    #[test]
+    fn r3_oversized_key_becomes_stub_with_original_message() {
+        assert_structural_stub(
+            serde_json::json!({"body":{"stringValue":"bad"},"attributes":[{"key":"k".repeat(1_200_000),"value":{"intValue":"1"}}]}),
+            true,
+        );
+    }
+
+    #[test]
+    fn r3_stub_reason_with_large_body_stays_bounded() {
+        assert_structural_stub(
+            serde_json::json!({"body":{"stringValue":format!("bad: {}", "💣\n\"".repeat(300_000))},"attributes":[{"key":"k".repeat(1_200_000),"value":{"intValue":"1"}}]}),
+            true,
+        );
+    }
+
+    #[test]
+    fn r3_oversized_event_name_becomes_stub() {
+        assert_structural_stub(
+            serde_json::json!({"body":{"stringValue":"bad"},"attributes":[],"eventName":"e".repeat(1_200_000)}),
+            true,
+        );
+    }
+
+    #[test]
+    fn r3_many_keys_become_stub_without_duplicate_keys() {
+        let attributes: Vec<_> = (0..25_000).map(|index| serde_json::json!({"key":format!("key-{index:027}"),"value":{"intValue":"1"}})).collect();
+        assert!(
+            attributes
+                .iter()
+                .all(|a| a["key"].as_str().unwrap().len() == 31)
+        );
+        assert_structural_stub(
+            serde_json::json!({"body":{"stringValue":"bad"},"attributes":attributes}),
+            true,
+        );
     }
 
     fn many_scopes() -> String {
