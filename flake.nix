@@ -65,6 +65,7 @@
           # would otherwise drop them (a missing fixture fails the golden test).
           extraSrcFiles = [
             "README.md"
+            ".config/nextest.toml"
             "tests/fixtures"
           ];
         };

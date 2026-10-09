@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Repair killed-writer fragments without corrupting the next record, take consistent read snapshots during rotation, and time out directory lock contention after ten seconds ([#31](https://github.com/vig-os/vigil/issues/31)).
+
 - Refresh replaced or missing state-directory locks and use directory-relative atomic no-replace rotation; report both fallback unlink failures and recover live files linked to matching signal segments on the next lock acquisition while preserving external backup links, and recognize macOS `ENOTSUP` for the fallback ([#25](https://github.com/vig-os/vigil/issues/25)).
 - Preserve tracing when a `log` logger already exists, install the subscriber before storage side effects, cap queue allocations at 1,048,576 slots, ignore empty overrides and relative HOME paths with clear diagnostics, and isolate the short-write child's output from redirected files ([#5](https://github.com/vig-os/vigil/issues/5))
 
