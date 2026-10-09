@@ -39,6 +39,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         common::export(memory.clone(), resource, batch);
         common::export(file.clone(), resource, batch);
     }
+    // Exercise the public initialization path and tracing bridge as well as
+    // the rich SDK fixtures. Read the resulting files into the same manifest.
+    let bridge_dir = dir.join("bridge");
+    // The driver sets VIGIL_DIR to this directory before starting us.
+    let guard = vigil::init("vigil-conformance")?;
+    let padding = "x".repeat(4096);
+    for index in 0..1024 {
+        tracing::info!(case = "large-batch", index, payload = %padding, "large batch record");
+    }
+    let huge = "z".repeat(3 * 1024 * 1024);
+    tracing::info!(case = "oversized", "{}", huge);
+    drop(guard);
+    let bridge_lines = std::fs::read_to_string(bridge_dir.join("logs.jsonl"))?;
+    std::fs::write(dir.join("logs-bridge.jsonl"), &bridge_lines)?;
     // The reference reader delivers valid EOF fragments and drops garbage EOF
     // fragments. Include only the valid record in the expected manifest.
     let eof_record = common::rec(&common::scope("eof", "1"), |record| {
@@ -51,6 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(dir.join("logs-unterminated-garbage.jsonl"), "garbage")?;
     let mut lines = memory.lines();
     lines.push(eof_line);
+    lines.extend(bridge_lines.lines().map(str::to_owned));
     let manifest: Vec<serde_json::Value> = lines
         .iter()
         .map(|line| serde_json::from_str(line).unwrap())

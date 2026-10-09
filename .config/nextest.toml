@@ -1,0 +1,3 @@
+# Multiprocess regressions spawn up to six children on the shared test host.
+[profile.default]
+test-threads = 1

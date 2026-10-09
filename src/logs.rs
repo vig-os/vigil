@@ -1,6 +1,6 @@
 //! An OpenTelemetry [`LogExporter`] that writes OTLP/JSON Lines.
 //!
-//! Each export batch becomes **one line**: one `LogsData` message in the
+//! Each export batch becomes bounded lines, each a `LogsData` message in the
 //! [OTLP/JSON encoding] (the OTel [file exporter] format). Serialization is
 //! done by `opentelemetry-proto`'s serde support, so 64-bit integers are
 //! decimal strings, trace and span ids are hex, enums are integers and keys are
@@ -77,16 +77,20 @@ use crate::sink::LineSink;
 /// or the Collector.
 pub const NON_FINITE: [&str; 3] = ["NaN", "Infinity", "-Infinity"];
 
-/// Writes each log export batch as one OTLP/JSON `LogsData` line to a
+/// Writes each log export batch as bounded OTLP/JSON `LogsData` lines to a
 /// [`LineSink`].
 ///
 /// See the [module documentation](self) for the format guarantees and an
-/// example. The exporter needs no async runtime: the SDK's batch processor
+/// example. Oversized records shorten body strings first, then largest
+/// attribute strings, and carry `vigil.truncated` and `vigil.original_size`
+/// (original single-record line bytes, including the envelope).
+/// The exporter needs no async runtime: the SDK's batch processor
 /// calls it from its own thread and the future it returns is already complete.
 #[derive(Debug)]
 pub struct OtlpJsonLogExporter<S: LineSink> {
     sink: S,
     resource: ResourceAttributesWithSchema,
+    max_line_bytes: usize,
 }
 
 impl<S: LineSink> OtlpJsonLogExporter<S> {
@@ -97,7 +101,17 @@ impl<S: LineSink> OtlpJsonLogExporter<S> {
         Self {
             sink,
             resource: ResourceAttributesWithSchema::default(),
+            max_line_bytes: 1_000_000,
         }
+    }
+
+    /// Maximum JSON payload bytes per line, excluding the newline (default
+    /// 1,000,000). Clamped to 1..=1,048,575 for the Collector's 1 MiB limit.
+    /// If the envelope alone cannot fit, export returns an explicit error.
+    #[must_use]
+    pub fn with_max_line_bytes(mut self, max_line_bytes: usize) -> Self {
+        self.max_line_bytes = max_line_bytes.clamp(1, 1_048_575);
+        self
     }
 
     /// The sink lines are written to.
@@ -114,9 +128,14 @@ impl<S: LineSink> OtlpJsonLogExporter<S> {
             resource_logs: vec![resource_logs],
         })
         .map_err(|e| OTelSdkError::InternalFailure(format!("encoding log batch: {e}")))?;
-        self.sink
-            .write_line(line.as_bytes())
-            .map_err(|e| OTelSdkError::InternalFailure(format!("writing log batch: {e}")))
+        let lines =
+            bounded_lines(&line, self.max_line_bytes).map_err(OTelSdkError::InternalFailure)?;
+        for line in lines {
+            self.sink
+                .write_line(line.as_bytes())
+                .map_err(|e| OTelSdkError::InternalFailure(format!("writing log batch: {e}")))?;
+        }
+        Ok(())
     }
 }
 
@@ -161,6 +180,130 @@ fn encode_line(request: &ExportLogsServiceRequest) -> Result<String, String> {
         return Err("a non-finite doubleValue was not sanitized".to_owned());
     }
     Ok(line)
+}
+
+// Work on the patched JSON so byte counts include escaping and non-finite
+// spellings. Preserve the original encoding verbatim for small batches.
+fn bounded_lines(line: &str, limit: usize) -> Result<Vec<String>, String> {
+    if line.len() <= limit {
+        return Ok(vec![line.to_owned()]);
+    }
+    let request: Json = serde_json::from_str(line).map_err(|e| e.to_string())?;
+    let mut lines = Vec::new();
+    for resource in request["resourceLogs"].as_array().into_iter().flatten() {
+        for scope in resource["scopeLogs"].as_array().into_iter().flatten() {
+            let mut envelope = request.clone();
+            envelope["resourceLogs"] = serde_json::json!([resource]);
+            envelope["resourceLogs"][0]["scopeLogs"] = serde_json::json!([scope]);
+            let slot = &mut envelope["resourceLogs"][0]["scopeLogs"][0]["logRecords"];
+            *slot = serde_json::json!([]);
+            let overhead = envelope.to_string().len();
+            let mut encoded = Vec::<String>::new();
+            let mut size = overhead;
+            for record in scope["logRecords"].as_array().into_iter().flatten() {
+                let mut record = record.clone();
+                let original_size = overhead + record.to_string().len();
+                if original_size > limit {
+                    let attrs = record["attributes"]
+                        .as_array_mut()
+                        .ok_or("record attributes missing")?;
+                    attrs.retain(|a| {
+                        a["key"] != "vigil.truncated" && a["key"] != "vigil.original_size"
+                    });
+                    attrs.push(
+                        serde_json::json!({"key":"vigil.truncated","value":{"boolValue":true}}),
+                    );
+                    attrs.push(serde_json::json!({"key":"vigil.original_size","value":{"intValue":original_size.to_string()}}));
+                    attrs.sort_by_key(|a| a["key"].as_str().unwrap_or_default().to_owned());
+                    while overhead + record.to_string().len() > limit {
+                        if !shrink_largest_string(&mut record["body"])
+                            && !shrink_largest_string(&mut record["attributes"])
+                        {
+                            return Err(format!(
+                                "log envelope or non-string fields exceed max_line_bytes={limit}"
+                            ));
+                        }
+                    }
+                }
+                let text = record.to_string();
+                let extra = text.len() + usize::from(!encoded.is_empty());
+                if size + extra > limit && !encoded.is_empty() {
+                    lines.push(fill_records(&envelope, &encoded));
+                    encoded.clear();
+                    size = overhead;
+                }
+                size += text.len() + usize::from(!encoded.is_empty());
+                encoded.push(text);
+            }
+            if !encoded.is_empty() {
+                lines.push(fill_records(&envelope, &encoded));
+            }
+        }
+    }
+    Ok(lines)
+}
+
+fn fill_records(envelope: &Json, records: &[String]) -> String {
+    // Serialize only the small envelope repeatedly, never the growing batch.
+    envelope.to_string().replacen(
+        "\"logRecords\":[]",
+        &format!("\"logRecords\":[{}]", records.join(",")),
+        1,
+    )
+}
+
+fn shrink_largest_string(value: &mut Json) -> bool {
+    fn largest(value: &Json) -> usize {
+        match value {
+            Json::String(s) => s.len(),
+            Json::Array(a) => a.iter().map(largest).max().unwrap_or(0),
+            Json::Object(o) => o
+                .iter()
+                .filter(|(k, _)| {
+                    k.as_str() != "key" && k.as_str() != "intValue" && k.as_str() != "doubleValue"
+                })
+                .map(|(_, v)| largest(v))
+                .max()
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+    let length = largest(value);
+    if length == 0 {
+        return false;
+    }
+    match value {
+        Json::String(s) => {
+            let mut end = s.len() / 2;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+            true
+        }
+        Json::Array(a) => a
+            .iter_mut()
+            .find(|v| largest(v) == length)
+            .is_some_and(shrink_largest_string),
+        Json::Object(o) => o
+            .iter_mut()
+            .find(|(k, v)| {
+                k.as_str() != "key"
+                    && k.as_str() != "intValue"
+                    && k.as_str() != "doubleValue"
+                    && largest(v) == length
+            })
+            .is_some_and(|(key, v)| {
+                if key == "bytesValue"
+                    && let Json::String(s) = v
+                {
+                    s.truncate((s.len() / 2) / 4 * 4);
+                    return true;
+                }
+                shrink_largest_string(v)
+            }),
+        _ => false,
+    }
 }
 
 // ---- grouping and normalization -------------------------------------------
@@ -321,5 +464,29 @@ fn patch_any_value(value: &AnyValue, json: &mut Json) {
             patch_key_values(&list.values, &mut json["kvlistValue"]["values"]);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn configured_limit_and_impossible_envelope() {
+        let exporter =
+            OtlpJsonLogExporter::new(crate::sink::MemorySink::new()).with_max_line_bytes(800);
+        assert_eq!(exporter.max_line_bytes, 800);
+        let record =
+            serde_json::json!({"body":{"stringValue":"é\n\"".repeat(900)},"attributes":[]});
+        let input = serde_json::json!({"resourceLogs":[{"resource":{},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[record.clone(),record]}]}]}).to_string();
+        let lines = bounded_lines(&input, exporter.max_line_bytes).unwrap();
+        assert_eq!(lines, bounded_lines(&input, 800).unwrap());
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|line| line.len() <= 800));
+        assert!(bounded_lines(&input, 1).is_err());
+        assert_eq!(
+            exporter.with_max_line_bytes(usize::MAX).max_line_bytes,
+            1_048_575
+        );
     }
 }

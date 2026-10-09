@@ -467,3 +467,40 @@ fn signed_zero_scopes_stay_distinct_and_records_keep_batch_order() {
         [vec!["ordered 0", "ordered 1", "ordered 2"]]
     );
 }
+
+#[test]
+fn large_batches_and_records_are_bounded() {
+    let scope = scope("large", "1");
+    let mut records: Vec<_> = (0..512)
+        .map(|_| rec(&scope, |r| r.set_body("x".repeat(4096).into())))
+        .collect();
+    records.push(rec(&scope, |r| {
+        r.set_body("💣\n\"".repeat(600_000).into());
+        r.add_attribute("payload", "y".repeat(1_100_000));
+    }));
+    let sink = MemorySink::new();
+    export(sink.clone(), &resource(vec![]), &records);
+    let lines = sink.lines();
+    assert!(lines.iter().all(|line| line.len() <= 1_000_000));
+    let parsed: Vec<Value> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let records: Vec<_> = parsed.iter().flat_map(all_records).collect();
+    assert_eq!(records.len(), 513);
+    let attrs = records.last().unwrap()["attributes"].as_array().unwrap();
+    assert!(
+        attrs
+            .iter()
+            .any(|a| a["key"] == "vigil.truncated" && a["value"]["boolValue"] == true)
+    );
+    assert!(attrs.iter().any(|a| {
+        a["key"] == "vigil.original_size"
+            && a["value"]["intValue"]
+                .as_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+                > 3_000_000
+    }));
+}

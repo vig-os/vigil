@@ -2,6 +2,7 @@
 
 import collections
 import json
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -72,6 +73,8 @@ def main():
         subprocess.run(
             ["cargo", "run", "--locked", "--example", "conformance", "--", temporary],
             check=True,
+            env=os.environ
+            | {"VIGIL_DIR": str(directory / "bridge"), "RUST_LOG": "info"},
         )
         inputs = sorted(
             path
@@ -87,6 +90,42 @@ def main():
         inputs[1].write_text("")
         expected = records(json.loads((directory / "manifest.json").read_text()))
         require(expected, "manifest must contain records")
+        for path in inputs:
+            require(
+                all(len(line) <= 1_000_000 for line in path.read_bytes().splitlines()),
+                f"Oversized line in {path}",
+            )
+        manifest_records = [json.loads(key)[2] for key in expected]
+
+        def attribute(record, key):
+            return next(
+                (a["value"] for a in record.get("attributes", []) if a["key"] == key),
+                {},
+            )
+
+        require(
+            sum(
+                attribute(r, "case").get("stringValue") == "large-batch"
+                for r in manifest_records
+            )
+            == 1024,
+            "large batch fixture missing records",
+        )
+        oversized = [
+            r
+            for r in manifest_records
+            if attribute(r, "case").get("stringValue") == "oversized"
+        ]
+        require(
+            len(oversized) == 1
+            and attribute(oversized[0], "vigil.truncated").get("boolValue") is True,
+            "oversized tracing record must have truncation marker",
+        )
+        require(
+            int(attribute(oversized[0], "vigil.original_size").get("intValue", 0))
+            > 3 * 1024 * 1024,
+            "original size must describe the oversized line",
+        )
         resources = {json.dumps(json.loads(key)[0], sort_keys=True) for key in expected}
         require(len(resources) >= 2, "fixture must contain at least two resources")
         output = directory / "output.jsonl"

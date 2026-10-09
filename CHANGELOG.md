@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- Bound OTLP/JSON log lines to the Collector limit, split large batches, and mark truncated oversized records; exercise large tracing records in Collector conformance ([#30](https://github.com/vig-os/vigil/issues/30))
+
 ### Added
 
 - Collector reference-reader conformance in CI compares complete rich log records across two resources, rotation, empty lines, garbage input and unterminated valid/garbage lines ([#6](https://github.com/vig-os/vigil/issues/6))
