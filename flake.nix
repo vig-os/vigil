@@ -59,8 +59,13 @@
           # vigil is a library crate: doctests are part of its contract.
           doctest = true;
           toolchainHash = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
-          # The crate's rustdoc front page is the README (include_str!).
-          extraSrcFiles = [ "README.md" ];
+          # The crate's rustdoc front page is the README (include_str!); the
+          # golden fixtures are read at test time, and crane's source filter
+          # would otherwise drop them (a missing fixture fails the golden test).
+          extraSrcFiles = [
+            "README.md"
+            "tests/fixtures"
+          ];
         };
 
         # Devkit knobs read from .vig-os (#1224, #1432, #1431, #1282, #1633): the

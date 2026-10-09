@@ -35,22 +35,41 @@ on:  # yamllint disable-line rule:truthy
         required: false
         type: string
         default: '["ubuntu-26.04"]'
+      dev-profile-path:
+        description: "Optional absolute path for the Nix dev-shell gcroot profile"
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
+  # Workaround for vig-os/devkit#1811; remove when the managed Tests/Lint lanes
+  # run Rust. Until then `just lint`/`just test` are Python recipes that skip
+  # without a pyproject.toml, so nothing else compiles or tests the crate.
+  # `nix flake check` runs the crane checks from flake.nix: clippy, fmt,
+  # nextest, doctests and docs.
   extension:
-    name: Extension Hook (Default No-op)
+    name: Rust checks (nix flake check)
     runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 30
     steps:
-      - name: Default extension summary
-        env:
-          MODE: ${{ inputs.mode }}
-          IMAGE: ${{ inputs.image }}
-          IMAGE_TAG: ${{ inputs.image-tag }}
-        run: |
-          echo "No CI extension configured."
-          echo "Mode: $MODE"
-          echo "Image: $IMAGE"
-          echo "Image tag: $IMAGE_TAG"
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Nix is required whatever the resolved delivery mode is, so the mode is
+      # pinned to `direnv` (the action's only Nix path) rather than forwarded.
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+
+      - name: Run nix flake check
+        run: nix flake check -L
