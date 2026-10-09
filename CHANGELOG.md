@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **ADR-0002 amended: rotation locks the state directory instead of a lock file** ([#4](https://github.com/vig-os/vigil/issues/4), [#1](https://github.com/vig-os/vigil/issues/1))
+  - Segment counter is at least 6 digits, rotation never replaces, signal names are `[a-z0-9_]+`
+
 ### Deprecated
 
 ### Removed
