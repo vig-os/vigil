@@ -1,11 +1,14 @@
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 
+mod init;
+pub use init::{Config, Guard, InitError, init};
+
 pub mod logs;
 pub mod rotate;
 pub mod sink;
 
-/// The version of this crate, stamped into every resource it describes.
+/// The version of this crate. Producer versions must be supplied via `Config::version`.
 ///
 /// ```
 /// assert!(!vigil::VERSION.is_empty());
