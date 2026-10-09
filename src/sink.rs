@@ -48,7 +48,25 @@ impl<T: LineSink + ?Sized> LineSink for Arc<T> {
 ///
 /// On a local filesystem the kernel positions each `O_APPEND` write at the end
 /// of file atomically, so lines written by many threads (or processes) sharing
-/// the file never interleave. The file is created with mode `0600` if missing.
+/// the file never interleave.
+///
+/// This is the **single-file** sink. It holds one open descriptor and does not
+/// follow renames or unlinks: after an external `rename` it keeps writing to
+/// the renamed file, and after an external `unlink` it writes to the orphaned
+/// inode and still reports `Ok`. Rotation-safe writing is the job of
+/// `rotate::RotatingFile` (#4). The mode `0600` applies only when this sink
+/// creates the file; an existing file keeps its permissions.
+///
+/// # Short writes
+///
+/// If a write is cut short (disk full, a file-size limit) the file is left
+/// ending in an unterminated fragment, and the error is returned. The sink does
+/// not try to repair it afterwards (the repair write can fail for the same
+/// reason). Instead every write first checks the file's last byte and, when it
+/// is not `\n`, prefixes the line with a `\n` **in the same single `write`**,
+/// so the fragment stays on its own line and the new line starts cleanly. Two
+/// writers can both add that prefix, which leaves an empty line.
+/// **Readers must skip empty and unparseable lines.**
 ///
 /// ```
 /// use vigil::sink::{AppendFile, LineSink};
@@ -80,7 +98,8 @@ impl AppendFile {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut options = OpenOptions::new();
-        options.append(true).create(true);
+        // `read` is only for the last-byte check; all writes are appends.
+        options.read(true).append(true).create(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let file = options.open(&path)?;
@@ -100,31 +119,57 @@ impl LineSink for AppendFile {
     }
 }
 
-/// One `write` of `line + '\n'` to `out`.
+/// The two file operations `append_line` needs, so tests can substitute a
+/// fake for a real file.
+trait Appender {
+    /// The last byte of the file, or `None` if it is empty.
+    fn last_byte(&self) -> io::Result<Option<u8>>;
+    /// One `write(2)`; returns the number of bytes accepted.
+    fn append(&self, buf: &[u8]) -> io::Result<usize>;
+}
+
+impl Appender for File {
+    fn last_byte(&self) -> io::Result<Option<u8>> {
+        use std::os::unix::fs::FileExt;
+        let len = self.metadata()?.len();
+        if len == 0 {
+            return Ok(None);
+        }
+        let mut byte = [0u8; 1];
+        self.read_exact_at(&mut byte, len - 1)?;
+        Ok(Some(byte[0]))
+    }
+
+    fn append(&self, buf: &[u8]) -> io::Result<usize> {
+        // `&File` implements `Write`, so no lock is needed: the kernel orders
+        // concurrent `O_APPEND` writes.
+        (&*self).write(buf)
+    }
+}
+
+/// One `write` of `[\n] + line + \n` to `out`, where the leading `\n` is only
+/// present when the file does not already end in one (a fragment left by an
+/// earlier short write, possibly by another process).
 ///
-/// On a short write (disk full, file-size limit) the tail is **not** retried:
-/// that would be a second `write(2)` another writer can slip in front of. The
-/// file now ends in an unterminated fragment, though, and the next line would
-/// glue onto it, corrupting that one too. So a single `\n` is appended on a
-/// best-effort basis, which leaves the fragment as its own (unparseable) line,
-/// and the original error is still returned.
-fn append_line<W>(out: &W, line: &[u8], path: &Path) -> io::Result<()>
-where
-    for<'a> &'a W: Write,
-{
-    let mut buf = Vec::with_capacity(line.len() + 1);
+/// On a short write the tail is **not** retried (a second `write(2)` another
+/// writer can slip in front of) and nothing else is appended (it would likely
+/// fail for the same reason): the error says what happened, and the next
+/// write's prefix terminates the fragment.
+fn append_line(out: &impl Appender, line: &[u8], path: &Path) -> io::Result<()> {
+    let needs_prefix = out.last_byte()?.is_some_and(|b| b != b'\n');
+    let mut buf = Vec::with_capacity(line.len() + 2);
+    if needs_prefix {
+        buf.push(b'\n');
+    }
     buf.extend_from_slice(line);
     buf.push(b'\n');
-    // `&File` implements `Write`, so no lock is needed: the kernel orders
-    // concurrent `O_APPEND` writes.
-    let written = (&*out).write(&buf)?;
+    let written = out.append(&buf)?;
     if written != buf.len() {
-        let _ = (&*out).write(b"\n");
         return Err(io::Error::new(
             io::ErrorKind::WriteZero,
             format!(
-                "short write to {}: {written} of {} bytes; the fragment was terminated \
-                 with a newline and is an unparseable line",
+                "short write to {}: {written} of {} bytes; the file now ends in an \
+                 unterminated fragment, which the next write will terminate",
                 path.display(),
                 buf.len()
             ),
@@ -203,42 +248,68 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A writer whose first `write` accepts only `limit` bytes.
+    /// An in-memory file whose first `write` accepts only `limit` bytes.
     #[derive(Default)]
     struct Truncating {
         limit: usize,
         data: Mutex<Vec<u8>>,
+        writes: Mutex<usize>,
     }
 
-    impl Write for &Truncating {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            let mut data = self.data.lock().unwrap();
-            let n = if data.is_empty() {
+    impl Appender for Truncating {
+        fn last_byte(&self) -> io::Result<Option<u8>> {
+            Ok(self.data.lock().unwrap().last().copied())
+        }
+
+        fn append(&self, buf: &[u8]) -> io::Result<usize> {
+            let mut writes = self.writes.lock().unwrap();
+            let n = if *writes == 0 {
                 buf.len().min(self.limit)
             } else {
                 buf.len()
             };
-            data.extend_from_slice(&buf[..n]);
+            *writes += 1;
+            self.data.lock().unwrap().extend_from_slice(&buf[..n]);
             Ok(n)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
         }
     }
 
     #[test]
-    fn short_write_terminates_the_fragment_and_errors() {
+    fn short_write_errors_accurately_and_the_next_write_terminates_the_fragment() {
         let out = Truncating {
             limit: 4,
             ..Default::default()
         };
         let err = append_line(&out, b"0123456789", Path::new("x")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WriteZero);
-        assert_eq!(*out.data.lock().unwrap(), b"0123\n");
-        // The next line starts on its own line.
+        assert!(err.to_string().contains("4 of 11 bytes"), "{err}");
+        // No repair write was attempted after the short write.
+        assert_eq!(*out.writes.lock().unwrap(), 1);
+        assert_eq!(*out.data.lock().unwrap(), b"0123");
+        // The next line carries the prefix, in the same single write.
         append_line(&out, b"next", Path::new("x")).unwrap();
+        assert_eq!(*out.writes.lock().unwrap(), 2);
         assert_eq!(*out.data.lock().unwrap(), b"0123\nnext\n");
+        // A clean file gets no prefix.
+        append_line(&out, b"more", Path::new("x")).unwrap();
+        assert_eq!(*out.data.lock().unwrap(), b"0123\nnext\nmore\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_file_terminates_a_foreign_fragment_in_one_write() {
+        let dir = tempdir();
+        let path = dir.join("x.jsonl");
+        std::fs::write(&path, b"complete\nfragment").unwrap();
+        AppendFile::open(&path)
+            .unwrap()
+            .write_line(b"next")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "complete\nfragment\nnext\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

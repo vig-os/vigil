@@ -180,6 +180,31 @@ pub fn golden_records() -> (Resource, Vec<Rec>) {
         }),
     ];
     let mut records = records;
+    // +0.0 and -0.0 scopes: equal under the SDK's PartialEq, different hashes.
+    let pos_zero = scope_with("zero", "1", vec![KeyValue::new("z", 0.0_f64)]);
+    let neg_zero = scope_with("zero", "1", vec![KeyValue::new("z", -0.0_f64)]);
+    for (i, scope) in [&pos_zero, &neg_zero, &pos_zero, &neg_zero]
+        .into_iter()
+        .enumerate()
+    {
+        records.push(rec(scope, |r| {
+            r.set_timestamp(at(1_700_000_020 + i as u64, 0));
+            r.set_body(format!("zero {i}").into());
+        }));
+    }
+    // Emission order within an untouched scope is kept, even when the
+    // timestamps run backwards.
+    let ordered = scope("ordered", "1.0.0");
+    for (i, secs) in [
+        (0, 1_700_000_090_u64),
+        (1, 1_700_000_050),
+        (2, 1_700_000_070),
+    ] {
+        records.push(rec(&ordered, |r| {
+            r.set_timestamp(at(secs, 0));
+            r.set_body(format!("ordered {i}").into());
+        }));
+    }
     for i in 0..4_i64 {
         records.push(rec(&nan_scope, |r| {
             r.set_timestamp(at(1_700_000_010 + i as u64, 0));

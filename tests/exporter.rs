@@ -69,7 +69,7 @@ fn wire_format_matches_otlp_json() {
         // Drop the NaN-bearing kinds so the line also deserializes via proto.
         recs.retain(|r| r.record.severity_number() != Some(Severity::Error));
         recs.retain(|r| !matches!(r.record.body(), Some(AnyValue::Map(_))));
-        recs.retain(|r| r.scope.name() != "gamma");
+        recs.retain(|r| matches!(r.scope.name(), "alpha" | "beta"));
         let _ = r;
         (resource(vec![KeyValue::new("service.name", "wire")]), recs)
     };
@@ -222,7 +222,10 @@ fn output_is_sorted_and_stable_across_runs() {
             ("alpha", "1.0.0"),
             ("alpha", "1.1.0"),
             ("beta", "2.1.0"),
-            ("gamma", "3.0.0")
+            ("gamma", "3.0.0"),
+            ("ordered", "1.0.0"),
+            ("zero", "1"),
+            ("zero", "1")
         ]
     );
     let keys: Vec<_> = line["resourceLogs"][0]["resource"]["attributes"]
@@ -342,6 +345,12 @@ fn concurrent_batches_never_interleave() {
     let mut per_thread = vec![0usize; THREADS];
     let mut lines = 0;
     for line in content.lines() {
+        // Readers skip empty lines: a writer that glimpsed another's write in
+        // flight (no trailing newline yet) adds a repair prefix, which lands
+        // after that complete line as an empty one.
+        if line.is_empty() {
+            continue;
+        }
         lines += 1;
         let value: Value = serde_json::from_str(line).expect("interleaved or torn line");
         let records = all_records(&value);
@@ -407,4 +416,54 @@ fn non_finite_doubles_in_resource_and_scope_attributes_are_sanitized() {
     assert_eq!(attrs[0]["key"], "scope_nan");
     assert_eq!(attrs[0]["value"]["doubleValue"], "NaN");
     assert_eq!(attrs[1]["value"]["doubleValue"], "-Infinity");
+}
+
+fn bodies_of_scope<'a>(line: &'a Value, name: &str) -> Vec<Vec<&'a str>> {
+    line["resourceLogs"][0]["scopeLogs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["scope"]["name"] == name)
+        .map(|s| {
+            s["logRecords"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["body"]["stringValue"].as_str().unwrap())
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn signed_zero_scopes_stay_distinct_and_records_keep_batch_order() {
+    let (resource, records) = golden_records();
+    let sink = MemorySink::new();
+    export(sink.clone(), &resource, &records);
+    let line = one_line(&sink);
+
+    // -0.0 and 0.0 are different scopes (faithful), -0.0 sorts first, and each
+    // holds its own records in batch order.
+    assert_eq!(
+        bodies_of_scope(&line, "zero"),
+        [vec!["zero 1", "zero 3"], vec!["zero 0", "zero 2"]]
+    );
+    let zero_scopes: Vec<_> = line["resourceLogs"][0]["scopeLogs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["scope"]["name"] == "zero")
+        .map(|s| {
+            s["scope"]["attributes"][0]["value"]["doubleValue"]
+                .as_f64()
+                .unwrap()
+        })
+        .collect();
+    assert!(zero_scopes[0].is_sign_negative() && zero_scopes[1].is_sign_positive());
+
+    // Records of an untouched scope are not re-sorted by time.
+    assert_eq!(
+        bodies_of_scope(&line, "ordered"),
+        [vec!["ordered 0", "ordered 1", "ordered 2"]]
+    );
 }

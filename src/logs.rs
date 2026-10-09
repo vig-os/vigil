@@ -44,13 +44,17 @@
 //! # Ok::<(), serde_json::Error>(())
 //! ```
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
+use opentelemetry_proto::tonic::common::v1::{
+    AnyValue, InstrumentationScope, KeyValue, any_value::Value,
+};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use opentelemetry_proto::tonic::resource::v1::Resource as ProtoResource;
 use opentelemetry_proto::transform::common::tonic::ResourceAttributesWithSchema;
-use opentelemetry_proto::transform::logs::tonic::group_logs_by_resource_and_scope;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use opentelemetry_sdk::logs::{LogBatch, LogExporter};
@@ -66,8 +70,8 @@ use crate::sink::LineSink;
 /// record in the batch). The proto3 JSON mapping (which OTLP/JSON follows)
 /// spells them as these strings. The Collector's `otlpjsonfile` receiver
 /// accepts that spelling as a `doubleValue` (verified against
-/// opentelemetry-collector-contrib 0.155.0, which round-trips them back
-/// unchanged), so the exporter uses it and keeps the value a double. Note that
+/// opentelemetry-collector-contrib 0.151.0, the version the flake pins, which
+/// round-trips them back unchanged), so the exporter uses it and keeps the value a double. Note that
 /// `opentelemetry-proto`'s own deserializer rejects these strings, so the
 /// lines cannot be read back through its types; read them with `serde_json`
 /// or the Collector.
@@ -103,16 +107,13 @@ impl<S: LineSink> OtlpJsonLogExporter<S> {
     }
 
     fn export_batch(&self, batch: &LogBatch<'_>) -> OTelSdkResult {
-        let mut resource_logs = group_logs_by_resource_and_scope(batch, &self.resource);
-        resource_logs.iter_mut().for_each(normalize_resource_logs);
-        resource_logs.retain(|r| r.scope_logs.iter().any(|s| !s.log_records.is_empty()));
-        if resource_logs.is_empty() {
+        let Some(resource_logs) = group_batch(batch, &self.resource) else {
             return Ok(());
-        }
-        resource_logs.sort_by_cached_key(sort_key_resource);
-
-        let line = encode_line(&ExportLogsServiceRequest { resource_logs })
-            .map_err(|e| OTelSdkError::InternalFailure(format!("encoding log batch: {e}")))?;
+        };
+        let line = encode_line(&ExportLogsServiceRequest {
+            resource_logs: vec![resource_logs],
+        })
+        .map_err(|e| OTelSdkError::InternalFailure(format!("encoding log batch: {e}")))?;
         self.sink
             .write_line(line.as_bytes())
             .map_err(|e| OTelSdkError::InternalFailure(format!("writing log batch: {e}")))
@@ -162,53 +163,71 @@ fn encode_line(request: &ExportLogsServiceRequest) -> Result<String, String> {
     Ok(line)
 }
 
-// ---- normalization (deterministic order, timestamps) ----------------------
+// ---- grouping and normalization -------------------------------------------
 
-fn normalize_resource_logs(resource_logs: &mut ResourceLogs) {
-    if let Some(resource) = &mut resource_logs.resource {
-        sort_attributes(&mut resource.attributes);
-    }
-    for scope_logs in &mut resource_logs.scope_logs {
-        if let Some(scope) = &mut scope_logs.scope {
-            sort_attributes(&mut scope.attributes);
-        }
-        scope_logs.log_records.iter_mut().for_each(normalize_record);
-    }
-    resource_logs.scope_logs.sort_by_cached_key(sort_key_scope);
-    merge_equal_scopes(&mut resource_logs.scope_logs);
-}
-
-/// Merge scope groups that describe the same scope.
+/// Group a batch by scope, deterministically, or `None` for an empty batch.
 ///
-/// The SDK groups by scope through a `HashMap`, and a scope attribute holding
-/// NaN is never equal to itself, so every record of such a scope lands in its
-/// own group, in `HashMap` order. Merging them gives one scope with many
-/// records; the records are then sorted (their emission order is already lost)
-/// so the output bytes do not depend on that order.
-fn merge_equal_scopes(scope_logs: &mut Vec<ScopeLogs>) {
-    let mut merged: Vec<ScopeLogs> = Vec::with_capacity(scope_logs.len());
-    let mut combined = false;
-    for next in scope_logs.drain(..) {
-        match merged.last_mut() {
-            Some(last) if sort_key_scope(last) == sort_key_scope(&next) => {
-                last.log_records.extend(next.log_records);
-                combined = true;
-            }
-            _ => merged.push(next),
-        }
+/// The SDK's `group_logs_by_resource_and_scope` is not used: it groups through
+/// a `HashMap` keyed by `InstrumentationScope`, whose `PartialEq` and `Hash`
+/// disagree for floats (`0.0 == -0.0` but their hashes differ; `NaN != NaN`), so
+/// scopes with such attributes merge or split depending on the hash seed.
+/// Here the key is the canonical text of the sanitized scope (attributes sorted
+/// by key, floats printed so that `-0.0` and `NaN` stay distinct), in a
+/// `BTreeMap`. Records keep the order the batch delivered them in within their
+/// scope. The batch has one resource, so there is exactly one `ResourceLogs`.
+fn group_batch(
+    batch: &LogBatch<'_>,
+    resource: &ResourceAttributesWithSchema,
+) -> Option<ResourceLogs> {
+    type Key = (String, String, String, String);
+    let mut scopes: BTreeMap<Key, ScopeLogs> = BTreeMap::new();
+    for (record, instrumentation) in batch.iter() {
+        // The target overrides only the scope name.
+        let name = record
+            .target()
+            .cloned()
+            .unwrap_or_else(|| Cow::Owned(instrumentation.name().to_owned()));
+        let exported = opentelemetry::InstrumentationScope::builder(name)
+            .with_version(instrumentation.version().unwrap_or_default().to_owned())
+            .with_schema_url(instrumentation.schema_url().unwrap_or_default().to_owned())
+            .with_attributes(instrumentation.attributes().cloned())
+            .build();
+        let mut scope = InstrumentationScope::from((&exported, None));
+        sort_attributes(&mut scope.attributes);
+        let schema_url = exported.schema_url().unwrap_or_default().to_owned();
+        // Debug, not JSON: JSON writes NaN and ±Inf all as `null`.
+        let key = (
+            scope.name.clone(),
+            scope.version.clone(),
+            schema_url.clone(),
+            format!("{:?}", scope.attributes),
+        );
+        let mut record = LogRecord::from(record);
+        normalize_record(&mut record);
+        scopes
+            .entry(key)
+            .or_insert_with(|| ScopeLogs {
+                scope: Some(scope),
+                schema_url,
+                log_records: Vec::new(),
+            })
+            .log_records
+            .push(record);
     }
-    if combined {
-        for group in &mut merged {
-            group.log_records.sort_by_cached_key(|r| {
-                (
-                    r.time_unix_nano,
-                    r.observed_time_unix_nano,
-                    format!("{r:?}"),
-                )
-            });
-        }
+    if scopes.is_empty() {
+        return None;
     }
-    *scope_logs = merged;
+    let mut attributes = resource.attributes.0.clone();
+    sort_attributes(&mut attributes);
+    Some(ResourceLogs {
+        resource: Some(ProtoResource {
+            attributes,
+            dropped_attributes_count: 0,
+            entity_refs: vec![],
+        }),
+        scope_logs: scopes.into_values().collect(),
+        schema_url: resource.schema_url.clone().unwrap_or_default(),
+    })
 }
 
 fn normalize_record(record: &mut LogRecord) {
@@ -236,31 +255,6 @@ fn sort_any_value(value: &mut AnyValue) {
         Some(Value::KvlistValue(list)) => sort_attributes(&mut list.values),
         _ => {}
     }
-}
-
-fn sort_key_resource(resource_logs: &ResourceLogs) -> String {
-    let attributes = resource_logs
-        .resource
-        .as_ref()
-        .map(|r| format!("{:?}", r.attributes))
-        .unwrap_or_default();
-    format!("{attributes}\u{0}{}", resource_logs.schema_url)
-}
-
-fn sort_key_scope(scope_logs: &ScopeLogs) -> (String, String, String, String) {
-    let (name, version, attributes) =
-        scope_logs
-            .scope
-            .as_ref()
-            .map_or_else(Default::default, |s| {
-                (
-                    s.name.clone(),
-                    s.version.clone(),
-                    // Debug, not JSON: JSON writes NaN and ±Inf all as `null`.
-                    format!("{:?}", s.attributes),
-                )
-            });
-    (name, version, scope_logs.schema_url.clone(), attributes)
 }
 
 // ---- non-finite doubles ----------------------------------------------------
