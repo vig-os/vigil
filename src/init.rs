@@ -1,9 +1,12 @@
 //! Process-wide tracing initialization.
-use std::{env, fmt, path::PathBuf, sync::Arc, time::Duration};
+use std::{env, fmt, io::Write, path::PathBuf, sync::Arc, time::Duration};
 
-use opentelemetry::KeyValue;
+use opentelemetry::{InstrumentationScope, KeyValue, logs::LoggerProvider};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_sdk::{Resource, logs::SdkLoggerProvider};
+use opentelemetry_sdk::{
+    Resource,
+    logs::{BatchConfigBuilder, BatchLogProcessor, SdkLogger, SdkLoggerProvider},
+};
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
@@ -22,14 +25,22 @@ impl fmt::Display for InitError {
 impl std::error::Error for InitError {}
 
 /// Owns the batch processor. Keep this alive until logging is finished.
+/// Drop waits up to five seconds, including time blocked on the directory lock.
+/// On timeout it warns on stderr; remaining records may be lost. The SDK worker
+/// may continue in the background until the lock is released.
 #[derive(Debug)]
 pub struct Guard {
     provider: Option<SdkLoggerProvider>,
 }
 impl Drop for Guard {
     fn drop(&mut self) {
-        if let Some(provider) = &self.provider {
-            let _ = provider.shutdown();
+        if let Some(provider) = &self.provider
+            && let Err(error) = provider.shutdown_with_timeout(Duration::from_secs(5))
+        {
+            let _ = writeln!(
+                std::io::stderr(),
+                "vigil: log shutdown failed: {error}; remaining records may be lost"
+            );
         }
     }
 }
@@ -37,7 +48,10 @@ impl Drop for Guard {
 /// Initialize logs with default configuration. See [`Config`] for overrides.
 ///
 /// Keep the returned guard alive: dropping it drains and shuts down the batch
-/// processor. Its 2048-record queue can drop records when full. Calling
+/// processor. Its default 65,536-record queue uses memory proportional to
+/// queue size times record size. Overflow drops records with a stderr warning.
+/// Drop waits up to five seconds for shutdown (including directory-lock waits),
+/// then warns that remaining records may be lost. Calling
 /// `std::process::exit` skips drop and loses queued records. No async runtime
 /// is needed. I/O failures fall back to stderr with one warning.
 ///
@@ -51,14 +65,14 @@ pub fn init(service: impl Into<String>) -> Result<Guard, InitError> {
 }
 
 /// Logging configuration. Explicit builder values win over environment values;
-/// environment values win over defaults. Invalid numeric environment values are
-/// ignored. `RUST_LOG` selects levels (default `info`). Storage defaults to
+/// environment values win over defaults. Invalid numeric environment values warn on stderr and use defaults. `RUST_LOG` selects levels (default `info`). Storage defaults to
 /// `$XDG_STATE_HOME/<service>`, then `$HOME/.local/state/<service>`.
 #[derive(Debug)]
 pub struct Config {
     service: String,
     dir: Option<PathBuf>,
     max_bytes: Option<u64>,
+    queue_size: Option<usize>,
     retention_days: Option<u64>,
     version: Option<String>,
     revision: Option<String>,
@@ -72,6 +86,7 @@ impl Config {
             service: service.into(),
             dir: None,
             max_bytes: None,
+            queue_size: None,
             retention_days: None,
             version: None,
             revision: None,
@@ -83,10 +98,18 @@ impl Config {
         self.dir = Some(dir.into());
         self
     }
-    /// Rotation limit in bytes; overrides `VIGIL_MAX_BYTES` (default 50 MiB).
+    /// Rotation limit in bytes (minimum 1; builder zero clamps to 1); overrides `VIGIL_MAX_BYTES` (default 50 MiB).
     #[must_use]
     pub fn max_bytes(mut self, bytes: u64) -> Self {
-        self.max_bytes = Some(bytes);
+        self.max_bytes = Some(bytes.max(1));
+        self
+    }
+    /// Maximum queued records (default 65,536); overrides `VIGIL_QUEUE_SIZE`.
+    /// Minimum 1. Memory is bounded by queue size times record size; overflow
+    /// drops records and emits a warning to stderr.
+    #[must_use]
+    pub fn queue_size(mut self, size: usize) -> Self {
+        self.queue_size = Some(size.max(1));
         self
     }
     /// Retention in days; zero keeps everything. Overrides `VIGIL_RETENTION_DAYS`.
@@ -112,6 +135,11 @@ impl Config {
     /// # Errors
     /// Returns an error for an invalid service name or existing global subscriber.
     pub fn init(self) -> Result<Guard, InitError> {
+        if tracing::dispatcher::has_been_set() {
+            return Err(InitError(
+                "cannot install global tracing subscriber: already set".into(),
+            ));
+        }
         if self.service.is_empty()
             || self.service == "."
             || self.service == ".."
@@ -126,10 +154,14 @@ impl Config {
         }
         let dir = self
             .dir
-            .or_else(|| env::var_os("VIGIL_DIR").map(PathBuf::from))
+            .or_else(|| {
+                env::var_os("VIGIL_DIR")
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+            })
             .or_else(|| {
                 env::var_os("XDG_STATE_HOME")
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| std::path::Path::new(s).is_absolute())
                     .map(|s| PathBuf::from(s).join(&self.service))
             })
             .or_else(|| {
@@ -138,20 +170,34 @@ impl Config {
                     .map(|s| PathBuf::from(s).join(".local/state").join(&self.service))
             });
         let mut rotation = RotationConfig::default();
-        if let Some(bytes) = self.max_bytes.or_else(|| number("VIGIL_MAX_BYTES")) {
+        if let Some(bytes) = self.max_bytes.or_else(|| number("VIGIL_MAX_BYTES", 1)) {
             rotation.max_bytes = bytes;
         }
         if let Some(days) = self
             .retention_days
-            .or_else(|| number("VIGIL_RETENTION_DAYS"))
+            .or_else(|| number("VIGIL_RETENTION_DAYS", 0))
         {
             rotation.retention =
                 (days != 0).then(|| Duration::from_secs(days.saturating_mul(86_400)));
         }
+        let queue_size = self
+            .queue_size
+            .or_else(|| number("VIGIL_QUEUE_SIZE", 1).and_then(|n| usize::try_from(n).ok()))
+            .unwrap_or(65_536);
+        let path_description = dir.as_ref().map_or_else(
+            || "<unresolved state directory>".into(),
+            |p| p.display().to_string(),
+        );
         let file = dir
             .ok_or_else(|| std::io::Error::other("neither XDG_STATE_HOME nor HOME is set"))
             .and_then(|dir| RotatingFile::open(&dir, "logs", rotation));
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let diagnostics = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                meta.target().starts_with("opentelemetry") && *meta.level() <= tracing::Level::WARN
+            }));
         match file {
             Ok(file) => {
                 let mut attrs = vec![
@@ -172,19 +218,28 @@ impl Config {
                 }
                 let provider = SdkLoggerProvider::builder()
                     .with_resource(Resource::builder_empty().with_attributes(attrs).build())
-                    .with_batch_exporter(OtlpJsonLogExporter::new(Arc::new(file)))
+                    .with_log_processor(
+                        BatchLogProcessor::builder(OtlpJsonLogExporter::new(Arc::new(file)))
+                            .with_batch_config(
+                                BatchConfigBuilder::default()
+                                    .with_max_queue_size(queue_size)
+                                    .with_max_export_batch_size(512)
+                                    .with_scheduled_delay(Duration::from_secs(1))
+                                    .build(),
+                            )
+                            .build(),
+                    )
                     .build();
-                let bridge = OpenTelemetryTracingBridge::new(&provider).with_filter(
-                    tracing_subscriber::filter::filter_fn(|meta| {
+                let bridge = OpenTelemetryTracingBridge::new(&NamedProvider(provider.clone()))
+                    .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
                         !meta.target().starts_with("opentelemetry")
-                    }),
-                );
+                    }));
                 let guard = Guard {
                     provider: Some(provider),
                 };
                 tracing_subscriber::registry()
-                    .with(filter)
-                    .with(bridge)
+                    .with(diagnostics)
+                    .with(bridge.with_filter(filter))
                     .try_init()
                     .map_err(|e| {
                         InitError(format!("cannot install global tracing subscriber: {e}"))
@@ -193,24 +248,53 @@ impl Config {
             }
             Err(error) => {
                 tracing_subscriber::registry()
-                    .with(filter)
+                    .with(diagnostics)
                     .with(
                         tracing_subscriber::fmt::layer()
                             .with_writer(std::io::stderr)
-                            .with_ansi(false),
+                            .with_ansi(false)
+                            .with_filter(filter)
+                            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                                !meta.target().starts_with("opentelemetry")
+                            })),
                     )
                     .try_init()
                     .map_err(|e| {
                         InitError(format!("cannot install global tracing subscriber: {e}"))
                     })?;
-                eprintln!("vigil: cannot open log storage: {error}; falling back to stderr");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "vigil: cannot open log storage at {path_description}: {error}; falling back to stderr"
+                );
                 Ok(Guard { provider: None })
             }
         }
     }
 }
-fn number(key: &str) -> Option<u64> {
-    env::var(key).ok()?.parse().ok()
+// The upstream bridge requests an empty scope; supply a named scope to avoid
+// the SDK's LoggerNameEmpty diagnostic before subscriber installation.
+struct NamedProvider(SdkLoggerProvider);
+impl LoggerProvider for NamedProvider {
+    type Logger = SdkLogger;
+    fn logger_with_scope(&self, _scope: InstrumentationScope) -> Self::Logger {
+        self.0.logger("vigil")
+    }
+}
+fn number(key: &str, minimum: u64) -> Option<u64> {
+    let value = env::var_os(key)?;
+    if let Some(number) = value
+        .to_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n >= minimum)
+    {
+        Some(number)
+    } else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "vigil: invalid {key}={value:?}; minimum {minimum}; using default"
+        );
+        None
+    }
 }
 fn hostname() -> Option<String> {
     ["/proc/sys/kernel/hostname", "/etc/hostname"]
