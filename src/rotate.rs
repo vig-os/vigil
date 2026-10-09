@@ -27,6 +27,16 @@
 //! * A failed or partial write is rolled back (`set_len` to the pre-write
 //!   length) before the error is returned, so a half line never glues onto the
 //!   next record.
+//! * If the lock file is deleted while processes run, each writer notices
+//!   after locking (the locked inode is no longer the one at the path),
+//!   recreates it and locks again, so exclusion is restored.
+//! * A forked child shares its parent's lock *open file description*: the two
+//!   do not exclude each other. Call `open` **after** `fork`, not before.
+//! * Reaching the same directory through a bind mount (or any second path to
+//!   it) gives two lock handles in one process, which block each other; that
+//!   is unsupported. Use one canonical path.
+//! * Segments whose mtime is in the future are not pruned until that time has
+//!   passed.
 //! * Readers need no lock: a line is written with a single `write(2)` to an
 //!   `O_APPEND` file, and rotation is an atomic `rename`.
 //!
@@ -40,7 +50,10 @@
 //! ```
 //!
 //! Segment names sort chronologically as plain strings, so [`segments`] simply
-//! sorts them. Directories are created `0700`, files `0600`.
+//! sorts them. Even if the clock goes backwards, a new segment's name is
+//! strictly greater than the newest existing one. Directories are created
+//! `0700`, files `0600`; on `open`, an existing directory or live/lock file with
+//! looser permissions is tightened (never loosened).
 
 use std::collections::HashMap;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -84,10 +97,42 @@ impl Default for RotationConfig {
 /// `(dev, ino)` of an open file.
 type FileId = (u64, u64);
 
-/// The cached live handle, replaced whenever the file at the live path changes.
+/// The cached live handle (replaced whenever the file at the live path
+/// changes) and the lock descriptor (replaced if the lock file is deleted).
 struct Live {
     file: File,
     id: FileId,
+    /// `flock`ed for the duration of every append.
+    lock: File,
+}
+
+impl Live {
+    fn open(live_path: &Path, lock_path: &Path) -> io::Result<Self> {
+        let lock = open_private(lock_path, false)?;
+        let (file, id) = open_live(live_path)?;
+        Ok(Self { file, id, lock })
+    }
+
+    fn reopen(&mut self, live_path: &Path) -> io::Result<()> {
+        (self.file, self.id) = open_live(live_path)?;
+        Ok(())
+    }
+
+    /// Take the exclusive lock on the lock *file*, not merely on a descriptor.
+    /// If the lock file was deleted (or replaced) behind our back, a descriptor
+    /// on the old inode no longer excludes processes using the new one, so
+    /// reopen the path and lock again until the locked inode is the one on disk.
+    fn acquire(&mut self, lock_path: &Path) -> io::Result<()> {
+        loop {
+            self.lock.lock()?;
+            let m = self.lock.metadata()?;
+            if disk_id(lock_path) == Some((m.dev(), m.ino())) {
+                return Ok(());
+            }
+            let _ = self.lock.unlock();
+            self.lock = open_private(lock_path, false)?;
+        }
+    }
 }
 
 /// State shared by every [`RotatingFile`] of one path in this process.
@@ -95,8 +140,7 @@ struct Shared {
     dir: PathBuf,
     signal: String,
     live_path: PathBuf,
-    /// Never renamed; `flock`ed for the duration of every append.
-    lock: File,
+    lock_path: PathBuf,
     /// Serialises threads (a `flock` does not exclude threads sharing one
     /// descriptor) and owns the cached live handle.
     live: Mutex<Live>,
@@ -158,6 +202,7 @@ impl RotatingFile {
         validate_signal(signal)?;
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         let dir = fs::canonicalize(dir)?;
+        tighten(&dir, 0o700)?;
         let live_path = dir.join(format!("{signal}.jsonl"));
 
         let mut registry = lock_ignore_poison(&REGISTRY);
@@ -165,13 +210,22 @@ impl RotatingFile {
         let (shared, first) = match registry.get(&live_path).and_then(Weak::upgrade) {
             Some(shared) => (shared, false),
             None => {
-                let lock = open_private(&dir.join(format!("{signal}.jsonl.lock")), false)?;
+                let lock_path = dir.join(format!("{signal}.jsonl.lock"));
+                // Before opening: another process may rotate the live file away
+                // at any moment, so a file that vanished is simply skipped.
+                for (p, mask) in [(&live_path, 0o600), (&lock_path, 0o600)] {
+                    match tighten(p, mask) {
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        r => r?,
+                    }
+                }
+                let live = Live::open(&live_path, &lock_path)?;
                 let shared = Arc::new(Shared {
                     dir,
                     signal: signal.to_owned(),
-                    live: Mutex::new(open_live(&live_path)?),
+                    live: Mutex::new(live),
                     live_path: live_path.clone(),
-                    lock,
+                    lock_path,
                 });
                 registry.insert(live_path, Arc::downgrade(&shared));
                 (shared, true)
@@ -197,7 +251,7 @@ impl RotatingFile {
     /// Any I/O error from locking, rotating or writing; pruning errors are
     /// ignored.
     pub fn append(&self, line: &[u8]) -> io::Result<()> {
-        self.append_with(line, |f, buf| f.write_all(buf))
+        self.append_with(line, write_once)
     }
 
     /// [`append`](Self::append) with the write step injectable, so tests can
@@ -214,20 +268,28 @@ impl RotatingFile {
 
         let s = &*self.shared;
         let mut live = lock_ignore_poison(&s.live);
-        s.lock.lock()?;
-        let _unlock = Unlock(&s.lock);
+        live.acquire(&s.lock_path)?;
+        let _unlock = Unlock(live.lock.try_clone()?);
 
         // Another process may have rotated (or removed) the file since our
         // last append: the cached handle then points at a renamed inode.
         if disk_id(&s.live_path) != Some(live.id) {
-            *live = open_live(&s.live_path)?;
+            live.reopen(&s.live_path)?;
         }
 
         let len = live.file.metadata()?.len();
         if len > 0 && len.checked_add(need).is_none_or(|n| n > self.cfg.max_bytes) {
-            let target = unique_target(&s.dir, &s.signal, &stamp(SystemTime::now()));
+            let newest = rotated_segments(&s.dir, &s.signal)?.pop();
+            let target = s.dir.join(next_segment_name(
+                &s.signal,
+                &stamp(SystemTime::now()),
+                newest
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .and_then(|n| n.to_str()),
+            ));
             fs::rename(&s.live_path, &target)?;
-            *live = open_live(&s.live_path)?;
+            live.reopen(&s.live_path)?;
             if let Some(keep) = self.cfg.retention {
                 prune(&s.dir, &s.signal, keep);
             }
@@ -244,9 +306,10 @@ impl RotatingFile {
 }
 
 /// Releases the `flock` on drop, including on early return and panic.
-struct Unlock<'a>(&'a File);
+/// Holds a clone of the lock descriptor (same open file description).
+struct Unlock(File);
 
-impl Drop for Unlock<'_> {
+impl Drop for Unlock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
     }
@@ -278,13 +341,40 @@ fn open_private(path: &Path, append: bool) -> io::Result<File> {
     opts.open(path)
 }
 
-fn open_live(path: &Path) -> io::Result<Live> {
+fn open_live(path: &Path) -> io::Result<(File, FileId)> {
     let file = open_private(path, true)?;
     let m = file.metadata()?;
-    Ok(Live {
-        id: (m.dev(), m.ino()),
-        file,
-    })
+    Ok((file, (m.dev(), m.ino())))
+}
+
+/// Tighten (never loosen) `path` to at most `mask` permission bits, so a
+/// directory or file that pre-dates us with looser modes does not leak.
+fn tighten(path: &Path, mask: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path)?.permissions().mode() & 0o7777;
+    if mode & !mask != 0 {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode & mask))?;
+    }
+    Ok(())
+}
+
+/// One `write(2)`; a short write is an error (the caller rolls back), so a
+/// lock-free reader never sees a line completed by a second call.
+fn write_once(w: &mut impl Write, buf: &[u8]) -> io::Result<()> {
+    let n = loop {
+        match w.write(buf) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            r => break r?,
+        }
+    };
+    if n == buf.len() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!("short write: {n} of {} bytes", buf.len()),
+        ))
+    }
 }
 
 fn disk_id(path: &Path) -> Option<FileId> {
@@ -322,34 +412,53 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-/// A rotated-segment path that does not exist yet. Called under the lock, so
-/// the existence check cannot race. The collision suffix `_NNNNNN` sorts after
-/// the bare name (`_` > `.`) and, zero-padded, in counter order.
-fn unique_target(dir: &Path, signal: &str, stamp: &str) -> PathBuf {
-    let first = dir.join(format!("{signal}-{stamp}.jsonl"));
-    if !first.exists() {
-        return first;
+const STAMP_LEN: usize = "YYYYMMDDTHHMMSS.nnnnnnnnnZ".len();
+
+/// Parse `<signal>-<stamp>[_NNNNNN].jsonl` into `(stamp, counter)`. Only this
+/// exact shape counts, so `logs-2.jsonl` (live file of signal `logs-2`) is not
+/// a segment of `logs`.
+fn parse_segment<'a>(name: &'a str, signal: &str) -> Option<(&'a str, u32)> {
+    let rest = name
+        .strip_prefix(signal)?
+        .strip_prefix('-')?
+        .strip_suffix(".jsonl")?;
+    let stamp = rest.get(..STAMP_LEN)?;
+    let digits = |s: &[u8]| s.iter().all(u8::is_ascii_digit);
+    let b = stamp.as_bytes();
+    let shaped = digits(&b[..8])
+        && b[8] == b'T'
+        && digits(&b[9..15])
+        && b[15] == b'.'
+        && digits(&b[16..25])
+        && b[25] == b'Z';
+    if !shaped {
+        return None;
     }
-    (1u64..)
-        .map(|n| dir.join(format!("{signal}-{stamp}_{n:06}.jsonl")))
-        .find(|p| !p.exists())
-        .unwrap_or(first)
+    match &rest[STAMP_LEN..] {
+        "" => Some((stamp, 0)),
+        tail => {
+            let n = tail.strip_prefix('_')?;
+            (n.len() == 6 && digits(n.as_bytes())).then(|| n.parse().ok().map(|n| (stamp, n)))?
+        }
+    }
 }
 
-/// Whether `name` is a rotated segment of `signal` (and not, say, of a signal
-/// called `<signal>-x`).
+/// The name for the next rotated segment: strictly greater (as a string) than
+/// `newest`, the newest existing segment, even if the clock went backwards.
+/// Under the lock, so nothing can race it. The collision suffix `_NNNNNN`
+/// sorts after the bare name (`_` > `.`) and, zero-padded, in counter order.
+fn next_segment_name(signal: &str, now: &str, newest: Option<&str>) -> String {
+    match newest.and_then(|n| parse_segment(n, signal)) {
+        Some((stamp, counter)) if stamp >= now => {
+            format!("{signal}-{stamp}_{:06}.jsonl", counter.saturating_add(1))
+        }
+        _ => format!("{signal}-{now}.jsonl"),
+    }
+}
+
+/// Whether `name` is a rotated segment of `signal`.
 fn is_segment_name(name: &str, signal: &str) -> bool {
-    let Some(rest) = name
-        .strip_prefix(signal)
-        .and_then(|r| r.strip_prefix('-'))
-        .and_then(|r| r.strip_suffix(".jsonl"))
-    else {
-        return false;
-    };
-    rest.starts_with(|c: char| c.is_ascii_digit())
-        && rest
-            .chars()
-            .all(|c| c.is_ascii_digit() || matches!(c, 'T' | 'Z' | '.' | '_'))
+    parse_segment(name, signal).is_some()
 }
 
 fn rotated_segments(dir: &Path, signal: &str) -> io::Result<Vec<PathBuf>> {
@@ -734,12 +843,12 @@ mod tests {
         let d = tmp("collide");
         fs::create_dir_all(&d).unwrap();
         let st = "20261009T120000.123456789Z";
-        let mut names = Vec::new();
+        let mut names: Vec<String> = Vec::new();
         for i in 0..12 {
-            let t = unique_target(&d, "s", st);
-            assert!(!t.exists());
-            fs::write(&t, format!("{i}")).unwrap();
-            names.push(t.file_name().unwrap().to_str().unwrap().to_owned());
+            let n = next_segment_name("s", st, names.last().map(String::as_str));
+            assert!(!d.join(&n).exists());
+            fs::write(d.join(&n), i.to_string()).unwrap();
+            names.push(n);
         }
         let unique: HashSet<_> = names.iter().collect();
         assert_eq!(unique.len(), 12);
@@ -749,8 +858,264 @@ mod tests {
         for (i, n) in names.iter().enumerate() {
             assert_eq!(fs::read_to_string(d.join(n)).unwrap(), i.to_string());
         }
-        // The suffix keeps sorting past single and double digits.
         assert!(names.iter().all(|n| is_segment_name(n, "s")));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn backwards_clock_still_orders_segments() {
+        let d = tmp("clock");
+        let log = RotatingFile::open(&d, "s", cfg(10)).unwrap();
+        let future = d.join("s-29990101T000000.000000000Z.jsonl");
+        fs::write(&future, "future\n").unwrap();
+        for i in 0..3 {
+            log.append(format!("rec{i}aaa").as_bytes()).unwrap();
+        }
+        let names: Vec<String> = segments(&d, "s")
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_owned())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names[..names.len() - 1], sorted[..names.len() - 1]);
+        assert_eq!(names.last().unwrap(), "s.jsonl");
+        // The newest rotated segment is the one just rotated, not the planted one.
+        let newest = &names[names.len() - 2];
+        assert_ne!(newest, "s-29990101T000000.000000000Z.jsonl");
+        assert!(
+            newest.as_str() > "s-29990101T000000.000000000Z.jsonl",
+            "{names:?}"
+        );
+        let hit = find_newest(&d, "s", |l| l.starts_with("rec").then(|| l.to_owned())).unwrap();
+        assert_eq!(hit.as_deref(), Some("rec2aaa"));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn signals_sharing_a_prefix_do_not_see_each_others_files() {
+        let d = tmp("prefix");
+        let old = RotationConfig {
+            max_bytes: 1000,
+            retention: Some(Duration::from_secs(90 * 86_400)),
+        };
+        let sigs = ["logs", "logs-2", "logs-2024"];
+        let handles: Vec<_> = sigs
+            .iter()
+            .map(|s| RotatingFile::open(&d, s, cfg(1000)).unwrap())
+            .collect();
+        for (h, s) in handles.iter().zip(sigs) {
+            h.append(format!("{s}-record").as_bytes()).unwrap();
+        }
+        for s in sigs {
+            assert_eq!(segments(&d, s).unwrap(), [d.join(format!("{s}.jsonl"))]);
+            assert_eq!(all_lines(&d, s), [format!("{s}-record")]);
+            age(&d.join(format!("{s}.jsonl")), 200);
+        }
+        // Opening `logs` with retention prunes only its own segments.
+        let seg = d.join("logs-20250101T000000.000000000Z.jsonl");
+        fs::write(&seg, "x\n").unwrap();
+        age(&seg, 200);
+        drop(handles);
+        let _again = RotatingFile::open(&d, "logs", old).unwrap();
+        assert!(!seg.exists());
+        for s in sigs {
+            assert!(
+                d.join(format!("{s}.jsonl")).exists(),
+                "{s} live file deleted"
+            );
+        }
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn segment_name_parser_is_strict() {
+        let ok = "20261009T120000.123456789Z";
+        assert_eq!(parse_segment(&format!("s-{ok}.jsonl"), "s"), Some((ok, 0)));
+        assert_eq!(
+            parse_segment(&format!("s-{ok}_000007.jsonl"), "s"),
+            Some((ok, 7))
+        );
+        for bad in [
+            "s-2.jsonl",
+            "s-2024.jsonl",
+            "s-20261009T120000.123456789Z_7.jsonl",
+            "s-20261009T120000.123456789Z_00000x.jsonl",
+            "s-20261009T120000.123456789.jsonl",
+            "s-20261009T120000.123456789Zx.jsonl",
+            "s-20261009x120000.123456789Z.jsonl",
+            "s-2026100９T120000.123456789Z.jsonl",
+            "s-.jsonl",
+        ] {
+            assert_eq!(parse_segment(bad, "s"), None, "{bad}");
+        }
+    }
+
+    /// Open a handle that bypasses the per-process registry, standing in for
+    /// another process.
+    fn open_independent(dir: &Path, signal: &str, cfg: RotationConfig) -> RotatingFile {
+        let dir = fs::canonicalize(dir).unwrap();
+        let live_path = dir.join(format!("{signal}.jsonl"));
+        let lock_path = dir.join(format!("{signal}.jsonl.lock"));
+        let shared = Arc::new(Shared {
+            live: Mutex::new(Live::open(&live_path, &lock_path).unwrap()),
+            dir,
+            signal: signal.to_owned(),
+            live_path,
+            lock_path,
+        });
+        RotatingFile { shared, cfg }
+    }
+
+    #[test]
+    fn deleted_lock_file_is_recreated_and_shared_again() {
+        let d = tmp("lockdel");
+        fs::create_dir_all(&d).unwrap();
+        let a = open_independent(&d, "s", cfg(100));
+        let b = open_independent(&d, "s", cfg(100));
+        a.append(b"a1").unwrap();
+        fs::remove_file(d.join("s.jsonl.lock")).unwrap();
+        a.append(b"a2").unwrap(); // a recreates the lock
+        b.append(b"b1").unwrap(); // b notices its inode is gone, joins a's
+        let on_disk = disk_id(&d.join("s.jsonl.lock")).unwrap();
+        for h in [&a, &b] {
+            let m = lock_ignore_poison(&h.shared.live).lock.metadata().unwrap();
+            assert_eq!((m.dev(), m.ino()), on_disk);
+        }
+        assert_eq!(all_lines(&d, "s"), ["a1", "a2", "b1"]);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn lock_deleted_under_load_loses_nothing_and_errors_nowhere() {
+        let d = tmp("lockload");
+        fs::create_dir_all(&d).unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|sc| {
+            let killer = sc.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = fs::remove_file(d.join("s.jsonl.lock"));
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            });
+            let writers: Vec<_> = (0..8)
+                .map(|t| {
+                    let h = open_independent(&d, "s", cfg(300));
+                    let _ = &h;
+                    sc.spawn(move || {
+                        for i in 0..100 {
+                            h.append(format!("{t:02}-{i:03}-pad-pad-pad").as_bytes())
+                                .unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for w in writers {
+                w.join().unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+            killer.join().unwrap();
+        });
+        let lines = all_lines(&d, "s");
+        assert_eq!(lines.len(), 800);
+        assert_eq!(lines.iter().collect::<HashSet<_>>().len(), 800);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn open_tightens_loose_modes_and_never_loosens() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("tighten");
+        fs::create_dir_all(&d).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let set = |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+        set(&d, 0o755);
+        fs::write(d.join("s.jsonl"), "").unwrap();
+        fs::write(d.join("s.jsonl.lock"), "").unwrap();
+        set(&d.join("s.jsonl"), 0o644);
+        set(&d.join("s.jsonl.lock"), 0o666);
+        let log = RotatingFile::open(&d, "s", cfg(10)).unwrap();
+        assert_eq!(mode(&d), 0o700);
+        assert_eq!(mode(&d.join("s.jsonl")), 0o600);
+        assert_eq!(mode(&d.join("s.jsonl.lock")), 0o600);
+        for _ in 0..3 {
+            log.append(b"aaaaaaaa").unwrap(); // rotated segments inherit 0600
+        }
+        for p in segments(&d, "s").unwrap() {
+            assert_eq!(mode(&p), 0o600, "{p:?}");
+        }
+        // Stricter than the target stays as it is.
+        drop(log);
+        set(&d, 0o500);
+        set(&d.join("s.jsonl"), 0o400);
+        let _again = RotatingFile::open(&d, "s", cfg(10));
+        assert_eq!(mode(&d), 0o500);
+        assert_eq!(mode(&d.join("s.jsonl")), 0o400);
+        set(&d, 0o700);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A writer that accepts at most `cap` bytes per call.
+    struct Short {
+        cap: usize,
+        calls: usize,
+        got: Vec<u8>,
+    }
+    impl Write for Short {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            let n = b.len().min(self.cap);
+            self.got.extend_from_slice(&b[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn short_write_is_an_error_after_exactly_one_write_call() {
+        let mut w = Short {
+            cap: 3,
+            calls: 0,
+            got: vec![],
+        };
+        let e = write_once(&mut w, b"abcdef\n").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(w.calls, 1, "no second write to finish the line");
+        let mut w = Short {
+            cap: 100,
+            calls: 0,
+            got: vec![],
+        };
+        write_once(&mut w, b"abc\n").unwrap();
+        assert_eq!((w.calls, w.got.as_slice()), (1, &b"abc\n"[..]));
+    }
+
+    #[test]
+    fn short_write_through_append_rolls_back() {
+        let d = tmp("shortappend");
+        let log = RotatingFile::open(&d, "s", cfg(1_000)).unwrap();
+        log.append(b"good1").unwrap();
+        let e = log
+            .append_with(b"abcdefgh", |f, buf| {
+                f.write_all(&buf[..4])?; // what a short write(2) leaves behind
+                write_once(
+                    &mut Short {
+                        cap: 4,
+                        calls: 0,
+                        got: vec![],
+                    },
+                    buf,
+                )
+            })
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::WriteZero);
+        log.append(b"good2").unwrap();
+        assert_eq!(
+            fs::read_to_string(d.join("s.jsonl")).unwrap(),
+            "good1\ngood2\n"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
