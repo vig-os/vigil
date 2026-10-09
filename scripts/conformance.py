@@ -126,6 +126,23 @@ def main():
             > 3 * 1024 * 1024,
             "original size must describe the oversized line",
         )
+        dropped = [
+            r
+            for r in manifest_records
+            if attribute(r, "vigil.dropped").get("boolValue") is True
+        ]
+        require(
+            len(dropped) == 1,
+            "unshrinkable record must produce exactly one dropped stub",
+        )
+        require(
+            attribute(dropped[0], "vigil.truncated").get("boolValue") is True,
+            "dropped stub must carry the truncation marker",
+        )
+        require(
+            dropped[0]["body"]["stringValue"].startswith("vigil: record dropped:"),
+            "dropped stub must explain its replacement",
+        )
         resources = {json.dumps(json.loads(key)[0], sort_keys=True) for key in expected}
         require(len(resources) >= 2, "fixture must contain at least two resources")
         output = directory / "output.jsonl"

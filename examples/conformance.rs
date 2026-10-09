@@ -39,6 +39,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         common::export(memory.clone(), resource, batch);
         common::export(file.clone(), resource, batch);
     }
+    let unshrinkable = common::rec(&common::scope("dropped", "1"), |record| {
+        record.set_body("unshrinkable integer attributes".into());
+        for index in 0..60_000 {
+            record.add_attribute(format!("integer-{index}"), 42_i64);
+        }
+    });
+    common::export(
+        memory.clone(),
+        &second_resource,
+        std::slice::from_ref(&unshrinkable),
+    );
+    common::export(file.clone(), &second_resource, &[unshrinkable]);
     // Exercise the public initialization path and tracing bridge as well as
     // the rich SDK fixtures. Read the resulting files into the same manifest.
     let bridge_dir = dir.join("bridge");
