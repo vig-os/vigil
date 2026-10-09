@@ -408,23 +408,30 @@ struct ReportingExporter {
 impl LogExporter for ReportingExporter {
     async fn export(&self, batch: LogBatch<'_>) -> opentelemetry_sdk::error::OTelSdkResult {
         let count = batch.iter().count();
-        if let Err(error) = self.inner.export(batch).await {
+        let result = self.inner.export(batch).await;
+        let replaced = self.inner.take_dropped_records();
+        let lost = if result.is_err() { count } else { replaced };
+        if lost != 0 {
             let mut failures = self
                 .failures
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            failures.dropped = failures.dropped.saturating_add(count);
+            failures.dropped = failures.dropped.saturating_add(lost);
             if failures
                 .last_report
                 .is_none_or(|last| last.elapsed() >= Duration::from_secs(60))
             {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "vigil: runtime log export failed: {error}; dropped records: {}",
-                    failures.dropped
-                );
-                failures.reported = failures.dropped;
-                failures.last_report = Some(Instant::now());
+                if let Err(error) = result {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "vigil: runtime log export failed: {error}; dropped records: {}",
+                        failures.dropped
+                    );
+                    failures.reported = failures.dropped;
+                    failures.last_report = Some(Instant::now());
+                } else {
+                    failures.report();
+                }
             }
         }
         Ok(())
@@ -452,4 +459,60 @@ fn diagnostics() -> LogLayer {
             meta.target().starts_with("opentelemetry") && *meta.level() <= tracing::Level::WARN
         }))
         .boxed()
+}
+
+#[cfg(test)]
+mod dropped_stub_tests {
+    use super::*;
+    use opentelemetry::logs::{LogRecord as _, Logger as _};
+    use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn dropped_stubs_are_counted_in_runtime_summary() {
+        let dir = std::env::temp_dir().join(format!("vigil-stub-summary-{}", std::process::id()));
+        let exporter = ReportingExporter {
+            inner: OtlpJsonLogExporter::new(Arc::new(
+                RotatingFile::open(&dir, "logs", RotationConfig::default()).unwrap(),
+            )),
+            failures: Mutex::new(Failures::default()),
+        };
+        let provider = SdkLoggerProvider::builder().build();
+        let logger = provider.logger("summary");
+        let mut record = logger.create_log_record();
+        record.set_observed_timestamp(std::time::SystemTime::now());
+        for index in 0..60_000 {
+            record.add_attribute(format!("integer-{index}"), 42_i64);
+        }
+        let scope = InstrumentationScope::builder("summary").build();
+        let records = [(&record, &scope)];
+        let mut export = std::pin::pin!(exporter.export(LogBatch::new(&records)));
+        assert!(matches!(
+            std::future::Future::poll(export.as_mut(), &mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(()))
+        ));
+        let failures = exporter.failures.lock().unwrap();
+        assert_eq!(
+            failures.dropped, 1,
+            "a stub must enter the same cumulative summary as export failures"
+        );
+        assert_eq!(failures.reported, 1, "the first loss must be reported");
+        drop(failures);
+        let mut again = std::pin::pin!(exporter.export(LogBatch::new(&records)));
+        assert!(matches!(
+            std::future::Future::poll(again.as_mut(), &mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(()))
+        ));
+        {
+            let failures = exporter.failures.lock().unwrap();
+            assert_eq!(failures.dropped, 2);
+            assert_eq!(failures.reported, 1, "summaries must remain rate limited");
+        }
+        assert!(
+            exporter
+                .shutdown_with_timeout(Duration::from_secs(1))
+                .is_ok()
+        );
+        assert_eq!(exporter.failures.lock().unwrap().reported, 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

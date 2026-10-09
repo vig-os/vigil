@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep attribute keys and event names immutable when bounding log lines; replace structurally oversized records with counted stubs that preserve small original messages ([#30](https://github.com/vig-os/vigil/issues/30))
+
+- Preserve healthy batch records with counted diagnostic stubs for unshrinkable records, truncate the largest string by the exact overflow, and pack scopes without copying whole batches ([#30](https://github.com/vig-os/vigil/issues/30))
+
+- Bound OTLP/JSON log lines to the Collector limit, split large batches, and mark truncated oversized records; exercise large tracing records in Collector conformance ([#30](https://github.com/vig-os/vigil/issues/30))
+
 - Repair killed-writer fragments without corrupting the next record, retry reads across rotation without locking readers and search newest-first with early exit, and preserve writer progress with blocking directory locks and a once-per-process warning after waits over ten seconds ([#31](https://github.com/vig-os/vigil/issues/31)).
 
 - Require retaining the logging guard, suppress shutdown warning floods, count and rate-limit runtime export losses, warn on invalid directory and filter overrides, use uname for host names, and document initialization after fork ([#32](https://github.com/vig-os/vigil/issues/32)).

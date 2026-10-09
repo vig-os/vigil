@@ -467,3 +467,103 @@ fn signed_zero_scopes_stay_distinct_and_records_keep_batch_order() {
         [vec!["ordered 0", "ordered 1", "ordered 2"]]
     );
 }
+
+#[test]
+fn large_batches_and_records_are_bounded() {
+    let scope = scope("large", "1");
+    let mut records: Vec<_> = (0..512)
+        .map(|_| rec(&scope, |r| r.set_body("x".repeat(4096).into())))
+        .collect();
+    records.push(rec(&scope, |r| {
+        r.set_body("💣\n\"".repeat(600_000).into());
+        r.add_attribute("payload", "y".repeat(1_100_000));
+    }));
+    let sink = MemorySink::new();
+    export(sink.clone(), &resource(vec![]), &records);
+    let lines = sink.lines();
+    assert!(lines.iter().all(|line| line.len() <= 1_000_000));
+    let parsed: Vec<Value> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let records: Vec<_> = parsed.iter().flat_map(all_records).collect();
+    assert_eq!(records.len(), 513);
+    let attrs = records.last().unwrap()["attributes"].as_array().unwrap();
+    assert!(
+        attrs
+            .iter()
+            .any(|a| a["key"] == "vigil.truncated" && a["value"]["boolValue"] == true)
+    );
+    assert!(attrs.iter().any(|a| {
+        a["key"] == "vigil.original_size"
+            && a["value"]["intValue"]
+                .as_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+                > 3_000_000
+    }));
+}
+
+#[test]
+fn unshrinkable_record_does_not_fail_export() {
+    let scope = scope("survivors", "1");
+    let healthy = || rec(&scope, |r| r.set_body("healthy".into()));
+    let bad = rec(&scope, |r| {
+        r.set_body("bad".into());
+        for index in 0..60_000 {
+            r.add_attribute(format!("integer-{index}"), 42_i64);
+        }
+    });
+    let sink = MemorySink::new();
+    export(
+        sink.clone(),
+        &resource(vec![]),
+        &[healthy(), bad, healthy()],
+    );
+    let lines = sink.lines();
+    assert!(lines.iter().all(|l| l.len() <= 1_000_000));
+    let parsed: Vec<Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let records: Vec<_> = parsed.iter().flat_map(all_records).collect();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0]["body"]["stringValue"], "healthy");
+    assert_eq!(records[2]["body"]["stringValue"], "healthy");
+    assert!(
+        records[1]["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["key"] == "vigil.dropped" && a["value"]["boolValue"] == true)
+    );
+}
+
+#[test]
+#[ignore = "run explicitly in release to measure the complete exporter"]
+fn many_scopes_export_release_benchmark() {
+    let scopes: Vec<_> = (0..512)
+        .map(|index| {
+            opentelemetry::InstrumentationScope::builder(format!("scope-{index:03}")).build()
+        })
+        .collect();
+    let records: Vec<_> = (0..10_000)
+        .map(|index| {
+            rec(&scopes[index % 512], |r| {
+                r.set_body("x".repeat(256).into());
+                r.add_attribute("index", index as i64);
+            })
+        })
+        .collect();
+    let sink = MemorySink::new();
+    let resource = resource(vec![]);
+    let start = std::time::Instant::now();
+    export(sink.clone(), &resource, &records);
+    let elapsed = start.elapsed();
+    eprintln!("Complete exporter, 10k records / 512 scopes: {elapsed:?}");
+    assert!(elapsed < std::time::Duration::from_secs(1));
+    let lines = sink.lines();
+    assert!(lines.len() < 10);
+    assert!(lines.iter().all(|l| l.len() <= 1_000_000));
+}
