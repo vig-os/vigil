@@ -36,8 +36,10 @@
 //!   directory-relative link/unlink, which requires hard-link support. If
 //!   linking fails, the live file stays intact and the append returns the error.
 //!   If both the live unlink and its undo fail, the error reports both failures;
-//!   the next lock acquisition heals a multiply linked live file by unlinking
-//!   its live name and creating a fresh file, preserving the segment's data.
+//!   the next lock acquisition heals the live file only if a segment of the
+//!   same signal in the locked directory shares its device and inode. It then
+//!   unlinks the live name and creates a fresh file, preserving the segment's
+//!   data. External backup links alone never trigger healing.
 //! * Open **one** [`RotatingFile`] per signal per process and share it (for
 //!   example in an `Arc`). Two `flock`s taken through different file
 //!   descriptors block each other even inside one process, so every
@@ -124,28 +126,47 @@ struct Live {
 }
 
 impl Live {
-    fn open(dir: &File, name: &Path) -> io::Result<Self> {
+    fn open(dir: &File, name: &Path, signal: &str) -> io::Result<Self> {
         let mut file = open_private(dir, name)?;
         // A failed fallback undo may have left both the live and segment names
-        // on this inode. Preserve the segment and start a fresh live file.
-        if rfs::fstat(&file)?.st_nlink > 1 {
+        // on this inode. Verify that the extra name is our segment, rather
+        // than an external backup link, before starting a fresh live file.
+        if has_segment_link(dir, signal, &rfs::fstat(&file)?)? {
             unlink_name(dir, name)?;
             file = open_private(dir, name)?;
         }
         Ok(Self { file })
     }
 
-    fn refresh(&mut self, dir: &File, name: &Path) -> io::Result<()> {
+    fn refresh(&mut self, dir: &File, name: &Path, signal: &str) -> io::Result<()> {
         let cached = rfs::fstat(&self.file)?;
         match rfs::statat(dir, name, AtFlags::empty()) {
             Ok(current)
-                if current.st_nlink == 1
-                    && (current.st_dev, current.st_ino) == (cached.st_dev, cached.st_ino) => {}
-            Ok(_) | Err(Errno::NOENT) => *self = Self::open(dir, name)?,
+                if (current.st_dev, current.st_ino) == (cached.st_dev, cached.st_ino)
+                    && !has_segment_link(dir, signal, &current)? => {}
+            Ok(_) | Err(Errno::NOENT) => *self = Self::open(dir, name, signal)?,
             Err(e) => return Err(e.into()),
         }
         Ok(())
     }
+}
+
+/// Only an extra link under this signal's segment name proves that rotation
+/// left a duplicate. External backups must keep their live name and records.
+fn has_segment_link(dir: &File, signal: &str, live: &rfs::Stat) -> io::Result<bool> {
+    if live.st_nlink <= 1 {
+        return Ok(false);
+    }
+    for name in rotated_names_at(dir, signal)? {
+        match rfs::statat(dir, name, AtFlags::empty()) {
+            Ok(segment) if (segment.st_dev, segment.st_ino) == (live.st_dev, live.st_ino) => {
+                return Ok(true);
+            }
+            Ok(_) | Err(Errno::NOENT) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(false)
 }
 
 /// The directory lock shared by every [`RotatingFile`] of one directory in
@@ -280,7 +301,7 @@ impl RotatingFile {
         let live_path = dir.join(format!("{signal}.jsonl"));
         let live = {
             let (handle, _unlock) = lock.lock_current(&dir)?;
-            let live = Live::open(&handle, Path::new(&format!("{signal}.jsonl")))?;
+            let live = Live::open(&handle, Path::new(&format!("{signal}.jsonl")), signal)?;
             if let Some(keep) = cfg.retention {
                 prune_at(&handle, signal, keep);
             }
@@ -327,12 +348,12 @@ impl RotatingFile {
         let name = PathBuf::from(format!("{}.jsonl", self.signal));
         let mut live = lock_ignore_poison(&self.live);
 
-        live.refresh(&dir, &name)?;
+        live.refresh(&dir, &name, &self.signal)?;
 
         let len = live.file.metadata()?.len();
         if len > 0 && len.checked_add(need).is_none_or(|n| n > self.cfg.max_bytes) {
             rotate(&dir, &self.signal, &name)?;
-            *live = Live::open(&dir, &name)?;
+            *live = Live::open(&dir, &name, &self.signal)?;
             if let Some(keep) = self.cfg.retention {
                 prune_at(&dir, &self.signal, keep);
             }
@@ -1351,6 +1372,58 @@ mod tests {
             assert_eq!(all_lines(&d, "s"), ["original"]);
             fs::remove_dir_all(d).unwrap();
         }
+    }
+
+    #[test]
+    fn external_hard_links_preserve_live_records_on_refresh_and_open() {
+        let root = tmp("external-links");
+        let d = root.join("state");
+        let backup = root.join("backup");
+        fs::create_dir_all(&backup).unwrap();
+        let log = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        for line in [b"one".as_slice(), b"two", b"three"] {
+            log.append(line).unwrap();
+        }
+        let live = d.join("s.jsonl");
+        let original = fs::metadata(&live).unwrap().ino();
+        fs::hard_link(&live, backup.join("s.jsonl")).unwrap();
+        // A segment-looking file of another signal must not justify healing.
+        fs::hard_link(&live, d.join("other-20260101T000000.000000000Z.jsonl")).unwrap();
+        // Nor may a segment of this signal on a different inode justify it.
+        let unrelated = d.join("s-20260101T000000.000000000Z.jsonl");
+        fs::write(&unrelated, "unrelated\n").unwrap();
+        log.append(b"four").unwrap();
+        assert_eq!(fs::metadata(&live).unwrap().ino(), original);
+        assert_eq!(
+            all_lines(&d, "s"),
+            ["unrelated", "one", "two", "three", "four"]
+        );
+        let reopened = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        reopened.append(b"five").unwrap();
+        assert_eq!(fs::metadata(&live).unwrap().ino(), original);
+        assert_eq!(
+            all_lines(&d, "s"),
+            ["unrelated", "one", "two", "three", "four", "five"]
+        );
+        assert_eq!(
+            fs::read_to_string(backup.join("s.jsonl")).unwrap(),
+            "one\ntwo\nthree\nfour\nfive\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn matching_segment_link_is_healed_on_open() {
+        let d = tmp("heal-on-open");
+        let log = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        log.append(b"original").unwrap();
+        let segment = d.join("s-20260101T000000.000000000Z.jsonl");
+        fs::hard_link(d.join("s.jsonl"), &segment).unwrap();
+        let reopened = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        reopened.append(b"next").unwrap();
+        assert_eq!(all_lines(&d, "s"), ["original", "next"]);
+        assert_eq!(fs::metadata(segment).unwrap().nlink(), 1);
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
