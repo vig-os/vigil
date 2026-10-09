@@ -56,7 +56,16 @@
 //!   is unsupported. Use one canonical path.
 //! * Segments whose mtime is in the future are not pruned until that time has
 //!   passed.
-//! * Readers need no lock: a line is written with a single `write(2)` to an
+//! * Readers never lock. They retry when segment names or the live inode
+//!   change during a read, up to eight copies. On exhaustion, `read_since`
+//!   returns only its last rotated-file prefix, excluding the live tail;
+//!   `find_newest` returns its final candidate. Both are best effort.
+//!   Writers wait in the kernel; waits over ten seconds
+//!   emit one stderr warning per process after acquiring, naming the directory.
+//! * A killed writer can leave an unterminated fragment in a rotated segment.
+//!   Read and ship files separately: concatenating raw files can glue that
+//!   fragment onto the next file's first record.
+//!   A line is written with a single `write(2)` to an
 //!   `O_APPEND` file, and rotation never replaces an existing segment. Atomic
 //!   rename publishes one name; the link/unlink fallback can briefly expose two
 //!   names for the same inode, including after a reported undo failure until
@@ -84,10 +93,11 @@ use rustix::io::Errno;
 use std::collections::HashMap;
 use std::fs::{self, DirBuilder, File};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MIB: u64 = 1024 * 1024;
 const DAY: u64 = 86_400;
@@ -185,12 +195,14 @@ impl DirLock {
     }
 
     fn lock_current(&self, path: &Path) -> io::Result<(MutexGuard<'_, File>, Unlock)> {
+        let start = Instant::now();
         let mut dir = lock_ignore_poison(&self.gate);
         // A directory can be renamed away while we wait for its lock. Retry
         // with the replacement, but do not spin forever under repeated swaps.
         for _ in 0..8 {
             let unlock = Unlock(dir.try_clone()?);
             dir.lock()?;
+            warn_slow_lock(path, start.elapsed(), &SLOW_LOCK_WARNED, &mut io::stderr());
             let locked = dir.metadata()?;
             match fs::metadata(path) {
                 Ok(current) if (locked.dev(), locked.ino()) == (current.dev(), current.ino()) => {
@@ -212,6 +224,19 @@ impl DirLock {
         Err(io::Error::other(
             "state directory changed repeatedly while locking",
         ))
+    }
+}
+
+const LOCK_WARNING_AFTER: Duration = Duration::from_secs(10);
+static SLOW_LOCK_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn warn_slow_lock(path: &Path, elapsed: Duration, warned: &AtomicBool, out: &mut impl Write) {
+    if elapsed > LOCK_WARNING_AFTER && !warned.swap(true, Ordering::Relaxed) {
+        let _ = writeln!(
+            out,
+            "vigil: waited over 10 seconds for state directory lock at {}",
+            path.display()
+        );
     }
 }
 
@@ -322,7 +347,8 @@ impl RotatingFile {
     /// `line` must not contain the trailing newline (an embedded one would
     /// split the record). Rotates first when the line would not fit. If the
     /// write fails part-way the file is truncated back to its pre-write length
-    /// and the error is returned.
+    /// and the error is returned. A fragment left by a killed writer is
+    /// separated from the new record by a leading newline in the same write.
     ///
     /// # Errors
     ///
@@ -342,7 +368,6 @@ impl RotatingFile {
         let mut buf = Vec::with_capacity(line.len().saturating_add(1));
         buf.extend_from_slice(line);
         buf.push(b'\n');
-        let need = buf.len() as u64;
 
         let (dir, _unlock) = self.lock.lock_current(&self.dir)?;
         let name = PathBuf::from(format!("{}.jsonl", self.signal));
@@ -351,6 +376,11 @@ impl RotatingFile {
         live.refresh(&dir, &name, &self.signal)?;
 
         let len = live.file.metadata()?.len();
+        let mut last = [b'\n'];
+        if len > 0 {
+            live.file.read_exact_at(&mut last, len - 1)?;
+        }
+        let need = (buf.len() as u64).saturating_add(u64::from(last[0] != b'\n'));
         if len > 0 && len.checked_add(need).is_none_or(|n| n > self.cfg.max_bytes) {
             rotate(&dir, &self.signal, &name)?;
             *live = Live::open(&dir, &name, &self.signal)?;
@@ -360,6 +390,13 @@ impl RotatingFile {
         }
 
         let before = live.file.metadata()?.len();
+        if before > 0 {
+            let mut last = [0];
+            live.file.read_exact_at(&mut last, before - 1)?;
+            if last[0] != b'\n' {
+                buf.insert(0, b'\n');
+            }
+        }
         if let Err(e) = write(&mut live.file, &buf) {
             // Best effort: never leave a half line for the next record.
             let _ = live.file.set_len(before);
@@ -405,7 +442,7 @@ fn open_private(dir: &File, name: &Path) -> io::Result<File> {
     let file = File::from(rfs::openat(
         dir,
         name,
-        OFlags::CREATE | OFlags::APPEND | OFlags::WRONLY | OFlags::CLOEXEC,
+        OFlags::CREATE | OFlags::APPEND | OFlags::RDWR | OFlags::CLOEXEC,
         Mode::from_bits_truncate(0o600),
     )?);
     let mode = rfs::fstat(&file)?.st_mode & 0o7777;
@@ -684,6 +721,8 @@ fn prune_at(dir: &File, signal: &str, keep: Duration) {
     }
 }
 
+/// A listing snapshot; paths can be renamed or pruned after return. Use
+/// [`read_since`] or [`find_newest`] to retry reads that overlap rotation.
 /// Every segment of `signal` in `dir`, oldest → newest: the rotated segments
 /// in chronological order, then the live file (if it exists).
 ///
@@ -749,7 +788,55 @@ fn read_segment(path: &Path) -> io::Result<Vec<String>> {
     }
 }
 
+// Names alone miss a replacement of the live inode under the same name.
+#[derive(PartialEq, Eq)]
+struct SnapshotState {
+    paths: Vec<PathBuf>,
+    live_inode: Option<(u64, u64)>,
+}
+
+fn snapshot_state(dir: &Path, signal: &str) -> io::Result<SnapshotState> {
+    let paths = segments(dir, signal)?;
+    let live_inode = match fs::metadata(dir.join(format!("{signal}.jsonl"))) {
+        Ok(meta) => Some((meta.dev(), meta.ino())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    Ok(SnapshotState { paths, live_inode })
+}
+
+// Never impede writers: under continuous rotation, return the eighth copy
+// through the caller's best-effort fallback rather than retrying indefinitely.
+fn retry_snapshot<T>(
+    dir: &Path,
+    signal: &str,
+    mut copy: impl FnMut(&[PathBuf]) -> io::Result<T>,
+    fallback: impl FnOnce(T) -> T,
+) -> io::Result<T> {
+    let mut attempts = 0;
+    loop {
+        let before = snapshot_state(dir, signal)?;
+        let result = copy(&before.paths)?;
+        let after = snapshot_state(dir, signal)?;
+        attempts += 1;
+        if before == after {
+            return Ok(result);
+        }
+        if attempts == 8 {
+            return Ok(fallback(result));
+        }
+    }
+}
+
 /// All lines of every segment last written at or after `since`, oldest first.
+///
+/// No reader lock is taken. Segment names and the live inode are checked before
+/// and after copying; a change retries the read, up to eight attempts. If all
+/// attempts race with rotation or pruning, return only the final copy's
+/// rotated-file prefix, excluding the live tail. This best-effort result can
+/// omit recent records (or retained records pruned during the read). Each file
+/// is split separately so an unterminated fragment cannot corrupt the first
+/// record of the next file.
 ///
 /// ```
 /// use vigil::rotate::{RotatingFile, read_since};
@@ -766,16 +853,51 @@ fn read_segment(path: &Path) -> io::Result<Vec<String>> {
 ///
 /// Any I/O error from listing or reading the segments.
 pub fn read_since(dir: &Path, signal: &str, since: Option<SystemTime>) -> io::Result<Vec<String>> {
-    let mut out = Vec::new();
-    for p in segments_since(dir, signal, since)? {
-        out.extend(read_segment(&p)?);
-    }
-    Ok(out)
+    read_since_with(dir, signal, since, read_segment)
+}
+
+fn read_since_with(
+    dir: &Path,
+    signal: &str,
+    since: Option<SystemTime>,
+    mut read: impl FnMut(&Path) -> io::Result<Vec<String>>,
+) -> io::Result<Vec<String>> {
+    let live_name = format!("{signal}.jsonl");
+    retry_snapshot(
+        dir,
+        signal,
+        |paths| {
+            let mut out = Vec::new();
+            let mut rotated_len = 0;
+            for path in paths {
+                if since.is_none_or(|cut| mtime(path).is_none_or(|time| time >= cut)) {
+                    out.extend(read(path)?);
+                }
+                if path
+                    .file_name()
+                    .is_some_and(|name| name != live_name.as_str())
+                {
+                    rotated_len = out.len();
+                }
+            }
+            Ok((out, rotated_len))
+        },
+        |(mut out, rotated_len)| {
+            // Under repeated rotation, the live tail may skip segments that were
+            // published since listing. Keep the immutable prefix, not that tail.
+            out.truncate(rotated_len);
+            (out, rotated_len)
+        },
+    )
+    .map(|(out, _)| out)
 }
 
 /// Search newest first (newest segment, newest line within it) and return the
 /// first `Some` that `pick` yields. Use it for "find the record with this id",
-/// which is usually near the end.
+/// which is usually near the end. Stops reading files as soon as a match is
+/// found. Uses the same eight-attempt, lock-free consistency check as
+/// [`read_since`]; after repeated changes the final result is best effort.
+/// `pick` may be invoked again on the same line when a snapshot is retried.
 ///
 /// ```
 /// use vigil::rotate::{RotatingFile, find_newest};
@@ -797,14 +919,21 @@ pub fn find_newest<T>(
     signal: &str,
     mut pick: impl FnMut(&str) -> Option<T>,
 ) -> io::Result<Option<T>> {
-    for p in segments(dir, signal)?.iter().rev() {
-        for line in read_segment(p)?.iter().rev() {
-            if let Some(found) = pick(line) {
-                return Ok(Some(found));
+    retry_snapshot(
+        dir,
+        signal,
+        |paths| {
+            for path in paths.iter().rev() {
+                for line in read_segment(path)?.iter().rev() {
+                    if let Some(found) = pick(line) {
+                        return Ok(Some(found));
+                    }
+                }
             }
-        }
-    }
-    Ok(None)
+            Ok(None)
+        },
+        |result| result,
+    )
 }
 
 #[cfg(test)]
@@ -834,6 +963,262 @@ mod tests {
 
     fn all_lines(dir: &Path, signal: &str) -> Vec<String> {
         read_since(dir, signal, None).unwrap()
+    }
+
+    #[test]
+    fn fragment_repair_preserves_next_json_record() {
+        let d = tmp("fragment");
+        let log = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        fs::write(d.join("s.jsonl"), b"{\"broken\":").unwrap();
+        let mut calls = 0;
+        log.append_with(br#"{"ok":1}"#, |file, buf| {
+            calls += 1;
+            write_once(file, buf)
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        let lines = all_lines(&d, "s");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&lines[1]).unwrap()["ok"],
+            1
+        );
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn concurrent_reader_snapshots_have_no_gaps() {
+        let d = tmp("snapshots");
+        let log = RotatingFile::open(&d, "s", cfg(200)).unwrap();
+        log.append(b"0").unwrap();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                for i in 1..1000 {
+                    log.append(i.to_string().as_bytes()).unwrap();
+                }
+            });
+            for _ in 0..1000 {
+                let lines = read_since(&d, "s", None).unwrap();
+                for (i, line) in lines.iter().enumerate() {
+                    assert_eq!(line.parse::<usize>().unwrap(), i);
+                }
+            }
+            writer.join().unwrap();
+        });
+        assert_eq!(all_lines(&d, "s").len(), 1000);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn held_directory_lock_eventually_succeeds() {
+        let d = tmp("timeout");
+        let log = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        let held = File::open(&d).unwrap();
+        held.lock().unwrap();
+        // Release even on the original blocking implementation, bounding this test.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(LOCK_WARNING_AFTER + Duration::from_secs(1));
+            held.unlock().unwrap();
+        });
+        let result = log.append(b"{}");
+        release.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn killed_writer_child_role() {
+        let Ok(d) = std::env::var("VIGIL_FRAGMENT_CHILD") else {
+            return;
+        };
+        let d = PathBuf::from(d);
+        let log = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        // Pause after a real short write while still inside append's write seam.
+        // SIGKILL prevents rollback, deterministically modelling an interrupted write.
+        log.append_with(br#"{"child":1}"#, |file, buf| {
+            file.write_all(&buf[..5])?;
+            fs::write(d.join("ready"), b"")?;
+            loop {
+                std::thread::park();
+            }
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn sigkill_fragment_is_repaired() {
+        let d = tmp("killed");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "rotate::tests::killed_writer_child_role"])
+            .env("VIGIL_FRAGMENT_CHILD", &d)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !d.join("ready").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(d.join("ready").exists());
+        let log = RotatingFile::open(&d, "s", cfg(1000)).unwrap();
+        log.append(br#"{"healthy":1}"#).unwrap();
+        let lines = all_lines(&d, "s");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&lines[1]).unwrap()["healthy"],
+            1
+        );
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn paused_reader_does_not_block_writer() {
+        let d = tmp("paused-reader");
+        let log = RotatingFile::open(&d, "s", cfg(200)).unwrap();
+        log.append(b"0").unwrap();
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (written_tx, written_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let reader_dir = &d;
+            let reader = scope.spawn(move || {
+                let mut first = true;
+                read_since_with(reader_dir, "s", None, |path| {
+                    if first {
+                        first = false;
+                        paused_tx.send(()).unwrap();
+                        resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                    read_segment(path)
+                })
+                .unwrap()
+            });
+            paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            scope.spawn(|| {
+                written_tx.send(log.append(b"1")).unwrap();
+            });
+            let result = written_rx.recv_timeout(Duration::from_secs(1));
+            resume_tx.send(()).unwrap();
+            reader.join().unwrap();
+            assert!(result.is_ok(), "paused reader blocked the writer");
+            result.unwrap().unwrap();
+        });
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn exhausted_reader_retries_return_only_rotated_prefix() {
+        let d = tmp("retry-limit");
+        let log = RotatingFile::open(&d, "s", cfg(2)).unwrap();
+        log.append(b"0").unwrap();
+        let mut rotations = 0;
+        let lines = read_since_with(&d, "s", None, |path| {
+            if path.file_name().unwrap() == "s.jsonl" {
+                rotations += 1;
+                log.append(rotations.to_string().as_bytes()).unwrap();
+            }
+            read_segment(path)
+        })
+        .unwrap();
+        assert_eq!(rotations, 8);
+        assert_eq!(lines, (0..7).map(|i| i.to_string()).collect::<Vec<_>>());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn newest_hit_does_not_read_old_history() {
+        let d = tmp("early-exit");
+        let log = RotatingFile::open(&d, "s", cfg(200)).unwrap();
+        log.append(b"hit").unwrap();
+        // An unreadable old segment makes an unnecessary history read fail,
+        // even when tests run as root.
+        fs::create_dir(d.join("s-20200101T000000.000000000Z.jsonl")).unwrap();
+        let hit = find_newest(&d, "s", |line| (line == "hit").then_some(())).unwrap();
+        assert_eq!(hit, Some(()));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn contention_child_role() {
+        let Ok(d) = std::env::var("VIGIL_CONTENTION_CHILD") else {
+            return;
+        };
+        let id = std::env::var("VIGIL_CONTENTION_ID").unwrap();
+        let d = PathBuf::from(d);
+        let log = RotatingFile::open(&d, "s", cfg(300)).unwrap();
+        let mut slowest = Duration::ZERO;
+        for i in 0..5000 {
+            let start = Instant::now();
+            log.append(format!("{id}:{i:04}").as_bytes()).unwrap();
+            slowest = slowest.max(start.elapsed());
+        }
+        fs::write(
+            d.join(format!("latency-{id}")),
+            slowest.as_secs_f64().to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn three_writers_complete_without_starvation() {
+        let d = tmp("contention");
+        fs::create_dir_all(&d).unwrap();
+        let mut children: Vec<_> = (0..3)
+            .map(|id| {
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "rotate::tests::contention_child_role"])
+                    .env("VIGIL_CONTENTION_CHILD", &d)
+                    .env("VIGIL_CONTENTION_ID", id.to_string())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut success = true;
+        for child in &mut children {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    success &= status.success();
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    success = false;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        for child in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(success, "contention child failed or exceeded 90 seconds");
+        let lines = all_lines(&d, "s");
+        assert_eq!(lines.len(), 15_000);
+        assert_eq!(lines.iter().collect::<HashSet<_>>().len(), 15_000);
+        for id in 0..3 {
+            let slowest: f64 = fs::read_to_string(d.join(format!("latency-{id}")))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(slowest < 5.0, "writer {id} max latency {slowest}s");
+        }
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn slow_lock_diagnostic_is_once_and_names_directory() {
+        let warned = AtomicBool::new(false);
+        let mut out = Vec::new();
+        let path = Path::new("/state/example");
+        warn_slow_lock(path, Duration::from_secs(10), &warned, &mut out);
+        assert!(out.is_empty());
+        for _ in 0..2 {
+            warn_slow_lock(path, Duration::from_secs(11), &warned, &mut out);
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains("/state/example"));
     }
 
     #[test]

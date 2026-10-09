@@ -1,3 +1,3 @@
-# Multiprocess regressions spawn up to six children on the shared test host.
+# Process tests spawn up to six child writers; serialize cases on shared hosts.
 [profile.default]
 test-threads = 1
