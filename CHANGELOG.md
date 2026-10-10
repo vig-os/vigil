@@ -9,44 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Collector reference-reader conformance in CI compares complete rich log records across two resources, rotation, empty lines, garbage input and unterminated valid/garbage lines ([#6](https://github.com/vig-os/vigil/issues/6))
-
-- `vigil::init` and `Config` bridge tracing into rotating OTLP/JSON logs, attach producer resources, honor XDG and environment settings, flush on guard drop, and fall back to stderr on storage failures ([#5](https://github.com/vig-os/vigil/issues/5))
-
-- **Multi-process-safe size rotation and age retention** ([#4](https://github.com/vig-os/vigil/issues/4))
-  - `vigil::rotate::RotatingFile` appends whole lines to `<dir>/<signal>.jsonl` under an `flock` on a separate `.lock` file, reopens when another process rotated, rolls back partial writes, and names rotated segments so they sort chronologically
-  - `segments`, `segments_since`, `read_since` and `find_newest` read them back
-  - Writers lock the directory (`flock`) instead of a lock file, so deleting files cannot break exclusion; signal names are `[a-z0-9_]+`; segment counters grow past six digits and rotation never replaces an existing file (hard-link, then unlink). Segment matching is exact (signals such as `logs` and `logs_2` never see each other's files), new segment names stay ordered when the clock goes backwards, looser modes on an existing directory or file are tightened on `open`, and each line is written with exactly one `write(2)`
-- `vigil::logs::OtlpJsonLogExporter`, an `opentelemetry_sdk` `LogExporter` that writes each export batch as one OTLP/JSON `LogsData` line to a `vigil::sink::LineSink`, with deterministic ordering, `timeUnixNano` backfilled from the observed time, and non-finite doubles spelled `"NaN"`/`"Infinity"`/`"-Infinity"` so the Collector keeps the line ([#3](https://github.com/vig-os/vigil/issues/3))
-- `vigil::sink::{LineSink, AppendFile, MemorySink}`: the line-sink seam, an `O_APPEND` single-`write(2)` file sink (mode 0600) and an in-memory test sink ([#3](https://github.com/vig-os/vigil/issues/3))
-- **ADR-0001 (on-disk format) and ADR-0002 (rotation and retention)** ([#1](https://github.com/vig-os/vigil/issues/1))
-  - Records the OTLP/JSON Lines format, versioning stance, and the multi-process rotation design with its pre-mortem evidence
-- CI extension runs `nix flake check -L` (clippy, fmt, nextest, doctests, docs) so `CI Summary` gates on the Rust checks; workaround for vig-os/devkit#1811 ([#18](https://github.com/vig-os/vigil/issues/18))
+- Collector reference-reader conformance in CI compares complete rich log records across two resources, rotation, empty lines, garbage input and unterminated valid/garbage lines; it also exercises large tracing records and diagnostic stubs ([#6](https://github.com/vig-os/vigil/issues/6), [#30](https://github.com/vig-os/vigil/issues/30)).
+- `vigil::init` and `Config` bridge tracing into rotating OTLP/JSON logs, attach producer resources (including the host name from `uname`), honor XDG and environment settings, and fall back to stderr on storage-open failures ([#5](https://github.com/vig-os/vigil/issues/5), [#32](https://github.com/vig-os/vigil/issues/32)).
+  - Retain the logging guard: drop drains and shuts down the batch processor with a five-second timeout and a warning on failure. The configurable queue defaults to 65,536 records and is capped at 1,048,576; overflow warns on stderr. Runtime export losses and diagnostic replacements are counted in rate-limited cumulative summaries, with remaining losses reported at shutdown. SDK warnings go to stderr, failed stderr writes are tolerated, and events after shutdown produce at most one warning.
+  - Invalid directory, filter and numeric overrides warn; empty overrides are ignored and relative HOME paths are rejected. An existing global subscriber is rejected before storage side effects; an existing `log` logger does not prevent tracing initialization. Initialize after fork, as documented.
+- **Multi-process-safe size rotation and age retention** on local Unix filesystems ([#4](https://github.com/vig-os/vigil/issues/4), [#25](https://github.com/vig-os/vigil/issues/25), [#31](https://github.com/vig-os/vigil/issues/31)).
+  - `vigil::rotate::RotatingFile` appends whole lines to `<dir>/<signal>.jsonl` under a blocking `flock` on the state directory, refreshes replaced or missing directory locks, and reopens the live file after another writer rotates. Operations use the locked directory descriptor; waits over ten seconds produce one warning per process.
+  - Rotation uses atomic no-replace rename, with directory-relative link/unlink only when unsupported. Both unlink and undo failures are reported; the next lock acquisition recovers live files sharing an inode with a matching signal segment while preserving external backup links.
+  - Signal names are `[a-z0-9_]+` and segment matching is exact. Segments order by timestamp and integer counter, including counters wider than six digits and backwards clock changes. Directories and files are created with modes 0700 and 0600, and looser existing permissions are tightened on open. Each line uses one `write(2)`; partial writes roll back and killed-writer fragments are separated from the next record.
+  - `segments`, `segments_since`, `read_since` and `find_newest` read segments back without locking writers. Reads retry across rotation with a bounded best-effort result; newest-first searches stop at the first matching file. Files must be read separately to avoid joining unterminated fragments across file boundaries.
+- `vigil::logs::OtlpJsonLogExporter`, an `opentelemetry_sdk` `LogExporter`, writes batches as bounded OTLP/JSON `LogsData` lines to a `vigil::sink::LineSink`, with deterministic ordering, missing `timeUnixNano` backfilled from observed time, and non-finite doubles spelled `"NaN"`/`"Infinity"`/`"-Infinity"` ([#3](https://github.com/vig-os/vigil/issues/3), [#30](https://github.com/vig-os/vigil/issues/30)).
+  - Lines default to at most 1,000,000 JSON payload bytes excluding the newline; the configurable cap is clamped to 1..=1,048,575 for the Collector's 1 MiB limit. Batches split at record boundaries and pack scopes while copying only resource/scope metadata. Oversized records shorten their largest strings by the escaped-byte overflow, preserving UTF-8 and base64 boundaries, and carry `vigil.truncated` and `vigil.original_size`.
+  - Attribute keys, event names and resource/scope fields remain immutable. Unshrinkable records become counted diagnostic stubs preserving identity and small original messages when space permits; healthy neighbors remain intact. A cap too small for the envelope and diagnostic identity returns an explicit error.
+- `vigil::sink::{LineSink, AppendFile, MemorySink}`: the line-sink seam, an `O_APPEND` single-`write(2)` file sink (mode 0600) and an in-memory test sink ([#3](https://github.com/vig-os/vigil/issues/3)).
+- **ADR-0001 (on-disk format) and ADR-0002 (rotation and retention)** record the OTLP/JSON Lines format, versioning stance and multi-process rotation design, including directory locks, no-replace rotation and bounded reader retries ([#1](https://github.com/vig-os/vigil/issues/1)).
+- CI extension runs `nix flake check -L` (clippy, fmt, nextest, doctests, docs) so `CI Summary` gates on the Rust checks; workaround for vig-os/devkit#1811 ([#18](https://github.com/vig-os/vigil/issues/18)).
 
 ### Changed
 
-- **ADR-0002 amended: rotation locks the state directory instead of a lock file** ([#4](https://github.com/vig-os/vigil/issues/4), [#1](https://github.com/vig-os/vigil/issues/1))
-  - Segment counter is at least 6 digits, rotation never replaces, signal names are `[a-z0-9_]+`
+- Merge concurrent changelog additions with Git's union driver and curate Unreleased entries to describe the implemented features ([#40](https://github.com/vig-os/vigil/issues/40)).
 
 ### Deprecated
 
 ### Removed
 
 ### Fixed
-
-- Keep attribute keys and event names immutable when bounding log lines; replace structurally oversized records with counted stubs that preserve small original messages ([#30](https://github.com/vig-os/vigil/issues/30))
-
-- Preserve healthy batch records with counted diagnostic stubs for unshrinkable records, truncate the largest string by the exact overflow, and pack scopes without copying whole batches ([#30](https://github.com/vig-os/vigil/issues/30))
-
-- Bound OTLP/JSON log lines to the Collector limit, split large batches, and mark truncated oversized records; exercise large tracing records in Collector conformance ([#30](https://github.com/vig-os/vigil/issues/30))
-
-- Repair killed-writer fragments without corrupting the next record, retry reads across rotation without locking readers and search newest-first with early exit, and preserve writer progress with blocking directory locks and a once-per-process warning after waits over ten seconds ([#31](https://github.com/vig-os/vigil/issues/31)).
-
-- Require retaining the logging guard, suppress shutdown warning floods, count and rate-limit runtime export losses, warn on invalid directory and filter overrides, use uname for host names, and document initialization after fork ([#32](https://github.com/vig-os/vigil/issues/32)).
-
-- Refresh replaced or missing state-directory locks and use directory-relative atomic no-replace rotation; report both fallback unlink failures and recover live files linked to matching signal segments on the next lock acquisition while preserving external backup links, and recognize macOS `ENOTSUP` for the fallback ([#25](https://github.com/vig-os/vigil/issues/25)).
-- Preserve tracing when a `log` logger already exists, install the subscriber before storage side effects, cap queue allocations at 1,048,576 slots, ignore empty overrides and relative HOME paths with clear diagnostics, and isolate the short-write child's output from redirected files ([#5](https://github.com/vig-os/vigil/issues/5))
-
-- Initialization tolerates failed stderr writes, routes SDK warnings to stderr, preserves 10,000-event bursts with a configurable 65,536-record queue, warns on invalid environment settings and shutdown timeouts, honors XDG path rules, and rejects duplicate subscribers before creating storage ([#5](https://github.com/vig-os/vigil/issues/5))
 
 ### Security
