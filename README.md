@@ -68,6 +68,40 @@ Decisions and their evidence are recorded as ADRs in [`docs/adr/`](docs/adr/): [
 
 Enter the pinned environment with `direnv allow` (or `nix develop`). `nix flake check` runs fmt, clippy, tests, doctests and docs. Changes enter through PRs to `dev`; `main` only takes release PRs.
 
+### Changelog updates
+
+Add entries under the existing `## Unreleased` heading. Fixes to features that
+have never shipped belong in their `Added` entry. `.gitattributes` uses Git's
+built-in union driver to retain concurrent additions; review the merged result
+for ordering, duplicate entries and contradictory edits. Union merging joins
+text and does not validate the changelog's meaning or structure.
+
+Release sync uses `git merge-tree`, which honors union: a clean merge can still
+retain both a release's `TBD` heading and its dated heading. The
+`scripts/check_changelog.py` check rejects duplicate version headings (regardless
+of date), duplicate Unreleased headings, repeated `###` section headings within
+a version, and duplicate top-level list entries. List entries must be unindented;
+indented sub-bullets are ignored so different parents may repeat explanatory
+text. Unordered markers (`-`, `*`, `+`) and numbered markers (`1.`, `1)`, etc.)
+are ignored when comparing entry text. Entries are deduplicated across the whole
+version per section kind, including repeated sections and deeper headings;
+the same text is allowed in different versions or kinds (such as Added and Fixed). It runs on every local commit and in `nix flake check` (and
+therefore CI). Resolve reported duplicates before accepting a release-sync PR;
+a conflict-free merge alone is insufficient. Run
+`python3 scripts/check_changelog.py` to check a resolution locally. The check
+ignores fenced examples and permits repeated bullet text in different sections;
+editorial review is still needed for contradictory entries with different text.
+
+GitHub's server-side **Update branch** does not honor this merge rule (see the
+[GitHub support discussion](https://github.com/orgs/community/discussions/9288)).
+Update locally with `git fetch origin` and `git rebase origin/dev`, review
+`CHANGELOG.md`, then push the feature branch with `git push --force-with-lease`
+if rebasing rewrote published commits. No custom driver configuration is needed.
+The root `.gitattributes` is consumer-owned: devkit 1.18.0 ships no such template
+path and its scaffold does not delete consumer files.
+[Changelog fragments are requested upstream](https://github.com/vig-os/devkit/issues/1858)
+to avoid shared-file edits during parallel work.
+
 ## License
 
 Apache-2.0.

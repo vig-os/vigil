@@ -158,6 +158,14 @@
             # per runner. Customize like the opt-in block below; the generated
             # config is a gitignored /nix/store symlink.
             hooks = {
+              changelog = {
+                enable = true;
+                name = "changelog structure";
+                entry = "${pkgs.python3}/bin/python3 scripts/check_changelog.py";
+                language = "system";
+                pass_filenames = false;
+                always_run = true;
+              };
               # Rust gates, run by `just precommit` (and so by CI's lint job).
               cargo-fmt = {
                 enable = true;
@@ -227,7 +235,23 @@
           }
         );
 
-        inherit (rust) checks;
+        checks = rust.checks // {
+          changelog =
+            pkgs.runCommand "changelog-check"
+              {
+                nativeBuildInputs = [
+                  pkgs.python3
+                  pkgs.git
+                ];
+              }
+              ''
+                export HOME="$TMPDIR"
+                cd ${self}
+                python3 scripts/check_changelog.py
+                python3 -m unittest discover -s scripts -p test_check_changelog.py -v
+                touch "$out"
+              '';
+        };
         packages = rust.packages // {
           vigil = rust.packages.default;
         };
