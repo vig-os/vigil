@@ -6,7 +6,7 @@ Decisions that shape vigil's on-disk contract, its concurrency behaviour and its
 |---|---|---|
 | [0001](0001-on-disk-format.md) | On-disk format: OTLP/JSON Lines | Accepted |
 | [0002](0002-rotation-and-retention.md) | Multi-process rotation and retention | Accepted |
-| [0004](0004-public-api-and-stability.md) | Public API, stability, composition and feature flags | Proposed |
+| [0004](0004-public-api-and-stability.md) | Public API, stability, composition and feature flags | Accepted |
 
 Numbers reserved for decisions in progress: ADR-0003 metrics and traces ([#38](https://github.com/vig-os/vigil/issues/38)), ADR-0005 audit trail ([#10](https://github.com/vig-os/vigil/issues/10)), ADR-0006 shipping ([#39](https://github.com/vig-os/vigil/issues/39)).
 
