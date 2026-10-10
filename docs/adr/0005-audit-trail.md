@@ -61,6 +61,9 @@ The plan in #10 and #12 built the chain and checkpoints "on tessera-core". The o
   | `sync_data` every 64 records | 1 961–1 982 records/s | — |
 
   Three runs on ext4. The host is shared, so these are orders of magnitude, not budgets ([#49](https://github.com/vig-os/vigil/issues/49) sets budgets).
+- **Torn lines and duplicate keys** (`serde_json` 1, scratch test):
+  - every UTF-8 prefix of a 1 271-byte record line fails with `Category::Eof`: 1 266 prefixes, plus 4 that cut a multibyte character;
+  - a complete line with a duplicated `stringValue` key parses as `serde_json::Value`, keeping the last value.
 - **Platform fsync.** In Rust 1.95.0 std (`library/std/src/sys/fs/unix.rs:1381-1430`), `File::sync_data` is `fdatasync` on Linux and `fcntl(F_FULLFSYNC)` on Apple targets, as is `sync_all`. Plain `fsync` on macOS does not flush the drive cache (`fsync(2)` on macOS); std already does the right thing.
 - **Nix and crane build.** A scratch clone of vigil (`fc7d8d5`) adds `blake3 = { version = "1", default-features = false, features = ["std"] }` and `ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize", "fast"] }`, plus a known-answer test (BLAKE3 of the empty input; RFC 8032 §7.1 TEST 1 signature with `verify_strict`).
   - `nix build .#checks.x86_64-linux.clippy .#checks.x86_64-linux.nextest`: exit 0, 127 tests passed, including the known-answer test, which crane runs in release mode.
@@ -109,6 +112,7 @@ The plan in #10 and #12 built the chain and checkpoints "on tessera-core". The o
   - Rotation (at `max_bytes`, default 50 MiB) is preceded by a sealing checkpoint (decision 8).
   - Each write is followed by an fsync (decision 6).
   - Lines are never truncated (decision 6).
+- **Sealing uses one staging file,** `.audit-next.jsonl`. Its leading dot keeps it out of the `audit.jsonl` / `audit-*.jsonl` patterns that readers and shippers match (ADR-0002 Consequences). It exists only while a rotation is in progress (decision 8).
 - **Archiving** (moving sealed segments to WORM or off-host storage) is an operator action outside vigil. Any sealed segment may be moved: the live file always starts with a checkpoint that carries the state the writer needs (decision 8). The live file and the trail marker (decision 8, "Creating a trail") must stay.
 
 ### 3. Record schema: OTLP log records with `audit.*` attributes
@@ -121,13 +125,21 @@ Each line is one `LogsData` with one `ResourceLogs`, one `ScopeLogs` and one `Lo
 | resource `host.name` | the host, when vigil's resource has it | yes (`0x06`) |
 | other resource attributes (`service.version`, `process.pid`, `vcs.ref.head.revision`, and whatever ADR-0003 adds) | context | no |
 | scope | `name` `vigil.audit`, `version` = vigil's version | no |
-| `timeUnixNano` (= `observedTimeUnixNano`) | taken from the system clock by vigil inside the locked section; the API takes no timestamp | yes (`0x03`) |
+| `timeUnixNano` | taken from the system clock by vigil inside the locked section; the API takes no timestamp | yes (`0x03`) |
+| `observedTimeUnixNano` | equal to `timeUnixNano`; a v1 reader rejects a record where it differs or is missing (`InvalidField`), so no second, unhashed time can be shown | no (bound by equality) |
 | `eventName` | `audit.record` or `audit.checkpoint` | yes, as the kind (`0x04`) |
 | `severityNumber` / `severityText` | `9` / `INFO`, fixed | no |
 | `traceId` / `spanId` | the current span, if any; correlation only | no |
 | `body` | absent; a v1 reader rejects a record that has one (`InvalidField`), so no unhashed text can sit next to hashed fields | — |
 
 Attributes. Integers are OTLP `intValue`, `audit.mmr_peaks` is an `arrayValue` of `stringValue`s, and everything else is a `stringValue`. Strings are UTF-8, must not be empty, and must not contain a NUL.
+
+**Integer decoding** (`intValue`, `timeUnixNano`, `observedTimeUnixNano`). OTLP/JSON writes 64-bit integers as decimal strings, and readers must accept JSON numbers too. vigil writes strings. A v1 reader accepts:
+
+- a string of ASCII digits with no sign, no leading zeros (except `"0"`), no whitespace and no exponent;
+- or a JSON integer number with the same restrictions.
+
+The value must fit in u64. Anything else, including a negative value, a fraction, `1e3` or `"+1"`, is `InvalidField`. So every value has exactly one decoding, and the hash covers that value.
 
 | Attribute | Kinds | Content | Tag |
 |---|---|---|---|
@@ -178,12 +190,22 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
   - every record at or before the last checkpoint signed by a trusted key cannot be edited, removed, inserted or reordered without a finding;
   - the records after it can be rewritten freely, because the attacker can recompute every hash;
   - the attacker can also **roll the trail back** to any earlier checkpoint, deleting the later checkpoints, segments and live file. What remains is a valid trail that ends at that checkpoint and has no uncovered tail, so the loss is not bounded by the checkpoint cadence.
-- **What detects a rollback or a rewritten tail:**
-  - anchors (decision 10): a missing anchored checkpoint is `AnchorMismatch`;
-  - the `Receipt`s the application stores with its own records (decision 13): a receipt whose `seq` is past the trail's end, or whose hash differs, proves loss;
-  - `--max-age` (decision 11): a trail whose newest trusted checkpoint is older than the given age is reported as `StaleHead`. Since an active trail checkpoints at least every `checkpoint_interval`, an old head means records are missing or the writer has stopped.
-- **Against an attacker who holds a trusted key,** only anchors and receipts help (decision 9).
-- **A torn write is not tampering.** A killed writer can leave an unterminated fragment (ADR-0002 decision 6); its `record` call never returned `Ok`. A fragment is a line that does not parse and is followed by either the end of the file or a newline that the next writer added (ADR-0002 repair). It is **TornWrite** (a warning) when the next complete record links to the last complete one before it, or when it is the file's last line. Any other unparsable line is an error. The writer applies exactly this rule when it rebuilds its state (decision 8), so a crash never makes the writer refuse a trail the verifier accepts.
+- **What detects a rollback or a rewritten tail**, and when:
+  - **A running writer** never moves its head back. It refuses (`CorruptTrail`) to extend a trail whose head is behind its own cached head, or whose record at its cached `seq` has a different hash (decision 8, "Writer state"). So a rollback or a tail rewrite while any writer is running stops all writes. It is not signed over.
+  - **A restarted writer** has no memory of the old head. It detects a rollback or rewrite only when it is given the head the application last saw: `AuditConfig::expect_head(seq, hash)`, taken from the highest `Receipt` the application has stored. `open` then fails with `HeadMismatch` unless the trail holds that `seq` with that hash.
+  - **Structural loss** is refused rather than repaired: a missing or empty live file, or a live file without its opening checkpoint (decision 8, "Crash recovery and structural loss"). Continuing then needs an operator decision (`vigil-audit resume`), and that decision is itself recorded in the trail.
+  - **The verifier** detects a rollback through anchors (decision 10: a missing anchored checkpoint is `AnchorMismatch`) and through receipts the application compares against the report.
+  - **`--max-age`** reports `StaleHead` when the newest trusted checkpoint is older than the given age. It detects a stopped writer, or a rollback after which **no** checkpoint was signed again. It does **not** detect a rollback once any writer has signed a fresh checkpoint on the shortened trail: for example, a writer restarted without `expect_head` on a live file truncated at a record boundary, or with a sealed segment renamed back to `audit.jsonl`.
+- **What cannot be detected without something kept outside the trail directory.** An attacker who can write the files can roll back or rewrite the uncovered tail, or roll back to any checkpoint. If afterwards a writer starts without `expect_head` and signs, the result is a consistent trail that verifies clean. Only anchors ([#57](https://github.com/vig-os/vigil/issues/57) and decision 10), receipts held by the application, or `expect_head` reveal it. The rustdoc of `AuditConfig::open` says so and recommends `expect_head` for regulated deployments.
+- **Against an attacker who holds a trusted key,** only anchors, receipts and `expect_head` help (decision 9).
+- **A torn write is not tampering, and nothing else is.** A killed writer can leave an unterminated fragment (ADR-0002 decision 6), and its `record` call never returned `Ok`. A torn fragment is always a strict byte prefix of a valid line. A line is **`TornWrite`** (a warning) only if all of these hold:
+  1. it is the last line of its file, or the next writer's repair newline ends it (ADR-0002 decision 6);
+  2. it fails to parse in the way only a prefix can: after dropping at most 3 trailing bytes of a cut UTF-8 sequence, it is valid UTF-8, and the JSON parser stops with an end-of-input error (`serde_json::error::Category::Eof`);
+  3. if a complete record follows, that record links to the last complete record before the fragment.
+
+  Any other line that does not parse, or that parses but is not a valid v1 record, is an error (`Unparsable`, `InvalidField`, …), including a complete line in the middle of a file. Probe: every UTF-8 prefix of a 1 271-byte record line (1 266 of them; 4 more cut a multibyte character) is `Category::Eof`.
+- **Duplicate JSON keys are rejected at every object level** (`InvalidField`). `serde_json::Value` silently keeps the last of two equal keys (probe: a line with `"stringValue":"user:jdoe","stringValue":"mallory"` parses, and other parsers such as Python's `json.loads` also keep the last). So vigil parses with a duplicate-rejecting deserializer, and its hash never covers a different value from the one another tool shows.
+- **The writer applies exactly the verifier's rules** when it rebuilds its state (decision 8). So a crash never makes the writer refuse a trail the verifier accepts, and the writer never accepts a line the verifier rejects.
 
 ### 6. The lossless sink: fsync per record, fail-closed, no queue
 
@@ -197,6 +219,7 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
 6. Returns `Ok(Receipt)` only after the fsync has returned.
 
 - **Directory fsync.** When the live file is created (first write or rotation), the directory descriptor is fsynced before any record in that file is acknowledged, so the file name is durable as well. #11's tests on the macOS lane ([#46](https://github.com/vig-os/vigil/issues/46)) must show this works on APFS.
+- **Assumption: the storage stack honours flushes.** "Durable after `Ok`" holds only if the disk, its controller and any hypervisor pass a flush through to stable storage. A volatile write cache without power-loss protection, or a VM disk in a mode that ignores flushes (for example QEMU `cache=unsafe`), voids the promise without any error vigil could see. The rustdoc and the README state this as a deployment requirement.
 - **A failed fsync poisons the handle.** After a failed fsync, Linux may have dropped the dirty pages and cleared the error ("fsyncgate", PostgreSQL 2018), so a retry could report success for data that is gone. vigil truncates back to the pre-write length (best effort) and returns `AuditErrorKind::Io`. Every later `record` on that handle fails with `AuditErrorKind::Poisoned`. Reopening rebuilds the state from what is actually on disk.
   - **If the truncate also fails,** the unacknowledged record stays visible, and other processes would chain onto bytes the kernel may later drop. The writer then creates `audit.poison` in the directory (holding the error text, `0600`) before releasing the lock. Every writer checks for that file under the lock, and `open` and `record` fail with `AuditErrorKind::Poisoned` while it exists. An operator removes it after `vigil-audit verify` has passed. If even that file cannot be created, the filesystem is failing and the other writers' own fsyncs fail too.
 - **Backpressure, unlike telemetry.** Telemetry queues, batches and drops when full (ADR-0004 decision 3 counts the loss). Audit does none of that:
@@ -221,6 +244,7 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
 - **Why both a chain and an MMR.** The chain gives a sequential check and pinpoints the first broken link. The MMR gives an O(log n) inclusion proof for one record and a consistency proof between two checkpoints, without shipping the trail. An anchor holder that keeps only checkpoints needs exactly that.
 - **One MMR over the whole trail, not one per segment.** It costs the same, because checkpoints carry the peaks. It also gives consistency proofs across segment boundaries, and one root commits to the entire history.
 - **No write-path cost.** The MMR is advanced only when a checkpoint is built, from the leaves since the previous checkpoint. The probe puts a push at 0.34 µs.
+- **Proof sizes.** An inclusion proof is O(log n) hashes. A consistency proof in tessera-compatible form is the old peaks plus every leaf appended since (`ConsistencyProof { old_peaks, appended }`), so its size grows with the gap: about 32 bytes per record between the two checkpoints. A minimal RFC 6962-style proof is O(log n), but tessera-core does not verify that form. [#57](https://github.com/vig-os/vigil/issues/57) decides which form the anchor-holder API exposes.
 
 ### 8. Signed checkpoints, cadence and segment sealing
 
@@ -234,27 +258,49 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
 
   (a) and (b) are evaluated at append time: no background thread. A due checkpoint is written in the same `write(2)` and fsync as the record, so it costs no extra fsync.
 - **What is never signed.** The records after the last checkpoint: at most `checkpoint_every`, or those since the interval elapsed, or more while a signer is down. They are chained but not signed, and the verifier reports them as `UncoveredTail` (decision 11).
-- **Segment sealing.** When a record would not fit, the writer:
-  1. writes a **closing checkpoint** as the last line of the old segment;
-  2. fsyncs;
-  3. renames the segment with no-replace semantics;
-  4. creates the new live file;
-  5. writes an **opening checkpoint** as its first line;
-  6. fsyncs the file and the directory;
-  7. writes the record.
+- **Segment sealing.** When a record would not fit, the writer does the following under the lock. At every step, the live path either names a complete live file or is missing while a complete staging file exists:
+  1. signs the **closing checkpoint** (`seq k`) and the **opening checkpoint** (`seq k+1`, which covers the closing one). If the signer fails, rotation is abandoned: nothing is written, the record goes into the current live file (which grows past `max_bytes`), and rotation is retried on the next append (decision 6);
+  2. creates `.audit-next.jsonl` (truncating a leftover one, which is never part of the trail), writes the opening checkpoint into it, and fsyncs it;
+  3. appends the closing checkpoint to the live file and fsyncs;
+  4. renames the live file to its segment name, no-replace;
+  5. renames `.audit-next.jsonl` to `audit.jsonl`, no-replace;
+  6. fsyncs the directory;
+  7. writes the record into the new live file.
 
-  Sealed segments may exceed `max_bytes` by the closing checkpoint, a few KB (its peaks list grows with the logarithm of the trail size). The closing checkpoint makes a sealed segment verifiable on its own, given the closing checkpoint of the segment before it. The opening checkpoint makes the live file self-sufficient for writers, so sealed segments can be archived away.
-- **Every segment starts with a checkpoint.** The first segment starts with the creation checkpoint at `seq 0`; every later one starts with an opening checkpoint. Only torn fragments may come before it. The verifier reports a segment that breaks this as `SegmentStructure`.
-- **Creating a trail is explicit.** `AuditConfig::create(signer)` (or `vigil-audit create --key <keyfile> --service <name> <dir>`) creates a new trail. It writes the marker file `audit.trail` (`0400`, holding the trail id), fsyncs it and the directory, and then writes the creation checkpoint at `seq 0` (`mmr_size` 0, `prev_hash` = the genesis value). It fails with `AuditErrorKind::TrailExists` if the marker or any audit file exists. `AuditConfig::open(signer)` never creates a trail: with no marker it fails with `AuditErrorKind::MissingTrail`. So a deleted or emptied directory stops the application (fail closed, decision 1) instead of starting a fresh, validly signed trail.
-- **Writer state across processes.** Each writer keeps the live file's descriptor open, as `RotatingFile` does, so its cached `(dev, ino)` cannot be confused with a reused inode. Under the lock, it compares that descriptor and its cached length with the live path:
-  - Same file and length: the cache is current.
-  - Same file, longer: it reads and checks the records appended since its cached offset.
-  - Same file, shorter: something truncated the trail, which is `AuditErrorKind::CorruptTrail`.
-  - Another file: it reads the live file, which starts with an opening checkpoint, so at most one segment is read.
-  - The live file is empty, or holds no complete checkpoint as its first record (a crash between steps 4 and 6 of sealing): it reads the newest sealed segment's closing checkpoint, then writes the missing opening checkpoint before the next record. A torn fragment stays in place and is skipped by the `TornWrite` rule.
-  - No live file and no sealed segment, but the marker exists: `AuditErrorKind::CorruptTrail`, because the head of the trail is gone.
+  The staging file is written before any rename, so the trail never has an empty or headless live file. Sealed segments may exceed `max_bytes` by the closing checkpoint, a few KB (its peaks list grows with the logarithm of the trail size). The closing checkpoint makes a sealed segment verifiable on its own, given the closing checkpoint of the segment before it. The opening checkpoint makes the live file self-sufficient for writers, so sealed segments can be archived away.
+- **Every segment starts with a checkpoint.** The first segment starts with the creation checkpoint at `seq 0`; every later one starts with an opening checkpoint. Nothing may come before it, not even a torn fragment, because both are written through the staging file and fsynced before the rename. The verifier reports a segment that breaks this as `SegmentStructure`.
+- **Creating a trail is explicit.** `AuditConfig::create(signer)` (or `vigil-audit create --key <keyfile> --service <name> <dir>`) creates a new trail:
+  1. It draws the **trail id**: 16 bytes from `getrandom`, never derived from anything in the directory, the key or the clock. So a trail re-created after deletion always has a new id, even with the same key.
+  2. It writes the marker file `audit.trail` (`0400`, holding the id) and fsyncs it and the directory.
+  3. It writes the creation checkpoint at `seq 0` (`mmr_size` 0, `prev_hash` = the genesis value) through the staging file, as in sealing steps 2, 5 and 6.
+  4. It returns the id (`AuditTrail::trail()`; the CLI prints it). The operator **pins** the id in the verifier's trust file, which is kept outside the trail directory (decision 9).
 
-  While doing so it recomputes hashes and links and applies decision 5's `TornWrite` rule. Any other break is `AuditErrorKind::CorruptTrail`: the writer refuses to extend a trail it cannot vouch for, and `vigil-audit verify` shows where it broke. The writer does not check signatures; it may not hold the other writers' keys.
+  `create` fails with `AuditErrorKind::TrailExists` if the marker or any audit file exists. `AuditConfig::open(signer)` never creates a trail: with no marker it fails with `AuditErrorKind::MissingTrail`. So a deleted or emptied directory stops the application (fail closed, decision 1) instead of starting a fresh trail. A re-created trail has an id that the trust file does not pin, so it fails verification (`TrailMismatch`) until an operator pins the new id on purpose.
+- **`open` writes and signs nothing.** It rebuilds the state, completes an interrupted sealing (below, which writes no new bytes), and checks `expect_head`. The first byte it writes comes from the first `record`, `checkpoint` or `close`.
+- **Writer state across processes.** Each writer keeps the live file's descriptor open, as `RotatingFile` does, so its cached `(dev, ino)` cannot be confused with a reused inode. It also caches its **head**: the highest `(seq, hash)` it has written or read. Under the lock, it compares the open descriptor and its cached length with the live path:
+  - **Same file and length:** the cache is current.
+  - **Same file, longer:** it reads and checks the records appended since its cached offset. The first must link to the cached head.
+  - **Same file, shorter:** something truncated the trail: `CorruptTrail`.
+  - **Another file** (another process rotated): it reads the rest of its old file through the descriptor it still holds, from the cached offset up to the closing checkpoint. Then it reads the new live file, whose opening checkpoint must link to that closing checkpoint. The chain from the cached head to the new head is therefore read in full, never assumed.
+
+  **The head never moves back.** If the trail's head on disk is below the cached head, or its record at the cached `seq` has a different hash, the result is `CorruptTrail` and the handle refuses to write. While reading, the writer recomputes hashes and links and applies decision 5's rules for torn writes and duplicate keys; any other break is also `CorruptTrail`. The writer does not check signatures; it may not hold the other writers' keys.
+- **Crash recovery and structural loss** (at `open`, or when the cache is unusable):
+  - **Crash recovery is limited to two cases:**
+    - **A torn fragment at the end of the live file** (decision 5's rule). It stays in place, and the next write's repair newline ends it.
+    - **An interrupted sealing:**
+      - live file present and `.audit-next.jsonl` present: the staging file is either complete or torn. Complete and linking to the live file's closing checkpoint: sealing steps 3–6 are finished (the closing checkpoint is appended only if missing). Torn, or not linking: it is discarded and sealing restarts at step 1 with the next append;
+      - live path missing, `.audit-next.jsonl` complete and linking to the newest sealed segment's closing checkpoint: steps 5 and 6 are finished.
+
+    Neither case writes a new record or signature.
+  - **Everything else is structural loss, refused with `CorruptTrail`:**
+    - a live path missing without a valid staging file;
+    - an empty live file;
+    - a live file whose first complete record is not a checkpoint that links to the newest sealed segment, or to the genesis value for the first segment;
+    - a missing head while the marker exists;
+    - a head that does not match `expect_head`, which is `HeadMismatch`.
+
+    vigil never guesses which case is innocent.
+  - **An operator decides** with `vigil-audit resume --key <keyfile> --actor <who> --reason <why> --head <seq>:<hash> <dir>`. It continues the trail from the named head, which must be the last complete record found and is typically the last one verified against anchors or receipts. It writes an opening checkpoint (when the live file is missing or headless) followed by a record with action `vigil.audit.resume`, the operator as actor, the reason, and the previous head in `audit.details`. The loss and the decision are thus both in the trail, and verification still reports the loss itself (for example `SeqGap`, `AnchorMismatch` or `HeadMismatch` against receipts).
 
 ### 9. Key custody and rotation
 
@@ -269,19 +315,30 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
   ```
 
   It returns pure Ed25519 signatures and uses only std types (ADR-0004 decision 1). An application can implement it over any device or remote signer. Because it is unsealed, a method added in 1.x must have a default implementation; a new required method is a major. The signer is called inside the locked section, so a slow signer slows down the writers of that trail. A checkpoint is due at most every `checkpoint_every` records.
-- **`KeyFileSigner`** is vigil's one implementation in 1.0. It loads a file holding the 32-byte seed as 64 hex characters, with surrounding whitespace allowed. That is the format `tessera keygen` writes (`signing_key_from_hex`), so one key file serves both tools.
+- **`KeyFileSigner`** is vigil's one implementation in 1.0. It loads a file holding the 32-byte seed as 64 hex characters, with surrounding whitespace allowed. That is the format `tessera keygen` writes (`signing_key_from_hex`), so tools are interoperable. **Use separate keys for vigil and tessera.** The domain-separated messages already prevent a signature from crossing over. Separate keys also keep a compromise of one tool's key from forcing the other's revocation, and let each be revoked on its own schedule.
   - Like OpenSSH, it refuses a file with group or other permission bits, or one owned by another user.
   - `vigil-audit keygen <file>` writes the seed (`0600`, never overwriting) and `<file>.pub` with the public key. The seed comes from `getrandom`.
   - The seed is held in `ed25519_dalek::SigningKey`, which zeroizes it on drop.
 - **What a local key protects against, and what it does not.** It protects against accidental corruption and against tampering by anyone who cannot read the key. It does not protect against an attacker who can read the key and write the trail: they can rewrite everything and sign it again. Against that, use (1) a key the application process cannot read, through a `Signer` over an off-device or hardware signer (reference backends deferred to [#58](https://github.com/vig-os/vigil/issues/58)), or (2) anchors (decision 10). The rustdoc of `AuditTrail` and the README say this.
-- **Rotation.** Reopen the trail with a new signer. Checkpoints name their `key_id`, and the chain fixes the order of keys. The verifier's trust file lists every key valid for the trail.
-- **Revocation is a bound, not a deletion.** A trust entry may carry `through=<seq>`: the key is trusted for checkpoints at `seq` ≤ that bound, and a checkpoint it signs beyond the bound is `UntrustedKey` (an error). A later checkpoint by a trusted key covers the whole earlier history, because it commits to the chain head and the MMR root. So after a suspected compromise, the operator:
-  1. verifies the trail against the anchors and finds the last checkpoint known good;
-  2. sets `through=<that seq>` on the old key's entry;
-  3. reopens the trail with the new key, adds that key to the trust file, and writes `checkpoint()`.
+- **Rotation.** Checkpoints name their `key_id`, the chain fixes the order of keys, and the trust file lists every key valid for the trail.
+- **Revocation is a pinned, confirmed bound.** A trust entry may carry `through=<seq>:<blake3:hex>`, naming a checkpoint the operator has verified as good. The verifier then requires:
+  - **pinned:** the record at that `seq` exists and has exactly that hash, else `RevocationMismatch`. This fixes the history up to the bound, so an attacker holding the old key cannot cut the trail back and forge it below the bound;
+  - **confirmed:** the trail contains, at a `seq` above the bound, a checkpoint signed by a **different** trusted key, else `RevocationUnconfirmed`. This pins the post-revocation head with a key the attacker does not hold, so a trail cut back to the bound, or forged above it with the old key, fails;
+  - **bounded:** a checkpoint signed by the old key above the bound is `UntrustedKey`.
+- **The rotation procedure,** for any number of writer processes:
+  1. **Stop every process writing the trail.** `close()` signs a last checkpoint with the old key, and no old-key writer may run after the bound: its checkpoints would be `UntrustedKey` for good.
+  2. Verify the trail against the anchors and receipts, and choose the bound: the last checkpoint known good. After a clean stop, that is the final `close()` checkpoint. After a suspected compromise, it is the last checkpoint that matches an anchor.
+  3. Generate the new key (`vigil-audit keygen`) and deploy it to every writer, removing the old key file.
+  4. In the trust file, add the new key and set `through=<seq>:<hash>` on the old one.
+  5. Confirm with `vigil-audit checkpoint --key <new keyfile> <dir>`, which opens the trail with `expect_head` set to the bound and writes one checkpoint. Run `resume` instead if records after the bound must be cut.
+  6. Start the writers with the new key.
 
-  The trail then verifies cleanly: the old key's checkpoints up to the bound are trusted, and everything after is covered by the new key. A key that was never trusted, or one removed from the file, makes its checkpoints `UntrustedKey`.
-- **Trust file format** (for `TrustedKeys::from_file` and `--trust`): UTF-8 lines of the form `ed25519 <64 hex> [through=<seq>] [comment]`; blank lines and lines starting with `#` are ignored. `TrustedKeys::new` takes `(public key, Option<u64> bound)` pairs.
+  The trail then verifies cleanly. Records between the bound and the confirming checkpoint are covered by the new key, which the operator vouches for in step 2. A key that was never trusted, or one removed from the file, makes its checkpoints `UntrustedKey`.
+- **Trust file format** (for `TrustPolicy::from_file` and `--trust`). UTF-8 lines; blank lines and lines starting with `#` are ignored:
+  - `trail <32 hex> [comment]` pins the trail id (decision 8). At least one is required.
+  - `ed25519 <64 hex> [through=<seq>:<blake3:hex>] [comment]` lists a trusted key.
+  - `TrustPolicy::new(trail)` with `.key(public_key)` and `.key_through(public_key, seq, hash)` builds the same in code.
+- **Keep the trust file outside the trail directory,** for example in the verifier's configuration or a reviewed repository. The marker `audit.trail` lives in the writable directory, so it is never a trust input.
 
 ### 10. Anchoring (optional)
 
@@ -297,20 +354,21 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
 ### 11. Verify API and CLI contract (#13)
 
 - **Library:**
-  - `vigil::audit::verify(dir: &Path, trust: &TrustedKeys) -> io::Result<Report>`;
+  - `vigil::audit::verify(dir: &Path, trust: &TrustPolicy) -> io::Result<Report>`;
   - `Verifier::new(trust)` with:
     - `.anchor(Checkpoint)`;
     - `.start_from(Checkpoint)`, for a trail whose older segments are archived: a trusted checkpoint supplies `seq`, `prev_hash` and peaks;
     - `.max_age(Duration)`: report `StaleHead` (an error) when the newest trusted checkpoint is older than this, measured against the verifier's clock (decision 5);
     - `.verify_dir(&Path)` and `.verify_files(impl IntoIterator<Item = PathBuf>)`, the latter for copies shipped through a Collector.
 - **Errors versus findings.** `io::Error` is only for not being able to read. Tampering is never an `Err`: it is a `Finding` in the `Report`.
+- **The trail is always pinned.** Every record whose `audit.trail` is not pinned in the `TrustPolicy` (or by `--trail`) is `TrailMismatch` (an error). Without a pin there is nothing to verify against: the CLI exits 2, and `TrustPolicy::new` requires a trail. Another trail signed by the same key, including one re-created after deletion, therefore never verifies as the expected one.
 - **Report.** `Report` exposes:
   - `trail()`, `records()`, `last_seq()`;
   - `covered_through()`: the highest `seq` covered by a checkpoint signed with a trusted key;
   - `findings()`;
   - `is_valid()`: no finding of severity `Error`.
 - **Finding.** `Finding` exposes `kind()`, `severity()`, `file()`, `line()`, `seq()` and `detail()`, the last naming expected and found values. `FindingKind` is `#[non_exhaustive]`:
-  - errors: `Unparsable`, `UnknownVersion`, `UnknownField`, `MissingField`, `InvalidField`, `HashMismatch`, `ChainBroken`, `SeqGap`, `SeqConflict` (two different records with one `seq`), `TrailMismatch`, `MmrMismatch`, `BadSignature`, `UntrustedKey`, `SegmentStructure`, `AnchorMismatch`, `StartMismatch`, `StaleHead`;
+  - errors: `Unparsable`, `UnknownVersion`, `UnknownField`, `MissingField`, `InvalidField`, `HashMismatch`, `ChainBroken`, `SeqGap`, `SeqConflict` (two different records with one `seq`), `TrailMismatch`, `MmrMismatch`, `BadSignature`, `UntrustedKey`, `RevocationMismatch`, `RevocationUnconfirmed`, `SegmentStructure`, `AnchorMismatch`, `StartMismatch`, `StaleHead`;
   - warnings: `TornWrite`, `ClockWentBackwards`, `DuplicateRecord` (the same record twice: a Collector can redeliver a line, and in vigil's own files a duplicated line changes no content);
   - info: `UncoveredTail`.
 - **How it verifies.** Records are ordered by `seq`, from vigil's segment order or from any order in shipped copies. Every record is checked; nothing stops at the first error. The first error in `seq` order is the **first broken link**, reported with file, line, `seq`, expected and found hash.
@@ -318,9 +376,11 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
 - **CLI** (`vigil-audit`, std-only argument parsing, `required-features = ["audit"]`):
 
   ```text
-  vigil-audit verify --trust <file> [--anchor <file>]... [--start-from <file>] [--max-age <duration>] [--strict] [--json] <dir|file>...
+  vigil-audit verify --trust <file> [--trail <id>] [--anchor <file>]... [--start-from <file>] [--max-age <duration>] [--strict] [--json] <dir|file>...
   vigil-audit checkpoints <dir>
+  vigil-audit checkpoint --key <keyfile> [--expect-head <seq>:<hash>] <dir>
   vigil-audit create --key <keyfile> --service <name> <dir>
+  vigil-audit resume --key <keyfile> --actor <who> --reason <why> --head <seq>:<hash> <dir>
   vigil-audit keygen <keyfile>
   ```
 
@@ -331,6 +391,23 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
 - **#13's acceptance includes:**
   - a round trip of a fixture trail through otelcol-contrib's `otlpjsonfile` → `file`, verified with `verify_files` (ADR-0001 decision 8);
   - property tests for delete, reorder, edit and truncate at every position, and for a forged checkpoint.
+- **Tests for the attacks decisions 5, 8 and 9 close** (#11 and #13; each fails against a writer or verifier that lacks the rule):
+  - **Rollback against a running writer.** With a writer open, an attacker truncates the live file at a record boundary, deletes it, or renames the newest sealed segment back to `audit.jsonl`. The next `record` is `CorruptTrail`, and nothing is signed.
+  - **Rollback across a restart.**
+    - The same three edits, then `open` with `expect_head` from the last receipt: `HeadMismatch`.
+    - Without `expect_head`: the documented gap. A test asserts that verify then reports clean, so the limit stays visible.
+    - Deleting or emptying the live file without a staging file: `open` is `CorruptTrail`, and `resume` writes a `vigil.audit.resume` record.
+  - **Crash points.** A crash is injected after each sealing step 1–6 and after a torn write at end of file. `open` recovers without writing a new record or signature, and verify reports no error.
+  - **Fake records.**
+    - A complete but invalid line between two linked records is `Unparsable` or `InvalidField`: an error, and the CLI exits 1.
+    - Every strict prefix of a valid line (each cut point, including inside a multibyte character) is `TornWrite`.
+    - A line with a duplicate key at any level is `InvalidField`.
+    - A non-canonical integer is `InvalidField`, as is an `observedTimeUnixNano` that differs from `timeUnixNano`.
+  - **Wrong trail.** A second trail created with the same key, or the trail re-created after deletion, is `TrailMismatch` against the pinned id.
+  - **Revocation.**
+    - With the old key: cut back to the bound and forge records and a checkpoint above it → `RevocationUnconfirmed`; forge below the bound → `RevocationMismatch` or `HashMismatch`.
+    - Following the procedure exactly → no error.
+    - An old-key writer left running → `UntrustedKey`.
 
 ### 12. Format freeze and the promise that old trails still verify
 
@@ -355,16 +432,16 @@ Only vigil's own types and std appear. Hashes and keys are byte arrays, not `bla
 
 | Item | Why it is public |
 |---|---|
-| `AuditConfig` (`new(service)`, `dir`, `max_bytes`, `checkpoint_every`, `checkpoint_interval`, `mirror_to_logs`, `create(self, signer)`, `open(self, signer)`) | Creating (explicitly, once) and opening a trail with its policy. |
-| `AuditTrail` (`record`, `checkpoint`, `close`, `dir`), `Send + Sync` | The trail handle, shared across threads. |
+| `AuditConfig` (`new(service)`, `dir`, `max_bytes`, `checkpoint_every`, `checkpoint_interval`, `mirror_to_logs`, `expect_head(seq, hash)`, `create(self, signer)`, `open(self, signer)`, `resume(self, signer, head, actor, reason)`) | Creating (explicitly, once), opening with the head the application last saw, and the operator's resume decision (decision 8). |
+| `AuditTrail` (`record`, `checkpoint`, `close`, `dir`, `trail`), `Send + Sync` | The trail handle, shared across threads. |
 | `Entry` (`new(actor, action, object)`, `reason`, `before`, `after`, `details`) | One audited action (decision 3). |
 | `Value` (`Text`, `Digest`; `Value::digest_of(&[u8])`), `#[non_exhaustive]` | A before or after value, or its digest. |
 | `Receipt` (`trail`, `seq`, `hash`, `hash_string`, `unsigned_records`) | Stored by the application with its own record: an application-side anchor (decision 5), and the signal that signing is behind (decision 6). |
 | `Checkpoint` (`seq`, `mmr_size`, `mmr_root`, `key_id`, `line`, `parse`) | Anchors and verification start points (decisions 10, 11). |
 | `Signer`, `SignerError`, `KeyFileSigner`, `keygen` | Key custody (decision 9). |
-| `TrustedKeys` (`new`, `from_file`) | The verifier's trust input. |
-| `verify`, `Verifier`, `Report`, `Finding`, `FindingKind` and `Severity` (both `#[non_exhaustive]`) | The verify contract (decision 11). |
-| `AuditError`, `AuditErrorKind` (`Io`, `Poisoned`, `TooLarge`, `InvalidEntry`, `CorruptTrail`, `MissingTrail`, `TrailExists`, `Signer`, `InvalidConfig`), `#[non_exhaustive]` | Matchable failures (ADR-0004 decision 3 shape). |
+| `TrustPolicy` (`new(trail)`, `trail`, `key`, `key_through`, `from_file`) | The verifier's trust input: pinned trail ids and keys with revocation bounds (decision 9). |
+| `verify`, `Verifier`, `Report`, `Finding`, `FindingKind` and `Severity` (both `#[non_exhaustive]`, `Copy + Eq + Debug`) | The verify contract (decision 11). |
+| `AuditError`, `AuditErrorKind` (`Io`, `Poisoned`, `TooLarge`, `InvalidEntry`, `CorruptTrail`, `HeadMismatch`, `MissingTrail`, `TrailExists`, `Signer`, `InvalidConfig`), `#[non_exhaustive]`, `Copy + Eq + Debug` like ADR-0004's kinds | Matchable failures (ADR-0004 decision 3 shape). |
 
 ### 14. Dependencies (feature `audit` only)
 
@@ -404,8 +481,15 @@ Only vigil's own types and std appear. Hashes and keys are byte arrays, not `bla
 - **Throughput is bounded by fsync.** Tens of records per second on slow virtual disks (probe), more on local NVMe. A consumer that needs bulk audit waits for [#56](https://github.com/vig-os/vigil/issues/56) or batches at the application level.
 - **Fail-closed means an audit outage stops the audited action.** That is the point, and the application must handle `Err` (for example, refuse the change and tell the operator). A signer outage does not stop it (decision 6), but it leaves records unsigned until the signer recovers.
 - **What a local key does not stop.** An attacker who holds the key and can write the files can rewrite and re-sign the trail. Only an off-device signer ([#58](https://github.com/vig-os/vigil/issues/58)) or anchors ([#57](https://github.com/vig-os/vigil/issues/57) and decision 10) detect that. This is written in the rustdoc and the README, not left to be discovered.
-- **What a writable trail does not stop without anchors.** An attacker who can write the files but has no trusted key can rewrite everything after the last trusted checkpoint, or roll the trail back to any earlier checkpoint (decision 5). Only anchors, the application's stored receipts, and `--max-age` reveal that. A crash alone loses only unacknowledged records. The verifier reports the uncovered tail; `--strict` fails on it.
-- **Creating a trail is a deployment step** (`create`), not something `open` does. An application whose audit directory was deleted stops until an operator acts.
+- **What a writable trail does not stop without something kept elsewhere.** An attacker who can write the files but has no trusted key can rewrite everything after the last trusted checkpoint, or roll the trail back to any earlier checkpoint (decision 5). A running writer refuses to continue after that. A restarted writer refuses only with `expect_head`. Once any writer signs on the shortened trail, only anchors and the application's receipts reveal it; `--max-age` does not. A crash alone loses only unacknowledged records and is recovered without an operator. Any other loss stops the trail until an operator runs `resume`, which records the decision. The verifier reports the uncovered tail; `--strict` fails on it.
+- **Operators carry real duties:**
+  - pin each trail id and keep the trust file outside the trail directory;
+  - stop every writer before rotating a key;
+  - decide on `resume` after structural loss;
+  - run on storage that honours flushes.
+
+  The README's audit section lists them.
+- **Creating a trail is a deployment step** (`create`), not something `open` does. An application whose audit directory was deleted stops until an operator acts, and a re-created trail fails verification until its new id is pinned.
 - **Disk only grows.** Archiving is the operator's job; vigil only guarantees that any sealed segment can be moved.
 - **The format is a long-term promise.** v1's encoding, domain strings and MMR can never change in 1.x. Every fix must be expressible as a v2, which costs an ADR and a second verifier path kept alive alongside v1.
 - **Code that must stay small.** The audit sink adds a second writer to the crate's riskiest file (`src/rotate.rs`, a crate-internal locked-section API). It is shared code, so the multi-process tests of ADR-0002 must cover both callers.
@@ -428,6 +512,11 @@ Only vigil's own types and std appear. Hashes and keys are byte arrays, not `bla
 - **A hash chain without an MMR.** Proving one record or one extension would require the whole trail. Rejected; anchors need consistency proofs (#57).
 - **Sign every record.** 11 µs and 64 bytes per record (probe), and a signer outage would stop every action. Checkpoints give the same tamper-evidence up to the uncovered tail. Rejected.
 - **tessera's `ed25519-env-v1` envelope for checkpoints.** A checkpoint signature would then also verify as a tessera product signature over the same string. It needs `serde_jcs`, and its format is unfrozen. Rejected for a domain-separated message (decision 8).
+- **Recover silently from a missing or empty live file** (the first draft: rebuild from the newest sealed segment and sign a new opening checkpoint). A crash and a rollback look the same from the directory, so the honest writer would sign over a shortened history. Rejected for the staging-file protocol, which makes every crash state recognisable, plus an operator `resume`.
+- **A head file in the trail directory** to remember the last head across restarts. The attacker who rolls the trail back can roll that file back too. Rejected for `expect_head`, which comes from the application's own store.
+- **Derive the trail id from the key or the creation checkpoint.** A re-created trail with the same key would get the same or a predictable id. A random id pinned out of band changes on re-creation. Rejected.
+- **Revocation by `through=<seq>` alone** (the first draft). With the stolen key, an attacker cuts the trail back below the bound and forges a fresh trail there, which verifies clean. Rejected for a pinned hash plus a confirming checkpoint by another key.
+- **Hash `observedTimeUnixNano` as a second field.** Two times with one meaning; requiring equality is simpler and shows one time. Rejected.
 - **An unsigned mode.** A second state space to test, for users who could anchor instead. Rejected (decision 9).
 - **A sidecar file for checkpoints.** Deleting the sidecar would not break the chain. Inline checkpoint records are covered by the chain themselves. Rejected.
 - **A background checkpoint thread.** A thread in a regulated module, for little gain over checkpoints evaluated at append time and on `close`. Rejected; an idle trail's tail is covered on `close` or at the next append.
