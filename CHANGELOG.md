@@ -27,8 +27,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Merge concurrent changelog additions with Git's union driver and curate Unreleased entries to describe the implemented features ([#40](https://github.com/vig-os/vigil/issues/40)).
-
 ### Deprecated
 
 ### Removed
