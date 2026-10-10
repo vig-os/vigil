@@ -113,7 +113,7 @@ vigil writes `<signal>.jsonl` exactly as ADR-0001/0002 say, whatever is enabled.
 A host uses one path, never both: both would deliver every record twice. Push is switched on in code (decision 6), so the operator's switch on a file-shipper host is `VIGIL_PUSH=off`. The file is the durable copy: catching up after an outage is the file shipper's job; push is a live, best-effort feed.
 
 **Exactly once ends at the backend's acceptance window.** The file shipper re-sends records that are hours or days old after an outage, and backends refuse records that are too old:
-- **Loki** (3.7.8 defaults: `reject_old_samples: true`, `reject_old_samples_max_age: 1w`);
+- **Loki** (3.7.8 defaults: `reject_old_samples: true`, `reject_old_samples_max_age: 1w`). Loki also accepts out-of-order entries per stream only within `max_chunk_age / 2` (1h by default) of that stream's newest entry. A catch-up that reads old segments while the live file is also being read, or that merges processes into one stream (the label config below drops `service.instance.id` from the labels), can therefore get old entries refused even inside the week;
 - **Prometheus**: samples older than the TSDB head are out of order unless `out_of_order_time_window` is set (default 0). The pre-mortem saw out-of-order rejections from Prometheus 3.15.
 
 So within ADR-0002's 90-day retention, a catch-up longer than those windows needs backend configuration, or the old records stay only in the files. This is documented with the reference config (#60). It was not probed here beyond reading Loki's defaults.
@@ -183,7 +183,7 @@ Extends ADR-0001 decision 5, implemented for logs and metrics in [#7](https://gi
 | data point | `timeUnixNano` |
 | `Span` | `spanId`, `endTimeUnixNano` |
 
-- **What this guarantees:** every line has a per-line value (a timestamp, or for spans a span id that is exported exactly once) within its first 128 bytes. So the first lines of two files of one signal in one directory differ within the receiver's default 1000-byte fingerprint (Probe K: byte 97 instead of 1092; 150/150 instead of 3/150).
+- **What this guarantees:** every line has a per-line value (a timestamp, or for spans a span id that is exported exactly once) within its first 128 bytes. So the first lines of any two files of one signal, across all the directories a shipper's glob matches, differ within the receiver's default 1000-byte fingerprint (Probe K: byte 97 instead of 1092; 150/150 instead of 3/150).
 - **Within ADR-0001's promises:** JSON readers ignore key order, which the Collector's file and HTTP receivers confirm (Probe K). ADR-0001 said field order is deterministic within a version and not promised across versions; this decision amends that stance (the amendment is marked in ADR-0001) so the time-first keys are promised, because a shipper's correctness depends on them. The order of the remaining keys stays unpromised.
 - **The test** ([#60](https://github.com/vig-os/vigil/issues/60)): segments whose first records have a 700-byte metric description and a 2 KiB log body must first differ within 1000 bytes.
 
@@ -243,7 +243,7 @@ let guard = vigil::Config::new("flock")
 ## Consequences
 
 - **Two supported paths, one format.**
-  - **Hosts with the Collector** get exactly-once shipping from the files with a documented, tested config.
+  - **Hosts with the Collector** get exactly-once shipping from the files, up to the backend's acceptance window (decision 1), with a documented, tested config.
   - **Hosts with Alloy** (the fleet) use `push` until Alloy can read OTLP files; push is live but loses data while the agent is down, and the files keep it.
   - The fleet rollout (#15) chooses per host and may land after 1.0.
 - **A shipper bug now costs data silently.** F2/F4 and Probe K lost records with no error anywhere; #60's conformance test is what keeps the reference config honest. Hand-written configs that drop a rule above will lose or duplicate data, so the README states the rules, not just the YAML.
@@ -258,7 +258,7 @@ let guard = vigil::Config::new("flock")
 
 ## Alternatives considered
 
-- **Keep ADR-0001 decision 9 (files only, no push).** Alloy hosts could then not ship metrics or traces at all until upstream adds a reader, which the owner rejected (decision v2).
+- **Keep ADR-0001 decision 9 (files only, no push).** Alloy hosts could then not ship metrics or traces at all until upstream adds a reader, which the owner rejected (owner decision of 2026-10-11, point 2).
 - **`filelog` receiver alone.** It ingests each line as a log body: metrics and traces become log text (R8). With the `otlpjson` connector it works (probed), but that connector is not in Alloy, and the Collector's own `otlpjsonfile` is the simpler reference there.
 - **Push replays from the files** (an in-process shipper with offsets). It would need shared offset state across every process writing a directory (ADR-0002's premise) and would duplicate the Collector's job. Rejected; completeness comes from the file shipper.
 - **Push instead of files when enabled** (no tee). It would lose everything while the agent is down and contradicts the owner's "files remain the durable copy".
@@ -273,7 +273,7 @@ let guard = vigil::Config::new("flock")
 - **A bigger `fingerprint_size` in the shipper config instead of decision 3.** The fingerprint is read from the head of every matched file on every poll, so making it cover a whole first line (up to 1 MiB) multiplies I/O across 90 days of segments. It also leaves every other `fileconsumer`-based shipper (Alloy's `filelog`, Fluent Bit) exposed. Fixing the cause in the writer is cheaper and covers them all.
 - **`delete_after_read` or shipper-side truncation.** Deletes or truncates files that writers append to under ADR-0002's lock protocol. Rejected.
 - **Push enabled by environment alone.** An endpoint variable set for some other program would silently turn on network traffic in every vigil binary on the host. Rejected; push is opted into in code, and the environment only tunes or disables it.
-- **Reading the standard `OTEL_EXPORTER_OTLP_*` variables.** They are often set host-wide or per session for other programs, including to remote collectors. Under decision 5 a remote value would disable vigil's push, and a loopback value meant for a different program would quietly redirect it. Their semantics also differ from vigil's (per-signal endpoints, a timeout in milliseconds). Rejected for `VIGIL_PUSH_*`, which only vigil reads.
+- **Reading the standard `OTEL_EXPORTER_OTLP_*` variables.** They are often set host-wide or per session for other programs, including to remote collectors. Under decision 5 a remote value would disable vigil's push, and a loopback value meant for a different program would quietly redirect it. They also carry per-signal endpoints that vigil does not need. Rejected for `VIGIL_PUSH_*`, which only vigil reads.
 - **Allowing `localhost` and resolving it once at init.** That needs a pinned resolver in the HTTP client and turns a configuration value into an environment check. An IP literal says the same thing without either. Rejected.
 
 ## References
