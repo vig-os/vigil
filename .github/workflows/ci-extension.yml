@@ -95,3 +95,25 @@ jobs:
         run: |
           nix develop -c python3 -m unittest discover -s scripts
           nix develop -c python3 scripts/conformance.py
+
+  supply-chain:
+    name: Supply chain (cargo-deny)
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+      # Live RustSec fetch needs network access unavailable in Nix derivations.
+      # The executable still comes exclusively from flake-pinned nixpkgs.
+      - name: Check supply-chain policy
+        run: nix develop -c python3 scripts/check_supply_chain.py

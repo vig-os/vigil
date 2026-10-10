@@ -1,0 +1,40 @@
+# Policy for the complete, all-features dependency graph, including dev deps.
+[graph]
+all-features = true
+
+[advisories]
+# The wrapper checks actual DB HEAD dates (seven days), because 0.19.6
+# does not reliably enforce maximum-db-staleness on a rewound cached DB.
+db-urls = ["https://github.com/RustSec/advisory-db"]
+# cargo-deny 0.19 always denies vulnerabilities (no severity threshold).
+# Unmaintained crates also fail: abandoned dependencies need explicit review.
+unmaintained = "all"
+# A yank can be packaging-only; warn so maintainers can assess and update it.
+yanked = "warn"
+ignore = []
+
+[licenses]
+allow = [
+    # Project license; preserves notices and includes a patent grant.
+    "Apache-2.0",
+    # Permissive; compatible with Apache-2.0 distribution with retained notices.
+    "MIT",
+    # unicode-ident's data license; permissive with retained Unicode notices.
+    "Unicode-3.0",
+]
+
+[bans]
+# scripts/check_supply_chain.py additionally denies duplicate semver majors
+# for EVERY opentelemetry* crate (0.x minors are distinct compatibility lines).
+multiple-versions = "warn"
+multiple-versions-include-dev = true
+# Reviewed: prost-derive/tracing-attributes/zerocopy-derive still use syn 2,
+# while futures-macro/serde_derive/thiserror-impl use syn 3. Proc-macro internals
+# do not cross the public API; remove this exact skip when they converge.
+skip = [{ crate = "syn@2.0.119", reason = "Proc-macro dependencies span syn 2 and 3; no shared runtime types" }]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
