@@ -114,18 +114,23 @@ def main():
     with tempfile.TemporaryDirectory(prefix="vigil-supply-chain-") as directory:
         path = Path(directory) / "metadata.json"
         path.write_bytes(metadata)
-        deny_code = subprocess.run(
-            [
-                "cargo",
-                "deny",
-                "--locked",
-                "check",
-                "--disable-fetch",
-                "--metadata-path",
-                str(path),
-            ],
-            check=False,
-        ).returncode
+        deny_code = 0
+        # A missing/corrupt DB aborts cargo-deny before other checks begin.
+        # Keep the offline subset independent so those findings remain visible.
+        for checks in [("bans", "licenses", "sources"), ("advisories",)]:
+            deny_code |= subprocess.run(
+                [
+                    "cargo",
+                    "deny",
+                    "--locked",
+                    "check",
+                    "--disable-fetch",
+                    "--metadata-path",
+                    str(path),
+                    *checks,
+                ],
+                check=False,
+            ).returncode
     return deny_code or fetch_code or int(bool(conflicts or freshness_errors))
 
 

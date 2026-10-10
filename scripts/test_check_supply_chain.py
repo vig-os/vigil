@@ -33,12 +33,13 @@ class GateTests(unittest.TestCase):
 
     def test_all_checks_run(self):
         """Aggregate conflict, fetch and policy failures without early returns."""
-        for conflict, fetch_code, deny_code in [
-            (True, 0, 0),
-            (True, 0, 4),
-            (False, 1, 0),
-            (False, 0, 8),
-            (False, 0, 0),
+        for conflict, fetch_code, deny_code, advisory_code in [
+            (True, 0, 0, 0),
+            (True, 0, 4, 1),
+            (False, 1, 0, 0),
+            (False, 0, 8, 0),
+            (False, 0, 0, 0),
+            (False, 0, 0, 1),
         ]:
             with self.subTest(conflict=conflict, fetch=fetch_code, deny=deny_code):
                 packages = [
@@ -53,6 +54,7 @@ class GateTests(unittest.TestCase):
                     subprocess.CompletedProcess([], 0, stdout=metadata),
                     subprocess.CompletedProcess([], fetch_code),
                     subprocess.CompletedProcess([], deny_code),
+                    subprocess.CompletedProcess([], advisory_code),
                 ]
                 with (
                     patch(
@@ -63,14 +65,19 @@ class GateTests(unittest.TestCase):
                     ) as run,
                 ):
                     self.assertEqual(
-                        bool(main()), bool(conflict or fetch_code or deny_code)
+                        bool(main()),
+                        bool(conflict or fetch_code or deny_code or advisory_code),
                     )
-                self.assertEqual(run.call_count, 3)
+                self.assertEqual(run.call_count, 4)
                 self.assertEqual(
                     run.call_args_list[1].args[0],
                     ["cargo", "deny", "--locked", "fetch"],
                 )
                 self.assertIn("--disable-fetch", run.call_args_list[2].args[0])
+                self.assertEqual(
+                    run.call_args_list[2].args[0][-3:], ["bans", "licenses", "sources"]
+                )
+                self.assertEqual(run.call_args_list[3].args[0][-1], "advisories")
 
 
 class FreshnessTests(unittest.TestCase):
@@ -116,6 +123,7 @@ class FreshnessTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, stdout=b'{"packages": []}'),
             subprocess.CompletedProcess([], 0),
             subprocess.CompletedProcess([], 0),
+            subprocess.CompletedProcess([], 0),
         ]
         with (
             patch(
@@ -124,7 +132,7 @@ class FreshnessTests(unittest.TestCase):
             patch("check_supply_chain.subprocess.run", side_effect=results) as run,
         ):
             self.assertNotEqual(main(), 0)
-            self.assertEqual(run.call_count, 3)
+            self.assertEqual(run.call_count, 4)
 
 
 if __name__ == "__main__":

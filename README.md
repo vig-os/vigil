@@ -91,7 +91,8 @@ when this file reaches `main` ([GitHub scheduling rules](https://docs.github.com
 The gate explicitly fetches RustSec and registry data, then checks with
 `--disable-fetch`. The wrapper enforces a seven-day limit on the actual DB HEAD
 commit date because cargo-deny 0.19.6 does not reliably enforce its staleness option. A fetch error
-fails the gate while the other checks still run. If cargo-deny silently retains
+fails the gate while the other checks still run. The offline subset and advisory
+checks run separately so a missing or corrupt DB cannot hide license or source findings. If cargo-deny silently retains
 a cache during an offline fetch, the freshness check rejects a DB whose HEAD
 commit is older than seven days; a recent cached DB can still pass. A quiet DB
 with no commits for seven days also fails and needs maintainer investigation.
