@@ -77,7 +77,7 @@ The plan in #10 and #12 built the chain and checkpoints "on tessera-core". The o
 
 - **ADR-0001:** one complete OTLP/JSON `LogsData` per line; the Collector `otlpjsonfile` receiver is the conformance oracle; it drops lines over 1 MiB, and it drops zero and empty fields on a round trip.
 - **ADR-0002:** the directory lock, inode recheck, segment names, no-replace rotation and partial-write repair are proven under multi-process load. Retention deletes old segments, which an audit trail must never do.
-- **ADR-0004** (Proposed, [PR #54](https://github.com/vig-os/vigil/pull/54)):
+- **[ADR-0004](0004-public-api-and-stability.md)** (Accepted):
   - feature `audit`, off by default, adding blake3, ed25519-dalek and vigil's own MMR;
   - the stable surface may name only vigil's own types, std and the `tracing` family;
   - errors have a `kind()` with a `#[non_exhaustive]` kind enum;
@@ -451,7 +451,9 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
 
 ### 13. Public surface (feature `audit`, under ADR-0004's rules)
 
-Only vigil's own types and std appear. Hashes and keys are byte arrays, not `blake3` or `ed25519-dalek` types.
+Only vigil's own types and std appear. Hashes and keys are byte arrays, not `blake3` or `ed25519-dalek` types. Following ADR-0004 decision 5, configuration is by builder methods on structs with private fields.
+
+**`audit` reads no `VIGIL_*` environment variable**, unlike telemetry. Its policy decides what is durable and what is signed, so it must be in reviewed code or the operator's deployment, not in an environment a process inherits.
 
 | Item | Why it is public |
 |---|---|
@@ -550,7 +552,7 @@ Only vigil's own types and std appear. Hashes and keys are byte arrays, not `bla
 
 - [vig-os/vigil#10](https://github.com/vig-os/vigil/issues/10) (requirement framing; owner decision 2026-10-11), [#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12), [#13](https://github.com/vig-os/vigil/issues/13), [#41](https://github.com/vig-os/vigil/issues/41), [#46](https://github.com/vig-os/vigil/issues/46), [#47](https://github.com/vig-os/vigil/issues/47), [#49](https://github.com/vig-os/vigil/issues/49), [#56](https://github.com/vig-os/vigil/issues/56), [#57](https://github.com/vig-os/vigil/issues/57), [#58](https://github.com/vig-os/vigil/issues/58), [#59](https://github.com/vig-os/vigil/issues/59)
 - Path-to-1.0 pre-mortem, 2026-10-10 (finding R3)
-- [ADR-0001](0001-on-disk-format.md) (format, bounded lines, conformance oracle), [ADR-0002](0002-rotation-and-retention.md) (rotation machinery), ADR-0004 public API and stability ([PR #54](https://github.com/vig-os/vigil/pull/54), Proposed)
+- [ADR-0001](0001-on-disk-format.md) (format, bounded lines, conformance oracle), [ADR-0002](0002-rotation-and-retention.md) (rotation machinery), [ADR-0004](0004-public-api-and-stability.md) (public API and stability)
 - [vig-os/tessera](https://github.com/vig-os/tessera) at `f08255d`: `docs/CONSUMING.md`, ADR-0028, ADR-0036, ADR-0037, ADR-0052, ADR-0058, `tessera-core/src/{hash,signing,manifest}.rs`
 - 21 CFR Part 11 §11.10(e); EU GMP Annex 11 §9; IEC 62304
 - [BLAKE3 specification](https://github.com/BLAKE3-team/BLAKE3-specs); [RFC 8032](https://www.rfc-editor.org/rfc/rfc8032) (Ed25519); [RFC 6962](https://www.rfc-editor.org/rfc/rfc6962) (Merkle tree hashing); [RFC 3161](https://www.rfc-editor.org/rfc/rfc3161) (time-stamp protocol)
