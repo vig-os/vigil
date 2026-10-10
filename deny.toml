@@ -3,6 +3,9 @@
 all-features = true
 
 [advisories]
+# The wrapper checks actual DB HEAD dates (seven days), because 0.19.6
+# does not reliably enforce maximum-db-staleness on a rewound cached DB.
+db-urls = ["https://github.com/RustSec/advisory-db"]
 # cargo-deny 0.19 always denies vulnerabilities (no severity threshold).
 # Unmaintained crates also fail: abandoned dependencies need explicit review.
 unmaintained = "all"

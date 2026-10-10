@@ -79,9 +79,23 @@ crates.io sources and the commented Apache-2.0-compatible license allow-list in
 lines (including distinct 0.x minors); other duplicates warn, with exact reviewed
 skips recorded in `deny.toml`.
 
-Each run fetches the latest RustSec advisory database; to refresh it manually,
-run `nix develop -c cargo deny fetch`. Fetch failures fail CI. This network
-requirement puts the gate in the CI extension rather than a sandboxed Nix check.
+`nix flake check` includes only the offline cargo-deny subset: bans, licenses
+and sources. The CI extension and `.github/workflows/supply-chain.yml` run the
+full gate, including advisories and the OpenTelemetry compatibility rule.
+The consumer-owned workflow checks `dev` weekly (Monday 06:23 UTC) and supports
+manual dispatch. Failures remain visible as red Actions runs; maintainers should
+subscribe to workflow failure notifications. GitHub enables scheduled workflows
+only when the workflow exists on the default branch, so automatic runs begin
+when this file reaches `main` ([GitHub scheduling rules](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)); a dispatch also always checks `dev`.
+
+The gate explicitly fetches RustSec and registry data, then checks with
+`--disable-fetch`. The wrapper enforces a seven-day limit on the actual DB HEAD
+commit date because cargo-deny 0.19.6 does not reliably enforce its staleness option. A fetch error
+fails the gate while the other checks still run. If cargo-deny silently retains
+a cache during an offline fetch, the freshness check rejects a DB whose HEAD
+commit is older than seven days; a recent cached DB can still pass. A quiet DB
+with no commits for seven days also fails and needs maintainer investigation.
+To refresh manually, run `nix develop -c cargo deny fetch` and rerun the full gate.
 Review license terms and notice requirements before changing `[licenses].allow`,
 justify each addition in a comment, and rerun the gate. Review and remove duplicate
 skips as dependencies converge; no vulnerability exceptions are currently allowed.

@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Supply-chain CI gates vulnerabilities, unmaintained crates, licenses, OpenTelemetry compatibility lines and dependency sources with flake-pinned cargo-deny ([#47](https://github.com/vig-os/vigil/issues/47)).
+- Supply-chain CI gates vulnerabilities, unmaintained crates, licenses, OpenTelemetry compatibility lines and dependency sources with flake-pinned cargo-deny, enforce advisory DB freshness and run weekly on `dev` ([#47](https://github.com/vig-os/vigil/issues/47)).
 
 - Collector reference-reader conformance in CI compares complete rich log records across two resources, rotation, empty lines, garbage input and unterminated valid/garbage lines; it also exercises large tracing records and diagnostic stubs ([#6](https://github.com/vig-os/vigil/issues/6), [#30](https://github.com/vig-os/vigil/issues/30)).
 - `vigil::init` and `Config` bridge tracing into rotating OTLP/JSON logs, attach producer resources (including the host name from `uname`), honor XDG and environment settings, and fall back to stderr on storage-open failures ([#5](https://github.com/vig-os/vigil/issues/5), [#32](https://github.com/vig-os/vigil/issues/32)).
