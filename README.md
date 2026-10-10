@@ -68,6 +68,24 @@ Decisions and their evidence are recorded as ADRs in [`docs/adr/`](docs/adr/): [
 
 Enter the pinned environment with `direnv allow` (or `nix develop`). `nix flake check` runs fmt, clippy, tests, doctests and docs. Changes enter through PRs to `dev`; `main` only takes release PRs.
 
+### Supply chain
+
+CI runs `nix develop -c python3 scripts/check_supply_chain.py` with cargo-deny
+0.19.x from flake-pinned nixpkgs. It checks the locked all-features graph,
+including dev dependencies: vulnerabilities and unmaintained crates fail;
+yanked releases warn for review because yanks can be packaging-only. Only
+crates.io sources and the commented Apache-2.0-compatible license allow-list in
+`deny.toml` are accepted. OpenTelemetry crates cannot span semver compatibility
+lines (including distinct 0.x minors); other duplicates warn, with exact reviewed
+skips recorded in `deny.toml`.
+
+Each run fetches the latest RustSec advisory database; to refresh it manually,
+run `nix develop -c cargo deny fetch`. Fetch failures fail CI. This network
+requirement puts the gate in the CI extension rather than a sandboxed Nix check.
+Review license terms and notice requirements before changing `[licenses].allow`,
+justify each addition in a comment, and rerun the gate. Review and remove duplicate
+skips as dependencies converge; no vulnerability exceptions are currently allowed.
+
 ### Changelog updates
 
 Add entries under the existing `## Unreleased` heading. Fixes to features that
