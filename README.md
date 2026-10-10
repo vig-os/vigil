@@ -76,6 +76,17 @@ built-in union driver to retain concurrent additions; review the merged result
 for ordering, duplicate entries and contradictory edits. Union merging joins
 text and does not validate the changelog's meaning or structure.
 
+Release sync uses `git merge-tree`, which honors union: a clean merge can still
+retain both a release's `TBD` heading and its dated heading. The
+`scripts/check_changelog.py` check rejects duplicate version headings (regardless
+of date), duplicate Unreleased headings, and identical bullet lines within a
+heading's section. It runs on every local commit and in `nix flake check` (and
+therefore CI). Resolve reported duplicates before accepting a release-sync PR;
+a conflict-free merge alone is insufficient. Run
+`python3 scripts/check_changelog.py` to check a resolution locally. The check
+ignores fenced examples and permits repeated bullet text in different sections;
+editorial review is still needed for contradictory entries with different text.
+
 GitHub's server-side **Update branch** does not honor this merge rule (see the
 [GitHub support discussion](https://github.com/orgs/community/discussions/9288)).
 Update locally with `git fetch origin` and `git rebase origin/dev`, review
