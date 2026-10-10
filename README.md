@@ -84,9 +84,10 @@ and sources. The CI extension and `.github/workflows/supply-chain.yml` run the
 full gate, including advisories and the OpenTelemetry compatibility rule.
 The consumer-owned workflow checks `dev` weekly (Monday 06:23 UTC) and supports
 manual dispatch. Failures remain visible as red Actions runs; maintainers should
-subscribe to workflow failure notifications. GitHub enables scheduled workflows
-only when the workflow exists on the default branch, so automatic runs begin
-when this file reaches `main` ([GitHub scheduling rules](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)); a dispatch also always checks `dev`.
+subscribe to workflow failure notifications. Neither scheduled runs nor manual
+`workflow_dispatch` runs work until this workflow file reaches the default branch,
+`main`, in the 1.0 release ([GitHub trigger requirements](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)).
+PR CI is the supply-chain gate until then. Once enabled, both triggers check `dev`.
 
 The gate explicitly fetches RustSec and registry data, then checks with
 `--disable-fetch`. The wrapper enforces a seven-day limit on the actual DB HEAD

@@ -101,7 +101,8 @@ def main():
     if conflicts:
         for name, versions in sorted(conflicts.items()):
             print(
-                f"error: duplicate OpenTelemetry compatibility lines: {name}: {versions}"
+                f"error: duplicate OpenTelemetry compatibility lines: {name}: {versions}",
+                flush=True,
             )
     # Fetch once, inspect actual content freshness, and prevent a second fetch
     # from changing the database between the freshness and policy checks.
