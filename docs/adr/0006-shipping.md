@@ -2,8 +2,8 @@
 
 - **Status:** Proposed
 - **Date:** 2026-10-11
-- **Supersedes:** [ADR-0001](0001-on-disk-format.md) decision 9 ("shipping stays outside the crate… no network exporter"). **Extends** ADR-0001 decision 5 and amends its versioning stance with a promised time-first JSON key order (decision 3 below).
-- **Issues:** [#39](https://github.com/vig-os/vigil/issues/39) (this decision); implemented by [#60](https://github.com/vig-os/vigil/issues/60) (reference shipper config and conformance), [#7](https://github.com/vig-os/vigil/issues/7) and [#8](https://github.com/vig-os/vigil/issues/8) (key order), [#41](https://github.com/vig-os/vigil/issues/41) (`push`); fleet rollout [#15](https://github.com/vig-os/vigil/issues/15)
+- **Supersedes:** [ADR-0001](0001-on-disk-format.md) decision 9 ("shipping stays outside the crate… no network exporter") **for the optional `push` feature only**; the default build keeps decision 9 unchanged. **Extends** ADR-0001 decision 5 and amends its versioning stance with a promised time-first JSON key order (decision 3 below).
+- **Issues:** [#39](https://github.com/vig-os/vigil/issues/39) (this decision); implemented by [#60](https://github.com/vig-os/vigil/issues/60) (reference shipper config and conformance), [#7](https://github.com/vig-os/vigil/issues/7) and [#8](https://github.com/vig-os/vigil/issues/8) (key order), [#64](https://github.com/vig-os/vigil/issues/64) (feature-independent writer), [#41](https://github.com/vig-os/vigil/issues/41) (`push`), [#65](https://github.com/vig-os/vigil/issues/65) (authenticated push transport, after 1.0); fleet rollout [#15](https://github.com/vig-os/vigil/issues/15)
 
 ## Context
 
@@ -32,6 +32,26 @@ Each run wrote 150 numbered records in three phases: 50 before the Collector sta
 - **F2:** `start_at: end` skips both what existed before the first start and what was written while the Collector was down.
 - **F4:** a record still unread when its file is rotated out of the pattern is lost.
 - **`include_file_name`:** by default (`true`) the receiver adds `log.file.name` to every log record's attributes and to every metric's `metadata`. Its value changes on every rotation (`metrics.jsonl`, then `metrics-20261011T….jsonl`). With `include_file_name: false` neither appears (F3 with the option set: same 150/0/0, no extra keys).
+
+### Probe S: the shipper when the backend is down, restarts and crashes
+
+The architect's review of this ADR found that Probe F's config loses data when the backend is unavailable; reproduced and extended here. A second Collector (`otlp` receiver → `file` exporter) stood in for the backend; the shipper read vigil's files and sent with `otlp_http`. "Disk queue" means `sending_queue: { storage: file_storage/vigil }`, sharing the receiver's storage extension.
+
+| Case | Shipper exporter | Scenario | Delivered | Lost | Duplicates |
+|---|---|---|---|---|---|
+| S1 | defaults (memory queue, 5 min retry cap) | 20 records; backend down 8 s; SIGTERM shipper ("Exporting failed. Dropping data."); backend up; restart | 0/20 | **20** | 0 |
+| S2 | disk queue, `max_elapsed_time: 0` | same | 20/20 | 0 | 0 |
+| S3 | disk queue, `max_elapsed_time: 0` | same, but SIGKILL instead of SIGTERM | 20/20 | 0 | 0 |
+| S4 | disk queue (and, once, memory queue), `block_on_overflow` off | 3000 records at ~1/ms, rotating every ~670; SIGKILL after 1.5 s; restart while writing continues; 3 runs | 2644, 2832, 2828 | **356, 168, 172** | 2, 10, 0 |
+| S5 | disk queue, `max_elapsed_time: 0`, `block_on_overflow: true` | as S4, 3 runs | 3000/3000 each | 0 | 0 |
+| S6 | as S5 but `max_elapsed_time: 5s` (stand-in for the 5 min default) | backend down 8 s, no restart | 8/20 | **12** | 0 |
+| S7 | as S5 | as S6 | 20/20 | 0 | 0 |
+| S8 | as S5, and S4's settings | 3000 records with rotation, **no** kill or restart, 4 variants | 3000/3000 each | 0 | 0 |
+
+- **S1:** the receiver commits its offsets once a line is handed to the pipeline, and the default sending queue lives in memory, so whatever was queued or retrying at shutdown is gone. S2/S3 fix this with a disk queue and unbounded retry.
+- **S4:** after a restart the receiver reads its backlog faster than the exporter sends; the full queue rejects data ("sending queue is full", `rejected_items`), the receiver does not retry rejected data, and its offsets move on. `block_on_overflow: true` turns that into backpressure (S5).
+- **S6:** the retry cap drops data on a long outage even while the shipper keeps running. In one run with a 5 s cap followed by a restart, the dropped batches were delivered after all (with 1 duplicate); this is not relied on.
+- **Duplicates:** a SIGKILL between handing a line to the queue and saving the read offset, or between a successful send and removing the queue item, re-sends a few records (S4: 2 and 10 of 3000). S3/S5 happened to show none. The Collector has no setting that closes this window.
 
 ### Probe K: fingerprints and JSON key order
 
@@ -112,31 +132,34 @@ vigil writes `<signal>.jsonl` exactly as ADR-0001/0002 say, whatever is enabled.
 
 A host uses one path, never both: both would deliver every record twice. Push is switched on in code (decision 6), so the operator's switch on a file-shipper host is `VIGIL_PUSH=off`. The file is the durable copy: catching up after an outage is the file shipper's job; push is a live, best-effort feed.
 
-**Exactly once ends at the backend's acceptance window.** The file shipper re-sends records that are hours or days old after an outage, and backends refuse records that are too old:
+**Delivery guarantees end at the backend's acceptance window.** The file shipper re-sends records that are hours or days old after an outage, and backends refuse records that are too old:
 - **Loki** (3.7.8 defaults: `reject_old_samples: true`, `reject_old_samples_max_age: 1w`). Loki also accepts out-of-order entries per stream only within `max_chunk_age / 2` (1h by default) of that stream's newest entry. A catch-up that reads old segments while the live file is also being read, or that merges processes into one stream (the label config below drops `service.instance.id` from the labels), can therefore get old entries refused even inside the week;
 - **Prometheus**: samples older than the TSDB head are out of order unless `out_of_order_time_window` is set (default 0). The pre-mortem saw out-of-order rejections from Prometheus 3.15.
 
 So within ADR-0002's 90-day retention, a catch-up longer than those windows needs backend configuration, or the old records stay only in the files. This is documented with the reference config (#60). It was not probed here beyond reading Loki's defaults.
 
-### 2. The reference file shipper: Collector-contrib `otlpjsonfile`, configured for exactly once
+### 2. The reference file shipper: Collector-contrib `otlpjsonfile`, configured to lose and duplicate nothing on clean restarts
 
 The reference config (shipped and tested in [#60](https://github.com/vig-os/vigil/issues/60)) is this, and each setting is load-bearing:
 
 ```yaml
 extensions:
   file_storage/vigil:
-    directory: ${env:VIGIL_SHIPPER_STATE}   # persistent; holds the read offsets
+    directory: ${env:VIGIL_SHIPPER_STATE}   # persistent; holds read offsets and the sending queues
     create_directory: true
 receivers:
   otlpjsonfile/logs:                        # likewise /metrics and /traces
-    include: ["${env:VIGIL_STATE_ROOT}/*/logs.jsonl", "${env:VIGIL_STATE_ROOT}/*/logs-*.jsonl"]   # e.g. ~/.local/state; set explicitly, never empty
+    include:                                # one pair per vigil service; VIGIL_STATE_ROOT e.g. ~/.local/state, never empty
+      - ${env:VIGIL_STATE_ROOT}/flock/logs.jsonl
+      - ${env:VIGIL_STATE_ROOT}/flock/logs-*.jsonl
     start_at: beginning
     include_file_name: false
     storage: file_storage/vigil
 exporters:
-  otlp_http/loki:       { endpoint: http://loki.example:3100/otlp }            # → /otlp/v1/logs
-  otlp_http/prometheus: { endpoint: http://prometheus.example:9090/api/v1/otlp } # → /api/v1/otlp/v1/metrics
-  otlp_http/traces:     { endpoint: http://tempo.example:4318 }                # → /v1/traces
+  otlp_http/loki:                           # likewise /prometheus and /traces
+    endpoint: http://loki.example:3100/otlp # → /otlp/v1/logs; Prometheus: …:9090/api/v1/otlp; traces: …:4318
+    sending_queue: { enabled: true, storage: file_storage/vigil, block_on_overflow: true }
+    retry_on_failure: { enabled: true, max_elapsed_time: 0 }
 service:
   extensions: [file_storage/vigil]
   pipelines:
@@ -145,18 +168,30 @@ service:
     traces:  { receivers: [otlpjsonfile/traces],  exporters: [otlp_http/traces] }
 ```
 
-The full form passes `otelcol-contrib validate` (0.151.0). The rules:
+The full form (three receivers, three exporters, three pipelines) passes `otelcol-contrib validate` (0.151.0). The rules:
 
-- **`storage` is required.** Without it a restart re-sends everything (F1: 100 duplicates). With it: exactly once across restarts and across rotations while the Collector is down (F3, F5).
+- **The receiver's `storage` is required.** Without it a restart re-sends everything (F1: 100 duplicates). With it, restarts and rotations while the Collector is down lose and duplicate nothing (F3, F5).
+- **Each exporter needs a disk `sending_queue` with `block_on_overflow: true` and `max_elapsed_time: 0`.** The memory queue loses everything queued or retrying at shutdown (S1: 20/20 lost). Without `block_on_overflow` a backlog overflows the queue and is rejected for good (S4: up to 356/3000 lost). Any finite retry cap drops data during an outage longer than it (S6: 12/20 lost with 5 s; the default is 5 min). With all three: S2, S3, S5, S7 lost and duplicated nothing. While the backend stays down, the queue fills, the receiver stops reading, and the backlog waits in vigil's own files, bounded only by retention.
 - **`start_at: beginning`.** With `end`, records written before the first start or during downtime are lost (F2: 100/150).
-- **`include` matches the live file and its segments.** `<signal>.jsonl` and `<signal>-*.jsonl`, the names ADR-0002 decision 5 fixes. Matching only the live file loses whatever was unread when it rotated (F4: 82/150).
+- **`include` lists each vigil service's live file and its segments.** `<service>/<signal>.jsonl` and `<service>/<signal>-*.jsonl`, the names ADR-0002 decision 5 fixes. Matching only the live file loses whatever was unread when it rotated (F4: 82/150). Services are listed by name rather than with `*/`, because `$XDG_STATE_HOME/*/logs.jsonl` also matches files other programs write, and the receiver would ingest or reject them. Adding a service is a config change, made by whatever deploys the services (g-fleet for the fleet, #15).
 - **`include_file_name: false`.** Otherwise every record carries a `log.file.name` that changes on rotation (F3 vs default). Only the shipper's own diagnostics need it.
 - **No `batch` processor below contrib 0.162.0.** The receiver's metrics and traces paths race with mutating consumers ([contrib#50314](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/50314)). vigil already batches, and the receiver forwards one line at a time.
 - **Defaults that must not be lowered:** `fingerprint_size` (1000; decision 3 guarantees uniqueness within it) and `max_log_size` (1 MiB; ADR-0001 decision 10 keeps lines below it).
 - **Never `delete_after_read`.** It would delete the live file while writers still append to it.
 - **The receiver's name.** It follows the flake's Collector pin: `otlpjsonfile` up to 0.153, `otlp_json_file` from 0.154 (the old name stays as a deprecated alias). #60 switches the config and the conformance test in the PR that moves the pin past 0.154.
 - **Permissions.** Files are `0600` in a `0700` directory (ADR-0002 decision 10), so the shipper runs **as the writing user** (for example a `systemd --user` unit) or as root. vigil does not loosen its permissions for a shipper.
-- **Retention outlives shipping lag.** A segment pruned (default 90 days, ADR-0002 decision 2) before the shipper reads it is lost. With this config, the remaining loss modes are this, losing the shipper's `file_storage` directory (everything is re-read: duplicates), and files written before decision 3 that start with identical bytes.
+- **Retention outlives shipping lag.** A segment pruned (default 90 days, ADR-0002 decision 2) before the shipper reads it is lost.
+- **Remaining loss and duplicate modes with this config,** each with its mitigation (#60 tests the ones marked ✓):
+
+| Mode | Effect | Mitigation |
+|---|---|---|
+| Backend down longer than retention | loss | Alert on shipper backlog. Retention (90 days by default) is the buffer. |
+| Backend rejects old or out-of-order records (decision 1) | loss, logged by the shipper as a permanent error | Backend acceptance windows. |
+| SIGKILL, crash or power loss between enqueue and offset save, or between send and queue removal | a few duplicates (S4: up to 10/3000) ✓ | Stop with SIGTERM (systemd's default). Backends that drop exact duplicates absorb them; not probed. |
+| `file_storage` directory lost or not persistent | full re-read: duplicates of everything retained; queued items lost but re-read | Put it on persistent storage owned by the shipper's user. |
+| Files that start with identical bytes (before decision 3 / #64 land) | silent loss (Probe K) ✓ | Decisions 3 and #64. |
+| Push and the file shipper both active | everything twice | Decision 1, `VIGIL_PUSH=off`. |
+| A hand-written config that drops a rule above | loss or duplicates (F1, F2, F4, S1, S4, S6) ✓ | Use the reference config. |
 - **Loki labels.** Deployments with many short-lived processes stop `service.instance.id` from becoming a Loki index label as follows; the default list's `k8s.*` and `cloud.*` entries can be added back as needed, and everything not listed becomes structured metadata (Probe L):
 
 ```yaml
@@ -185,18 +220,19 @@ Extends ADR-0001 decision 5, implemented for logs and metrics in [#7](https://gi
 
 - **What this guarantees:** every line has a per-line value (a timestamp, or for spans a span id that is exported exactly once) within its first 128 bytes. So the first lines of any two files of one signal, across all the directories a shipper's glob matches, differ within the receiver's default 1000-byte fingerprint (Probe K: byte 97 instead of 1092; 150/150 instead of 3/150).
 - **Within ADR-0001's promises:** JSON readers ignore key order, which the Collector's file and HTTP receivers confirm (Probe K). ADR-0001 said field order is deterministic within a version and not promised across versions; this decision amends that stance (the amendment is marked in ADR-0001) so the time-first keys are promised, because a shipper's correctness depends on them. The order of the remaining keys stays unpromised.
-- **The test** ([#60](https://github.com/vig-os/vigil/issues/60)): segments whose first records have a 700-byte metric description and a 2 KiB log body must first differ within 1000 bytes.
+- **The order must not depend on the consumer's build.** Today's writer gets its order from `serde_json`'s maps (`src/logs.rs:182` goes through `to_value`). Those maps are sorted by default but insertion-ordered when *any* crate in the consumer's graph enables `serde_json/preserve_order`, because Cargo unifies features (review probe, [#64](https://github.com/vig-os/vigil/issues/64)). So decision 3 requires a writer whose output order is fixed by vigil's code: an explicit ordered representation or a serializer with a fixed field order, never `serde_json::Map`'s default. #64 builds that writer; #7 and #8 apply the table above on top of it.
+- **The test** ([#60](https://github.com/vig-os/vigil/issues/60)): segments whose first records have a 700-byte metric description and a 2 KiB log body must first differ within 1000 bytes. It runs **with `serde_json/preserve_order` enabled** (as #64's determinism tests do), so feature unification cannot hide a regression.
 
 ### 4. The `push` feature: a tee of the same lines to a loopback OTLP/HTTP agent
 
 ADR-0004 decision 7 names the feature `push` and makes it off by default. This decision supersedes ADR-0001 decision 9 for that feature only: **without `push`, vigil contains no network code** (unchanged).
 
 - **Encoding and transport.** Each line that goes to a file, already bounded by ADR-0001 decision 10 and ordered by decision 3, is also POSTed **byte-for-byte** as an OTLP/HTTP request body with `Content-Type: application/json`. Logs go to `<endpoint>/v1/logs`, metrics to `/v1/metrics`, traces to `/v1/traces`; per-signal endpoints are used as given ([OTLP/HTTP](https://opentelemetry.io/docs/specs/otlp/#otlphttp)). A `LogsData`/`MetricsData`/`TracesData` line is exactly an `Export*ServiceRequest` body. So the pushed payload is the file payload; there is no second encoder, and file and push cannot diverge (Probe P: Collector and Alloy, equal by meaning). No compression on loopback.
-- **Client.** `ureq` 3 with `default-features = false`, as `dep:ureq` behind `push`: +6 crates, no async runtime, no TLS (Probe D). One `vigil-push` thread per `Guard` drains a queue shared by all signals, reusing one keep-alive connection. vigil configures the agent explicitly:
+- **Client.** `ureq` 3 with `default-features = false`, as `dep:ureq` behind `push`: +6 crates, no async runtime, no TLS (Probe D). One `vigil-push` thread per pipeline (one pipeline per process, ADR-0004 decision 2) drains a queue shared by all signals, reusing one keep-alive connection. vigil configures the agent explicitly:
   - no proxy (overriding `ureq`'s environment default);
   - `max_redirects = 0`, so an agent cannot redirect vigil off the host;
   - a global per-request timeout.
-- **Tee order.** The exporter writes the line to the file first, then enqueues it without blocking (Probe P: worst append plus enqueue 6 ms against a down or hung agent). The line is enqueued even if the file write failed: it may then be the only copy. It still counts in `ShutdownError::lost_records` (ADR-0004 decision 3), because the durable copy is missing.
+- **Tee order.** The exporter writes the line to the file first, then enqueues it without blocking (Probe P: worst append plus enqueue 6 ms against a down or hung agent). The line is enqueued even if the file write failed: it may then be the only copy. It still counts as lost in `FlushError::lost(Signal::…)` (ADR-0004 decision 3, in the signal's own unit), because the durable copy is missing.
 - **Backpressure.** The queue is bounded in bytes (`Push::queue_bytes`, default 16 MiB, enough for 16 maximum-size lines). When full, the **oldest** queued line is dropped (the line the worker is currently sending or retrying is not in the queue and is not evicted; it keeps its own 60 s limit): the newest data matters most to a live feed, a newer cumulative point supersedes an older one, and the file keeps everything.
 - **Retry,** per the OTLP/HTTP spec:
   - Connection errors, timeouts, and HTTP 429/502/503/504 are retried with exponential backoff (500 ms initial, ×2, 30 s cap, full jitter), honouring `Retry-After` up to the cap.
@@ -205,7 +241,7 @@ ADR-0004 decision 7 names the feature `push` and makes it off by default. This d
   - A 200 with `partialSuccess` counts the rejected items as not delivered.
 - **When the agent is down,** the head line retries, the queue fills, the oldest lines drop, and the application is not slowed (Probe P). When the agent returns, delivery resumes with whatever is queued. Nothing is replayed from the files.
 - **Shutdown.** `Guard::shutdown`/`shutdown_with_timeout` first flushes the SDK into the files. Then the push worker gets the rest of the same budget, and every request's timeout is capped by what remains of it. At the deadline the remaining queue is dropped. `Drop` behaves the same with the default 5 s budget. If the SDK flush uses the whole budget (ADR-0003's meter shutdown can), push gets none, and the final export (for metrics, the last cumulative point) reaches only the file. Probe P: 18.9 s for a 2 s budget without the cap, 2.02 s with it.
-- **Reporting.** Undelivered pushes are **not** lost records (the files have them), so they are not in `lost_records`. vigil reports them on stderr through the runtime-loss rate limiter (ADR-0001 decision 10), once more at shutdown with the count, the endpoint and the state directory, and once per process for each distinct non-retryable status. Header values are never printed.
+- **Reporting.** Undelivered pushes are **not** lost data (the files have them), so they are not counted in `FlushError::lost`. vigil reports them on stderr through the runtime-loss rate limiter (ADR-0001 decision 10), once more at shutdown with the count, the endpoint and the state directory, and once per process for each distinct non-retryable status. Header values are never printed.
 - **Storage fallback.** If storage fell back to stderr (`Guard::dir()` is `None`), push still runs, and the stderr warning says it is then the only copy.
 
 ### 5. Security: loopback, plain HTTP, optional headers
@@ -214,6 +250,11 @@ ADR-0004 decision 7 names the feature `push` and makes it off by default. This d
 - **Remote shipping and TLS are the agent's job.** Alloy and the Collector both have TLS and auth to Loki and Prometheus.
 - **Headers** (`Push::header`, `VIGIL_PUSH_HEADERS`) carry a token for an agent that wants one. `Debug` for `Push` redacts their values.
 - **On a multi-user host** any local user can reach a loopback listener. Whether the agent accepts unauthenticated pushes is the agent's configuration; the headers let it require a token.
+- **Known 1.0 limit: the peer is not authenticated.** Plain HTTP to a loopback port proves nothing about who listens there. While the agent is not running, any local user can bind `127.0.0.1:4318` (ports from 1024 up need no privilege) and receive every pushed line and every header, including an `authorization` token. That sidesteps the `0600`/`0700` permissions that protect the files (ADR-0002 decision 10). Mitigations for 1.0, all documented in `push`'s rustdoc and the README (#41):
+  - On hosts where other users must not read the telemetry, use the file shipper, not `push`.
+  - Run the agent on a privileged loopback port (below 1024): on Linux with the default `net.ipv4.ip_unprivileged_port_start = 1024`, an unprivileged user cannot take it over. It is no mitigation on macOS, which lets unprivileged processes bind low ports.
+  - Treat a push header token as disclosed to local users: scope it to the local agent, never a backend credential.
+- **Fix after 1.0: [#65](https://github.com/vig-os/vigil/issues/65).** It covers a Unix-socket transport whose filesystem permissions and peer credentials authenticate the agent, or TLS to a pinned certificate. Headers are then sent only over a verified transport. It is additive, a minor.
 
 ### 6. Public surface and configuration
 
@@ -243,13 +284,13 @@ let guard = vigil::Config::new("flock")
 ## Consequences
 
 - **Two supported paths, one format.**
-  - **Hosts with the Collector** get exactly-once shipping from the files, up to the backend's acceptance window (decision 1), with a documented, tested config.
+  - **Hosts with the Collector** get shipping from the files with no loss and no duplicates across backend outages and clean restarts. A crash can re-send a few records, and old records are subject to the backend's acceptance window (decision 1). with a documented, tested config.
   - **Hosts with Alloy** (the fleet) use `push` until Alloy can read OTLP files; push is live but loses data while the agent is down, and the files keep it.
   - The fleet rollout (#15) chooses per host and may land after 1.0.
-- **A shipper bug now costs data silently.** F2/F4 and Probe K lost records with no error anywhere; #60's conformance test is what keeps the reference config honest. Hand-written configs that drop a rule above will lose or duplicate data, so the README states the rules, not just the YAML.
-- **Key order is a contract.** Decision 3 binds the serializer: changing which keys come first is a format change under ADR-0001's versioning stance. Implementing it needs ordered maps or a custom writer in place of `serde_json`'s sorted maps. That is a cost in #7, paid once for all signals.
-- **The `push` feature costs** 6 crates and one thread per `Guard`, and only in builds that enable it. The default build stays network-free. Moving to a `ureq` 4 later is internal (no `ureq` type is public), so it is a vigil minor.
-- **What push cannot do:** reach a remote collector, use TLS, or backfill. Adding TLS later is additive: a new feature (for example `push-tls`, pulling `rustls`; +12 crates in Probe D) and a builder method, through a new ADR, so a vigil minor.
+- **A shipper bug now costs data silently.** F2/F4 and Probe K lost records with no error anywhere, and S1/S4/S6 lost them with only shipper log lines; #60's conformance test is what keeps the reference config honest. Hand-written configs that drop a rule above will lose or duplicate data, so the README states the rules, not just the YAML.
+- **Key order is a contract.** Decision 3 binds the serializer: changing which keys come first is a format change under ADR-0001's versioning stance. Implementing it needs a writer whose order vigil's code fixes, independent of `serde_json` features (#64), with the table applied in #7 and #8, paid once for all signals.
+- **The `push` feature costs** 6 crates and one thread per process, and only in builds that enable it. The default build stays network-free. Moving to a `ureq` 4 later is internal (no `ureq` type is public), so it is a vigil minor.
+- **What push cannot do:** reach a remote collector, authenticate its peer, use TLS, or backfill. The peer limit (decision 5) is a documented 1.0 limit. The fix ([#65](https://github.com/vig-os/vigil/issues/65): a Unix socket, or a `push-tls` feature pulling `rustls`, +12 crates in Probe D) is additive, through a new ADR, so a vigil minor.
 - **Upstream (owner's decision, nothing filed).** Two realistic options, both "report first":
   - **(a)** Comment on [grafana/alloy#6752](https://github.com/grafana/alloy/issues/6752) with this use case and Probe K/F evidence, asking for `otelcol.connector.otlpjson`. Alloy already has `filelog` and `storage.file`, and the probe shows that pipeline works.
   - **(b)** Open a feature request for `otelcol.receiver.otlpjsonfile` per Alloy's inclusion criteria; likely a community component at best, given alpha stability and a codeowner search.
@@ -268,9 +309,11 @@ let guard = vigil::Config::new("flock")
 - **A hand-written HTTP/1.1 client on `std::net`.** Zero crates, but chunked responses, keep-alive and `Retry-After` parsing become vigil's code to get right. Rejected.
 - **Protobuf bodies** (`application/x-protobuf`, via `prost`). Smaller on the wire, but a second serialization path; loopback makes size irrelevant, and JSON is proven on both receivers (Probe P). Rejected.
 - **Drop-newest when the queue is full.** Keeps the start of an outage window, which the files already hold, and loses the live tail. Rejected for drop-oldest.
-- **TLS and remote endpoints in 1.0.** The owner's target is a local agent (one per host, ADR-029). TLS adds `rustls` and `ring` (+12 crates), trust-root policy (bundled or platform roots for private CAs) and certificate configuration surface, all of which the agent already has. Rejected for 1.0; additive later (Consequences).
-- **Unix domain sockets to the agent.** Not probed here, `ureq` has no built-in UDS transport, and the OTLP/HTTP default every agent ships with is TCP on port 4318. Rejected; a later ADR can add it if an agent needs it.
+- **TLS and remote endpoints in 1.0.** The owner's target is a local agent (one per host, ADR-029). TLS adds `rustls` and `ring` (+12 crates), trust-root policy (bundled or platform roots for private CAs) and certificate configuration surface, all of which the agent already has. Deferred to [#65](https://github.com/vig-os/vigil/issues/65); additive later (Consequences).
+- **Unix domain sockets to the agent in 1.0.** They would authenticate the peer (decision 5's limit), but `ureq` has no built-in UDS transport and agent support was not probed. Deferred to [#65](https://github.com/vig-os/vigil/issues/65), not rejected.
 - **A bigger `fingerprint_size` in the shipper config instead of decision 3.** The fingerprint is read from the head of every matched file on every poll, so making it cover a whole first line (up to 1 MiB) multiplies I/O across 90 days of segments. It also leaves every other `fileconsumer`-based shipper (Alloy's `filelog`, Fluent Bit) exposed. Fixing the cause in the writer is cheaper and covers them all.
+- **A `*/` glob over the state root, filtered by a marker file vigil writes into each state directory.** The receiver cannot filter by a sibling file, so this would need a new vigil file format and still a per-host shipper step. Listing services is what deployments already know. Rejected.
+- **The Collector's defaults for the exporter queue and retry.** They lose data (S1, S4, S6). Rejected for decision 2's settings.
 - **`delete_after_read` or shipper-side truncation.** Deletes or truncates files that writers append to under ADR-0002's lock protocol. Rejected.
 - **Push enabled by environment alone.** An endpoint variable set for some other program would silently turn on network traffic in every vigil binary on the host. Rejected; push is opted into in code, and the environment only tunes or disables it.
 - **Reading the standard `OTEL_EXPORTER_OTLP_*` variables.** They are often set host-wide or per session for other programs, including to remote collectors. Under decision 5 a remote value would disable vigil's push, and a loopback value meant for a different program would quietly redirect it. They also carry per-signal endpoints that vigil does not need. Rejected for `VIGIL_PUSH_*`, which only vigil reads.
@@ -278,7 +321,7 @@ let guard = vigil::Config::new("flock")
 
 ## References
 
-- [vig-os/vigil#39](https://github.com/vig-os/vigil/issues/39), [#60](https://github.com/vig-os/vigil/issues/60), [#41](https://github.com/vig-os/vigil/issues/41), [#15](https://github.com/vig-os/vigil/issues/15), [#7](https://github.com/vig-os/vigil/issues/7), [#8](https://github.com/vig-os/vigil/issues/8)
+- [vig-os/vigil#39](https://github.com/vig-os/vigil/issues/39), [#60](https://github.com/vig-os/vigil/issues/60), [#41](https://github.com/vig-os/vigil/issues/41), [#64](https://github.com/vig-os/vigil/issues/64), [#65](https://github.com/vig-os/vigil/issues/65), [#15](https://github.com/vig-os/vigil/issues/15), [#7](https://github.com/vig-os/vigil/issues/7), [#8](https://github.com/vig-os/vigil/issues/8)
 - [ADR-0001](0001-on-disk-format.md) (format; decisions 5, 6, 8, 9, 10), [ADR-0002](0002-rotation-and-retention.md) (segment names, permissions, retention), ADR-0003 ([#38](https://github.com/vig-os/vigil/issues/38): `service.instance.id`, exporter seam), ADR-0004 ([#37](https://github.com/vig-os/vigil/issues/37): stable surface, errors, feature table)
 - [OTLP/HTTP](https://opentelemetry.io/docs/specs/otlp/#otlphttp) (paths, JSON encoding, retryable statuses, `Retry-After`, partial success); [OTLP exporter configuration](https://opentelemetry.io/docs/specs/otel/protocol/exporter/) (environment variables)
 - Collector-contrib: [`otlpjsonfilereceiver`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/otlpjsonfilereceiver) (alpha), [`otlpjsonconnector`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/connector/otlpjsonconnector) (alpha), [#50314](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/50314) (count-after-consume race, fixed v0.162.0), [#45339](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/45339) (rename to `otlp_json_file`, v0.154.0)
