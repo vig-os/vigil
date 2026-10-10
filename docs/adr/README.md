@@ -1,13 +1,14 @@
 # Architecture decision records
 
-Decisions that shape vigil's on-disk contract and its concurrency behaviour. Each ADR records what was decided, the evidence behind it, and what was rejected, so a reviewer can challenge it before code depends on it.
+Decisions that shape vigil's on-disk contract, its concurrency behaviour and its public API. Each ADR records what was decided, the evidence behind it, and what was rejected, so a reviewer can challenge it before code depends on it.
 
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-on-disk-format.md) | On-disk format: OTLP/JSON Lines | Accepted |
 | [0002](0002-rotation-and-retention.md) | Multi-process rotation and retention | Accepted |
+| [0004](0004-public-api-and-stability.md) | Public API, stability, composition and feature flags | Accepted |
 
-ADR-0003 (the audit trail) is owned by [#10](https://github.com/vig-os/vigil/issues/10) and lands with the 0.3.0 design.
+Numbers reserved for decisions in progress: ADR-0003 metrics and traces ([#38](https://github.com/vig-os/vigil/issues/38)), ADR-0005 audit trail ([#10](https://github.com/vig-os/vigil/issues/10)), ADR-0006 shipping ([#39](https://github.com/vig-os/vigil/issues/39)).
 
 ## Template
 
