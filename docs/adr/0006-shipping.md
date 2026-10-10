@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-10-11
-- **Supersedes:** [ADR-0001](0001-on-disk-format.md) decision 9 ("shipping stays outside the crate… no network exporter"). **Extends** ADR-0001 decision 5 with a JSON key order (decision 3 below).
+- **Supersedes:** [ADR-0001](0001-on-disk-format.md) decision 9 ("shipping stays outside the crate… no network exporter"). **Extends** ADR-0001 decision 5 and amends its versioning stance with a promised time-first JSON key order (decision 3 below).
 - **Issues:** [#39](https://github.com/vig-os/vigil/issues/39) (this decision); implemented by [#60](https://github.com/vig-os/vigil/issues/60) (reference shipper config and conformance), [#7](https://github.com/vig-os/vigil/issues/7) and [#8](https://github.com/vig-os/vigil/issues/8) (key order), [#41](https://github.com/vig-os/vigil/issues/41) (`push`); fleet rollout [#15](https://github.com/vig-os/vigil/issues/15)
 
 ## Context
@@ -106,11 +106,17 @@ ADR-0003 adds a per-process `service.instance.id` to every signal and leaves Lok
 
 ### 1. Files are always written; shipping reads them or tees them
 
-vigil writes `<signal>.jsonl` exactly as ADR-0001/0002 say, whatever is enabled. A deployment ships each signal by **one** of two paths:
+vigil writes `<signal>.jsonl` exactly as ADR-0001/0002 say, whatever is enabled. A host ships by **one** of two paths:
 - **(a) a file shipper** that reads the files (the reference is the Collector-contrib `otlpjsonfile` receiver, decision 2);
 - **(b) the `push` feature** (decision 4), which sends the same lines to a local agent while they are written.
 
-A host uses one path per signal, never both: both would deliver every record twice. The file is the durable copy: completeness (backfill after an outage, replay) is the file shipper's job; push is a live, best-effort feed.
+A host uses one path, never both: both would deliver every record twice. Push is switched on in code (decision 6), so the operator's switch on a file-shipper host is `VIGIL_PUSH=off`. The file is the durable copy: catching up after an outage is the file shipper's job; push is a live, best-effort feed.
+
+**Exactly once ends at the backend's acceptance window.** The file shipper re-sends records that are hours or days old after an outage, and backends refuse records that are too old:
+- **Loki** (3.7.8 defaults: `reject_old_samples: true`, `reject_old_samples_max_age: 1w`);
+- **Prometheus**: samples older than the TSDB head are out of order unless `out_of_order_time_window` is set (default 0). The pre-mortem saw out-of-order rejections from Prometheus 3.15.
+
+So within ADR-0002's 90-day retention, a catch-up longer than those windows needs backend configuration, or the old records stay only in the files. This is documented with the reference config (#60). It was not probed here beyond reading Loki's defaults.
 
 ### 2. The reference file shipper: Collector-contrib `otlpjsonfile`, configured for exactly once
 
@@ -123,7 +129,7 @@ extensions:
     create_directory: true
 receivers:
   otlpjsonfile/logs:                        # likewise /metrics and /traces
-    include: ["${env:XDG_STATE_HOME}/*/logs.jsonl", "${env:XDG_STATE_HOME}/*/logs-*.jsonl"]
+    include: ["${env:VIGIL_STATE_ROOT}/*/logs.jsonl", "${env:VIGIL_STATE_ROOT}/*/logs-*.jsonl"]   # e.g. ~/.local/state; set explicitly, never empty
     start_at: beginning
     include_file_name: false
     storage: file_storage/vigil
@@ -150,7 +156,7 @@ The full form passes `otelcol-contrib validate` (0.151.0). The rules:
 - **Never `delete_after_read`.** It would delete the live file while writers still append to it.
 - **The receiver's name.** It follows the flake's Collector pin: `otlpjsonfile` up to 0.153, `otlp_json_file` from 0.154 (the old name stays as a deprecated alias). #60 switches the config and the conformance test in the PR that moves the pin past 0.154.
 - **Permissions.** Files are `0600` in a `0700` directory (ADR-0002 decision 10), so the shipper runs **as the writing user** (for example a `systemd --user` unit) or as root. vigil does not loosen its permissions for a shipper.
-- **Retention outlives shipping lag.** A segment pruned (default 90 days, ADR-0002 decision 2) before the shipper reads it is lost. That is the only loss mode left with this config.
+- **Retention outlives shipping lag.** A segment pruned (default 90 days, ADR-0002 decision 2) before the shipper reads it is lost. With this config, the remaining loss modes are this, losing the shipper's `file_storage` directory (everything is re-read: duplicates), and files written before decision 3 that start with identical bytes.
 - **Loki labels.** Deployments with many short-lived processes stop `service.instance.id` from becoming a Loki index label as follows; the default list's `k8s.*` and `cloud.*` entries can be added back as needed, and everything not listed becomes structured metadata (Probe L):
 
 ```yaml
@@ -178,7 +184,7 @@ Extends ADR-0001 decision 5, implemented for logs and metrics in [#7](https://gi
 | `Span` | `spanId`, `endTimeUnixNano` |
 
 - **What this guarantees:** every line has a per-line value (a timestamp, or for spans a span id that is exported exactly once) within its first 128 bytes. So the first lines of two files of one signal in one directory differ within the receiver's default 1000-byte fingerprint (Probe K: byte 97 instead of 1092; 150/150 instead of 3/150).
-- **Within ADR-0001's promises:** JSON readers ignore key order, which the Collector's file and HTTP receivers confirm (Probe K). ADR-0001 already says field order is deterministic within a version and not promised across versions; this decision makes it part of the contract, because a shipper's correctness now depends on it.
+- **Within ADR-0001's promises:** JSON readers ignore key order, which the Collector's file and HTTP receivers confirm (Probe K). ADR-0001 said field order is deterministic within a version and not promised across versions; this decision amends that stance (the amendment is marked in ADR-0001) so the time-first keys are promised, because a shipper's correctness depends on them. The order of the remaining keys stays unpromised.
 - **The test** ([#60](https://github.com/vig-os/vigil/issues/60)): segments whose first records have a 700-byte metric description and a 2 KiB log body must first differ within 1000 bytes.
 
 ### 4. The `push` feature: a tee of the same lines to a loopback OTLP/HTTP agent
@@ -191,22 +197,22 @@ ADR-0004 decision 7 names the feature `push` and makes it off by default. This d
   - `max_redirects = 0`, so an agent cannot redirect vigil off the host;
   - a global per-request timeout.
 - **Tee order.** The exporter writes the line to the file first, then enqueues it without blocking (Probe P: worst append plus enqueue 6 ms against a down or hung agent). The line is enqueued even if the file write failed: it may then be the only copy. It still counts in `ShutdownError::lost_records` (ADR-0004 decision 3), because the durable copy is missing.
-- **Backpressure.** The queue is bounded in bytes (`Push::queue_bytes`, default 16 MiB, enough for 16 maximum-size lines). When full, the **oldest** queued line is dropped: the newest data matters most to a live feed, a newer cumulative point supersedes an older one, and the file keeps everything.
+- **Backpressure.** The queue is bounded in bytes (`Push::queue_bytes`, default 16 MiB, enough for 16 maximum-size lines). When full, the **oldest** queued line is dropped (the line the worker is currently sending or retrying is not in the queue and is not evicted; it keeps its own 60 s limit): the newest data matters most to a live feed, a newer cumulative point supersedes an older one, and the file keeps everything.
 - **Retry,** per the OTLP/HTTP spec:
   - Connection errors, timeouts, and HTTP 429/502/503/504 are retried with exponential backoff (500 ms initial, ×2, 30 s cap, full jitter), honouring `Retry-After` up to the cap.
   - A line still undelivered 60 s after its first attempt is dropped.
   - Any other status is dropped at once (Probe P: 404, no retry).
   - A 200 with `partialSuccess` counts the rejected items as not delivered.
 - **When the agent is down,** the head line retries, the queue fills, the oldest lines drop, and the application is not slowed (Probe P). When the agent returns, delivery resumes with whatever is queued. Nothing is replayed from the files.
-- **Shutdown.** `Guard::shutdown`/`shutdown_with_timeout` first flushes the SDK into the files. Then the push worker gets the rest of the same budget, and every request's timeout is capped by what remains of it. At the deadline the remaining queue is dropped. `Drop` behaves the same with the default 5 s budget. Probe P: 18.9 s for a 2 s budget without the cap, 2.02 s with it.
+- **Shutdown.** `Guard::shutdown`/`shutdown_with_timeout` first flushes the SDK into the files. Then the push worker gets the rest of the same budget, and every request's timeout is capped by what remains of it. At the deadline the remaining queue is dropped. `Drop` behaves the same with the default 5 s budget. If the SDK flush uses the whole budget (ADR-0003's meter shutdown can), push gets none, and the final export (for metrics, the last cumulative point) reaches only the file. Probe P: 18.9 s for a 2 s budget without the cap, 2.02 s with it.
 - **Reporting.** Undelivered pushes are **not** lost records (the files have them), so they are not in `lost_records`. vigil reports them on stderr through the runtime-loss rate limiter (ADR-0001 decision 10), once more at shutdown with the count, the endpoint and the state directory, and once per process for each distinct non-retryable status. Header values are never printed.
 - **Storage fallback.** If storage fell back to stderr (`Guard::dir()` is `None`), push still runs, and the stderr warning says it is then the only copy.
 
 ### 5. Security: loopback, plain HTTP, optional headers
 
-- **Endpoints must be loopback:** `http://` with a host that is a loopback IP literal (`127.0.0.0/8`, `::1`) or `localhost` resolving only to loopback addresses at init. `https://` and any other host are refused. The default is `http://127.0.0.1:4318`, the OTLP/HTTP default port, an IP literal so no resolver is involved.
+- **Endpoints must be loopback IP literals:** `http://` with a host in `127.0.0.0/8` or `[::1]`. Host names (including `localhost`) are refused, because the client would resolve them again on every connection and a resolver change could send data off the host. IPv4-mapped forms (`[::ffff:127.0.0.1]`) are refused too. This makes the check purely syntactic, so a bad endpoint in code is always a caller mistake. `https://` is refused. The default is `http://127.0.0.1:4318`, the OTLP/HTTP default port, an IP literal so no resolver is involved.
 - **Remote shipping and TLS are the agent's job.** Alloy and the Collector both have TLS and auth to Loki and Prometheus.
-- **Headers** (`Push::header`, `OTEL_EXPORTER_OTLP_HEADERS`) carry a token for an agent that wants one. `Debug` for `Push` redacts their values.
+- **Headers** (`Push::header`, `VIGIL_PUSH_HEADERS`) carry a token for an agent that wants one. `Debug` for `Push` redacts their values.
 - **On a multi-user host** any local user can reach a loopback listener. Whether the agent accepts unauthenticated pushes is the agent's configuration; the headers let it require a token.
 
 ### 6. Public surface and configuration
@@ -215,7 +221,7 @@ All items are behind `#[cfg(feature = "push")]` and name only vigil and std type
 
 ```rust
 let guard = vigil::Config::new("flock")
-    .push(vigil::Push::local())                            // http://127.0.0.1:4318
+    .push(vigil::Push::local())                            // VIGIL_PUSH_ENDPOINT, else http://127.0.0.1:4318
     // or vigil::Push::endpoint("http://127.0.0.1:4318")
     //        .header("authorization", "Bearer …")
     //        .timeout(Duration::from_secs(10))            // per request, default 10 s
@@ -225,11 +231,12 @@ let guard = vigil::Config::new("flock")
 
 - **`Push`** is a struct with private fields, built with methods (ADR-0004 decision 5), and is `Debug + Clone + Send + Sync`. **`Config::push(Push)`** turns push on; nothing else does.
 - **`InitErrorKind::InvalidPushEndpoint`** (new variant; the enum is `#[non_exhaustive]`) covers an endpoint given in code that is not a loopback `http://` URL or does not parse. It is a caller mistake (ADR-0004 decision 3).
-- **Environment variables,** read only when push is configured, as defaults that builder values beat:
-  - `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_{LOGS,METRICS,TRACES}_ENDPOINT`;
-  - `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TIMEOUT`;
-  - `VIGIL_PUSH=off`, which disables push without a rebuild.
-  - An empty value counts as unset. An invalid or non-loopback value from the environment warns once on stderr and disables push for that signal; the environment degrades, it does not fail `init` (ADR-0004 decision 3).
+- **Environment variables.** They use vigil's own `VIGIL_*` names (ADR-0004), not the `OTEL_EXPORTER_OTLP_*` ones, which a host may set for other programs (see Alternatives). They are read only when push is configured in code. An empty value counts as unset.
+  - `VIGIL_PUSH_ENDPOINT`: the base URL. It is used only with `Push::local()`, which sets no endpoint of its own; an endpoint given with `Push::endpoint(..)` beats it, like every builder value. The signal paths are appended; there are no per-signal endpoints, because one local agent takes all signals.
+  - `VIGIL_PUSH_HEADERS`: `key=value` pairs separated by commas, values percent-decoded (the OTLP exporter format). Added to builder headers; a builder header with the same name wins.
+  - `VIGIL_PUSH_TIMEOUT_MS`: the per-request timeout in milliseconds. A builder `timeout` beats it.
+  - `VIGIL_PUSH=off` disables push. It is the **one deliberate exception** to builder-beats-environment: an operator's kill switch only ever removes network traffic, and it is the documented way to keep push off on a file-shipper host (decision 1). Any other value is ignored with a warning.
+  - An invalid environment value (an endpoint that is not a loopback IP literal, a bad header or a bad number) warns once on stderr and disables push. The environment degrades; it does not fail `init` (ADR-0004 decision 3).
 - **The dependency test** (#41) stays offline. `tests/deps.rs` keeps its forbidden list, which `push` must not touch either (Probe D: it doesn't). It adds a check, from `Cargo.toml`, that `ureq` is `optional`, enabled only by `push`, and that `default` does not contain `push`, because `Cargo.lock` lists optional dependencies too.
 - **Conformance** (#41): a CI leg runs the Collector's `otlp` receiver with a `file` exporter, pushes from `vigil::init`, and compares the pushed records with the files by meaning.
 
@@ -265,7 +272,9 @@ let guard = vigil::Config::new("flock")
 - **Unix domain sockets to the agent.** Not probed here, `ureq` has no built-in UDS transport, and the OTLP/HTTP default every agent ships with is TCP on port 4318. Rejected; a later ADR can add it if an agent needs it.
 - **A bigger `fingerprint_size` in the shipper config instead of decision 3.** The fingerprint is read from the head of every matched file on every poll, so making it cover a whole first line (up to 1 MiB) multiplies I/O across 90 days of segments. It also leaves every other `fileconsumer`-based shipper (Alloy's `filelog`, Fluent Bit) exposed. Fixing the cause in the writer is cheaper and covers them all.
 - **`delete_after_read` or shipper-side truncation.** Deletes or truncates files that writers append to under ADR-0002's lock protocol. Rejected.
-- **Push enabled by environment alone.** `OTEL_EXPORTER_OTLP_ENDPOINT` set for some other program would silently turn on network traffic in every vigil binary on the host. Rejected; push is opted into in code, and the environment only tunes or disables it.
+- **Push enabled by environment alone.** An endpoint variable set for some other program would silently turn on network traffic in every vigil binary on the host. Rejected; push is opted into in code, and the environment only tunes or disables it.
+- **Reading the standard `OTEL_EXPORTER_OTLP_*` variables.** They are often set host-wide or per session for other programs, including to remote collectors. Under decision 5 a remote value would disable vigil's push, and a loopback value meant for a different program would quietly redirect it. Their semantics also differ from vigil's (per-signal endpoints, a timeout in milliseconds). Rejected for `VIGIL_PUSH_*`, which only vigil reads.
+- **Allowing `localhost` and resolving it once at init.** That needs a pinned resolver in the HTTP client and turns a configuration value into an environment check. An IP literal says the same thing without either. Rejected.
 
 ## References
 
