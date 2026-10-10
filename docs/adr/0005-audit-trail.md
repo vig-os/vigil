@@ -1,0 +1,445 @@
+# ADR-0005: Audit trail
+
+- **Status:** Proposed
+- **Date:** 2026-10-11
+- **Issues:** [#10](https://github.com/vig-os/vigil/issues/10) (this decision); implemented by [#11](https://github.com/vig-os/vigil/issues/11) (sink and record API), [#12](https://github.com/vig-os/vigil/issues/12) (chain, MMR, checkpoints), [#13](https://github.com/vig-os/vigil/issues/13) (verify API and CLI, tamper tests); deferred work in [#56](https://github.com/vig-os/vigil/issues/56), [#57](https://github.com/vig-os/vigil/issues/57), [#58](https://github.com/vig-os/vigil/issues/58), [#59](https://github.com/vig-os/vigil/issues/59)
+
+## Context
+
+### What the requirement is
+
+21 CFR Part 11 §11.10(e) asks for "secure, computer-generated, time-stamped audit trails to independently record the date and time of operator entries and actions that create, modify, or delete electronic records. Record changes shall not obscure previously recorded information." The trail must be kept as long as the records it covers and be available for review and copying. EU GMP Annex 11 §9 adds the reason for a change. Read together, they ask for **attribution, tamper-evidence and retention**, not for a particular data structure. Operational telemetry (vigil's logs, metrics and traces) is out of scope: it may sample, batch and drop, which an audit trail must never do. Medical-device use places this module under IEC 62304, so it must stay small, closed and heavily tested.
+
+### The owner's question: does tessera benefit vigil's audit trail?
+
+The plan in #10 and #12 built the chain and checkpoints "on tessera-core". The owner asked whether that coupling is real or came from misreading the discussion, since tessera is the data-product crate and not telemetry. This section answers with evidence from vig-os/tessera at `f08255d` (`dev`, 2026-10-05): `docs/CONSUMING.md`, ADRs 0028, 0036, 0037, 0052 and 0058, and `tessera-core`'s `hash.rs`, `signing.rs` and `manifest.rs`.
+
+**What tessera is.** A FAIR data-product format. A product (`.tsra`) is built, then **sealed once**: `manifest_hash` is blake3 over the RFC 8785 (JCS) canonical manifest, which commits to `content_hash`, the MMR root over the ordered block digests. A sealed product is immutable; a new version is a new product (ADR-0022/0036). Tessera's own "audit" is the version history of datasets: ADR-0036's `log/<lineage>.jsonl` is "a pure rebuildable cache, *not* canonical", and the RFC's "History — append-only manifest/hash chain" means chains of product versions. Nothing in tessera records operator actions.
+
+**What vigil's audit trail is.** A live, append-only event log with many writer processes. Every record must be durable before the action it records is allowed to proceed. The log is never finished, so it cannot be sealed once.
+
+**Concept-by-concept comparison:**
+
+| tessera concept (where) | vigil audit need | Fit |
+|---|---|---|
+| blake3, digests spelled `"blake3:<hex>"` (`hash.rs` `digest`) | record hashes | **Fits.** vigil spells its record hashes the same way (decision 4). |
+| MMR: leaf `blake3(0x00 ‖ digest string)`, node `blake3(0x01 ‖ l ‖ r)`, peaks bagged right to left, empty root `blake3("")` (`hash.rs`, ADR-0028/0049) | an append-only commitment with cheap proofs | **Fits exactly.** vigil adopts the construction bit for bit (decision 7). Probe: identical roots for every size 1..=2048 and for the empty trail. |
+| inclusion and consistency proofs (`inclusion_proof`, `ConsistencyProof { old_peaks, appended }`) | proving one record to an auditor; proving that a later checkpoint extends an anchored one | **Fits.** Probe: tessera-core verifies proofs against vigil roots, including a consistency proof built from a vigil checkpoint's stored peaks. |
+| `MerkleAccumulator` (streaming push, `root()`) | resuming the MMR from a checkpoint after a restart or in another process | **Gap.** Its peaks are private; it cannot be resumed from stored peaks. |
+| sealing: `manifest_hash` over the JCS manifest, once | per-record integrity in a log that never ends | **Does not fit.** There is no hash-chain primitive and no checkpoint type; a product is sealed once and is immutable afterwards. |
+| `ed25519-env-v1`: Ed25519 over the JCS `{alg, key_id, manifest_hash, signer, signed_at, key_format}` (`signing.rs`, ADR-0037) | signing checkpoints | **Partly fits.** Same curve, same raw 32-byte keys and hex key files (`tessera keygen` files are usable by vigil, decision 9). The envelope is bound to the meaning "manifest hash" and needs `serde_jcs`. Reusing it would make a vigil checkpoint signature a valid tessera product signature over the same string (a cross-protocol confusion), so vigil signs its own domain-separated message. |
+| product schemas, embedded JSON Schema (`schema.rs`) | the audit record schema | **Does not fit.** They describe data products; an audit record is an OTLP log record (ADR-0001). |
+| `Producer` `{tool, version, git_commit, git_repo, dirty}` (ADR-0058) | who wrote the trail | **Maps 1:1** to the resource vigil already writes (`service.name`, `service.version`, `vcs.ref.head.revision`), for the export in #59. |
+| "non-deterministic bytes ride outside the seal; identity-bearing bytes are sealed" (ADR-0058) | what the record hash covers | **Same rule.** vigil hashes every field that carries meaning and leaves only correlation and transport fields outside (decision 4). |
+| archival trust principle: verification depends only on bits in the product plus bits the verifier already holds (ADR-0037 §1) | verifying a trail in year 10, offline | **Adopted** (decision 11). |
+| distribution: git-only, `0.1.0-alpha.1` unreleased, format `v0` "deliberately unfrozen", edition 2021, toolchain `stable` with no MSRV (ADR-0052, `CONSUMING.md`, `Cargo.toml`) | a crates.io release whose format is frozen at 1.0 | **Blocks a dependency.** A crate with a git dependency cannot be published (pre-mortem R3: `cargo package` exits 101), and an unfrozen format under the trail cannot carry decision 12's promise. |
+
+**Answer.** The coupling came from shared vocabulary and shared primitives, not from a shared problem. Tessera seals finished artefacts, while vigil's audit trail is a live log. What tessera-core would contribute (blake3, an MMR, Ed25519) comes straight from `blake3` and `ed25519-dalek` plus an MMR whose push and root take under 50 lines (probe). Taking it as a dependency would add 41 crates (scratch crate on tessera-core: 41 normal dependencies, against 23 for `blake3` plus `ed25519-dalek`), and the two parts that do not fit (sealing and the envelope) would have to be worked around. Tessera does benefit vigil in two concrete ways, and this ADR takes both:
+
+1. **A proven MMR construction, adopted bit for bit.** tessera-core can check vigil's roots and proofs today without either crate depending on the other (decision 7, probe below).
+2. **An archival home.** A sealed audit segment can become a tessera product, for long-term FAIR archiving next to the data it audits. That export and an optional swap to tessera-core's MMR code are the adoption path (decision 15, [#59](https://github.com/vig-os/vigil/issues/59)). The owner is happy to adopt the core once it is published and frozen.
+
+### Probes (2026-10-11, Rust 1.95.0 from the dev shell, scratch crates outside the repository)
+
+- **MMR equivalence.** A scratch crate implements the MMR of decision 7 over 32-byte record hashes, with tessera-core (path dependency on the `f08255d` clone) as a dev-dependency.
+  - Roots are equal to `MerkleAccumulator::root()` for every size 1..=2048, to `merkle_root` at sizes 1..=70 and every 97th size, and the empty root is equal too.
+  - `verify_inclusion` accepts vigil-root proofs at indices 0, 1, 99, 100, 511, 512 and 776 of 777, and rejects a swapped leaf.
+  - `verify_consistency` accepts a `ConsistencyProof` built from each stored checkpoint's peaks (every 100 records), and the proof equals tessera's own `consistency_proof`.
+  - Resuming from stored peaks reproduces the final root.
+  - `cargo test --release`: 2 passed. Mutation: bagging left to right instead fails both tests (`n=3`).
+- **Cost per record** (release, thin LTO, vm-dev, 200 000 records of about 1.4 KB, each with reason, before and after):
+  - canonical encoding, blake3, chain link and the OTLP/JSON line: **1.26 µs per record** (SIMD blake3), 2.67 µs with blake3's `pure` feature;
+  - MMR push: 0.34 µs (0.45 µs pure);
+  - Ed25519 sign: 11.1 µs; `verify_strict`: 24.1 µs.
+- **fsync policy** (one process appending about 1.4 KB lines):
+
+  | Policy | ext4 on virtio (`/home`) | tmpfs |
+  |---|---|---|
+  | no fsync | 0.77–1.6 M records/s | 2.1 M records/s |
+  | `sync_data` each record | p50 23–34 ms, p99 57–84 ms, **30–37 records/s** | 1.8 M records/s (a no-op) |
+  | `sync_all` each record | p50 28–35 ms, 30–34 records/s | 1.7 M records/s |
+  | `sync_data` every 64 records | 1 961–1 982 records/s | — |
+
+  Three runs on ext4. The host is shared, so these are orders of magnitude, not budgets ([#49](https://github.com/vig-os/vigil/issues/49) sets budgets).
+- **Platform fsync.** In Rust 1.95.0 std (`library/std/src/sys/fs/unix.rs:1381-1430`), `File::sync_data` is `fdatasync` on Linux and `fcntl(F_FULLFSYNC)` on Apple targets, as is `sync_all`. Plain `fsync` on macOS does not flush the drive cache (`fsync(2)` on macOS); std already does the right thing.
+- **Nix and crane build.** A scratch clone of vigil (`fc7d8d5`) adds `blake3 = { version = "1", default-features = false, features = ["std"] }` and `ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize", "fast"] }`, plus a known-answer test (BLAKE3 of the empty input; RFC 8032 §7.1 TEST 1 signature with `verify_strict`).
+  - `nix build .#checks.x86_64-linux.clippy .#checks.x86_64-linux.nextest`: exit 0, 127 tests passed, including the known-answer test, which crane runs in release mode.
+  - The same build with blake3's `pure` feature (the configuration decision 14 chooses): exit 0, 127 passed. `pure` adds no crate (81 either way).
+  - `#![forbid(unsafe_code)]` stays in vigil.
+  - The normal dependency tree grows from 64 to 81 crates (arrayvec, blake3, block-buffer, constant_time_eq, cpufeatures, crypto-common, curve25519-dalek(-derive), digest, ed25519, ed25519-dalek, generic-array, sha2, signature, subtle, typenum, zeroize).
+  - Licenses: MIT/Apache-2.0, `CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception` (blake3) and BSD-3-Clause (curve25519-dalek, ed25519-dalek, subtle). Declared MSRVs are at most 1.85.
+  - `getrandom` 0.3.4 is already in the tree (through `opentelemetry_sdk` → `rand`), so using it adds no crate.
+
+### Constraints from earlier decisions
+
+- **ADR-0001:** one complete OTLP/JSON `LogsData` per line; the Collector `otlpjsonfile` receiver is the conformance oracle; it drops lines over 1 MiB, and it drops zero and empty fields on a round trip.
+- **ADR-0002:** the directory lock, inode recheck, segment names, no-replace rotation and partial-write repair are proven under multi-process load. Retention deletes old segments, which an audit trail must never do.
+- **ADR-0004** (Proposed, [PR #54](https://github.com/vig-os/vigil/pull/54)):
+  - feature `audit`, off by default, adding blake3, ed25519-dalek and vigil's own MMR;
+  - the stable surface may name only vigil's own types, std and the `tracing` family;
+  - errors have a `kind()` with a `#[non_exhaustive]` kind enum;
+  - every public enum is `#[non_exhaustive]` and no public struct has public fields;
+  - `init` degrades instead of failing when the environment is at fault.
+
+## Decision
+
+### 1. Scope: a separate, synchronous, fail-closed API behind feature `audit`
+
+- The feature **`audit`** (off by default, ADR-0004 decision 7) adds the module `vigil::audit` and the binary `vigil-audit`.
+- Audit records are **not** `tracing` events. A filter, a sampler or a full batch queue can drop a `tracing` event, and an audit record must never be dropped. The application calls `AuditTrail::record` directly and gets a `Result`.
+- The trail is opened on its own (`AuditConfig::open`), independent of `vigil::init`. An application can audit even when its telemetry has degraded to stderr.
+- **Exception to ADR-0004 decision 3:** opening a trail and writing to it **fail closed**. An environment fault (unwritable directory, failed fsync, unusable key) is an `Err`, never a degradation. The caller must not complete the audited action without an `Ok`.
+- **Out of scope:** electronic signatures (§11.50, §11.70, §11.100–300), identity management and authentication (the application passes an authenticated actor), access control beyond file modes (§11.10(d)), and making personal data erasable inside the trail (put a digest in the trail instead, decision 3).
+
+### 2. Files: ADR-0002's machinery in a directory of its own
+
+- The trail lives in **`<state dir>/audit/`**: `audit.jsonl` (live) and `audit-<stamp>[_NNNNNN].jsonl` (sealed segments, ADR-0002 decision 5 names). The state directory is the one `init` resolves (`$XDG_STATE_HOME/<service>/`); `AuditConfig::dir` overrides the audit directory itself.
+- **Its own directory, so its own lock.** All signals in one directory share one lock (ADR-0002 decision 3). An audit fsync of tens of milliseconds (probe) must not hold up log appends, and audit files must never sit in a directory that retention prunes.
+- **Reused from ADR-0002**, through a crate-internal locked-section API in `src/rotate.rs` (as implemented in #11):
+  - the directory `flock` with device and inode recheck;
+  - the live-file inode recheck before every write;
+  - collision-free segment names;
+  - atomic no-replace rotation;
+  - rollback of partial writes and repair of unterminated tails;
+  - modes `0600` and `0700`;
+  - local filesystems only;
+  - lock-free readers that retry.
+- **Different from ADR-0002:**
+  - Retention is always off: vigil never deletes or rewrites an audit file.
+  - Rotation (at `max_bytes`, default 50 MiB) is preceded by a sealing checkpoint (decision 8).
+  - Each write is followed by an fsync (decision 6).
+  - Lines are never truncated (decision 6).
+- **Archiving** (moving sealed segments to WORM or off-host storage) is an operator action outside vigil. Any sealed segment may be moved: the live file always starts with a checkpoint that carries the state the writer needs (decision 8). The live file and the trail marker (decision 8, "Creating a trail") must stay.
+
+### 3. Record schema: OTLP log records with `audit.*` attributes
+
+Each line is one `LogsData` with one `ResourceLogs`, one `ScopeLogs` and one `LogRecord`, written by vigil's OTLP/JSON encoder (ADR-0001). A reader may also meet lines that contain several records, for example after a Collector round trip, and must accept them.
+
+| OTLP field | Content | Hashed |
+|---|---|---|
+| resource `service.name` | the service the trail belongs to | yes (tag `0x05`) |
+| resource `host.name` | the host, when vigil's resource has it | yes (`0x06`) |
+| other resource attributes (`service.version`, `process.pid`, `vcs.ref.head.revision`, and whatever ADR-0003 adds) | context | no |
+| scope | `name` `vigil.audit`, `version` = vigil's version | no |
+| `timeUnixNano` (= `observedTimeUnixNano`) | taken from the system clock by vigil inside the locked section; the API takes no timestamp | yes (`0x03`) |
+| `eventName` | `audit.record` or `audit.checkpoint` | yes, as the kind (`0x04`) |
+| `severityNumber` / `severityText` | `9` / `INFO`, fixed | no |
+| `traceId` / `spanId` | the current span, if any; correlation only | no |
+| `body` | absent; a v1 reader rejects a record that has one (`InvalidField`), so no unhashed text can sit next to hashed fields | — |
+
+Attributes. Integers are OTLP `intValue`, `audit.mmr_peaks` is an `arrayValue` of `stringValue`s, and everything else is a `stringValue`. Strings are UTF-8, must not be empty, and must not contain a NUL.
+
+| Attribute | Kinds | Content | Tag |
+|---|---|---|---|
+| `audit.v` | both | format version, `1` | — (fixed by the domain string) |
+| `audit.trail` | both | 32 lowercase hex characters (16 random bytes from `getrandom`), chosen when the trail is created (decision 8) | `0x01` |
+| `audit.seq` | both | 0-based, contiguous across segments; the authoritative order | `0x02` |
+| `audit.actor` | record, required | the authenticated identity the application supplies (Part 11 "operator") | `0x10` |
+| `audit.action` | record, required | what was done, convention `<domain>.<verb>` with verbs such as `create`, `modify`, `delete` (Part 11 "create, modify, or delete") | `0x11` |
+| `audit.object` | record, required | the identifier of the regulated record acted on | `0x12` |
+| `audit.reason` | record, optional | why (Annex 11 §9) | `0x13` |
+| `audit.before` / `audit.before_digest` | record, optional, at most one of the pair | the prior value as text, or `blake3:<hex>` of it | `0x14` / `0x15` |
+| `audit.after` / `audit.after_digest` | record, optional, at most one of the pair | the new value, same rule | `0x16` / `0x17` |
+| `audit.details` | record, optional | free text (for example JSON) | `0x18` |
+| `audit.mmr_size`, `audit.mmr_root`, `audit.key_id`, `audit.sig` | checkpoint, required | decision 8 | `0x20`, `0x21`, `0x23`, `0x24` |
+| `audit.mmr_peaks` | checkpoint, present exactly when `audit.mmr_size` > 0, with exactly popcount(`mmr_size`) entries | decision 8; absent at size 0 because the Collector drops empty arrays | `0x22` |
+| `audit.prev_hash` | both | the previous record's `audit.hash` | `0x7f` |
+| `audit.hash` | both | this record's hash (decision 4) | — (it is the output) |
+
+- **Empty strings are rejected, not dropped.** The Collector drops empty values (ADR-0001 decision 8), and an absent field and an empty one would then hash differently after a round trip.
+- **A v1 reader rejects every log-record attribute outside the v1 set** (`UnknownField`), and any attribute key that appears twice in one record (`InvalidField`). Otherwise an unhashed attribute such as `audit.note` or `approved_by` could be added to a signed record and look authoritative, or two values for one key could make vigil hash one while another OTLP tool shows the other. vigil writes no other attributes.
+- **Resource and scope attributes other than `service.name` and `host.name` are not authenticated.** They are context for shipping and debugging; `vigil-audit verify` never presents them as part of the record.
+- **The before and after values** are what makes a change "not obscure previously recorded information". Where a value is large or personal, the application passes `Value::Digest`, keeping the trail small and free of the data itself. The application's own store must then keep the value the digest refers to.
+
+### 4. Canonical encoding and record hash (frozen in v1)
+
+The hash covers **values, not JSON bytes**. A verifier parses the OTLP/JSON line, extracts the fields and re-encodes them. So the hash survives anything that preserves attribute values: re-serialisation by a newer `opentelemetry-proto`, attribute reordering, or the Collector's `intValue` spelling.
+
+```text
+F(tag, v)    = tag (1 byte) ‖ len(v) (u32, big-endian) ‖ v
+fields       = F(0x01, trail[16]) ‖ F(0x02, seq u64 BE) ‖ F(0x03, time u64 BE) ‖ F(0x04, kind: 0x01 record | 0x02 checkpoint)
+               ‖ F(0x05, service.name) ‖ [F(0x06, host.name)]
+               ‖ kind fields in ascending tag order, absent optional fields omitted
+               ‖ F(0x7f, prev_hash[32])
+hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
+```
+
+- Strings are their UTF-8 bytes as written, with no normalisation.
+- Integers (`0x02`, `0x03`, `0x20`) are u64 big-endian, 8 bytes.
+- Digests (`0x15`, `0x17`, `0x21`), keys (`0x23`) and hashes are raw bytes: 32 each, signatures 64 bytes. `0x22` is the concatenated 32-byte peaks, left to right, and is omitted when `mmr_size` is 0.
+- `audit.hash` and every digest attribute are spelled `blake3:<64 lowercase hex>`, tessera's spelling.
+- A record hash is plain blake3 over bytes that begin with the domain string, so it really is "blake3 of something". tessera-core can therefore use it directly as an MMR leaf digest.
+
+### 5. Hash chain
+
+- `prev_hash` of `seq 0` is `blake3("vigil.audit.v1.genesis\0" ‖ trail)`. `prev_hash` of `seq n` is the `hash` of `seq n−1`. No separate genesis record exists.
+- **The chain has no key.** Against accidental damage (bit rot, a bad copy, a buggy tool), the chain alone detects editing any hashed field, deleting, inserting or reordering records (a `seq` gap, a duplicate or a broken link), splicing from another trail (`trail` mismatch) and losing the head (`seq 0` must link to the genesis value).
+- **Against an attacker who can write the files but cannot use a trusted key**, only signed checkpoints protect, and only what they cover:
+  - every record at or before the last checkpoint signed by a trusted key cannot be edited, removed, inserted or reordered without a finding;
+  - the records after it can be rewritten freely, because the attacker can recompute every hash;
+  - the attacker can also **roll the trail back** to any earlier checkpoint, deleting the later checkpoints, segments and live file. What remains is a valid trail that ends at that checkpoint and has no uncovered tail, so the loss is not bounded by the checkpoint cadence.
+- **What detects a rollback or a rewritten tail:**
+  - anchors (decision 10): a missing anchored checkpoint is `AnchorMismatch`;
+  - the `Receipt`s the application stores with its own records (decision 13): a receipt whose `seq` is past the trail's end, or whose hash differs, proves loss;
+  - `--max-age` (decision 11): a trail whose newest trusted checkpoint is older than the given age is reported as `StaleHead`. Since an active trail checkpoints at least every `checkpoint_interval`, an old head means records are missing or the writer has stopped.
+- **Against an attacker who holds a trusted key,** only anchors and receipts help (decision 9).
+- **A torn write is not tampering.** A killed writer can leave an unterminated fragment (ADR-0002 decision 6); its `record` call never returned `Ok`. A fragment is a line that does not parse and is followed by either the end of the file or a newline that the next writer added (ADR-0002 repair). It is **TornWrite** (a warning) when the next complete record links to the last complete one before it, or when it is the file's last line. Any other unparsable line is an error. The writer applies exactly this rule when it rebuilds its state (decision 8), so a crash never makes the writer refuse a trail the verifier accepts.
+
+### 6. The lossless sink: fsync per record, fail-closed, no queue
+
+`AuditTrail::record(&self, &Entry) -> Result<Receipt, AuditError>` does the following, all under the audit directory's lock:
+
+1. Brings its cached chain state up to date (decision 8, "Writer state").
+2. Checks that the entry is valid and that the encoded line is at most 1 000 000 bytes, the bound of ADR-0001 decision 10. An oversized entry is `AuditErrorKind::TooLarge`. Audit lines are **never truncated**, because truncation would change hashed content; use digests for large values.
+3. Rotates if the line does not fit (decision 8).
+4. Writes the record line, followed by a checkpoint line when one is due, with **one `write(2)`**.
+5. Calls **`File::sync_data`**: `fdatasync` on Linux, `F_FULLFSYNC` on macOS (probe).
+6. Returns `Ok(Receipt)` only after the fsync has returned.
+
+- **Directory fsync.** When the live file is created (first write or rotation), the directory descriptor is fsynced before any record in that file is acknowledged, so the file name is durable as well. #11's tests on the macOS lane ([#46](https://github.com/vig-os/vigil/issues/46)) must show this works on APFS.
+- **A failed fsync poisons the handle.** After a failed fsync, Linux may have dropped the dirty pages and cleared the error ("fsyncgate", PostgreSQL 2018), so a retry could report success for data that is gone. vigil truncates back to the pre-write length (best effort) and returns `AuditErrorKind::Io`. Every later `record` on that handle fails with `AuditErrorKind::Poisoned`. Reopening rebuilds the state from what is actually on disk.
+  - **If the truncate also fails,** the unacknowledged record stays visible, and other processes would chain onto bytes the kernel may later drop. The writer then creates `audit.poison` in the directory (holding the error text, `0600`) before releasing the lock. Every writer checks for that file under the lock, and `open` and `record` fail with `AuditErrorKind::Poisoned` while it exists. An operator removes it after `vigil-audit verify` has passed. If even that file cannot be created, the filesystem is failing and the other writers' own fsyncs fail too.
+- **Backpressure, unlike telemetry.** Telemetry queues, batches and drops when full (ADR-0004 decision 3 counts the loss). Audit does none of that:
+  - no queue, no batching across calls, no sampling and no drop;
+  - no timeout: an expired timeout would not tell whether the record was written;
+  - `record` blocks on the lock and the fsync.
+- **Throughput.** The probe gives about 30 records/s per trail on vm-dev's ext4 and effectively unbounded throughput on tmpfs, which offers no durability. That fits operator actions at human rate, the purpose of this module. Bulk event streams belong in logs. Group commit and an atomic batch API keep `Ok`'s meaning and the format, and are deferred to [#56](https://github.com/vig-os/vigil/issues/56) as a post-1.0 minor.
+- **Signer failure does not fail the record.** If a checkpoint is due and the signer fails:
+  - the record is still written, chained and acknowledged;
+  - the checkpoint is retried on the next append;
+  - the failure is reported once on stderr, counted in `Receipt::unsigned_records()`, and returned as an error by an explicit `AuditTrail::checkpoint()`;
+  - rotation waits for a successful checkpoint, so a segment can grow past `max_bytes` while the signer is down.
+
+  A signer outage would otherwise stop every audited action.
+- **Mirror into logs** (optional, `AuditConfig::mirror_to_logs(true)`, off by default). After the durable write, vigil emits a `tracing` event (target `vigil::audit`, INFO) with action, object, seq and hash, but never before or after values. It is observability only: filters may drop it, and it is not part of the trail.
+
+### 7. One MMR over the whole trail, built the way tessera-core builds it
+
+- **Leaves.** Every record is a leaf, checkpoints included, in `seq` order. The leaf for `seq i` is `blake3(0x00 ‖ "blake3:<hex of hash_i>")`.
+- **Construction.** Interior nodes are `blake3(0x01 ‖ left ‖ right)`. Peaks are merged on the binary carry. The root bags the peaks right to left with the node hash; the empty root is `blake3("")`. This is tessera-core's construction (`hash.rs`, ADR-0028/0049, `f08255d`), and the probe shows they are equal.
+- **Peak heights are not stored.** They are the set bits of `mmr_size`, left to right.
+- **Why both a chain and an MMR.** The chain gives a sequential check and pinpoints the first broken link. The MMR gives an O(log n) inclusion proof for one record and a consistency proof between two checkpoints, without shipping the trail. An anchor holder that keeps only checkpoints needs exactly that.
+- **One MMR over the whole trail, not one per segment.** It costs the same, because checkpoints carry the peaks. It also gives consistency proofs across segment boundaries, and one root commits to the entire history.
+- **No write-path cost.** The MMR is advanced only when a checkpoint is built, from the leaves since the previous checkpoint. The probe puts a push at 0.34 µs.
+
+### 8. Signed checkpoints, cadence and segment sealing
+
+- **What a checkpoint is.** A record of kind `audit.checkpoint` at `seq k`. It commits to the chain head (`prev_hash` = hash of `seq k−1`) and to the MMR over leaves `0..k`: `audit.mmr_size` = `k`, `audit.mmr_root`, and `audit.mmr_peaks`, an array of `blake3:<hex>` strings that is absent when `k` is 0. It also carries `audit.key_id` (the 64-hex Ed25519 public key) and `audit.sig` (128 hex).
+- **What is signed.** `sig` is Ed25519 (RFC 8032, pure, not prehashed) over `"vigil.audit.v1.checkpoint\0" ‖ blake3(fields without 0x24)`. That is a fixed 58-byte message, convenient for devices that sign short messages. The checkpoint's own record hash covers `sig` as well, so the chain covers the signature. Verification uses ed25519-dalek's `verify_strict`, which rejects non-canonical and small-order encodings. That choice is part of v1.
+- **When one is written:**
+  - (a) after a record, when `checkpoint_every` records (default 1 000) have been written since the last checkpoint;
+  - (b) after a record, when `checkpoint_interval` (default 60 s) has passed since the last checkpoint;
+  - (c) at rotation;
+  - (d) on `AuditTrail::checkpoint()` and `close()`. `Drop` also tries, best effort.
+
+  (a) and (b) are evaluated at append time: no background thread. A due checkpoint is written in the same `write(2)` and fsync as the record, so it costs no extra fsync.
+- **What is never signed.** The records after the last checkpoint: at most `checkpoint_every`, or those since the interval elapsed, or more while a signer is down. They are chained but not signed, and the verifier reports them as `UncoveredTail` (decision 11).
+- **Segment sealing.** When a record would not fit, the writer:
+  1. writes a **closing checkpoint** as the last line of the old segment;
+  2. fsyncs;
+  3. renames the segment with no-replace semantics;
+  4. creates the new live file;
+  5. writes an **opening checkpoint** as its first line;
+  6. fsyncs the file and the directory;
+  7. writes the record.
+
+  Sealed segments may exceed `max_bytes` by the closing checkpoint, a few KB (its peaks list grows with the logarithm of the trail size). The closing checkpoint makes a sealed segment verifiable on its own, given the closing checkpoint of the segment before it. The opening checkpoint makes the live file self-sufficient for writers, so sealed segments can be archived away.
+- **Every segment starts with a checkpoint.** The first segment starts with the creation checkpoint at `seq 0`; every later one starts with an opening checkpoint. Only torn fragments may come before it. The verifier reports a segment that breaks this as `SegmentStructure`.
+- **Creating a trail is explicit.** `AuditConfig::create(signer)` (or `vigil-audit create --key <keyfile> --service <name> <dir>`) creates a new trail. It writes the marker file `audit.trail` (`0400`, holding the trail id), fsyncs it and the directory, and then writes the creation checkpoint at `seq 0` (`mmr_size` 0, `prev_hash` = the genesis value). It fails with `AuditErrorKind::TrailExists` if the marker or any audit file exists. `AuditConfig::open(signer)` never creates a trail: with no marker it fails with `AuditErrorKind::MissingTrail`. So a deleted or emptied directory stops the application (fail closed, decision 1) instead of starting a fresh, validly signed trail.
+- **Writer state across processes.** Each writer keeps the live file's descriptor open, as `RotatingFile` does, so its cached `(dev, ino)` cannot be confused with a reused inode. Under the lock, it compares that descriptor and its cached length with the live path:
+  - Same file and length: the cache is current.
+  - Same file, longer: it reads and checks the records appended since its cached offset.
+  - Same file, shorter: something truncated the trail, which is `AuditErrorKind::CorruptTrail`.
+  - Another file: it reads the live file, which starts with an opening checkpoint, so at most one segment is read.
+  - The live file is empty, or holds no complete checkpoint as its first record (a crash between steps 4 and 6 of sealing): it reads the newest sealed segment's closing checkpoint, then writes the missing opening checkpoint before the next record. A torn fragment stays in place and is skipped by the `TornWrite` rule.
+  - No live file and no sealed segment, but the marker exists: `AuditErrorKind::CorruptTrail`, because the head of the trail is gone.
+
+  While doing so it recomputes hashes and links and applies decision 5's `TornWrite` rule. Any other break is `AuditErrorKind::CorruptTrail`: the writer refuses to extend a trail it cannot vouch for, and `vigil-audit verify` shows where it broke. The writer does not check signatures; it may not hold the other writers' keys.
+
+### 9. Key custody and rotation
+
+- **A signer is required to create or open a trail.** There is no unsigned mode, so there is one state space to test.
+- **`Signer`** is a public, unsealed trait:
+
+  ```rust
+  pub trait Signer: Send + Sync + fmt::Debug {
+      fn public_key(&self) -> [u8; 32];
+      fn sign(&self, message: &[u8]) -> Result<[u8; 64], SignerError>;
+  }
+  ```
+
+  It returns pure Ed25519 signatures and uses only std types (ADR-0004 decision 1). An application can implement it over any device or remote signer. Because it is unsealed, a method added in 1.x must have a default implementation; a new required method is a major. The signer is called inside the locked section, so a slow signer slows down the writers of that trail. A checkpoint is due at most every `checkpoint_every` records.
+- **`KeyFileSigner`** is vigil's one implementation in 1.0. It loads a file holding the 32-byte seed as 64 hex characters, with surrounding whitespace allowed. That is the format `tessera keygen` writes (`signing_key_from_hex`), so one key file serves both tools.
+  - Like OpenSSH, it refuses a file with group or other permission bits, or one owned by another user.
+  - `vigil-audit keygen <file>` writes the seed (`0600`, never overwriting) and `<file>.pub` with the public key. The seed comes from `getrandom`.
+  - The seed is held in `ed25519_dalek::SigningKey`, which zeroizes it on drop.
+- **What a local key protects against, and what it does not.** It protects against accidental corruption and against tampering by anyone who cannot read the key. It does not protect against an attacker who can read the key and write the trail: they can rewrite everything and sign it again. Against that, use (1) a key the application process cannot read, through a `Signer` over an off-device or hardware signer (reference backends deferred to [#58](https://github.com/vig-os/vigil/issues/58)), or (2) anchors (decision 10). The rustdoc of `AuditTrail` and the README say this.
+- **Rotation.** Reopen the trail with a new signer. Checkpoints name their `key_id`, and the chain fixes the order of keys. The verifier's trust file lists every key valid for the trail.
+- **Revocation is a bound, not a deletion.** A trust entry may carry `through=<seq>`: the key is trusted for checkpoints at `seq` ≤ that bound, and a checkpoint it signs beyond the bound is `UntrustedKey` (an error). A later checkpoint by a trusted key covers the whole earlier history, because it commits to the chain head and the MMR root. So after a suspected compromise, the operator:
+  1. verifies the trail against the anchors and finds the last checkpoint known good;
+  2. sets `through=<that seq>` on the old key's entry;
+  3. reopens the trail with the new key, adds that key to the trust file, and writes `checkpoint()`.
+
+  The trail then verifies cleanly: the old key's checkpoints up to the bound are trusted, and everything after is covered by the new key. A key that was never trusted, or one removed from the file, makes its checkpoints `UntrustedKey`.
+- **Trust file format** (for `TrustedKeys::from_file` and `--trust`): UTF-8 lines of the form `ed25519 <64 hex> [through=<seq>] [comment]`; blank lines and lines starting with `#` are ignored. `TrustedKeys::new` takes `(public key, Option<u64> bound)` pairs.
+
+### 10. Anchoring (optional)
+
+- **What an anchor is.** A checkpoint line copied to a place the attacker cannot rewrite: another host, WORM storage, a ticket, a mail.
+- **vigil 1.0 provides:**
+  - `AuditTrail::checkpoint()`, which returns the `Checkpoint` just written, with its line;
+  - `vigil-audit checkpoints <dir>`, which prints the checkpoint lines;
+  - `vigil-audit verify --anchor <file>`, which requires every anchored checkpoint to be in the trail with the same `trail`, `seq` and `hash`. A missing or different checkpoint is `AnchorMismatch`.
+- **Push.** With `push` (ADR-0006, [#41](https://github.com/vig-os/vigil/issues/41)), audit lines can ship to a backend like any log, and that backend becomes an anchor.
+- **What anchoring adds.** A trail rewritten and re-signed with a stolen key no longer matches the anchors.
+- **Deferred to [#57](https://github.com/vig-os/vigil/issues/57):** RFC 3161 timestamp tokens, transparency-log submission, and a public consistency-proof API for anchor holders. They need ASN.1/DER and HTTP, and none of them changes the v1 encoding.
+
+### 11. Verify API and CLI contract (#13)
+
+- **Library:**
+  - `vigil::audit::verify(dir: &Path, trust: &TrustedKeys) -> io::Result<Report>`;
+  - `Verifier::new(trust)` with:
+    - `.anchor(Checkpoint)`;
+    - `.start_from(Checkpoint)`, for a trail whose older segments are archived: a trusted checkpoint supplies `seq`, `prev_hash` and peaks;
+    - `.max_age(Duration)`: report `StaleHead` (an error) when the newest trusted checkpoint is older than this, measured against the verifier's clock (decision 5);
+    - `.verify_dir(&Path)` and `.verify_files(impl IntoIterator<Item = PathBuf>)`, the latter for copies shipped through a Collector.
+- **Errors versus findings.** `io::Error` is only for not being able to read. Tampering is never an `Err`: it is a `Finding` in the `Report`.
+- **Report.** `Report` exposes:
+  - `trail()`, `records()`, `last_seq()`;
+  - `covered_through()`: the highest `seq` covered by a checkpoint signed with a trusted key;
+  - `findings()`;
+  - `is_valid()`: no finding of severity `Error`.
+- **Finding.** `Finding` exposes `kind()`, `severity()`, `file()`, `line()`, `seq()` and `detail()`, the last naming expected and found values. `FindingKind` is `#[non_exhaustive]`:
+  - errors: `Unparsable`, `UnknownVersion`, `UnknownField`, `MissingField`, `InvalidField`, `HashMismatch`, `ChainBroken`, `SeqGap`, `SeqConflict` (two different records with one `seq`), `TrailMismatch`, `MmrMismatch`, `BadSignature`, `UntrustedKey`, `SegmentStructure`, `AnchorMismatch`, `StartMismatch`, `StaleHead`;
+  - warnings: `TornWrite`, `ClockWentBackwards`, `DuplicateRecord` (the same record twice: a Collector can redeliver a line, and in vigil's own files a duplicated line changes no content);
+  - info: `UncoveredTail`.
+- **How it verifies.** Records are ordered by `seq`, from vigil's segment order or from any order in shipped copies. Every record is checked; nothing stops at the first error. The first error in `seq` order is the **first broken link**, reported with file, line, `seq`, expected and found hash.
+- **Locking and offline use.** The verifier takes no lock and verifies a snapshot, using ADR-0002 decision 12's retry. Following ADR-0037 §1, it needs only the trail files, the trust file and local anchors: no network.
+- **CLI** (`vigil-audit`, std-only argument parsing, `required-features = ["audit"]`):
+
+  ```text
+  vigil-audit verify --trust <file> [--anchor <file>]... [--start-from <file>] [--max-age <duration>] [--strict] [--json] <dir|file>...
+  vigil-audit checkpoints <dir>
+  vigil-audit create --key <keyfile> --service <name> <dir>
+  vigil-audit keygen <keyfile>
+  ```
+
+- **Exit codes.** `0`: no error findings. With `--strict`, also no warnings and no uncovered tail. `1`: at least one error finding (or, with `--strict`, a warning or an uncovered tail). `2`: usage or I/O error.
+- **Text output.** The first line reads `OK trail <id>: <n> records, seq 0..<m>, signed through <k>` or `FAIL trail <id>: …`. Then one line per finding: `<file>:<line>: seq <s>: <kind>: <detail>`.
+- **JSON output.** `--json` prints the report as one JSON object.
+- **Stability.** Within 1.x, the exit codes and the JSON keys are stable. New keys may be added; existing ones are not removed or renamed.
+- **#13's acceptance includes:**
+  - a round trip of a fixture trail through otelcol-contrib's `otlpjsonfile` → `file`, verified with `verify_files` (ADR-0001 decision 8);
+  - property tests for delete, reorder, edit and truncate at every position, and for a forged checkpoint.
+
+### 12. Format freeze and the promise that old trails still verify
+
+- **What v1 is.** Decisions 3 to 9 together: attribute names and types, the canonical encoding, the domain strings, the hash, the MMR, the checkpoint message, Ed25519 with `verify_strict`, and the file names. `audit.v` = `1`.
+- **The promise from 1.0.0:**
+  - every vigil 1.x release verifies every trail written by any vigil ≥ 1.0.0;
+  - every 1.x release writes v1 by default;
+  - v1 verification is never removed in 1.x. A 2.0 that drops it must say, in its ADR, how v1 trails are verified from then on (for example with a kept `vigil-audit` 1.x).
+
+  `dev` before 1.0.0 is unpublished, so the format may still change there, with fixtures regenerated in the same PR.
+- **How the format can change.** Any change to what is written is a v2 and needs a new ADR. A 1.x minor may add v2 *verification* and opt-in v2 writing. Making v2 the default is a major. A version change happens only at a segment boundary, after a closing checkpoint.
+- **Enforcement** (in #13):
+  - **Golden vectors**, committed as test data: canonical encodings and hashes of sample records; MMR roots for sizes 0..=64, recorded once from both vigil's code and tessera-core at `f08255d`, with no dependency kept; deterministic RFC 8032 signatures for fixed seeds.
+  - **Fixture trails** under `tests/fixtures/audit/v1/`, generated with fixed seeds, a fixed trail id and an injected clock. They cover multi-segment, rotation, a key rotation, a torn write and an uncovered tail. Tampered variants carry the findings they must produce.
+  - **Frozen at 1.0.0.** Once the 1.0.0 tag exists, a CI step fails if any file under `tests/fixtures/audit/v1/` differs from the tag.
+- **Dependency bumps cannot change the format.** BLAKE3 output is fixed by its specification and Ed25519 signatures by RFC 8032, so a bump of `blake3` or `ed25519-dalek` changes no byte; the golden vectors catch it if one ever does. Neither crate's types are public, so a major bump of either is invisible to users.
+- **Collector copies.** The promise covers vigil's own files and copies whose attribute values are unchanged. A shipper that rewrites values is outside it.
+
+### 13. Public surface (feature `audit`, under ADR-0004's rules)
+
+Only vigil's own types and std appear. Hashes and keys are byte arrays, not `blake3` or `ed25519-dalek` types.
+
+| Item | Why it is public |
+|---|---|
+| `AuditConfig` (`new(service)`, `dir`, `max_bytes`, `checkpoint_every`, `checkpoint_interval`, `mirror_to_logs`, `create(self, signer)`, `open(self, signer)`) | Creating (explicitly, once) and opening a trail with its policy. |
+| `AuditTrail` (`record`, `checkpoint`, `close`, `dir`), `Send + Sync` | The trail handle, shared across threads. |
+| `Entry` (`new(actor, action, object)`, `reason`, `before`, `after`, `details`) | One audited action (decision 3). |
+| `Value` (`Text`, `Digest`; `Value::digest_of(&[u8])`), `#[non_exhaustive]` | A before or after value, or its digest. |
+| `Receipt` (`trail`, `seq`, `hash`, `hash_string`, `unsigned_records`) | Stored by the application with its own record: an application-side anchor (decision 5), and the signal that signing is behind (decision 6). |
+| `Checkpoint` (`seq`, `mmr_size`, `mmr_root`, `key_id`, `line`, `parse`) | Anchors and verification start points (decisions 10, 11). |
+| `Signer`, `SignerError`, `KeyFileSigner`, `keygen` | Key custody (decision 9). |
+| `TrustedKeys` (`new`, `from_file`) | The verifier's trust input. |
+| `verify`, `Verifier`, `Report`, `Finding`, `FindingKind` and `Severity` (both `#[non_exhaustive]`) | The verify contract (decision 11). |
+| `AuditError`, `AuditErrorKind` (`Io`, `Poisoned`, `TooLarge`, `InvalidEntry`, `CorruptTrail`, `MissingTrail`, `TrailExists`, `Signer`, `InvalidConfig`), `#[non_exhaustive]` | Matchable failures (ADR-0004 decision 3 shape). |
+
+### 14. Dependencies (feature `audit` only)
+
+- **`blake3` 1** with `default-features = false, features = ["std", "pure"]`.
+  - `pure` compiles no C or assembly, which removes a C toolchain from every consumer build and from the IEC 62304 SOUP list.
+  - It costs 1.4 µs per record (2.67 against 1.26 µs, probe), negligible next to a millisecond-scale fsync.
+  - It keeps blake3's Rust SIMD paths.
+- **`ed25519-dalek` 2** with `default-features = false, features = ["std", "zeroize", "fast"]`. No `rand_core`: keys come from `getrandom` bytes through `SigningKey::from_bytes`.
+- **`getrandom` 0.3**, already in the tree.
+- **The MMR** is vigil's own code (push, root and peaks; the probe's version is under 50 lines), with the golden vectors of decision 12. Proof generation is not needed by `verify`, which recomputes everything, and comes with the anchor-holder API in [#57](https://github.com/vig-os/vigil/issues/57).
+- **Cost and licences.** 17 more crates in the normal tree (64 → 81, probe; `pure` adds none). [#47](https://github.com/vig-os/vigil/issues/47)'s licence allowlist must admit BSD-3-Clause and CC0-1.0. crates.io only; no git dependency.
+
+### 15. Tessera mapping and adoption path
+
+- **Now:**
+  - vigil's MMR is tessera-core's construction (decision 7);
+  - record hashes use tessera's digest spelling (decision 4);
+  - key files are tessera keygen files (decision 9);
+  - `Producer` maps to vigil's resource attributes.
+
+  So tessera-core 0.1.0-alpha.1 can already recompute any vigil checkpoint root from the trail's record hashes, and check inclusion and consistency proofs against it, with no code on either side.
+- **The adoption path** ([#59](https://github.com/vig-os/vigil/issues/59)) is gated on tessera-core being on crates.io with its format frozen:
+  1. `vigil-audit export-tsra` packages a sealed segment as a tessera product: one blob block, the vigil checkpoint in sealed metadata, `producer` per ADR-0058. tessera then signs the product with its own envelope.
+  2. Optionally, vigil replaces its private MMR code with tessera-core's. This needs a resume-from-peaks API, which tessera-core lacks at `f08255d`, and must leave every golden vector and fixture byte unchanged.
+
+  Neither step changes v1.
+- **What vigil does not adopt:** tessera's sealing model and its signature envelope (Context table), and its product schemas.
+
+## Consequences
+
+- **Regulated consumers get a trail they can show an auditor:**
+  - attributable (actor), time-stamped by the system, with reason and before and after;
+  - append-only and tamper-evident;
+  - never deleted by vigil;
+  - verifiable offline with one CLI, for as long as 1.x lasts.
+- **The trail is plain OTLP/JSON.** Any OTLP tool reads it and the Collector ships it; integrity checks need only `vigil-audit`.
+- **Throughput is bounded by fsync.** Tens of records per second on slow virtual disks (probe), more on local NVMe. A consumer that needs bulk audit waits for [#56](https://github.com/vig-os/vigil/issues/56) or batches at the application level.
+- **Fail-closed means an audit outage stops the audited action.** That is the point, and the application must handle `Err` (for example, refuse the change and tell the operator). A signer outage does not stop it (decision 6), but it leaves records unsigned until the signer recovers.
+- **What a local key does not stop.** An attacker who holds the key and can write the files can rewrite and re-sign the trail. Only an off-device signer ([#58](https://github.com/vig-os/vigil/issues/58)) or anchors ([#57](https://github.com/vig-os/vigil/issues/57) and decision 10) detect that. This is written in the rustdoc and the README, not left to be discovered.
+- **What a writable trail does not stop without anchors.** An attacker who can write the files but has no trusted key can rewrite everything after the last trusted checkpoint, or roll the trail back to any earlier checkpoint (decision 5). Only anchors, the application's stored receipts, and `--max-age` reveal that. A crash alone loses only unacknowledged records. The verifier reports the uncovered tail; `--strict` fails on it.
+- **Creating a trail is a deployment step** (`create`), not something `open` does. An application whose audit directory was deleted stops until an operator acts.
+- **Disk only grows.** Archiving is the operator's job; vigil only guarantees that any sealed segment can be moved.
+- **The format is a long-term promise.** v1's encoding, domain strings and MMR can never change in 1.x. Every fix must be expressible as a v2, which costs an ADR and a second verifier path kept alive alongside v1.
+- **Code that must stay small.** The audit sink adds a second writer to the crate's riskiest file (`src/rotate.rs`, a crate-internal locked-section API). It is shared code, so the multi-process tests of ADR-0002 must cover both callers.
+- **Dependencies.** 17 more crates with `audit` on, and BSD-3-Clause and CC0-1.0 in the licence allowlist.
+- **Tessera.** Its interoperability costs vigil nothing now, and it keeps the adoption path open without making vigil's promise depend on tessera's release schedule.
+
+## Alternatives considered
+
+- **Build on `tessera-core` now** (the plan in #12). It is git-only, so vigil could not be published: `cargo package` exits 101 (pre-mortem R3). Its format is deliberately unfrozen (ADR-0052), so the promise of decision 12 would rest on another crate's moving format. It has no chain or checkpoint primitive and cannot resume an MMR. It would add 41 crates against 23. Rejected; its useful part is adopted as a construction (decision 7), and the rest is the adoption path (#59).
+- **Wait for tessera-core 1.0 before shipping audit.** It would tie vigil 1.0 to another project's release, for primitives two mature crates already provide. Rejected.
+- **Leave audit out of the 1.0 surface** (pre-mortem R3's third option). The 0.3.0 milestone and the owner want audit in 1.0, and nothing in the design needs an unstable dependency any more. Rejected.
+- **Hash the JSON bytes of the line** (or a JCS canonicalisation of them). The bytes depend on `opentelemetry-proto`'s serialisation, which changes across bumps, and on the Collector's rewriting, so old trails would stop verifying after a bump. JCS adds `serde_jcs` and float canonicalisation for no gain. Rejected for a value-level encoding (decision 4).
+- **Emit audit records through `tracing`.** Filters, sampling and the batch queue can drop them, and the caller cannot get a durable `Result`. Rejected (decision 1).
+- **Share the telemetry directory and lock.** An audit fsync would block log appends, and retention would apply. Rejected (decision 2).
+- **A separate rotation implementation for audit.** It would duplicate the most tested code in the crate. Rejected for a crate-internal locked-section API over ADR-0002's machinery.
+- **fsync every N records, or on a timer.** An `Ok` would no longer mean durable, and a crash would lose acknowledged records. Rejected; group commit (#56) is the variant that keeps the meaning.
+- **`sync_all` instead of `sync_data`.** Same cost (probe). It also flushes metadata the append does not need, and std maps both to `F_FULLFSYNC` on macOS. Rejected; directory metadata is fsynced explicitly when it changes.
+- **Truncate oversized records like logs** (ADR-0001 decision 10). That would change hashed content and lose the record. Rejected for `TooLarge`.
+- **Per-segment MMRs.** No consistency proof across segments, and a segment root alone does not bind segment order. A trail-wide MMR costs the same once checkpoints carry peaks. Rejected.
+- **A hash chain without an MMR.** Proving one record or one extension would require the whole trail. Rejected; anchors need consistency proofs (#57).
+- **Sign every record.** 11 µs and 64 bytes per record (probe), and a signer outage would stop every action. Checkpoints give the same tamper-evidence up to the uncovered tail. Rejected.
+- **tessera's `ed25519-env-v1` envelope for checkpoints.** A checkpoint signature would then also verify as a tessera product signature over the same string. It needs `serde_jcs`, and its format is unfrozen. Rejected for a domain-separated message (decision 8).
+- **An unsigned mode.** A second state space to test, for users who could anchor instead. Rejected (decision 9).
+- **A sidecar file for checkpoints.** Deleting the sidecar would not break the chain. Inline checkpoint records are covered by the chain themselves. Rejected.
+- **A background checkpoint thread.** A thread in a regulated module, for little gain over checkpoints evaluated at append time and on `close`. Rejected; an idle trail's tail is covered on `close` or at the next append.
+- **Ship TPM, Secure Enclave or PKCS#11 signers in 1.0.** Platform-specific dependencies, and many such devices do not support Ed25519. Deferred to #58 behind the `Signer` trait.
+- **RFC 3161 in 1.0.** It needs ASN.1/DER and HTTP. Deferred to #57; anchoring by copying checkpoint lines works without them.
+
+## References
+
+- [vig-os/vigil#10](https://github.com/vig-os/vigil/issues/10) (requirement framing; owner decision 2026-10-11), [#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12), [#13](https://github.com/vig-os/vigil/issues/13), [#41](https://github.com/vig-os/vigil/issues/41), [#46](https://github.com/vig-os/vigil/issues/46), [#47](https://github.com/vig-os/vigil/issues/47), [#49](https://github.com/vig-os/vigil/issues/49), [#56](https://github.com/vig-os/vigil/issues/56), [#57](https://github.com/vig-os/vigil/issues/57), [#58](https://github.com/vig-os/vigil/issues/58), [#59](https://github.com/vig-os/vigil/issues/59)
+- Path-to-1.0 pre-mortem, 2026-10-10 (finding R3)
+- [ADR-0001](0001-on-disk-format.md) (format, bounded lines, conformance oracle), [ADR-0002](0002-rotation-and-retention.md) (rotation machinery), ADR-0004 public API and stability ([PR #54](https://github.com/vig-os/vigil/pull/54), Proposed)
+- [vig-os/tessera](https://github.com/vig-os/tessera) at `f08255d`: `docs/CONSUMING.md`, ADR-0028, ADR-0036, ADR-0037, ADR-0052, ADR-0058, `tessera-core/src/{hash,signing,manifest}.rs`
+- 21 CFR Part 11 §11.10(e); EU GMP Annex 11 §9; IEC 62304
+- [BLAKE3 specification](https://github.com/BLAKE3-team/BLAKE3-specs); [RFC 8032](https://www.rfc-editor.org/rfc/rfc8032) (Ed25519); [RFC 6962](https://www.rfc-editor.org/rfc/rfc6962) (Merkle tree hashing); [RFC 3161](https://www.rfc-editor.org/rfc/rfc3161) (time-stamp protocol)
+- Rust 1.95.0 std `library/std/src/sys/fs/unix.rs` (`fsync`/`datasync` on Apple)
