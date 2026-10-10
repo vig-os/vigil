@@ -28,8 +28,43 @@ class ChangelogTests(unittest.TestCase):
             [],
         )
         for marker in ("-", "*", "+"):
-            text = f"### Added\n{marker} Same\n\n  {marker} Same\n"
+            text = f"### Added\n{marker} Same\n\n{marker} Same\n"
             self.assertIn("duplicate bullet", check(text)[0])
+
+    def test_duplicate_sections_within_version(self):
+        text = "## Unreleased\n### Added\n- x\n### Added\n- y\n"
+        self.assertIn("duplicate section 'Added'", check(text)[0])
+        self.assertEqual(
+            check("## Unreleased\n### Added\n- x\n## [0.1.0]\n### Added\n- y\n"),
+            [],
+        )
+
+    def test_bullet_scope_survives_repeated_sections_and_subheadings(self):
+        text = (
+            "## Unreleased\n### Added\n- Same\n### Fixed\n- Other\n"
+            "### Added\n#### Details\n- Same\n"
+        )
+        errors = check(text)
+        self.assertTrue(any("duplicate section" in error for error in errors))
+        self.assertTrue(any("duplicate bullet" in error for error in errors))
+        self.assertEqual(len(check("### Added\n- Same\n#### Details\n- Same\n")), 1)
+
+    def test_nested_items_under_distinct_parents_are_allowed(self):
+        for marker in ("-", "*", "+", "1.", "2)"):
+            with self.subTest(marker=marker):
+                text = (
+                    f"## Unreleased\n### Added\n{marker} A\n"
+                    f"  {marker} Documented in README\n{marker} B\n"
+                    f"  {marker} Documented in README\n"
+                )
+                self.assertEqual(check(text), [])
+
+    def test_numbered_items_and_marker_changes(self):
+        for first, second in (("1.", "2."), ("1)", "2)"), ("-", "*"), ("-", "1.")):
+            with self.subTest(first=first, second=second):
+                text = f"## Unreleased\n### Added\n{first} Same\n{second} Same\n"
+                self.assertIn("duplicate bullet", check(text)[0])
+        self.assertEqual(check("### Added\n1. Same\n### Fixed\n2. Same\n"), [])
 
     def test_fenced_examples_are_ignored(self):
         self.assertEqual(
@@ -98,6 +133,18 @@ class ChangelogTests(unittest.TestCase):
         self.assertIn("## [0.2.0] - TBD", merged)
         self.assertIn("## [0.2.0] - 2026-10-11", merged)
         self.assertIn("duplicate heading '0.2.0'", check(merged)[0])
+
+    def test_parallel_new_sections_union_is_rejected(self):
+        base = "# Changelog\n\n## Unreleased\n\n### Added\n\n- Existing\n"
+        merged = self.merge(
+            base,
+            base + "- Added A\n\n### Security\n\n- Security A\n",
+            base + "- Added B\n\n### Security\n\n- Security B\n",
+        )
+        self.assertEqual(merged.count("### Security"), 2)
+        self.assertTrue(
+            any("duplicate section 'Security'" in error for error in check(merged))
+        )
 
     def test_parallel_unreleased_additions_merge_and_validate(self):
         base = "# Changelog\n\n## Unreleased\n\n### Added\n\n- Existing\n"

@@ -9,12 +9,16 @@ def check(text: str) -> list[str]:
     """Return line-numbered duplicate diagnostics, scoped by Markdown headings.
 
     Version identity excludes the release date, so TBD and dated headings for
-    the same version conflict. Bullets are compared after stripping indentation
-    within each heading's section; distinct sections may repeat the same text.
-    Fenced code blocks are ignored.
+    the same version conflict. Each version may contain a section kind only once.
+    Unindented list items are compared by text (ignoring markers and numbers)
+    across the whole version and section kind, even if that section repeats or
+    contains deeper headings. Different versions/kinds may repeat the same text.
+    Indented items and fenced code blocks are ignored.
     """
     headings: dict[str, int] = {}
-    bullets: dict[str, int] = {}
+    sections: dict[str, int] = {}
+    bullets: dict[tuple[str, str], int] = {}
+    section = ""
     errors = []
     fence = None
     for number, line in enumerate(text.splitlines(), 1):
@@ -27,8 +31,10 @@ def check(text: str) -> list[str]:
         if marker:
             fence = marker[1]
             continue
-        if re.match(r"^#{1,6}\s", line):
+        if re.match(r"^#{1,2}\s", line):
+            sections = {}
             bullets = {}
+            section = ""
         heading = re.match(r"^##\s+(?:\[([^\]]+)\]|(Unreleased)\b)", line)
         if heading:
             key = heading[1] or heading[2]
@@ -39,14 +45,27 @@ def check(text: str) -> list[str]:
                 )
             else:
                 headings[key] = number
-        if re.match(r"^[-*+]\s", stripped):
-            if stripped in bullets:
+        subsection = re.match(r"^###\s+(.+?)(?:\s+#+)?\s*$", line)
+        if subsection:
+            section = subsection[1]
+            if section in sections:
                 errors.append(
-                    f"line {number}: duplicate bullet {stripped!r} "
-                    f"(first at line {bullets[stripped]})"
+                    f"line {number}: duplicate section {section!r} "
+                    f"(first at line {sections[section]})"
                 )
             else:
-                bullets[stripped] = number
+                sections[section] = number
+        item = re.match(r"^(?:[-*+]|[0-9]+[.)])\s+(.+)", line)
+        if item:
+            content = item[1].rstrip()
+            bullet_key = (section, content)
+            if bullet_key in bullets:
+                errors.append(
+                    f"line {number}: duplicate bullet {content!r} "
+                    f"(first at line {bullets[bullet_key]})"
+                )
+            else:
+                bullets[bullet_key] = number
     return errors
 
 

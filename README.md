@@ -79,8 +79,13 @@ text and does not validate the changelog's meaning or structure.
 Release sync uses `git merge-tree`, which honors union: a clean merge can still
 retain both a release's `TBD` heading and its dated heading. The
 `scripts/check_changelog.py` check rejects duplicate version headings (regardless
-of date), duplicate Unreleased headings, and identical bullet lines within a
-heading's section. It runs on every local commit and in `nix flake check` (and
+of date), duplicate Unreleased headings, repeated `###` section headings within
+a version, and duplicate top-level list entries. List entries must be unindented;
+indented sub-bullets are ignored so different parents may repeat explanatory
+text. Unordered markers (`-`, `*`, `+`) and numbered markers (`1.`, `1)`, etc.)
+are ignored when comparing entry text. Entries are deduplicated across the whole
+version per section kind, including repeated sections and deeper headings;
+the same text is allowed in different versions or kinds (such as Added and Fixed). It runs on every local commit and in `nix flake check` (and
 therefore CI). Resolve reported duplicates before accepting a release-sync PR;
 a conflict-free merge alone is insufficient. Run
 `python3 scripts/check_changelog.py` to check a resolution locally. The check
