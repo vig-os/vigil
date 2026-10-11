@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Deny missing public documentation and missing error/panic sections across stable and unstable APIs with all features in flake and CI checks ([#44](https://github.com/vig-os/vigil/issues/44)).
 - Apply ADR-0006 decision 3 time-first JSON key order to logs ([#64](https://github.com/vig-os/vigil/issues/64)).
+- Drop log records whose body or attribute AnyValues nest deeper than 16 array/map edges and count them as lost log records; these records were previously exported ([#64](https://github.com/vig-os/vigil/issues/64)).
 
 - **Breaking:** exporters, sinks and exact OpenTelemetry re-exports require `--cfg vigil_unstable`; `NON_FINITE` is crate-private. Docs.rs labels the unstable surface, which is compiled and tested separately; empty `RUST_LOG` uses the default filter and unnamed guards drop immediately ([#42](https://github.com/vig-os/vigil/issues/42)).
 
