@@ -17,9 +17,10 @@ name = "vigil"
 
 [features]
 default = []
-audit = ["dep:blake3", "dep:ed25519-dalek", "dep:zeroize", "dep:serde"]
+audit = ["dep:blake3", "dep:ed25519-dalek", "dep:zeroize", "dep:serde", "dep:base64"]
 
 [dependencies]
+base64 = { version = "0.22", optional = true }
 blake3 = { version = "1", optional = true, default-features = false, features = ["std", "pure"] }
 ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["std", "zeroize", "fast"] }
 zeroize = { version = "1", optional = true, default-features = false }

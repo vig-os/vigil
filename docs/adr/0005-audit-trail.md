@@ -192,10 +192,16 @@ Attributes. Integers are OTLP `intValue`, `audit.mmr_peaks` is an `arrayValue` o
 **Integer decoding (amended 2026-10-11, B1 security review of PR #75).**
 `intValue`, `timeUnixNano` and `observedTimeUnixNano` accept only the encoder's
 canonical decimal strings: ASCII digits, no sign, whitespace, exponent or
-leading zero except `"0"`, fitting u64. JSON numbers are `InvalidField`, even
+leading zero except `"0"`. Timestamps fit u64; audit intValue counters fit i64. JSON numbers are `InvalidField`, even
 below 2^53. The earlier permission to accept numbers is withdrawn: float-based
 readers round larger integers, so an audited value could be displayed differently
 (decisions 3/5). Unhashed signed-int64 context also uses canonical decimal strings.
+
+**Collector bounds (amended 2026-10-11, B1 round 3).** All OTLP `intValue`s
+fit i64 (context may be negative); audit.seq and audit.mmr_size are nonnegative.
+Writers reject larger counters with `InvalidConfig`. Context `bytesValue` must
+decode with standard padded base64, like pdata: CR/LF inside the decoded JSON
+string are ignored and nonzero unused trailing bits are accepted.
 
 **Closed messages (amended 2026-10-11, same review).** LogsData, ResourceLogs,
 ScopeLogs, Resource, Scope and all nested OTLP messages accept only their v1
@@ -208,10 +214,10 @@ time remains `InvalidField`), syntax/UTF-8/blank input is
 canonical record hash is `HashMismatch`. Decoder errors retain these finding
 kinds for #13; writers can refuse them as `CorruptTrail` (decision 8).
 
-**Framing and bounds (amended 2026-10-11, same review).** Reject raw CR anywhere
-in an audit line (`InvalidField`), including CRLF endings; never copy CR into
-checkpoint anchors or normalize input. Escaped `\r` inside a JSON string remains
-authenticated content. Allow one optional final LF. Enforce the 1 000 000-byte
+**Framing and bounds (amended 2026-10-11, same review).** Reject raw ASCII controls anywhere
+in an audit payload (`InvalidField`), including interior LF, tabs and CR.
+Escaped controls inside JSON strings remain content. Allow one optional final LF,
+excluded from checkpoint anchors; double-final LF is rejected (round 3 amendment). Enforce the 1 000 000-byte
 JSON payload bound before parsing (`TooLarge`, verifier `InvalidField`), excluding
 that optional LF, and the JSON deserializer's 128-level nesting bound. These
 rules also cover Collector multi-record lines and unhashed scope/resource data.

@@ -228,7 +228,9 @@ impl Record {
     ///
     /// # Errors
     ///
-    /// Returns [`AuditErrorKind::InvalidEntry`] if any supplied text (including
+    /// Returns [`AuditErrorKind::InvalidConfig`] if the sequence exceeds
+    /// `i64::MAX` (the OTLP int64 bound), or [`AuditErrorKind::InvalidEntry`]
+    /// if any supplied text (including
     /// service, host, or before/after text) is empty or contains NUL, or
     /// [`AuditErrorKind::TooLarge`] if a canonical field exceeds `u32::MAX` bytes.
     pub fn new(context: RecordContext, entry: Entry) -> Result<Self, AuditError> {
@@ -240,7 +242,8 @@ impl Record {
     /// # Errors
     ///
     /// Returns [`AuditErrorKind::InvalidConfig`] if MMR size differs from the
-    /// sequence number, [`AuditErrorKind::InvalidEntry`] if service or host is
+    /// sequence number or either exceeds `i64::MAX`,
+    /// [`AuditErrorKind::InvalidEntry`] if service or host is
     /// empty or contains NUL, or [`AuditErrorKind::TooLarge`] if a canonical
     /// field exceeds `u32::MAX` bytes.
     pub fn checkpoint(
@@ -256,6 +259,12 @@ impl Record {
         Self::build(context, Kind::Checkpoint(fields))
     }
     fn build(context: RecordContext, kind: Kind) -> Result<Self, AuditError> {
+        if context.seq > i64::MAX as u64 {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                "sequence exceeds OTLP int64",
+            ));
+        }
         valid_text(&context.service)?;
         if let Some(host) = &context.host {
             valid_text(host)?;

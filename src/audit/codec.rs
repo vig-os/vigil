@@ -1,5 +1,9 @@
 use super::*;
 use crate::audit::FindingKind;
+use base64::{
+    Engine, alphabet,
+    engine::{GeneralPurpose, GeneralPurposeConfig},
+};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value as Json};
 use std::{collections::BTreeMap, fmt};
@@ -245,12 +249,20 @@ fn any_value(v: &Json) -> Result<(), AuditError> {
                     }
                 }
             }
-            "stringValue" | "bytesValue" if val.is_string() => {}
+            "stringValue" if val.is_string() => {}
+            "bytesValue"
+                if val.as_str().is_some_and(|s| {
+                    let engine = GeneralPurpose::new(
+                        &alphabet::STANDARD,
+                        GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true),
+                    );
+                    engine.decode(s.replace(['\r', '\n'], "")).is_ok()
+                }) => {}
             "boolValue" if val.is_boolean() => {}
             "intValue"
-                if val.as_str().is_some_and(|s| {
-                    integer(val).is_ok() || s.parse::<i64>().is_ok_and(|n| n.to_string() == s)
-                }) => {}
+                if val
+                    .as_str()
+                    .is_some_and(|s| s.parse::<i64>().is_ok_and(|n| n.to_string() == s)) => {}
             "doubleValue"
                 if val.is_number()
                     || ["NaN", "Infinity", "-Infinity"].contains(&val.as_str().unwrap_or("")) => {}
@@ -411,7 +423,7 @@ impl Record {
     /// policy remains deferred to #68. Receipt reconciliation across resume is
     /// separate and deferred to #70. JSON nesting is limited to 128 levels.
     /// Only canonical camelCase message keys and decimal-string int64 fields
-    /// are accepted. Raw CR bytes are InvalidField (escaped string CR is content).
+    /// are accepted. Raw ASCII controls are InvalidField (escaped string controls are content).
     /// JSON payloads over 1,000,000 bytes, excluding one optional final LF, fail
     /// with TooLarge/InvalidField before parsing. No input is normalized.
     pub fn parse_line(bytes: &[u8]) -> Result<Vec<Self>, AuditError> {
@@ -422,7 +434,7 @@ impl Record {
                 FindingKind::InvalidField,
             ));
         }
-        if bytes.contains(&b'\r') {
+        if bytes.iter().any(|b| b.is_ascii_control()) {
             return Err(corrupt());
         }
         let json = decode_complete_json(bytes).map_err(|e| {
@@ -488,7 +500,7 @@ impl Checkpoint {
             seq: record.context.seq,
             hash,
             fields,
-            line: line.to_owned(),
+            line: line.strip_suffix('\n').unwrap_or(line).to_owned(),
         })
     }
     /// Returns the checkpoint's sequence number.
@@ -511,7 +523,7 @@ impl Checkpoint {
     pub fn key_id(&self) -> [u8; 32] {
         self.fields.key
     }
-    /// Returns the original complete OTLP/JSON line, preserving its spelling.
+    /// Returns the original OTLP/JSON payload, excluding the optional final LF.
     pub fn line(&self) -> &str {
         &self.line
     }

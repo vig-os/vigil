@@ -1,6 +1,5 @@
 use super::*;
 use serde_json::{Value as Json, json};
-
 const GOLDEN: &str = include_str!("../../tests/fixtures/audit/codec.jsonl");
 fn fixture(cp: bool) -> Json {
     serde_json::from_str(GOLDEN.lines().nth(usize::from(cp)).unwrap()).unwrap()
@@ -8,13 +7,11 @@ fn fixture(cp: bool) -> Json {
 fn log(v: &mut Json) -> &mut Json {
     &mut v["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]
 }
+fn attrs(v: &mut Json) -> &mut Vec<Json> {
+    log(v)["attributes"].as_array_mut().unwrap()
+}
 fn attr<'a>(v: &'a mut Json, key: &str) -> &'a mut Json {
-    &mut log(v)["attributes"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|a| a["key"] == key)
-        .unwrap()["value"]
+    &mut attrs(v).iter_mut().find(|a| a["key"] == key).unwrap()["value"]
 }
 fn rejected(v: &Json) {
     let error = Record::parse_line(v.to_string().as_bytes()).unwrap_err();
@@ -47,7 +44,7 @@ fn codec_golden_and_checkpoint_anchor() {
 fn codec_collector_shape_and_context() {
     let mut v = fixture(false);
     let expected = Record::parse_line(v.to_string().as_bytes()).unwrap()[0].canonical();
-    log(&mut v)["attributes"].as_array_mut().unwrap().reverse();
+    attrs(&mut v).reverse();
     for (key, value) in [
         ("traceId", json!("11".repeat(16))),
         ("spanId", json!("22".repeat(8))),
@@ -105,10 +102,7 @@ fn codec_rejects_display_fields_and_duplicates() {
     }
     for key in ["audit.note", "audit.mmr_size", "audit.actor"] {
         let mut v = fixture(false);
-        log(&mut v)["attributes"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"key":key,"value":{"stringValue":"forged"}}));
+        attrs(&mut v).push(json!({"key":key,"value":{"stringValue":"forged"}}));
         rejected(&v);
     }
     let raw = fixture(false).to_string();
@@ -196,7 +190,7 @@ fn codec_rejects_integer_spellings_and_invalid_values() {
     attr(&mut v, "audit.actor")["stringValue"] = json!("mallory");
     rejected(&v);
     let mut v = fixture(false);
-    log(&mut v)["attributes"].as_array_mut().unwrap().push(json!({"key":"audit.before_digest","value":{"stringValue":format!("blake3:{}", "00".repeat(32))}}));
+    attrs(&mut v).push(json!({"key":"audit.before_digest","value":{"stringValue":format!("blake3:{}", "00".repeat(32))}}));
     rejected(&v);
     for value in [json!(""), json!("x\u{0}")] {
         let mut v = fixture(false);
@@ -213,10 +207,7 @@ fn codec_rejects_checkpoint_shape_and_empty_lines() {
         "audit.sig",
     ] {
         let mut v = fixture(true);
-        log(&mut v)["attributes"]
-            .as_array_mut()
-            .unwrap()
-            .retain(|a| a["key"] != key);
+        attrs(&mut v).retain(|a| a["key"] != key);
         rejected(&v);
     }
     for (key, value) in [
@@ -224,10 +215,7 @@ fn codec_rejects_checkpoint_shape_and_empty_lines() {
         ("audit.actor", json!({"stringValue":"forged"})),
     ] {
         let mut v = fixture(true);
-        log(&mut v)["attributes"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"key":key,"value":value}));
+        attrs(&mut v).push(json!({"key":key,"value":value}));
         rejected(&v);
     }
     let mut v = fixture(true);
@@ -273,12 +261,11 @@ fn codec_short_fuzz_never_panics() {
         let _ = Record::parse_line(&input);
     }
 }
-
 #[test]
-fn codec_optional_values_u64_boundary_and_nonzero_checkpoint() {
+fn codec_optional_values_int64_boundary_and_nonzero_checkpoint() {
     let previous = Record::genesis(&[0x11; 16]);
     let record = Record::new(
-        RecordContext::new([0x11; 16], u64::MAX, u64::MAX, "svc", previous),
+        RecordContext::new([0x11; 16], i64::MAX as u64, u64::MAX, "svc", previous),
         Entry::new("α", "sample.modify", "id:1")
             .before(Value::Digest([0; 32]))
             .after(Value::Text("new".into())),
@@ -291,28 +278,19 @@ fn codec_optional_values_u64_boundary_and_nonzero_checkpoint() {
         .retain(|a| a["key"] != "host.name");
     log(&mut v)["timeUnixNano"] = json!(u64::MAX.to_string());
     log(&mut v)["observedTimeUnixNano"] = json!(u64::MAX.to_string());
-    attr(&mut v, "audit.seq")["intValue"] = json!(u64::MAX.to_string());
+    attr(&mut v, "audit.seq")["intValue"] = json!(i64::MAX.to_string());
     attr(&mut v, "audit.hash")["stringValue"] = json!(digest_string(&record.hash()));
-    log(&mut v)["attributes"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|a| {
-            ![
-                "audit.reason",
-                "audit.details",
-                "audit.before",
-                "audit.after_digest",
-            ]
-            .contains(&a["key"].as_str().unwrap())
-        });
+    attrs(&mut v).retain(|a| {
+        !matches!(
+            a["key"].as_str(),
+            Some("audit.reason" | "audit.details" | "audit.before" | "audit.after_digest")
+        )
+    });
     for (key, value) in [
         ("audit.before_digest", digest_string(&[0; 32])),
         ("audit.after", "new".into()),
     ] {
-        log(&mut v)["attributes"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"key":key,"value":{"stringValue":value}}));
+        attrs(&mut v).push(json!({"key":key,"value":{"stringValue":value}}));
     }
     assert_eq!(
         Record::parse_line(v.to_string().as_bytes()).unwrap()[0].canonical(),
@@ -344,10 +322,7 @@ fn codec_optional_values_u64_boundary_and_nonzero_checkpoint() {
         .iter()
         .map(|p| json!({"stringValue":digest_string(p)}))
         .collect();
-    log(&mut v)["attributes"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"key":"audit.mmr_peaks",
+    attrs(&mut v).push(json!({"key":"audit.mmr_peaks",
         "value":{"arrayValue":{"values":peaks}}}));
     let decoded = Checkpoint::parse(&v.to_string()).unwrap();
     assert_eq!(decoded.seq(), 3);
@@ -355,14 +330,13 @@ fn codec_optional_values_u64_boundary_and_nonzero_checkpoint() {
     assert_eq!(decoded.mmr_root(), mmr.root());
     // A structurally valid zero signature parses: verification is explicitly #13.
     assert_eq!(decoded.key_id(), [0; 32]);
-    let attrs = log(&mut v)["attributes"].as_array_mut().unwrap();
+    let attrs = attrs(&mut v);
     attrs.last_mut().unwrap()["value"]["arrayValue"]["values"]
         .as_array_mut()
         .unwrap()
         .pop();
     rejected(&v);
 }
-
 #[test]
 fn codec_rejects_collector_alias_forgery() {
     let mut v = fixture(false);
@@ -374,7 +348,6 @@ fn codec_rejects_collector_alias_forgery() {
         "Collector alias forgery was silently accepted"
     );
 }
-
 #[test]
 fn codec_closed_messages_and_nested_context() {
     let mut base = fixture(false);
@@ -384,64 +357,27 @@ fn codec_closed_messages_and_nested_context() {
         {"key":"context","value":{"kvlistValue":{"values":[{"key":"nested","value":
             {"arrayValue":{"values":[{"stringValue":"context"}]}}}]}}}]);
     assert!(Record::parse_line(base.to_string().as_bytes()).is_ok());
-    for (pointer, aliases) in [
-        ("", &["resource_logs"][..]),
-        ("/resourceLogs/0", &["scope_logs", "schema_url"][..]),
-        (
-            "/resourceLogs/0/scopeLogs/0",
-            &["log_records", "schema_url"][..],
-        ),
-        (
-            "/resourceLogs/0/resource",
-            &["dropped_attributes_count", "entity_refs"][..],
-        ),
-        (
-            "/resourceLogs/0/resource/entityRefs/0",
-            &["schema_url", "id_keys", "description_keys"][..],
-        ),
-        (
-            "/resourceLogs/0/scopeLogs/0/scope",
-            &["dropped_attributes_count"][..],
-        ),
-        (
-            "/resourceLogs/0/resource/attributes/0",
-            &["key_strindex"][..],
-        ),
-        (
-            "/resourceLogs/0/resource/attributes/0/value",
-            &[
-                "string_value",
-                "int_value",
-                "bool_value",
-                "double_value",
-                "bytes_value",
-                "array_value",
-                "kvlist_value",
-            ][..],
-        ),
-        (
-            "/resourceLogs/0/scopeLogs/0/scope/attributes/0/value/kvlistValue",
-            &[][..],
-        ),
-        (
-            "/resourceLogs/0/scopeLogs/0/scope/attributes/0/value/kvlistValue/values/0/value/arrayValue",
-            &[][..],
-        ),
-        (
-            "/resourceLogs/0/scopeLogs/0/logRecords/0",
-            &[
-                "time_unix_nano",
-                "observed_time_unix_nano",
-                "severity_number",
-                "severity_text",
-                "event_name",
-                "trace_id",
-                "span_id",
-                "dropped_attributes_count",
-            ][..],
-        ),
-    ] {
-        for key in aliases.iter().copied().chain(["forged"]) {
+    let cases = json!({
+        "": ["resource_logs"],
+        "/resourceLogs/0": ["scope_logs", "schema_url"],
+        "/resourceLogs/0/scopeLogs/0": ["log_records", "schema_url"],
+        "/resourceLogs/0/resource": ["dropped_attributes_count", "entity_refs"],
+        "/resourceLogs/0/resource/entityRefs/0": ["schema_url", "id_keys", "description_keys"],
+        "/resourceLogs/0/scopeLogs/0/scope": ["dropped_attributes_count"],
+        "/resourceLogs/0/resource/attributes/0": ["key_strindex"],
+        "/resourceLogs/0/resource/attributes/0/value": ["string_value", "int_value", "bool_value", "double_value", "bytes_value", "array_value", "kvlist_value"],
+        "/resourceLogs/0/scopeLogs/0/scope/attributes/0/value/kvlistValue": [],
+        "/resourceLogs/0/scopeLogs/0/scope/attributes/0/value/kvlistValue/values/0/value/arrayValue": [],
+        "/resourceLogs/0/scopeLogs/0/logRecords/0": ["time_unix_nano", "observed_time_unix_nano", "severity_number", "severity_text", "event_name", "trace_id", "span_id", "dropped_attributes_count"]
+    });
+    for (pointer, aliases) in cases.as_object().unwrap() {
+        for key in aliases
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .chain(["forged"])
+        {
             let mut v = base.clone();
             v.pointer_mut(pointer)
                 .unwrap()
@@ -483,10 +419,10 @@ fn codec_cr_framing() {
     assert!(Checkpoint::parse(&format!("{line}\n")).is_ok());
     // JSON escapes are content, not framing CR bytes.
     let mut v = fixture(false);
-    attr(&mut v, "audit.actor")["stringValue"] = json!("α\r");
+    attr(&mut v, "audit.actor")["stringValue"] = json!("α\r\n\t");
     let record = Record::new(
         RecordContext::new([0x11; 16], 0, 123, "svc", Record::genesis(&[0x11; 16])).host("host"),
-        Entry::new("α\r", "sample.modify", "id:1")
+        Entry::new("α\r\n\t", "sample.modify", "id:1")
             .reason("reason")
             .before(Value::Text("old".into()))
             .after(Value::digest_of(b"new"))
@@ -550,4 +486,59 @@ fn codec_verifier_finding_kinds() {
     )
     .unwrap_err();
     assert_eq!(error.finding_kind(), None);
+}
+#[test]
+fn codec_line_controls_and_final_lf() {
+    let line = GOLDEN.lines().nth(1).unwrap();
+    let cases = [
+        format!("{line}\n\n"),
+        line.replacen('{', "{\n", 1),
+        line.replacen('{', "{\t", 1),
+        format!("{line}\n\t"),
+    ];
+    for bad in cases {
+        assert!(Record::parse_line(bad.as_bytes()).is_err());
+        assert!(Checkpoint::parse(&bad).is_err());
+    }
+    let cp = Checkpoint::parse(&format!("{line}\n")).unwrap();
+    assert_eq!(cp.line(), line);
+}
+#[test]
+fn codec_context_int64_and_base64() {
+    let cases = json!([
+        [false, {"intValue":"9223372036854775808"}], [false, {"intValue":"18446744073709551615"}],
+        [false, {"intValue":"-9223372036854775809"}], [false, {"bytesValue":"!!!"}],
+        [false, {"bytesValue":"YQ"}], [false, {"bytesValue":"YQ==="}], [false, {"bytesValue":"Y Q=="}],
+        [false, {"bytesValue":"____"}], [true, {"bytesValue":""}], [true, {"bytesValue":"YQ=="}],
+        [true, {"bytesValue":"YR=="}], [true, {"bytesValue":"Y\r\nQ=="}],
+        [true, {"intValue":"9223372036854775807"}], [true, {"intValue":"-9223372036854775808"}]
+    ]);
+    for case in cases.as_array().unwrap() {
+        let mut v = fixture(false);
+        v["resourceLogs"][0]["scopeLogs"][0]["scope"] =
+            json!({"attributes":[{"key":"context", "value":case[1]}]});
+        assert_eq!(
+            Record::parse_line(v.to_string().as_bytes()).is_ok(),
+            case[0].as_bool().unwrap(),
+            "{case}"
+        );
+    }
+}
+#[test]
+fn codec_writer_int64_bounds() {
+    for seq in [i64::MAX as u64 + 1, u64::MAX] {
+        let context = RecordContext::new([0; 16], seq, 0, "svc", [0; 32]);
+        assert_eq!(
+            Record::new(context.clone(), Entry::new("a", "b", "c"))
+                .unwrap_err()
+                .kind(),
+            AuditErrorKind::InvalidConfig
+        );
+        let peaks = vec![[0; 32]; seq.count_ones() as usize];
+        let fields = CheckpointFields::new(seq, [0; 32], peaks, [0; 32], [0; 64]).unwrap();
+        assert_eq!(
+            Record::checkpoint(context, fields).unwrap_err().kind(),
+            AuditErrorKind::InvalidConfig
+        );
+    }
 }
