@@ -1,34 +1,9 @@
+use super::validation::*;
 use super::*;
 use crate::audit::FindingKind;
-use base64::{
-    Engine, alphabet,
-    engine::{GeneralPurpose, GeneralPurposeConfig},
-};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value as Json};
-use std::{collections::BTreeMap, fmt};
-
-fn corrupt() -> AuditError {
-    finding(FindingKind::InvalidField)
-}
-fn finding(kind: FindingKind) -> AuditError {
-    AuditError::decoding(AuditErrorKind::CorruptTrail, kind)
-}
-fn message(v: &Json, allowed: &[&str]) -> Result<(), AuditError> {
-    if object(v)?
-        .keys()
-        .any(|key| !allowed.contains(&key.as_str()))
-    {
-        return Err(finding(FindingKind::UnknownField));
-    }
-    Ok(())
-}
-fn required<'a>(v: &'a Json, key: &str) -> Result<&'a Json, AuditError> {
-    v.get(key).ok_or_else(|| finding(FindingKind::MissingField))
-}
-fn mapped<T>(result: Result<T, AuditError>) -> Result<T, AuditError> {
-    result.map_err(|_| corrupt())
-}
+use std::fmt;
 
 // Preserve serde's error category at the seam for B2's torn-prefix recovery.
 // Warning/strict policy belongs to #68, not the complete-record decoder.
@@ -113,25 +88,6 @@ impl<'de> Visitor<'de> for UniqueVisitor {
         Ok(Unique(Json::Object(values)))
     }
 }
-fn object(v: &Json) -> Result<&Map<String, Json>, AuditError> {
-    v.as_object().ok_or_else(corrupt)
-}
-fn array(v: &Json) -> Result<&Vec<Json>, AuditError> {
-    v.as_array().ok_or_else(corrupt)
-}
-fn text(v: &Json) -> Result<&str, AuditError> {
-    let s = v.as_str().ok_or_else(corrupt)?;
-    mapped(valid_text(s))?;
-    Ok(s)
-}
-fn integer(v: &Json) -> Result<u64, AuditError> {
-    let s = v.as_str().ok_or_else(corrupt)?;
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) || (s.len() > 1 && s.starts_with('0'))
-    {
-        return Err(corrupt());
-    }
-    s.parse().map_err(|_| corrupt())
-}
 fn scalar<'a>(v: &'a Json, key: &str) -> Result<&'a Json, AuditError> {
     message(v, &[key])?;
     let fields = object(v)?;
@@ -160,23 +116,6 @@ fn hex_array<const N: usize>(s: &str) -> Result<[u8; N], AuditError> {
 fn digest(v: &Json) -> Result<[u8; 32], AuditError> {
     hex_array(string(v)?.strip_prefix("blake3:").ok_or_else(corrupt)?)
 }
-type Attributes<'a> = BTreeMap<&'a str, &'a Json>;
-fn attributes(v: &Json) -> Result<Attributes<'_>, AuditError> {
-    let mut result = BTreeMap::new();
-    for a in array(v)? {
-        message(a, &["key", "value"])?;
-        let fields = object(a)?;
-        let key = text(required(a, "key")?)?;
-        let value = fields
-            .get("value")
-            .ok_or_else(|| finding(FindingKind::MissingField))?;
-        any_value(value)?;
-        if result.insert(key, value).is_some() {
-            return Err(corrupt());
-        }
-    }
-    Ok(result)
-}
 fn take<'a>(attrs: &mut Attributes<'a>, key: &str) -> Result<&'a Json, AuditError> {
     attrs
         .remove(key)
@@ -193,104 +132,6 @@ fn value(
         (None, None) => Ok(None),
         _ => Err(corrupt()),
     }
-}
-fn schema_url(v: &Json) -> Result<(), AuditError> {
-    if v.get("schemaUrl").is_some_and(|v| !v.is_string()) {
-        return Err(corrupt());
-    }
-    Ok(())
-}
-fn context_message(v: &Json, resource: bool) -> Result<(), AuditError> {
-    message(
-        v,
-        if resource {
-            &["attributes", "droppedAttributesCount", "entityRefs"]
-        } else {
-            &["name", "version", "attributes", "droppedAttributesCount"]
-        },
-    )?;
-    for key in ["name", "version"] {
-        if v.get(key).is_some_and(|v| !v.is_string()) {
-            return Err(corrupt());
-        }
-    }
-    if let Some(count) = v.get("droppedAttributesCount")
-        && count.as_u64().is_none_or(|n| n > u32::MAX.into())
-    {
-        return Err(corrupt());
-    }
-    if let Some(attrs) = v.get("attributes") {
-        attributes(attrs)?;
-    }
-    if let Some(refs) = v.get("entityRefs") {
-        for entity in array(refs)? {
-            message(entity, &["schemaUrl", "type", "idKeys", "descriptionKeys"])?;
-            schema_url(entity)?;
-            if entity.get("type").is_some_and(|v| !v.is_string()) {
-                return Err(corrupt());
-            }
-            for key in ["idKeys", "descriptionKeys"] {
-                if let Some(keys) = entity.get(key)
-                    && array(keys)?.iter().any(|v| !v.is_string())
-                {
-                    return Err(corrupt());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-fn any_value(v: &Json) -> Result<(), AuditError> {
-    message(
-        v,
-        &[
-            "stringValue",
-            "boolValue",
-            "intValue",
-            "doubleValue",
-            "bytesValue",
-            "arrayValue",
-            "kvlistValue",
-        ],
-    )?;
-    if object(v)?.len() > 1 {
-        return Err(corrupt());
-    }
-    for (key, val) in object(v)? {
-        match key.as_str() {
-            "arrayValue" | "kvlistValue" => {
-                message(val, &["values"])?;
-                if let Some(values) = val.get("values") {
-                    if key == "arrayValue" {
-                        for value in array(values)? {
-                            any_value(value)?;
-                        }
-                    } else {
-                        attributes(values)?;
-                    }
-                }
-            }
-            "stringValue" if val.is_string() => {}
-            "bytesValue"
-                if val.as_str().is_some_and(|s| {
-                    let engine = GeneralPurpose::new(
-                        &alphabet::STANDARD,
-                        GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true),
-                    );
-                    engine.decode(s).is_ok()
-                }) => {}
-            "boolValue" if val.is_boolean() => {}
-            "intValue"
-                if val
-                    .as_str()
-                    .is_some_and(|s| s.parse::<i64>().is_ok_and(|n| n.to_string() == s)) => {}
-            "doubleValue"
-                if val.is_number()
-                    || ["NaN", "Infinity", "-Infinity"].contains(&val.as_str().unwrap_or("")) => {}
-            _ => return Err(corrupt()),
-        }
-    }
-    Ok(())
 }
 fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditError> {
     if log.get("body").is_some() {
@@ -442,22 +283,20 @@ impl Record {
     /// signatures or trust (#13). It does not classify incomplete input as a torn
     /// write: recovery needs file position and adjacent links (B2); strict warning
     /// policy remains deferred to #68. Receipt reconciliation across resume is
-    /// separate and deferred to #70. JSON nesting is limited to 128 levels.
+    /// separate and deferred to #70. Context AnyValue nesting is limited to 16 container edges; JSON also has a 128-level parser guard.
     /// Only canonical camelCase message keys and decimal-string int64 fields
     /// are accepted. Raw bytes below 0x20 are InvalidField; escaped controls and DEL are content.
     /// JSON payloads over 1,000,000 bytes, excluding one optional final LF, fail
     /// with TooLarge/InvalidField before parsing. No input is normalized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditErrorKind::TooLarge`] for payloads exceeding the byte cap.
+    /// Invalid framing, JSON, context, record fields or hashes return
+    /// [`AuditErrorKind::CorruptTrail`] with a typed verifier finding.
     pub fn parse_line(bytes: &[u8]) -> Result<Vec<Self>, AuditError> {
         let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-        if bytes.len() > 1_000_000 {
-            return Err(AuditError::decoding(
-                AuditErrorKind::TooLarge,
-                FindingKind::InvalidField,
-            ));
-        }
-        if bytes.iter().any(|b| *b < 0x20) {
-            return Err(corrupt());
-        }
+        payload(bytes)?;
         let json = decode_complete_json(bytes).map_err(|e| {
             finding(if e.is_data() {
                 FindingKind::InvalidField
@@ -465,20 +304,17 @@ impl Record {
                 FindingKind::Unparsable
             })
         })?;
+        contexts(&json)?;
         message(&json, &["resourceLogs"])?;
         let mut records = Vec::new();
         for resource in array(required(&json, "resourceLogs")?)? {
             message(resource, &["resource", "scopeLogs", "schemaUrl"])?;
             schema_url(resource)?;
             let context = required(resource, "resource")?;
-            context_message(context, true)?;
             let attrs = attributes(required(context, "attributes")?)?;
             for scope in array(required(resource, "scopeLogs")?)? {
                 message(scope, &["scope", "logRecords", "schemaUrl"])?;
                 schema_url(scope)?;
-                if let Some(context) = scope.get("scope") {
-                    context_message(context, false)?;
-                }
                 for log in array(required(scope, "logRecords")?)? {
                     records.push(parse_record(log, &attrs)?);
                 }
@@ -507,6 +343,11 @@ impl Checkpoint {
     /// Parses exactly one checkpoint from a complete OTLP/JSON line.
     /// Ordinary actions or multiple records are CorruptTrail.
     /// No signature or trust verification is performed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Record::parse_line`] errors; returns
+    /// [`AuditErrorKind::CorruptTrail`] for an ordinary record or multiple records.
     pub fn parse(line: &str) -> Result<Self, AuditError> {
         let mut records = Record::parse_line(line.as_bytes())?;
         if records.len() != 1 {

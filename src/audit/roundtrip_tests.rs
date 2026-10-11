@@ -1,10 +1,7 @@
 //! The B1 writer projection uses the production telemetry OTLP encoder; no sink I/O.
 use super::*;
-use opentelemetry_proto::tonic::{
-    collector::logs::v1::ExportLogsServiceRequest,
-    common::v1::{AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList, any_value},
-    logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
-    resource::v1::Resource,
+use opentelemetry_proto::tonic::common::v1::{
+    AnyValue, ArrayValue, KeyValue, KeyValueList, any_value,
 };
 use proptest::{
     prelude::*,
@@ -26,111 +23,15 @@ fn kv(key: &str, value: AnyValue) -> KeyValue {
 fn text(value: &str) -> AnyValue {
     av(any_value::Value::StringValue(value.into()))
 }
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-fn digest(bytes: &[u8]) -> AnyValue {
-    text(&format!("blake3:{}", hex(bytes)))
-}
-fn request(record: &Record, extra: AnyValue) -> ExportLogsServiceRequest {
-    let c = &record.context;
-    let mut attributes = vec![
-        kv("audit.v", av(any_value::Value::IntValue(1))),
-        kv("audit.trail", text(&hex(&c.trail))),
-        kv("audit.seq", av(any_value::Value::IntValue(c.seq as i64))),
-        kv("audit.prev_hash", digest(&c.previous)),
-        kv("audit.hash", digest(&record.hash())),
-    ];
-    let event_name = match &record.kind {
-        Kind::Entry(entry) => {
-            for (key, value) in [
-                ("audit.actor", Some(&entry.actor)),
-                ("audit.action", Some(&entry.action)),
-                ("audit.object", Some(&entry.object)),
-                ("audit.reason", entry.reason.as_ref()),
-                ("audit.details", entry.details.as_ref()),
-            ] {
-                if let Some(value) = value {
-                    attributes.push(kv(key, text(value)));
-                }
-            }
-            for (key, value) in [
-                ("audit.before", &entry.before),
-                ("audit.after", &entry.after),
-            ] {
-                match value {
-                    Some(Value::Text(value)) => attributes.push(kv(key, text(value))),
-                    Some(Value::Digest(value)) => {
-                        attributes.push(kv(&format!("{key}_digest"), digest(value)))
-                    }
-                    None => {}
-                }
-            }
-            "audit.record"
-        }
-        Kind::Checkpoint(cp) => {
-            attributes.extend([
-                kv(
-                    "audit.mmr_size",
-                    av(any_value::Value::IntValue(cp.size as i64)),
-                ),
-                kv("audit.mmr_root", digest(&cp.root)),
-                kv("audit.key_id", text(&hex(&cp.key))),
-                kv("audit.sig", text(&hex(&cp.signature))),
-            ]);
-            if !cp.peaks.is_empty() {
-                attributes.push(kv(
-                    "audit.mmr_peaks",
-                    av(any_value::Value::ArrayValue(ArrayValue {
-                        values: cp.peaks.iter().map(|p| digest(p)).collect(),
-                    })),
-                ));
-            }
-            "audit.checkpoint"
-        }
-    };
-    let mut resource_attributes = vec![
-        kv("service.name", text(&c.service)),
-        kv("context", extra.clone()),
-    ];
-    if let Some(host) = &c.host {
-        resource_attributes.push(kv("host.name", text(host)));
-    }
-    ExportLogsServiceRequest {
-        resource_logs: vec![ResourceLogs {
-            resource: Some(Resource {
-                attributes: resource_attributes,
-                ..Default::default()
-            }),
-            scope_logs: vec![ScopeLogs {
-                scope: Some(InstrumentationScope {
-                    name: "vigil.audit".into(),
-                    attributes: vec![kv("context", extra)],
-                    ..Default::default()
-                }),
-                log_records: vec![LogRecord {
-                    time_unix_nano: c.time,
-                    observed_time_unix_nano: c.time,
-                    severity_number: 9,
-                    severity_text: "INFO".into(),
-                    event_name: event_name.into(),
-                    attributes,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        }],
-    }
-}
 fn unicode() -> BoxedStrategy<String> {
     prop::collection::vec(prop_oneof![3 => any::<char>().prop_filter("non-NUL", |c| *c != '\0'),
-        2 => prop::sample::select(vec!['\u{7f}', '\u{1}', '\n', '\r', '\t', '\u{d7ff}', '\u{e000}', '\u{10000}', '\u{10ffff}'])], 1..40)
+        2 => prop::sample::select(vec!['\u{2028}', '\u{2029}', '\u{7f}', '\u{1}', '\n', '\r', '\t', '\u{d7ff}', '\u{e000}', '\u{10000}', '\u{10ffff}'])], 1..40)
         .prop_map(|chars| chars.into_iter().collect()).boxed()
 }
 fn any_value() -> BoxedStrategy<AnyValue> {
     prop_oneof![
-        unicode().prop_map(|s| text(&s)),
+        prop_oneof![unicode(), Just(String::new())].prop_map(|s| text(&s)),
+        Just(AnyValue { value: None }),
         any::<bool>().prop_map(|v| av(any_value::Value::BoolValue(v))),
         prop_oneof![any::<i64>(), Just(i64::MIN), Just(i64::MAX)]
             .prop_map(|v| av(any_value::Value::IntValue(v))),
@@ -147,18 +48,48 @@ fn any_value() -> BoxedStrategy<AnyValue> {
         prop_oneof![
             prop::collection::vec(inner.clone(), 0..4)
                 .prop_map(|values| av(any_value::Value::ArrayValue(ArrayValue { values }))),
-            prop::collection::vec(inner, 0..4).prop_map(|values| av(
-                any_value::Value::KvlistValue(KeyValueList {
-                    values: values
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, v)| kv(&format!("key{i}"), v))
-                        .collect()
-                })
-            ))
+            prop::collection::vec(
+                (
+                    prop_oneof![unicode(), Just(String::new()), Just("duplicate".into())],
+                    prop::option::of(inner)
+                ),
+                0..4
+            )
+            .prop_map(|pairs| av(any_value::Value::KvlistValue(KeyValueList {
+                values: pairs
+                    .into_iter()
+                    .map(|(key, value)| KeyValue {
+                        key,
+                        value,
+                        ..Default::default()
+                    })
+                    .collect()
+            })))
         ]
     })
+    .prop_flat_map(|leaf| {
+        (
+            Just(leaf),
+            0usize..=validation::MAX_CONTEXT_DEPTH + 4,
+            any::<bool>(),
+        )
+    })
+    .prop_map(|(leaf, depth, kvlist)| nested(leaf, depth, kvlist))
     .boxed()
+}
+fn nested(mut leaf: AnyValue, depth: usize, kvlist: bool) -> AnyValue {
+    for _ in 0..depth {
+        leaf = if kvlist {
+            av(any_value::Value::KvlistValue(KeyValueList {
+                values: vec![kv("nested", leaf)],
+            }))
+        } else {
+            av(any_value::Value::ArrayValue(ArrayValue {
+                values: vec![leaf],
+            }))
+        };
+    }
+    leaf
 }
 fn value() -> BoxedStrategy<Option<Value>> {
     prop::option::of(prop_oneof![
@@ -170,7 +101,11 @@ fn value() -> BoxedStrategy<Option<Value>> {
 fn generated() -> impl Strategy<Value = (Record, AnyValue)> {
     (
         prop::collection::vec(unicode(), 6),
-        (prop::option::of(unicode()), prop::option::of(unicode())),
+        (
+            prop::option::of(unicode()),
+            prop::option::of(unicode()),
+            prop::option::of(unicode()),
+        ),
         value(),
         value(),
         any::<[u8; 16]>(),
@@ -179,12 +114,12 @@ fn generated() -> impl Strategy<Value = (Record, AnyValue)> {
         (any::<[u8; 32]>(), any::<[u8; 32]>(), any::<[u8; 64]>()),
         any_value(),
         any::<bool>(),
-        prop_oneof![15 => Just(0usize), 1 => 999_900usize..=1_000_000],
+        prop_oneof![15 => Just(0usize), 1 => 999_900usize..=1_000_100],
     )
         .prop_map(
             |(
                 strings,
-                (host, reason),
+                (host, reason, details),
                 before,
                 after,
                 trail,
@@ -209,16 +144,18 @@ fn generated() -> impl Strategy<Value = (Record, AnyValue)> {
                         .unwrap(),
                     )
                 } else {
-                    let mut entry =
-                        Entry::new(&strings[1], &strings[2], &strings[3]).details(&strings[4]);
+                    let mut entry = Entry::new(&strings[1], &strings[2], &strings[3]);
+                    entry.details = details;
                     entry.reason = reason;
                     entry.before = before;
                     entry.after = after;
                     Kind::Entry(entry)
                 };
                 let mut record = Record::build(context, kind).unwrap();
-                if target != 0 {
-                    let line = crate::logs::encode_line(&request(&record, extra.clone())).unwrap();
+                if target != 0
+                    && let Ok(request) = request(&record, extra.clone())
+                {
+                    let line = crate::logs::encode_line(&request).unwrap();
                     assert!(line.len() < target);
                     record
                         .context
@@ -229,19 +166,29 @@ fn generated() -> impl Strategy<Value = (Record, AnyValue)> {
             },
         )
 }
-fn roundtrip(record: &Record, extra: AnyValue) -> String {
-    let line = crate::logs::encode_line(&request(record, extra)).unwrap();
+fn roundtrip(record: &Record, extra: AnyValue) -> Option<String> {
+    let request = match request(record, extra) {
+        Ok(request) => request,
+        Err(error) => {
+            assert!(matches!(
+                error.kind(),
+                AuditErrorKind::InvalidConfig | AuditErrorKind::TooLarge
+            ));
+            return None;
+        }
+    };
+    let line = crate::logs::encode_line(&request).unwrap();
     assert!(line.len() <= 1_000_000);
     let decoded = Record::parse_line(line.as_bytes()).unwrap();
     assert_eq!(decoded.len(), 1);
     assert_eq!(decoded[0].canonical(), record.canonical());
     assert_eq!(decoded[0].hash(), record.hash());
-    line
+    Some(line)
 }
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
     #[test]
-    fn writer_lines_always_verify((record, extra) in generated()) { roundtrip(&record, extra); }
+    fn writer_lines_always_verify((record, extra) in generated()) { let _ = roundtrip(&record, extra); }
 }
 fn corpus() -> Vec<String> {
     let mut runner = TestRunner::new_with_rng(
@@ -249,12 +196,19 @@ fn corpus() -> Vec<String> {
         TestRng::from_seed(RngAlgorithm::ChaCha, &[0x75; 32]),
     );
     let strategy = generated();
-    (0..256)
-        .map(|_| {
-            let (record, extra) = strategy.new_tree(&mut runner).unwrap().current();
-            roundtrip(&record, extra)
-        })
-        .collect()
+    let mut lines = Vec::new();
+    let mut refused = 0;
+    while lines.len() < 256 {
+        let (record, extra) = strategy.new_tree(&mut runner).unwrap().current();
+        if let Some(line) = roundtrip(&record, extra) {
+            lines.push(line);
+        } else {
+            refused += 1;
+        }
+        assert!(refused < 10_000, "generator must reach the accepted domain");
+    }
+    assert!(refused > 0, "fixed seed must exercise typed refusals");
+    lines
 }
 #[test]
 fn fixed_seed_corpus_matches_generator() {
@@ -277,4 +231,116 @@ fn regenerate_writer_corpus() {
         .write_all(bytes.as_bytes())
         .unwrap();
     println!("corpus BLAKE3 {}", blake3::hash(bytes.as_bytes()).to_hex());
+}
+
+fn record() -> Record {
+    Record::new(
+        RecordContext::new([0; 16], 0, 0, "service", [0; 32]),
+        Entry::new("actor", "action", "object"),
+    )
+    .unwrap()
+}
+#[test]
+fn context_domain_regression() {
+    let record = record();
+    let invalid = [
+        vec![kv("", text("value"))],
+        vec![kv("duplicate", text("a")), kv("duplicate", text("b"))],
+        vec![KeyValue {
+            key: "missing".into(),
+            value: None,
+            ..Default::default()
+        }],
+        vec![kv("none", AnyValue { value: None })],
+    ];
+    for values in invalid {
+        let extra = av(any_value::Value::KvlistValue(KeyValueList { values }));
+        assert_eq!(
+            request(&record, extra).unwrap_err().kind(),
+            AuditErrorKind::InvalidConfig
+        );
+    }
+    for kvlist in [false, true] {
+        assert!(
+            roundtrip(
+                &record,
+                nested(text(""), validation::MAX_CONTEXT_DEPTH, kvlist)
+            )
+            .is_some()
+        );
+        assert_eq!(
+            request(
+                &record,
+                nested(text(""), validation::MAX_CONTEXT_DEPTH + 1, kvlist)
+            )
+            .unwrap_err()
+            .kind(),
+            AuditErrorKind::InvalidConfig
+        );
+    }
+    assert_eq!(
+        request(&record, nested(text(""), 64, true))
+            .unwrap_err()
+            .kind(),
+        AuditErrorKind::InvalidConfig
+    );
+    assert!(roundtrip(&record, text("\u{2028}\u{2029}")).is_some());
+    let unicode_record = Record::new(
+        RecordContext::new([0; 16], 0, 0, "\u{2028}\u{2029}", [0; 32]),
+        Entry::new("\u{2028}", "\u{2029}", "object"),
+    )
+    .unwrap();
+    assert!(roundtrip(&unicode_record, text("")).is_some());
+}
+#[test]
+fn reader_uses_shared_context_domain() {
+    let invalid = [
+        serde_json::json!([{"key":"", "value":{"stringValue":"a"}}]),
+        serde_json::json!([{"key":"duplicate", "value":{"stringValue":"a"}}, {"key":"duplicate", "value":{"stringValue":"b"}}]),
+        serde_json::json!([{"key":"missing"}]),
+        serde_json::json!([{"key":"null", "value":null}]),
+        serde_json::json!([{"key":"empty", "value":{}}]),
+    ];
+    for attributes in invalid {
+        for resource in [false, true] {
+            let mut json =
+                crate::logs::encode_json(&request(&record(), text("valid")).unwrap()).unwrap();
+            if resource {
+                json["resourceLogs"][0]["resource"]["attributes"] = attributes.clone();
+            } else {
+                json["resourceLogs"][0]["scopeLogs"][0]["scope"]["attributes"] = attributes.clone();
+            }
+            let error = Record::parse_line(&serde_json::to_vec(&json).unwrap()).unwrap_err();
+            assert_eq!(error.kind(), AuditErrorKind::CorruptTrail);
+            assert!(matches!(
+                error.finding_kind(),
+                Some(
+                    crate::audit::FindingKind::InvalidField
+                        | crate::audit::FindingKind::MissingField
+                )
+            ));
+        }
+    }
+    for kvlist in [false, true] {
+        let mut json =
+            crate::logs::encode_json(&request(&record(), text("valid")).unwrap()).unwrap();
+        json["resourceLogs"][0]["scopeLogs"][0]["scope"]["attributes"][0]["value"] =
+            serde_json::to_value(nested(text(""), validation::MAX_CONTEXT_DEPTH + 1, kvlist))
+                .unwrap();
+        assert_eq!(
+            Record::parse_line(&serde_json::to_vec(&json).unwrap())
+                .unwrap_err()
+                .finding_kind(),
+            Some(crate::audit::FindingKind::InvalidField)
+        );
+    }
+}
+#[test]
+fn writer_refuses_oversize_without_truncation() {
+    let mut record = record();
+    record.context.service = "x".repeat(validation::MAX_PAYLOAD_BYTES);
+    assert_eq!(
+        request(&record, text("valid")).unwrap_err().kind(),
+        AuditErrorKind::TooLarge
+    );
 }

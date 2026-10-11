@@ -39,3 +39,11 @@ To regenerate, set `VIGIL_CORPUS_PATH` to a fresh output path and run
 in the dev shell. Compress that output with Python `gzip.compress(..., mtime=0)`
 and update the digest from the printed BLAKE3. The ignored test is an explicit
 fixture-writing utility; both verification tests run normally in CI.
+
+The production mapping and reader share context validation. The generator now
+includes empty/duplicate/random keys, absent KeyValue/AnyValue values, empty
+strings, absent details, U+2028/U+2029, arrays/kvlist depths at and beyond 16,
+and size refusals. Corpus generation exercises typed refusals and collects 256
+accepted lines; it does not discard a successfully emitted unverifiable line.
+Depth counts container edges from root AnyValue depth zero. Invalid context
+returns InvalidConfig; oversized payloads return TooLarge before writing.

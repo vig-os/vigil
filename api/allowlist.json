@@ -130,5 +130,27 @@
       "vigil::audit::checkpoint_message": "fn",
       "vigil::audit::verify_signature": "fn"
     }
+  },
+  {
+    "justification": "ADR-0005 decisions 3, 4, 7 and 9; #11/#12 B1 strict decoding, checkpoint anchors and typed verifier findings",
+    "items": {
+      "vigil::audit::AuditError::finding_kind": "fn",
+      "vigil::audit::Checkpoint": "struct",
+      "vigil::audit::Checkpoint::hash": "fn",
+      "vigil::audit::Checkpoint::key_id": "fn",
+      "vigil::audit::Checkpoint::line": "fn",
+      "vigil::audit::Checkpoint::mmr_root": "fn",
+      "vigil::audit::Checkpoint::mmr_size": "fn",
+      "vigil::audit::Checkpoint::parse": "fn",
+      "vigil::audit::Checkpoint::seq": "fn",
+      "vigil::audit::FindingKind": "enum",
+      "vigil::audit::FindingKind::HashMismatch": "variant",
+      "vigil::audit::FindingKind::InvalidField": "variant",
+      "vigil::audit::FindingKind::MissingField": "variant",
+      "vigil::audit::FindingKind::UnknownField": "variant",
+      "vigil::audit::FindingKind::UnknownVersion": "variant",
+      "vigil::audit::FindingKind::Unparsable": "variant",
+      "vigil::audit::Record::parse_line": "fn"
+    }
   }
 ]

@@ -244,27 +244,52 @@ excluded from checkpoint anchors; double-final LF is rejected (round 3 amendment
 JSON payload bound before parsing (`TooLarge`, verifier `InvalidField`), excluding
 that optional LF, and the JSON deserializer's 128-level nesting bound. These
 rules also cover Collector multi-record lines and unhashed scope/resource data.
-**Writer/reader invariant (amended 2026-10-11, B1 round 5).** Every line the
-writer can emit verifies: validated records, projected to OTLP and serialized
-through the shared encoder, must decode to identical canonical record bytes
-and hashes. The payload limit is checked before emission; oversized records
-are refused, never truncated. [RFC 8259 §7](https://www.rfc-editor.org/rfc/rfc8259#section-7) permits DEL (U+007F) in strings, as do
-the encoder and pdata, so the decoder accepts it. Only unescaped bytes below
-0x20 are forbidden (apart from the final framing LF); escaped controls remain
-content. The shared encoder omits an absent protobuf body rather than emitting
-`body: null`, honoring the audit body's required absence. Property tests cover
-entries/checkpoints, full Unicode, control and scalar boundaries, nested AnyValue
-kinds, signed int64 extremes, bytes and payloads near the one-million-byte cap.
-A reproducible 256-line corpus from the same generator is checked by the real
-pinned Collector in CI. This checks individual records, not chain history (#13).
+**Writer/reader invariant (2026-10-11, decided in review of PR #75).** The
+decoder stays strict (canonical-only). The invariant “every line the writer can
+emit verifies” is enforced by construction: ONE shared validation module defines
+the accepted domain, and BOTH the production mapping and `parse_line` call it.
+There are no duplicated domain rules. Keys must be nonempty, NUL-free and unique
+within each attribute/kvlist list; KeyValue values must be present, and AnyValue
+must contain exactly one value. Context string values may be empty or contain
+escaped controls; authenticated text and keys must be nonempty and NUL-free.
+Full Unicode, including DEL, U+2028 and U+2029, is accepted without normalization.
+`MAX_CONTEXT_DEPTH = 16` counts container edges from an attribute's root AnyValue
+at depth zero, for both arrays and kvlists. This stays well below serde's 128
+JSON-level guard and pdata's limits (a kvlist consumes several JSON levels).
+`MAX_PAYLOAD_BYTES = 1_000_000` excludes one optional terminal framing LF.
+Unescaped bytes below 0x20 are refused; escaped controls remain content.
 
-| Deliberate v1 rejection accepted by pdata | Why the writer never emits it |
-| --- | --- |
-| intValue `"+5"` or `"007"` | Canonical signed decimal, no plus or leading zeros |
-| Quoted finite doubleValue, e.g. `"1.5"` | Finite doubles are JSON numbers; only NaN/Infinity are strings |
-| Numeric timeUnixNano/observedTimeUnixNano | UInt64 timestamps are canonical decimal strings |
-| Tab between tokens | Encoder emits compact JSON, with controls escaped inside strings |
-| `trace_id` and other snake_case aliases | Encoder emits canonical camelCase keys |
+The `pub(crate)` production `Record` → `ExportLogsServiceRequest` mapping is the
+boundary B2/B3 MUST use. Invalid context returns typed `InvalidConfig`; excessive
+size returns `TooLarge`, before any write. It preflights typed context with the same nesting guard before cloning or JSON
+projection, then validates the shared encoder's patched JSON tree before
+serialization. Excessive nesting never reaches the reader's parser limit. The current mapping materializes that tree and serializes
+once to check the byte budget, then returns the typed request for the eventual
+sink to encode; this deliberate extra projection keeps one set of body and
+non-finite-double rules. No truncation or context sanitization occurs. The shared
+encoder omits an absent body rather than emitting `body: null`.
+
+Property tests generate entries/checkpoints, absent details, empty strings,
+random keys including empty/duplicate keys, missing values, all AnyValue kinds,
+signed int64 extremes, depth at/beyond the limit, full Unicode and payloads
+at/beyond the size cap. Every input either receives a typed writer refusal or
+round-trips to identical canonical record bytes and hash. A fixed-seed corpus
+of 256 accepted lines from that same generator runs through the real pinned
+Collector in CI; refused samples are exercised during corpus generation.
+This verifies individual records, not chain history (#13).
+
+| Input accepted by pdata | Vigil reader (canonical-only) | Writer boundary |
+| --- | --- | --- |
+| intValue `"+5"` or `"007"` | Reject noncanonical decimal | Emits canonical decimal |
+| Quoted finite doubleValue, e.g. `"1.5"` | Reject | Emits finite numbers, only non-finite strings |
+| Numeric timeUnixNano/observedTimeUnixNano | Reject | Emits decimal strings |
+| Tab between tokens | Reject raw control | Emits compact JSON with escaped content |
+| `trace_id` and other snake_case aliases | Reject | Emits camelCase |
+| Empty or NUL-containing context key | Reject InvalidField | Refuse InvalidConfig |
+| Duplicate keys in an attribute/kvlist list | Reject InvalidField | Refuse InvalidConfig |
+| KeyValue without value (`null`/absent), or empty AnyValue | Reject InvalidField/MissingField | Refuse InvalidConfig |
+| Context nesting above 16 container edges | Reject InvalidField (or Unparsable at parser guard) | Refuse InvalidConfig |
+| Payload above 1,000,000 bytes | Reject TooLarge/InvalidField | Refuse TooLarge |
 
 **Whitespace decision (2026-10-11, #82).** ASCII space between tokens and before
 or after the JSON value is accepted and preserved; anchors retain that spelling

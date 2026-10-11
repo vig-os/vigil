@@ -1,4 +1,13 @@
 use super::{AuditError, AuditErrorKind};
+use validation::valid_text;
+
+#[path = "validation.rs"]
+mod validation;
+#[cfg_attr(not(test), allow(dead_code))] // B2/B3 consume this production boundary.
+#[path = "writer.rs"]
+mod writer;
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use writer::request;
 
 /// A before/after value. Use digests for personal or large values; retain the
 /// referenced data separately in the application's own store.
@@ -112,16 +121,6 @@ impl Entry {
         fields
     }
 }
-fn valid_text(text: &str) -> Result<(), AuditError> {
-    if text.is_empty() || text.contains('\0') {
-        return Err(AuditError::new(
-            AuditErrorKind::InvalidEntry,
-            "strings must be nonempty and contain no NUL",
-        ));
-    }
-    Ok(())
-}
-
 /// Checkpoint commitment to all leaves preceding its own sequence number.
 #[derive(Clone, Debug)]
 pub struct CheckpointFields {
