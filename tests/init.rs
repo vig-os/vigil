@@ -1,3 +1,4 @@
+//! Initialization precedence, storage fallback and runtime diagnostics.
 use serde_json::Value;
 use std::{
     fs,

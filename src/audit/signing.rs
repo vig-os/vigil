@@ -23,6 +23,12 @@ pub trait Signer: Send + Sync + fmt::Debug {
     /// Returns the raw 32-byte Ed25519 public key.
     fn public_key(&self) -> [u8; 32];
     /// Signs the exact message using pure Ed25519 (not prehashed Ed25519ph).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SignerError`] when the implementation cannot access its key
+    /// or complete signing, for example if external key custody is unavailable.
+    /// The in-memory [`KeySeed`] implementation always succeeds.
     fn sign(&self, message: &[u8]) -> Result<[u8; 64], SignerError>;
 }
 
@@ -45,6 +51,11 @@ impl KeySeed {
     /// them apart. A public key is accepted as a seed and silently derives a
     /// different signing key. Check the derived public key against the trusted
     /// key id before use. The v1 key-file format allows no header or prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SignerError`] if the trimmed input is not exactly 64 ASCII
+    /// hexadecimal characters.
     pub fn parse(text: &str) -> Result<Self, SignerError> {
         let text = text.trim().as_bytes();
         if text.len() != 64 {
@@ -89,6 +100,12 @@ pub fn checkpoint_message(unsigned_fields: &[u8]) -> Vec<u8> {
 
 /// Checks a pure Ed25519 signature with strict canonical/small-order checks.
 /// This validates a message signature only, not trust policy or trail history.
+///
+/// # Errors
+///
+/// Returns [`SignerError`] if the public key cannot be decoded or strict
+/// Ed25519 verification rejects the signature for the supplied key and message,
+/// including noncanonical signatures and small-order keys or signature points.
 pub fn verify_signature(
     key: &[u8; 32],
     message: &[u8],

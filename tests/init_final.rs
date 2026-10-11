@@ -1,3 +1,4 @@
+//! Logger coexistence, environment validation and concurrent initialization.
 use std::{fs, process::Command};
 struct Logger;
 impl log::Log for Logger {

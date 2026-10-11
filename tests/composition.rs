@@ -1,3 +1,4 @@
+//! Consumer layer filters and process-wide pipeline reservation.
 use std::{fs, process::Command};
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 use vigil::{Config, Console, InitErrorKind};

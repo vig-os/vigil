@@ -14,6 +14,11 @@ impl Mmr {
     }
     /// Restores peaks; their heights are the set bits of size, high to low.
     /// This checks shape only: callers must authenticate the checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditErrorKind::InvalidConfig`] if peak count differs from
+    /// the population count of `size`.
     pub fn from_peaks(size: u64, peaks: Vec<[u8; 32]>) -> Result<Self, AuditError> {
         if peaks.len() != size.count_ones() as usize {
             return Err(AuditError::new(
@@ -25,6 +30,12 @@ impl Mmr {
     }
     /// Appends a record hash (checkpoints are leaves too). At u64::MAX leaves,
     /// returns InvalidConfig without changing state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditErrorKind::InvalidConfig`] if the leaf count would
+    /// overflow `u64`, or a peak needed for merging is missing. The latter
+    /// cannot occur for state constructed through this type's public API.
     pub fn push(&mut self, hash: [u8; 32]) -> Result<(), AuditError> {
         let next = self
             .size
