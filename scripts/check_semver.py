@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Check the pre-publish stable API without accepting a vacuous pass."""
 
+import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
+import tomllib
 
 
 def checks_ran(output):
@@ -28,6 +31,52 @@ def stable_environment():
     env["CARGO_BUILD_RUSTFLAGS"] = ""
     env["CARGO_BUILD_RUSTDOCFLAGS"] = ""
     return env
+
+
+def event_labels(path):
+    """Read labels from the PR event; non-PR runs have no exception."""
+    if not path:
+        return set()
+    event = json.loads(Path(path).read_text())
+    return {label["name"] for label in event.get("pull_request", {}).get("labels", [])}
+
+
+def evaluate(output, status, labels, version, summary=None):
+    """Accept only complete, reviewed pre-publish major findings, never tool errors."""
+    if not checks_ran(output):
+        print("Semver gate failed: no positive check-count summary", file=sys.stderr)
+        return 1
+    if status == 0:
+        return 0
+    result = re.search(
+        r"semver requires new major version: (\d+) major and (\d+) minor checks failed",
+        output,
+    )
+    findings = re.findall(
+        r"(?ms)^--- failure .+?(?=^--- failure |^     Summary|\Z)", output
+    )
+    if not result or status != 1:
+        return status or 1
+    major, minor = map(int, result.groups())
+    reviewed = "semver:major" in labels and version.startswith("0.")
+    complete = major > 0 and minor == 0 and len(findings) == major
+    if summary:
+        with Path(summary).open("a") as report:
+            report.write("## Semver major findings\n\n")
+            report.write(
+                f"Pre-publish reviewed label present: {reviewed}. Major checks: {major}.\n\n"
+            )
+            for finding in findings:
+                report.write("````text\n" + finding.rstrip() + "\n````\n\n")
+            report.write(
+                f"Exception accepted: {reviewed and complete}. ADR-0004 decision 12.\n"
+            )
+    if reviewed and complete:
+        print(
+            "Reviewed pre-publish semver:major exception accepted; findings retained in summary"
+        )
+        return 0
+    return status
 
 
 def main():
@@ -65,10 +114,14 @@ def main():
         check=False,
     )
     print(result.stdout, end="", flush=True)
-    if not checks_ran(result.stdout):
-        print("Semver gate failed: no positive check-count summary", file=sys.stderr)
-        return 1
-    return result.returncode
+    version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+    return evaluate(
+        result.stdout,
+        result.returncode,
+        event_labels(os.environ.get("GITHUB_EVENT_PATH")),
+        version,
+        os.environ.get("GITHUB_STEP_SUMMARY"),
+    )
 
 
 if __name__ == "__main__":

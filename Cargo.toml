@@ -50,3 +50,11 @@ harness = false
 [[example]]
 name = "flock"
 test = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(vigil_unstable)'] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs", "--cfg", "vigil_unstable"]
+rustc-args = ["--cfg", "vigil_unstable"]

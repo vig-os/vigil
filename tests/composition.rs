@@ -117,6 +117,10 @@ fn per_layer_filters_and_process_reservation() {
             .output()
             .unwrap();
         assert!(
+            String::from_utf8_lossy(&out.stdout).contains("1 passed;"),
+            "{out:?}"
+        );
+        assert!(
             out.status.success(),
             "{}{}",
             String::from_utf8_lossy(&out.stdout),

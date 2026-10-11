@@ -16,12 +16,11 @@ being built, and the pre-1.0 `dev` branch may change it.
   OpenTelemetry upgrade inside vigil is a minor release.
   Moving to `tracing` 0.2 or `tracing-subscriber` 0.4 would be a major. Removing a
   feature or changing the default features is a major. See
-  [ADR-0004](docs/adr/0004-public-api-and-stability.md) decisions 1, 5 and 7. CI
-  already runs the semver compatibility gate ([Semver](#semver)); the gate that fails
-  on any OpenTelemetry type in the surface arrives with
-  [#42](https://github.com/vig-os/vigil/issues/42) (part 3/3).
+  [ADR-0004](docs/adr/0004-public-api-and-stability.md) decisions 1, 5 and 7. CI checks the committed public API snapshot and the ADR allowlist, including
+  hidden items and macro expansions, alongside the semver gate ([Semver](#semver)).
 - **`vigil_unstable` is excluded.** Items behind `--cfg vigil_unstable` (the exporters,
-  sinks, the re-exported OpenTelemetry crates and `install_opentelemetry_globals`) may
+  sinks and the re-exported OpenTelemetry crates; global-provider installation
+  remains deferred to #7/#8) may
   change in any minor release. Applications that set the cfg should pin `~1.N`
   ([ADR-0004](docs/adr/0004-public-api-and-stability.md) decision 4).
 - **On-disk format.** Every line is valid OTLP/JSON, one signal per file, with the
@@ -53,6 +52,26 @@ being built, and the pre-1.0 `dev` branch may change it.
   (default histogram boundaries, span and cardinality limits, batch sizes), which may
   change in a minor release with a changelog entry; and copies of files that a shipper
   has rewritten.
+
+## Unstable SDK access
+
+Exporters and sinks are crate-private by default. Applications composing their
+own SDK pipeline can opt in with `RUSTFLAGS="--cfg vigil_unstable" cargo build`,
+or set `[build] rustflags = ["--cfg", "vigil_unstable"]` in their own
+`.cargo/config.toml`. Use `vigil::unstable::{opentelemetry, opentelemetry_sdk}`
+for the exact versions linked by vigil. These APIs may change in any minor;
+applications should pin vigil with `~1.N`. A library using them forces its
+applications to enable the cfg, must document that requirement, and should avoid
+pinning `~1.N` itself because that constrains every dependent in the graph.
+Global-provider installation and the tracing integration re-export follow in
+#7/#8; neither is implemented today.
+
+Cargo uses one rustflags source, in precedence order: `CARGO_ENCODED_RUSTFLAGS`,
+`RUSTFLAGS`, matching target rustflags (including `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`),
+then build rustflags. Earlier sources replace later ones: add the cfg to whichever
+source the application already uses. Changing flags rebuilds dependencies once.
+Docs.rs labels the unstable surface; CI compiles and tests it separately from
+the stable [API snapshot and ADR allowlist](api/README.md) and semver gate.
 
 ## Rust version policy
 
@@ -120,7 +139,8 @@ records: the first error is reported on stderr, followed by cumulative dropped-r
 summaries at most once per minute during failing exports and at shutdown if needed.
 After the guard drops, events are discarded with one stderr warning.
 `VIGIL_DIR` must be absolute; relative values warn and use the default resolution.
-Empty `RUST_LOG` values count as unset. Invalid values warn and use the default.
+Empty `RUST_LOG` values count as unset, so the default is `info` (or the configured
+`default_filter`). Invalid values warn and use the default.
 `Config::filter_env("FLOCK_LOG").default_filter("flk=info,flock=info")`
 selects another variable and default; an invalid default returns `InvalidFilter`.
 `Config::console(Console::Stderr)` adds human-readable stderr with the same
@@ -295,9 +315,15 @@ Run locally with `git fetch origin` followed by
 The gate refuses to compare when the merge base equals HEAD, including a
 workflow dispatch on `dev` or a release PR from `dev` to `main`; run it on a
 feature PR into `dev`. Self-comparison cannot prove compatibility.
-The public-API allowlist gate arrives with #42 (part 3/3).
+CI also checks the committed [API snapshot and ADR allowlist](api/README.md),
+including hidden exports, without any exception.
 See [ADR-0004](docs/adr/0004-public-api-and-stability.md) for the stability policy
-and the architect-reviewed `semver:major` exception before publication.
+and the `semver:major` exception before publication. Only the architect/owner
+applies that label after reviewing every major finding and its ADR justification
+in the PR body. The job runs the same minor-release check, lists every major
+finding in its summary, and accepts them only with the label on a pre-publish
+version. Zero checks, tool failures and missing labels still fail. Labels come
+from the PR event payload; a new PR event/run is required after label changes.
 
 ## Audit format (opt-in)
 

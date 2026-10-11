@@ -74,6 +74,10 @@ fn run(mode: &str, dir: &std::path::Path, extra: &[(&str, &str)]) -> std::proces
     }
     let output = cmd.output().unwrap();
     assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+        "{output:?}"
+    );
+    assert!(
         output.status.success(),
         "{}{}",
         String::from_utf8_lossy(&output.stdout),

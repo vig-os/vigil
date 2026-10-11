@@ -1,14 +1,19 @@
 //! Write fixed rich records in multiple rotated batches and an expected manifest.
+#[cfg(vigil_unstable)]
 #[path = "../tests/common/mod.rs"]
 mod common;
 
+#[cfg(vigil_unstable)]
 use opentelemetry::{KeyValue, logs::LogRecord as _};
+#[cfg(vigil_unstable)]
 use std::{path::PathBuf, sync::Arc};
+#[cfg(vigil_unstable)]
 use vigil::{
     rotate::{RotatingFile, RotationConfig},
     sink::MemorySink,
 };
 
+#[cfg(vigil_unstable)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = PathBuf::from(
         std::env::args_os()
@@ -84,4 +89,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         serde_json::to_vec_pretty(&manifest)?,
     )?;
     Ok(())
+}
+
+#[cfg(not(vigil_unstable))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    Err("conformance requires RUSTFLAGS=\"--cfg vigil_unstable\"".into())
 }

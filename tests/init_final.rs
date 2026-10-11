@@ -76,6 +76,10 @@ fn run(mode: &str, envs: &[(&str, &str)]) -> (std::path::PathBuf, std::process::
         cmd.env(k, v);
     }
     let out = cmd.output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1 passed;"),
+        "{out:?}"
+    );
     (dir, out)
 }
 #[test]

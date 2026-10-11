@@ -80,6 +80,14 @@ jobs:
       - name: Cargo tests with one test thread
         run: nix develop -c cargo test --locked --lib --bins --tests --examples --all-features -- --test-threads=1
 
+      - name: Stable public API snapshot and ADR allowlist
+        run: nix develop -c python3 scripts/check_public_api.py
+      - name: Unstable API compilation
+        run: nix develop -c env RUSTFLAGS="--cfg vigil_unstable" cargo check --locked --all-features
+      - name: Unstable exporter and sink tests
+        run: |
+          nix develop -c env RUSTFLAGS="--cfg vigil_unstable" cargo test --locked --all-targets --all-features
+          nix develop -c env RUSTFLAGS="--cfg vigil_unstable" cargo test --locked --doc --all-features
       - name: Run nix flake check
         run: nix flake check -L
 

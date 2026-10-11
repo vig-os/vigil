@@ -3,6 +3,7 @@
 //! `serde_json::Value`, not on a round trip through opentelemetry-proto, which
 //! would hide encoding mistakes symmetric on both sides.
 
+#![cfg(vigil_unstable)]
 mod common;
 
 use std::sync::Arc;

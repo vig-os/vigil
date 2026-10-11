@@ -74,7 +74,11 @@ def main():
             ["cargo", "run", "--locked", "--example", "conformance", "--", temporary],
             check=True,
             env=os.environ
-            | {"VIGIL_DIR": str(directory / "bridge"), "RUST_LOG": "info"},
+            | {
+                "VIGIL_DIR": str(directory / "bridge"),
+                "RUST_LOG": "info",
+                "CARGO_ENCODED_RUSTFLAGS": "--cfg\x1fvigil_unstable",
+            },
         )
         inputs = sorted(
             path

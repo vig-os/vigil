@@ -1,6 +1,7 @@
 //! Generated exporter inputs, checked against independent wire-level invariants.
 //! Equal-sized truncation candidates have no specified tie-break in ADR-0001;
 //! tests allow either maximum while requiring exact overflow and determinism.
+#![cfg(vigil_unstable)]
 mod common;
 use common::*;
 use opentelemetry::{

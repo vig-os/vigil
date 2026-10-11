@@ -1,7 +1,9 @@
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(feature = "audit")]
+#[cfg_attr(docsrs, doc(cfg(feature = "audit")))]
 pub mod audit;
 
 mod init;
@@ -9,9 +11,32 @@ mod lifecycle;
 pub use init::{Config, Console, Guard, InitError, InitErrorKind, init};
 pub use lifecycle::{FlushError, FlushErrorKind, Signal};
 
+#[cfg(vigil_unstable)]
+#[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
 pub mod logs;
+#[cfg(not(vigil_unstable))]
+mod logs;
 pub mod rotate;
+#[cfg(vigil_unstable)]
+#[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
 pub mod sink;
+#[cfg(not(vigil_unstable))]
+mod sink;
+
+/// Exact OpenTelemetry versions used by vigil; outside its semver promise.
+///
+/// Enable `--cfg vigil_unstable` in the application's build and pin `~1.N`.
+/// Libraries using these paths require their applications to enable the cfg.
+/// The tracing integration re-export follows with traces in #8; global provider
+/// installation remains deferred to #7/#8.
+#[cfg(vigil_unstable)]
+#[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
+pub mod unstable {
+    /// The OpenTelemetry API version linked by vigil.
+    pub use opentelemetry;
+    /// The OpenTelemetry SDK version linked by vigil.
+    pub use opentelemetry_sdk;
+}
 
 /// The version of this crate. Producer versions must be supplied via `Config::version`.
 ///
