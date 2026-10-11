@@ -4,6 +4,18 @@
 
 > **Pre-alpha.** The design is settled; the code is being built. Logs are implemented; other signals and audit are being built. Track progress in the milestones.
 
+## Rust version policy
+
+The MSRV is Rust 1.95 (`Cargo.toml`), independent of the devkit pin. Raises
+require a minor release and a changelog entry; the new stable Rust release must
+be at least six months old on the vigil release date. Linux CI builds and tests
+all features at the MSRV and checks `aarch64-apple-darwin` at the same version.
+A second Linux lane builds and tests the latest stable (currently 1.99.0) through locked fenix, allowing warnings;
+advance its independent manifest pin in `flake.nix` on each stable release. The macOS lane
+uses the dev pin. Today MSRV and dev pin are both 1.95.0; the MSRV lane adds the
+Apple-target check and diverges as soon as devkit advances past 1.95.
+See [ADR-0004 decision 11](docs/adr/0004-public-api-and-stability.md#11-msrv-policy).
+
 ## What it is
 
 One crate, two layers:

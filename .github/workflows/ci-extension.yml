@@ -140,3 +140,43 @@ jobs:
       # the Nix derivation sandbox. The tools still come from pinned nixpkgs.
       - name: Check stable API against merge base with dev
         run: nix develop -c python3 scripts/check_semver.py
+
+  msrv:
+    name: MSRV (Linux and Apple target)
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+      - name: Build and test all features
+        run: nix develop .#msrv -c python3 scripts/check_rust_version.py msrv
+
+  latest-stable:
+    name: Latest stable (Linux)
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+      - name: Build and test all features
+        run: nix develop .#latest-stable -c python3 scripts/check_rust_version.py latest-stable

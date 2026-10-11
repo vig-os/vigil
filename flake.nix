@@ -91,6 +91,24 @@
             name: value: nixpkgs.lib.nameValuePair "audit-${name}" value
           ) audit.checks;
 
+        # Independent of rust-toolchain.toml: ADR-0004 decision 11.
+        fenix = vigos.inputs.fenix.packages.${system};
+        msrvVersion = "1.95.0";
+        declaredMsrv = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.rust-version;
+        msrvToolchain =
+          assert pkgs.lib.assertMsg (
+            declaredMsrv == msrvVersion || "${declaredMsrv}.0" == msrvVersion
+          ) "Cargo.toml rust-version (${declaredMsrv}) and the MSRV toolchain (${msrvVersion}) disagree";
+          fenix.fromToolchainFile {
+            file = pkgs.writeText "msrv-toolchain.toml" ''
+              [toolchain]
+              channel = "${msrvVersion}"
+              profile = "minimal"
+              targets = ["aarch64-apple-darwin"]
+            '';
+            sha256 = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
+          };
+
         # Devkit knobs read from .vig-os (#1224, #1432, #1431, #1282, #1633): the
         # flake-generated pre-commit hooks — the branch guard and the
         # commit-message validator — follow the workspace manifest, mirroring
@@ -156,105 +174,127 @@
       {
         # The dev shell = the shared vigOS toolchain + your extras.
         # `direnv allow` (via .envrc) or `nix develop` enters it.
-        devShells.default = vigos.lib.mkProjectShell (
-          {
-            inherit pkgs;
-            extraPackages = extraPackages pkgs;
+        devShells = {
+          default = vigos.lib.mkProjectShell (
+            {
+              inherit pkgs;
+              extraPackages = extraPackages pkgs;
 
-            # The rust capability module, fed the same toolchain the checks
-            # build with (what mkRustProject's own devShell would wire).
-            modules = [
-              {
-                name = "rust";
-                checks = "mkRustProject";
-                inherit (rust) toolchain;
-              }
+              # The rust capability module, fed the same toolchain the checks
+              # build with (what mkRustProject's own devShell would wire).
+              modules = [
+                {
+                  name = "rust";
+                  checks = "mkRustProject";
+                  inherit (rust) toolchain;
+                }
+              ];
+
+              # Host-runner hooks (#1167): direnv CI runs on the bare host
+              # runner, so let the flake GENERATE .pre-commit-config.yaml from
+              # the shared base hook set, resolved entirely from the Nix store
+              # (incl. pymarkdown, now a flake system hook, #1170) rather than
+              # building the committed YAML remote pre-commit repo hook envs
+              # per runner. Customize like the opt-in block below; the generated
+              # config is a gitignored /nix/store symlink.
+              hooks = {
+                changelog = {
+                  enable = true;
+                  name = "changelog structure";
+                  entry = "${pkgs.python3}/bin/python3 scripts/check_changelog.py";
+                  language = "system";
+                  pass_filenames = false;
+                  always_run = true;
+                };
+                # Rust gates, run by `just precommit` (and so by CI's lint job).
+                cargo-fmt = {
+                  enable = true;
+                  name = "cargo fmt --check";
+                  entry = "cargo fmt --all -- --check";
+                  files = "\\.rs$";
+                  language = "system";
+                  pass_filenames = false;
+                };
+                cargo-clippy = {
+                  enable = true;
+                  name = "cargo clippy -D warnings";
+                  entry = "cargo clippy --all-targets --all-features --locked -- -D warnings";
+                  files = "(\\.rs$|^Cargo\\.(toml|lock)$)";
+                  language = "system";
+                  pass_filenames = false;
+                };
+              };
+
+              # Opt-in: let the flake GENERATE .pre-commit-config.yaml from the
+              # shared base hook set instead of hand-managing the scaffolded
+              # YAML — toggle base hooks, add per-hook/global excludes, or add
+              # fully custom hooks; hook updates then flow with `nix flake
+              # update vigos`, and your customization lives HERE (preserved).
+              # Contract + migration steps:
+              # https://github.com/vig-os/devkit/blob/main/docs/MIGRATION.md ("Customizing
+              # pre-commit hooks from the project flake"). Uncomment to opt in, then
+              # delete .pre-commit-config.yaml (the generated config refuses to
+              # overwrite an existing file). The generated store symlink is ignored
+              # automatically on (re)scaffold (#1092); add durable root ignores you
+              # own to .gitignore.project.
+              #
+              #   hooks = {
+              #     typos.enable = false;                    # toggle a base hook
+              #     detect-private-keys.excludes = [ "worker/src/index\\.ts" ];
+              #     my-data-check = {                        # fully custom hook
+              #       enable = true;
+              #       entry = "./scripts/check-dat.sh";
+              #       files = "\\.dat$";
+              #       language = "system";
+              #     };
+              #   };
+              #   hooksExcludes = [ "^data/stopping/" "\\.dat$" ]; # global excludes
+            }
+            # Forwarded only when the resolved devkit accepts it (#1249): the vigos
+            # input floats to main, which may predate the argument; older builders
+            # then fall back to their gitflow default instead of failing eval.
+            // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? workflow) {
+              # Branch guard follows the workspace workflow model (#1224).
+              inherit workflow;
+            }
+            // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? branchTypes) {
+              # Branch guard follows the workspace branch-type set (#1432).
+              inherit branchTypes;
+            }
+            // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? commitTypes) {
+              # validate-commit-msg follows the workspace commit-type set (#1431).
+              inherit commitTypes;
+            }
+            // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? refsPolicy) {
+              # validate-commit-msg follows the workspace Refs policy (#1282).
+              inherit refsPolicy;
+            }
+            // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? refsOptionalTypes) {
+              # validate-commit-msg follows the workspace exempt set (#1633).
+              inherit refsOptionalTypes;
+            }
+          );
+
+          msrv = pkgs.mkShell {
+            packages = [
+              msrvToolchain
+              pkgs.python3
             ];
+            MSRV_VERSION = msrvVersion;
+          };
+          # Latest stable, resolved by the locked fenix implementation with a
+          # separate fixed manifest. Advance this pin on each stable release.
+          latest-stable = pkgs.mkShell {
+            packages = [
+              (fenix.toolchainOf {
+                channel = "1.99.0";
+                sha256 = "18mn2v2wrc66a6cqasrdm0dp76xyrq914xqlcmw8skrnhv4dsvff";
+              }).minimalToolchain
+              pkgs.python3
+            ];
+          };
 
-            # Host-runner hooks (#1167): direnv CI runs on the bare host
-            # runner, so let the flake GENERATE .pre-commit-config.yaml from
-            # the shared base hook set, resolved entirely from the Nix store
-            # (incl. pymarkdown, now a flake system hook, #1170) rather than
-            # building the committed YAML remote pre-commit repo hook envs
-            # per runner. Customize like the opt-in block below; the generated
-            # config is a gitignored /nix/store symlink.
-            hooks = {
-              changelog = {
-                enable = true;
-                name = "changelog structure";
-                entry = "${pkgs.python3}/bin/python3 scripts/check_changelog.py";
-                language = "system";
-                pass_filenames = false;
-                always_run = true;
-              };
-              # Rust gates, run by `just precommit` (and so by CI's lint job).
-              cargo-fmt = {
-                enable = true;
-                name = "cargo fmt --check";
-                entry = "cargo fmt --all -- --check";
-                files = "\\.rs$";
-                language = "system";
-                pass_filenames = false;
-              };
-              cargo-clippy = {
-                enable = true;
-                name = "cargo clippy -D warnings";
-                entry = "cargo clippy --all-targets --all-features --locked -- -D warnings";
-                files = "(\\.rs$|^Cargo\\.(toml|lock)$)";
-                language = "system";
-                pass_filenames = false;
-              };
-            };
-
-            # Opt-in: let the flake GENERATE .pre-commit-config.yaml from the
-            # shared base hook set instead of hand-managing the scaffolded
-            # YAML — toggle base hooks, add per-hook/global excludes, or add
-            # fully custom hooks; hook updates then flow with `nix flake
-            # update vigos`, and your customization lives HERE (preserved).
-            # Contract + migration steps:
-            # https://github.com/vig-os/devkit/blob/main/docs/MIGRATION.md ("Customizing
-            # pre-commit hooks from the project flake"). Uncomment to opt in, then
-            # delete .pre-commit-config.yaml (the generated config refuses to
-            # overwrite an existing file). The generated store symlink is ignored
-            # automatically on (re)scaffold (#1092); add durable root ignores you
-            # own to .gitignore.project.
-            #
-            #   hooks = {
-            #     typos.enable = false;                    # toggle a base hook
-            #     detect-private-keys.excludes = [ "worker/src/index\\.ts" ];
-            #     my-data-check = {                        # fully custom hook
-            #       enable = true;
-            #       entry = "./scripts/check-dat.sh";
-            #       files = "\\.dat$";
-            #       language = "system";
-            #     };
-            #   };
-            #   hooksExcludes = [ "^data/stopping/" "\\.dat$" ]; # global excludes
-          }
-          # Forwarded only when the resolved devkit accepts it (#1249): the vigos
-          # input floats to main, which may predate the argument; older builders
-          # then fall back to their gitflow default instead of failing eval.
-          // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? workflow) {
-            # Branch guard follows the workspace workflow model (#1224).
-            inherit workflow;
-          }
-          // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? branchTypes) {
-            # Branch guard follows the workspace branch-type set (#1432).
-            inherit branchTypes;
-          }
-          // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? commitTypes) {
-            # validate-commit-msg follows the workspace commit-type set (#1431).
-            inherit commitTypes;
-          }
-          // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? refsPolicy) {
-            # validate-commit-msg follows the workspace Refs policy (#1282).
-            inherit refsPolicy;
-          }
-          // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? refsOptionalTypes) {
-            # validate-commit-msg follows the workspace exempt set (#1633).
-            inherit refsOptionalTypes;
-          }
-        );
+        };
 
         checks = rustChecks // {
           changelog =
@@ -270,6 +310,7 @@
                 cd ${self}
                 python3 scripts/check_changelog.py
                 python3 -m unittest discover -s scripts -p test_check_changelog.py -v
+                python3 -m unittest discover -s scripts -p test_check_rust_version.py -v
                 touch "$out"
               '';
         };
