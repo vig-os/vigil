@@ -20,6 +20,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .nth(1)
             .ok_or("expected output directory")?,
     );
+    #[cfg(feature = "metrics")]
+    metric_fixture(&dir)?;
     let file = Arc::new(RotatingFile::open(
         &dir,
         "logs",
@@ -94,4 +96,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(not(vigil_unstable))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     Err("conformance requires RUSTFLAGS=\"--cfg vigil_unstable\"".into())
+}
+
+#[cfg(all(vigil_unstable, feature = "metrics"))]
+fn metric_fixture(dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    use opentelemetry::metrics::MeterProvider;
+    use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+    let sink = MemorySink::new();
+    let exporter =
+        vigil::metric_export::OtlpJsonMetricExporter::new(sink.clone()).with_max_line_bytes(1400);
+    let provider = SdkMeterProvider::builder()
+        .with_reader(
+            PeriodicReader::builder(exporter)
+                .with_interval(std::time::Duration::from_secs(3600))
+                .build(),
+        )
+        .build();
+    let meter = provider.meter("conformance");
+    let gauge = meter.f64_gauge("nonfinite").build();
+    let histogram = meter.f64_histogram("histogram").build();
+    for index in 0..20 {
+        let attrs = [
+            KeyValue::new("series", index),
+            KeyValue::new("nonfinite", f64::NAN),
+        ];
+        gauge.record(f64::NAN, &attrs);
+        histogram.record(f64::INFINITY, &attrs);
+    }
+    provider.shutdown()?;
+    let lines = sink.lines();
+    assert!(lines.len() > 2, "metrics must split");
+    std::fs::write(dir.join("metrics.jsonl"), lines.join("\n") + "\n")?;
+    Ok(())
 }

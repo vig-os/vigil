@@ -48,6 +48,7 @@ vigil goes from 0.0.0 on `dev` straight to a published 1.0.0 ([ADR-0004](0004-pu
 
 - Every line is one complete `LogsData`, `MetricsData` or `TracesData` object in **OTLP/JSON**, as defined by the Stable OTLP spec, terminated by `\n`, one signal per file (decision 1).
 - The field encoding is exactly OTLP/JSON: 64-bit integers as decimal strings, hex `traceId`/`spanId`, integer enums, lowerCamelCase keys, base64 `bytesValue` (decision 3). `NaN` and `±Inf` are written in the spellings of decision 6, `timeUnixNano` is never `"0"` (decision 7), and no line exceeds `max_line_bytes`, with oversized records shortened or replaced by a diagnostic stub as marked in decision 10.
+  **Amendment (2026-10-12, #7):** the preceding shortening/stub promise applies to log records (decision 10) and spans (ADR-0003 decision 17). Metric data points are never shortened: oversized points are dropped and reported as specified by ADR-0003 decision 11's amendment, because their attributes are series identity.
 - The JSON keys come in the fixed **time-first order** of [ADR-0006](0006-shipping.md) decision 3, because file shippers identify files by their first bytes.
 - Readers ignore unknown fields, as OTLP requires of them. An additive change to the spec is taken in a minor release (see below).
 

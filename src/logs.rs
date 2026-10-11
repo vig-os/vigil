@@ -58,9 +58,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use opentelemetry_proto::tonic::common::v1::{
-    AnyValue, InstrumentationScope, KeyValue, any_value::Value,
-};
+use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+#[cfg(any(test, feature = "audit"))]
+use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value::Value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource as ProtoResource;
 use opentelemetry_proto::transform::common::tonic::ResourceAttributesWithSchema;
@@ -69,6 +69,7 @@ use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use opentelemetry_sdk::logs::{LogBatch, LogExporter};
 use serde_json::Value as Json;
 
+use crate::envelope::{patch_any_value, patch_key_values, sort_any_value, sort_attributes};
 use crate::sink::LineSink;
 
 /// Maximum container edges from a root log AnyValue at depth zero.
@@ -158,24 +159,22 @@ impl<S: LineSink> OtlpJsonLogExporter<S> {
             let Some(resource_logs) = group_batch(batch, &self.resource) else {
                 return Ok(());
             };
-            let accepted = resource_logs
-                .scope_logs
-                .iter()
-                .map(|scope| scope.log_records.len())
-                .sum();
             let request = ExportLogsServiceRequest {
                 resource_logs: vec![resource_logs],
             };
             let json = project_json(&request)
                 .map_err(|e| OTelSdkError::InternalFailure(format!("encoding log batch: {e}")))?;
-            let line = encode_projected(&json).map_err(OTelSdkError::InternalFailure)?;
-            let lines = counted_lines(&line, &json, self.max_line_bytes, accepted)
-                .map_err(OTelSdkError::InternalFailure)?;
+            let lines = crate::envelope::bounded_lines(
+                &json,
+                self.max_line_bytes,
+                crate::envelope::Envelope::Logs,
+            )
+            .map_err(OTelSdkError::InternalFailure)?;
             for line in lines {
-                self.sink.write_line(line.text.as_bytes()).map_err(|e| {
+                self.sink.write_line(line.text().as_bytes()).map_err(|e| {
                     OTelSdkError::InternalFailure(format!("writing log batch: {e}"))
                 })?;
-                lost -= line.records - line.stubs;
+                lost -= line.records() - line.stubs();
             }
             Ok(())
         })();
@@ -219,6 +218,7 @@ pub(crate) fn encode_line(request: &ExportLogsServiceRequest) -> Result<String, 
     encode_projected(&json)
 }
 
+#[cfg(any(test, feature = "audit"))]
 fn encode_projected(json: &Json) -> Result<String, String> {
     let line = crate::ordered_json::encode(json, "", crate::ordered_json::LOGS)?;
     // Refuse any non-finite double the patching missed.
@@ -288,96 +288,9 @@ fn bounded_lines_counted(
     dropped: &mut usize,
 ) -> Result<Vec<String>, String> {
     let json = serde_json::from_str(line).map_err(|e| e.to_string())?;
-    let lines = counted_lines(line, &json, limit, 0)?;
+    let lines = crate::envelope::bounded_lines(&json, limit, crate::envelope::Envelope::Logs)?;
     *dropped = dropped.saturating_add(lines.iter().map(|line| line.stubs).sum::<usize>());
     Ok(lines.into_iter().map(|line| line.text).collect())
-}
-
-struct CountedLine {
-    text: String,
-    records: usize,
-    stubs: usize,
-}
-
-fn counted_lines(
-    line: &str,
-    request: &Json,
-    limit: usize,
-    records: usize,
-) -> Result<Vec<CountedLine>, String> {
-    if line.len() <= limit {
-        return Ok(vec![CountedLine {
-            text: line.to_owned(),
-            records,
-            stubs: 0,
-        }]);
-    }
-    let mut lines = Vec::new();
-    for resource in request["resourceLogs"].as_array().into_iter().flatten() {
-        let (resource_start, resource_end) = array_frame(resource, "scopeLogs")?;
-        let resource_prefix = format!("{{\"resourceLogs\":[{resource_start}");
-        let mut current = resource_prefix.clone();
-        let mut has_scopes = false;
-        let mut records = 0;
-        let mut stubs = 0;
-        for scope in resource["scopeLogs"].as_array().into_iter().flatten() {
-            let (scope_prefix, scope_end) = array_frame(scope, "logRecords")?;
-            let closing = scope_end.len() + resource_end.len() + 2;
-            let overhead = resource_prefix.len() + scope_prefix.len() + closing;
-            let mut open = false;
-            for record in scope["logRecords"].as_array().into_iter().flatten() {
-                let (text, replaced) = fit_record(record, overhead, limit)?;
-                let extra = if open {
-                    1
-                } else {
-                    scope_prefix.len() + usize::from(has_scopes)
-                };
-                if current.len() + extra + text.len() + closing > limit && has_scopes {
-                    if open {
-                        current.push_str(&scope_end);
-                    }
-                    current.push_str(&resource_end);
-                    current.push_str("]}");
-                    lines.push(CountedLine {
-                        text: current,
-                        records,
-                        stubs,
-                    });
-                    records = 0;
-                    stubs = 0;
-                    current = resource_prefix.clone();
-                    has_scopes = false;
-                    open = false;
-                }
-                if !open {
-                    if has_scopes {
-                        current.push(',');
-                    }
-                    current.push_str(&scope_prefix);
-                    open = true;
-                    has_scopes = true;
-                } else {
-                    current.push(',');
-                }
-                current.push_str(&text);
-                records += 1;
-                stubs += usize::from(replaced);
-            }
-            if open {
-                current.push_str(&scope_end);
-            }
-        }
-        if has_scopes {
-            current.push_str(&resource_end);
-            current.push_str("]}");
-            lines.push(CountedLine {
-                text: current,
-                records,
-                stubs,
-            });
-        }
-    }
-    Ok(lines)
 }
 
 #[cfg(test)]
@@ -388,24 +301,6 @@ fn ordered_line(line: &str) -> Result<String, String> {
 
 // Copy only metadata, never the batch or a scope's records. The array comes
 // first; its suffix carries alphabetical metadata, serialized exactly once.
-fn array_frame(value: &Json, field: &str) -> Result<(String, String), String> {
-    let metadata: serde_json::Map<String, Json> = value
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter(|(key, _)| key.as_str() != field)
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    let metadata =
-        crate::ordered_json::encode(&Json::Object(metadata), "", crate::ordered_json::LOGS)?;
-    let suffix = if metadata == "{}" {
-        "]}".to_owned()
-    } else {
-        format!("],{}", &metadata[1..])
-    };
-    Ok((format!("{{\"{field}\":["), suffix))
-}
-
 fn ordered_record(value: &Json) -> Result<String, String> {
     crate::ordered_json::encode(value, "logRecords", crate::ordered_json::LOGS)
 }
@@ -422,7 +317,11 @@ fn markers(original_size: usize, dropped: bool) -> Vec<Json> {
     attributes
 }
 
-fn fit_record(record: &Json, overhead: usize, limit: usize) -> Result<(String, bool), String> {
+pub(crate) fn fit_record(
+    record: &Json,
+    overhead: usize,
+    limit: usize,
+) -> Result<(String, bool), String> {
     let original = ordered_record(record)?;
     let original_size = overhead + original.len();
     if original_size <= limit {
@@ -722,23 +621,6 @@ fn normalize_record(record: &mut LogRecord) {
     }
 }
 
-/// Sort by key (stable, so duplicate keys keep their emission order) and
-/// recurse into nested values.
-fn sort_attributes(attributes: &mut [KeyValue]) {
-    attributes.sort_by(|a, b| a.key.cmp(&b.key));
-    for value in attributes.iter_mut().filter_map(|kv| kv.value.as_mut()) {
-        sort_any_value(value);
-    }
-}
-
-fn sort_any_value(value: &mut AnyValue) {
-    match &mut value.value {
-        Some(Value::ArrayValue(array)) => array.values.iter_mut().for_each(sort_any_value),
-        Some(Value::KvlistValue(list)) => sort_attributes(&mut list.values),
-        _ => {}
-    }
-}
-
 // ---- non-finite doubles ----------------------------------------------------
 
 /// Patch the serialized `json` of `resource_logs`, walking the typed tree and
@@ -770,42 +652,6 @@ fn patch_record(record: &LogRecord, json: &mut Json) {
         fields.remove("body");
     }
     patch_key_values(&record.attributes, &mut json["attributes"]);
-}
-
-fn patch_key_values(key_values: &[KeyValue], json: &mut Json) {
-    for (kv, json_kv) in key_values
-        .iter()
-        .zip(json.as_array_mut().into_iter().flatten())
-    {
-        if let Some(value) = &kv.value {
-            patch_any_value(value, &mut json_kv["value"]);
-        }
-    }
-}
-
-fn patch_any_value(value: &AnyValue, json: &mut Json) {
-    match &value.value {
-        Some(Value::DoubleValue(d)) if !d.is_finite() => {
-            let spelling = if d.is_nan() {
-                NON_FINITE[0]
-            } else if *d > 0.0 {
-                NON_FINITE[1]
-            } else {
-                NON_FINITE[2]
-            };
-            json["doubleValue"] = Json::String(spelling.to_owned());
-        }
-        Some(Value::ArrayValue(array)) => {
-            let items = json["arrayValue"]["values"].as_array_mut();
-            for (value, json) in array.values.iter().zip(items.into_iter().flatten()) {
-                patch_any_value(value, json);
-            }
-        }
-        Some(Value::KvlistValue(list)) => {
-            patch_key_values(&list.values, &mut json["kvlistValue"]["values"]);
-        }
-        _ => {}
-    }
 }
 
 #[cfg(test)]
@@ -1387,7 +1233,8 @@ mod ordered_tests {
         let line = encode_projected(&json).unwrap();
         let limit = expected.len() + 1;
         assert!(line.len() > limit);
-        let lines = counted_lines(&line, &json, limit, 2).unwrap();
+        let lines =
+            crate::envelope::bounded_lines(&json, limit, crate::envelope::Envelope::Logs).unwrap();
         assert_eq!(lines.len(), 2);
         for line in lines {
             assert_eq!(line.text, expected);

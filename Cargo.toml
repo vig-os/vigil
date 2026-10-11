@@ -16,7 +16,8 @@ categories = ["development-tools::debugging"]
 name = "vigil"
 
 [features]
-default = []
+default = ["metrics"]
+metrics = ["opentelemetry_sdk/metrics", "opentelemetry-proto/metrics"]
 # CI-only consumer feature-unification regression coverage.
 test-preserve-order = ["serde_json/preserve_order"]
 audit = ["dep:blake3", "dep:ed25519-dalek", "dep:zeroize", "dep:base64"]

@@ -51,6 +51,7 @@ pub enum FlushErrorKind {
 pub struct FlushError {
     kind: FlushErrorKind,
     logs: u64,
+    metric_data_points: bool,
     source: Option<OTelSdkError>,
 }
 impl FlushError {
@@ -88,11 +89,13 @@ impl FlushError {
 }
 impl fmt::Display for FlushError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:?}: at least {} log records lost",
-            self.kind, self.logs
-        )?;
+        write!(f, "{:?}", self.kind)?;
+        if self.logs != 0 || !self.metric_data_points {
+            write!(f, ": at least {} log records lost", self.logs)?;
+        }
+        if self.metric_data_points {
+            write!(f, ": metric data-point export losses")?;
+        }
         if let Some(source) = &self.source {
             write!(f, ": {source}")?;
         }
@@ -108,6 +111,7 @@ impl std::error::Error for FlushError {
 #[derive(Debug, Default)]
 struct Period {
     logs: u64,
+    metric_data_points: bool,
     failed: bool,
     timeout: bool,
 }
@@ -139,6 +143,12 @@ impl Losses {
         state.period.failed |= failed;
         state.pending_failed |= failed;
         state.pending_stderr = state.pending_stderr.saturating_add(logs);
+    }
+    #[cfg(feature = "metrics")]
+    pub(crate) fn metric_data_points(&self, failed: bool) {
+        let mut state = self.state();
+        state.period.metric_data_points = true;
+        state.period.failed |= failed;
     }
     pub(crate) fn reached(&self, logs: u64) {
         let mut state = self.state();
@@ -180,7 +190,7 @@ impl Losses {
             FlushErrorKind::Timeout
         } else if period.failed || result.is_err() {
             FlushErrorKind::Failed
-        } else if period.logs != 0 {
+        } else if period.logs != 0 || period.metric_data_points {
             FlushErrorKind::DataLost
         } else {
             return Ok(());
@@ -188,6 +198,7 @@ impl Losses {
         Err(FlushError {
             kind,
             logs: period.logs,
+            metric_data_points: period.metric_data_points,
             source: result.err(),
         })
     }
@@ -425,6 +436,43 @@ mod tests {
         // Pins the SDK event name, field and shutdown thread capture.
         assert_eq!(losses.state().sdk_overflow, 9);
         assert_eq!(forwarded.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn metric_data_point_outcomes_have_no_measurement_or_log_count() {
+        let losses = Losses::default();
+        for failed in [false, true] {
+            losses.metric_data_points(failed);
+            let error = losses.finish(Ok(())).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if failed {
+                    FlushErrorKind::Failed
+                } else {
+                    FlushErrorKind::DataLost
+                }
+            );
+            assert_eq!(error.lost(Signal::Metrics), 0);
+            assert_eq!(error.lost(Signal::Logs), 0);
+            assert!(!error.to_string().contains("log records"));
+            assert!(error.to_string().contains("metric"));
+            assert!(losses.finish(Ok(())).is_ok());
+        }
+        losses.metric_data_points(true);
+        losses.record(3, false);
+        let error = losses.finish(Ok(())).unwrap_err();
+        assert_eq!(error.kind(), FlushErrorKind::Failed);
+        assert!(error.to_string().contains("3 log records"));
+        assert!(error.to_string().contains("metric"));
+        losses.metric_data_points(true);
+        assert_eq!(
+            losses
+                .finish(Err(OTelSdkError::Timeout(Duration::ZERO)))
+                .unwrap_err()
+                .kind(),
+            FlushErrorKind::Timeout
+        );
     }
 
     #[test]

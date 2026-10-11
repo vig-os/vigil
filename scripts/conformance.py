@@ -24,6 +24,19 @@ def normalize(value):
         return value
     result = {}
     for key, item in value.items():
+        if key in (
+            "intValue",
+            "timeUnixNano",
+            "observedTimeUnixNano",
+            "startTimeUnixNano",
+            "count",
+            "asInt",
+        ):
+            item = str(int(item))
+        if key == "explicitBounds":
+            item = [float(bound) for bound in item]
+        if key == "bucketCounts":
+            item = [str(int(count)) for count in item]
         if key in ("intValue", "timeUnixNano", "observedTimeUnixNano"):
             item = str(int(item))
         if key == "doubleValue" and isinstance(item, (int, float)):
@@ -64,6 +77,32 @@ def records(messages):
                         record,
                     ]
                     result[json.dumps(normalize(identity), sort_keys=True)] += 1
+    return result
+
+
+def metric_points(messages):
+    """Compare repeated metric metadata and points independently of splits."""
+    result = collections.Counter()
+    for message in messages:
+        for resource in message["resourceMetrics"]:
+            for scope in resource.get("scopeMetrics", []):
+                for metric in scope.get("metrics", []):
+                    field = next(
+                        k for k in ("sum", "gauge", "histogram") if k in metric
+                    )
+                    for point in metric[field]["dataPoints"]:
+                        identity = [
+                            {k: v for k, v in resource.items() if k != "scopeMetrics"},
+                            {k: v for k, v in scope.items() if k != "metrics"},
+                            {k: v for k, v in metric.items() if k != field},
+                            {
+                                k: v
+                                for k, v in metric[field].items()
+                                if k != "dataPoints"
+                            },
+                            point,
+                        ]
+                        result[json.dumps(normalize(identity), sort_keys=True)] += 1
     return result
 
 
@@ -197,17 +236,27 @@ def main():
         resources = {json.dumps(json.loads(key)[0], sort_keys=True) for key in expected}
         require(len(resources) >= 2, "fixture must contain at least two resources")
         output = directory / "output.jsonl"
+        metric_output = directory / "metrics-output.jsonl"
         config = directory / "collector.yaml"
         config.write_text(f"""receivers:
   otlpjsonfile:
     include: [{json.dumps(str(directory / "logs*.jsonl"))}]
     start_at: beginning
     include_file_name: false
+  otlpjsonfile/metrics:
+    include: [{json.dumps(str(directory / "metrics.jsonl"))}]
+    start_at: beginning
+    include_file_name: false
 exporters:
+  file/metrics:
+    path: {json.dumps(str(metric_output))}
   file:
     path: {json.dumps(str(output))}
 service:
   pipelines:
+    metrics:
+      receivers: [otlpjsonfile/metrics]
+      exporters: [file/metrics]
     logs:
       receivers: [otlpjsonfile]
       exporters: [file]
@@ -240,6 +289,18 @@ service:
                     child.wait()
                 log.seek(0)
                 print(log.read())
+        expected_metrics = metric_points(
+            json.loads(line)
+            for line in json_lines((directory / "metrics.jsonl").read_text())
+        )
+        actual_metrics = metric_points(
+            json.loads(line) for line in json_lines(metric_output.read_text())
+        )
+        require(sum(expected_metrics.values()) == 40, "missing metric fixture points")
+        require(
+            actual_metrics == expected_metrics,
+            f"Metric differences: {expected_metrics - actual_metrics}; unexpected: {actual_metrics - expected_metrics}",
+        )
         actual = records(json.loads(line) for line in json_lines(output.read_text()))
         require(
             actual == expected,
@@ -248,7 +309,7 @@ service:
         print(
             f"Conformant: {sum(actual.values())} records including {len(writer_lines)} generated writer cases across {len(list(directory.glob('logs*.jsonl')))} input files; valid EOF delivered, garbage EOF dropped"
         )
-    # TODO: extend reference-reader conformance to metrics (#7) and traces (#8).
+    # TODO: extend reference-reader conformance to traces (#8).
 
 
 if __name__ == "__main__":
