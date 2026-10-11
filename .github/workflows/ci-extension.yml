@@ -154,8 +154,9 @@ jobs:
       labels: ${{ steps.review.outputs.labels }}
     # Run after every heavy lane, even on failure/skip, so the final verdict
     # reads labels at the end of full CI rather than before a long build.
+    # Stop superseded runs promptly; always() would hold the concurrency slot.
     needs: [extension, conformance, supply-chain, msrv, latest-stable]
-    if: always()
+    if: ${{ !cancelled() }}
     name: Semver compatibility
     runs-on: ${{ fromJSON(inputs.runner-json) }}
     timeout-minutes: 30
