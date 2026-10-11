@@ -211,11 +211,10 @@ personal data, retaining the referenced values in the application's own store.
 
 ## Temporary MSRV rejection proof
 
-This doctest deliberately uses `std::fmt::from_fn`, stabilized in Rust 1.96:
+This doctest deliberately uses `std::assert_matches!`, stabilized in Rust 1.96:
 <https://blog.rust-lang.org/2026/05/28/Rust-1.96.0/>.
 It will be reverted after capturing the failing MSRV CI run for #45.
 
 ```rust
-let display = std::fmt::from_fn(|f| f.write_str("MSRV proof"));
-assert_eq!(display.to_string(), "MSRV proof");
+std::assert_matches!(Some(45), Some(45));
 ```
