@@ -91,15 +91,14 @@
             name: value: nixpkgs.lib.nameValuePair "audit-${name}" value
           ) audit.checks;
 
-
         # Independent of rust-toolchain.toml: ADR-0004 decision 11.
         fenix = vigos.inputs.fenix.packages.${system};
         msrvVersion = "1.95.0";
         declaredMsrv = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.rust-version;
         msrvToolchain =
           assert pkgs.lib.assertMsg (
-            declaredMsrv == "1.95" || declaredMsrv == msrvVersion
-          ) "Cargo.toml rust-version and the MSRV toolchain disagree";
+            declaredMsrv == msrvVersion || "${declaredMsrv}.0" == msrvVersion
+          ) "Cargo.toml rust-version (${declaredMsrv}) and the MSRV toolchain (${msrvVersion}) disagree";
           fenix.fromToolchainFile {
             file = pkgs.writeText "msrv-toolchain.toml" ''
               [toolchain]

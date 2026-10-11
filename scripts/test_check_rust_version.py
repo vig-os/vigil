@@ -1,6 +1,7 @@
 """Regression checks for compiler drift and inherited warning flags."""
 
 import os
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ class RustLaneTests(unittest.TestCase):
     """Exercise the lane's guard before Cargo can run."""
 
     def run_lane(self, lane, compiler, expected="1.95.0"):
+        manifest = Path(__file__).resolve().parents[1] / "Cargo.toml"
         env = {
             "MSRV_VERSION": expected,
             "RUSTFLAGS": "-Dwarnings --cfg vigil_unstable",
@@ -20,6 +22,7 @@ class RustLaneTests(unittest.TestCase):
         }
         with (
             patch.dict(os.environ, env, clear=True),
+            patch("check_rust_version.Path", return_value=manifest),
             patch("sys.argv", ["check_rust_version.py", lane]),
             patch("subprocess.check_output", return_value=f"rustc {compiler} (test)"),
             patch("subprocess.run") as cargo,
