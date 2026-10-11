@@ -172,7 +172,7 @@ impl Guard {
     /// record greater than `lost(Signal::Logs)` when overflow was seen.
     pub fn flush(&self) -> Result<(), FlushError> {
         match &self.provider {
-            Some(provider) => self.losses.finish(provider.force_flush()),
+            Some(provider) => self.losses.finish(crate::lifecycle::flush(provider)),
             None => Ok(()),
         }
     }
@@ -734,10 +734,7 @@ impl LogExporter for ReportingExporter {
     async fn export(&self, batch: LogBatch<'_>) -> opentelemetry_sdk::error::OTelSdkResult {
         let result = self.inner.export(batch).await;
         let lost = self.inner.take_dropped_records();
-        self.losses.add(lost as u64);
-        if result.is_err() {
-            self.losses.failed.store(true, Ordering::Release);
-        }
+        self.losses.record(lost as u64, result.is_err());
         if lost != 0 {
             let mut failures = self
                 .failures

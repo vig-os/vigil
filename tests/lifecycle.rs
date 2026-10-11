@@ -20,7 +20,10 @@ fn child() {
         return;
     }
     let guard = Config::new("lifecycle").dir(&dir).init().unwrap();
-    if matches!(mode.as_str(), "timeout" | "flush_timeout") {
+    if matches!(
+        mode.as_str(),
+        "timeout" | "flush_timeout" | "concurrent_flush"
+    ) {
         let lock = fs::File::open(&dir).unwrap();
         lock.lock().unwrap();
         tracing::info!("blocked export");
@@ -37,6 +40,23 @@ fn child() {
                 "blocked records are not certainly lost"
             );
             lock.unlock().unwrap();
+        } else if mode == "concurrent_flush" {
+            std::thread::scope(|scope| {
+                let first = scope.spawn(|| guard.flush().unwrap_err());
+                let second = scope.spawn(|| guard.flush().unwrap_err());
+                for error in [first.join().unwrap(), second.join().unwrap()] {
+                    assert_eq!(error.kind(), FlushErrorKind::Timeout);
+                    assert_eq!(error.lost(Signal::Logs), 0);
+                }
+            });
+            assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(8),
+                "flushes must not serialize their timeout budgets"
+            );
+            lock.unlock().unwrap();
+            guard.flush().unwrap();
+            guard.shutdown().unwrap();
         } else {
             let error = guard.flush().unwrap_err();
             assert_eq!(error.kind(), FlushErrorKind::Timeout);
@@ -98,7 +118,14 @@ fn child() {
 
 #[test]
 fn lifecycle_reports_period_losses_and_stderr_fallback_succeeds() {
-    for mode in ["loss", "fallback", "success", "timeout", "flush_timeout"] {
+    for mode in [
+        "loss",
+        "fallback",
+        "success",
+        "timeout",
+        "flush_timeout",
+        "concurrent_flush",
+    ] {
         let dir =
             std::env::temp_dir().join(format!("vigil-lifecycle-{}-{mode}", std::process::id()));
         let out = Command::new(std::env::current_exe().unwrap())

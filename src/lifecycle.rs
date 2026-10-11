@@ -3,13 +3,14 @@ use opentelemetry::InstrumentationScope;
 use opentelemetry_sdk::{
     Resource,
     error::{OTelSdkError, OTelSdkResult},
-    logs::{BatchLogProcessor, LogProcessor, SdkLogRecord},
+    logs::{BatchLogProcessor, LogProcessor, SdkLogRecord, SdkLoggerProvider},
 };
 use std::{
+    cell::Cell,
     fmt,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -104,27 +105,53 @@ impl std::error::Error for FlushError {
 }
 
 #[derive(Debug, Default)]
+struct Period {
+    logs: u64,
+    failed: bool,
+    overflow: bool,
+    timeout: bool,
+}
+
+#[derive(Debug, Default)]
 pub(crate) struct Losses {
-    pub(crate) logs: AtomicU64,
-    pub(crate) failed: AtomicBool,
-    pub(crate) overflow: AtomicBool,
-    timeout: AtomicBool,
+    // Publish a failed export's count and kind together; a flush must not
+    // split them across periods when the worker starts its next export.
+    period: Mutex<Period>,
     pub(crate) shutting_down: AtomicBool,
 }
 impl Losses {
+    pub(crate) fn record(&self, logs: u64, failed: bool) {
+        let mut period = self
+            .period
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        period.logs = period.logs.saturating_add(logs);
+        period.failed |= failed;
+    }
+
     pub(crate) fn add(&self, logs: u64) {
-        let _ = self
-            .logs
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                Some(count.saturating_add(logs))
-            });
+        self.record(logs, false);
+    }
+
+    fn overflowed(&self) {
+        self.period
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .overflow = true;
     }
 
     pub(crate) fn finish(&self, result: OTelSdkResult) -> Result<(), FlushError> {
-        let logs = self.logs.swap(0, Ordering::AcqRel);
-        let failed = self.failed.swap(false, Ordering::AcqRel);
-        let overflow = self.overflow.swap(false, Ordering::AcqRel);
-        let timeout = self.timeout.swap(false, Ordering::AcqRel);
+        let Period {
+            logs,
+            failed,
+            overflow,
+            timeout,
+        } = std::mem::take(
+            &mut *self
+                .period
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         let kind = if timeout || matches!(result, Err(OTelSdkError::Timeout(_))) {
             FlushErrorKind::Timeout
         } else if failed || result.is_err() {
@@ -143,10 +170,30 @@ impl Losses {
 
     fn observe(&self, result: OTelSdkResult) -> OTelSdkResult {
         if matches!(result, Err(OTelSdkError::Timeout(_))) {
-            self.timeout.store(true, Ordering::Release);
+            self.period
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .timeout = true;
         }
         result
     }
+}
+
+thread_local! {
+    // force_flush runs on its caller's thread. Keep its typed timeout per
+    // caller so simultaneous shared-pipeline flushes cannot consume it.
+    static FLUSH_TIMEOUT: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+pub(crate) fn flush(provider: &SdkLoggerProvider) -> OTelSdkResult {
+    FLUSH_TIMEOUT.with(|timeout| {
+        timeout.set(None);
+        let result = provider.force_flush();
+        match timeout.take() {
+            Some(duration) => Err(OTelSdkError::Timeout(duration)),
+            None => result,
+        }
+    })
 }
 
 // Preserve typed processor timeouts before the provider stringifies them.
@@ -160,7 +207,11 @@ impl LogProcessor for ReportingProcessor {
         self.inner.emit(data, scope);
     }
     fn force_flush(&self) -> OTelSdkResult {
-        self.losses.observe(self.inner.force_flush())
+        let result = self.inner.force_flush();
+        if let Err(OTelSdkError::Timeout(duration)) = &result {
+            FLUSH_TIMEOUT.with(|timeout| timeout.set(Some(*duration)));
+        }
+        result
     }
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
         self.losses
@@ -193,7 +244,7 @@ pub(crate) struct Overflow(pub(crate) Arc<Losses>);
 impl<S: Subscriber> Layer<S> for Overflow {
     fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
         if event.metadata().name() == "BatchLogProcessor.LogDroppingStarted" {
-            self.0.overflow.store(true, Ordering::Release);
+            self.0.overflowed();
         }
     }
 }
@@ -263,7 +314,7 @@ mod tests {
     use super::*;
     use opentelemetry::logs::{Logger as _, LoggerProvider as _};
     use opentelemetry_sdk::logs::{BatchConfigBuilder, LogBatch, LogExporter, SdkLoggerProvider};
-    use std::sync::{Condvar, Mutex, mpsc};
+    use std::sync::{Condvar, atomic::AtomicU64, mpsc};
     use tracing_subscriber::layer::SubscriberExt;
 
     #[derive(Debug)]
@@ -373,7 +424,7 @@ mod tests {
     fn typed_timeouts_precede_failures_and_counted_losses() {
         let losses = Losses::default();
         losses.add(2);
-        losses.failed.store(true, Ordering::Relaxed);
+        losses.record(0, true);
         let result = losses.observe(Err(OTelSdkError::Timeout(Duration::ZERO)));
         let error = losses.finish(result).unwrap_err();
         assert_eq!(error.kind(), FlushErrorKind::Timeout);
@@ -384,8 +435,8 @@ mod tests {
     fn failed_precedes_data_loss_and_periods_reset() {
         let losses = Losses::default();
         losses.add(3);
-        losses.failed.store(true, Ordering::Relaxed);
-        losses.overflow.store(true, Ordering::Relaxed);
+        losses.record(0, true);
+        losses.overflowed();
         let error = losses.finish(Ok(())).unwrap_err();
         assert_eq!(error.kind(), FlushErrorKind::Failed);
         assert_eq!(error.lost(Signal::Logs), 3);
