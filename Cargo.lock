@@ -945,6 +945,7 @@ dependencies = [
  "opentelemetry-appender-tracing",
  "opentelemetry-proto",
  "opentelemetry_sdk",
+ "proptest",
  "rustix",
  "serde_json",
  "tracing",

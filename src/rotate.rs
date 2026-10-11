@@ -2626,3 +2626,42 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn segment_round_trip(seconds in 0u64..4_000_000_000, nanos in 0u32..1_000_000_000, counter in 0u64..u64::MAX, signal in "[a-z0-9_]{1,24}") {
+            let stamp = stamp_at(seconds, nanos);
+            let name = if counter == 0 { format!("{signal}-{stamp}.jsonl") } else { format!("{signal}-{stamp}_{counter:06}.jsonl") };
+            prop_assert_eq!(parse_segment(&name, &signal), Some((stamp.as_str(), counter)));
+            let first = next_segment_name(&signal, &stamp, None);
+            prop_assert_eq!(parse_segment(&first, &signal), Some((stamp.as_str(), 0)));
+            let next = next_segment_name(&signal, &stamp, Some(&name));
+            prop_assert_eq!(parse_segment(&next, &signal), Some((stamp.as_str(), counter + 1)));
+        }
+        #[test]
+        fn segment_total_order(a in 0u64..4_000_000_000, b in 0u64..4_000_000_000, x in 0u64..10_000_000, y in 0u64..10_000_000) {
+            let sa = stamp_at(a, 0);
+            let sb = stamp_at(b, 0);
+            let pa = PathBuf::from(format!("logs-{sa}_{x:06}.jsonl"));
+            let pb = PathBuf::from(format!("logs-{sb}_{y:06}.jsonl"));
+            let same_stamp = PathBuf::from(format!("logs-{sa}_{y:06}.jsonl"));
+            prop_assert_eq!(segment_key(&pa, "logs").cmp(&segment_key(&same_stamp, "logs")), x.cmp(&y));
+            prop_assert_eq!(segment_key(&pa, "logs").cmp(&segment_key(&pb, "logs")), (a, x).cmp(&(b, y)));
+        }
+        #[test]
+        fn signal_validation(signal in ".{0,40}") {
+            let valid = !signal.is_empty() && signal.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_');
+            prop_assert_eq!(validate_signal(&signal).is_ok(), valid);
+        }
+        #[test]
+        fn valid_signals(signal in "[a-z0-9_]{1,40}") {
+            prop_assert!(validate_signal(&signal).is_ok());
+        }
+    }
+}
