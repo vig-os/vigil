@@ -38,7 +38,10 @@ Invalid numeric environment values emit a warning naming the variable and value
 and use the default, except queue values above the cap clamp to the cap.
 Empty `VIGIL_*` values are unset without warnings; relative `XDG_STATE_HOME`
 and `HOME` are ignored, with rejected values explained if no path is available. `VIGIL_MAX_BYTES` has a minimum of 1 byte and defaults to 50 MiB and `VIGIL_RETENTION_DAYS` to 90
-(`0` keeps everything). Explicit `Config` values override environment values.
+(`0` keeps everything). `Config::retention(Option<Duration>)` uses durations:
+`None` keeps everything, while `Some(Duration::ZERO)` prunes rotated segments
+at the next prune. Explicit `retention(None)` overrides the environment.
+Explicit `Config` values override environment values.
 `Config::revision` or `VIGIL_VCS_REVISION` supplies the producer commit.
 Storage initialization failures emit one warning and fall back to stderr;
 a second initialization returns an error before creating storage. An existing

@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** apply ADR-0004 decisions 2 and 5: replace `Config::retention_days` with `retention(Option<Duration>)`; make `RotationConfig` fields private, add validated builders, and remove `Copy` ([#42](https://github.com/vig-os/vigil/issues/42)).
+
 ### Deprecated
 
 ### Removed

@@ -18,7 +18,7 @@ fn child() {
     let cfg = if matches!(mode.as_str(), "env" | "xdg" | "home" | "relative") {
         cfg
     } else {
-        cfg.dir(&dir).max_bytes(1_000_000).retention_days(0)
+        cfg.dir(&dir).max_bytes(1_000_000).retention(None)
     };
     let guard = cfg.init().unwrap();
     assert!(

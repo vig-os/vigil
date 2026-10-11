@@ -100,7 +100,7 @@ pub struct Config {
     dir: Option<PathBuf>,
     max_bytes: Option<u64>,
     queue_size: Option<usize>,
-    retention_days: Option<u64>,
+    retention: Option<Option<Duration>>,
     version: Option<String>,
     revision: Option<String>,
 }
@@ -114,7 +114,7 @@ impl Config {
             dir: None,
             max_bytes: None,
             queue_size: None,
-            retention_days: None,
+            retention: None,
             version: None,
             revision: None,
         }
@@ -148,10 +148,13 @@ impl Config {
         self.queue_size = Some(size.clamp(1, MAX_QUEUE_SIZE));
         self
     }
-    /// Retention in days; zero keeps everything. Overrides `VIGIL_RETENTION_DAYS`.
+    /// Retention duration; `None` keeps everything and `Some(Duration::ZERO)`
+    /// prunes rotated segments at the next prune. Overrides
+    /// `VIGIL_RETENTION_DAYS` (whole days, where zero instead keeps everything).
+    /// An explicit `retention(None)` overrides the environment too.
     #[must_use]
-    pub fn retention_days(mut self, days: u64) -> Self {
-        self.retention_days = Some(days);
+    pub fn retention(mut self, retention: Option<Duration>) -> Self {
+        self.retention = Some(retention);
         self
     }
     /// Producer version, for example `env!("CARGO_PKG_VERSION")` in the caller.
@@ -257,14 +260,13 @@ impl Config {
             });
         let mut rotation = RotationConfig::default();
         if let Some(bytes) = self.max_bytes.or_else(|| number("VIGIL_MAX_BYTES", 1)) {
-            rotation.max_bytes = bytes;
+            rotation = rotation.max_bytes(bytes);
         }
-        if let Some(days) = self
-            .retention_days
-            .or_else(|| number("VIGIL_RETENTION_DAYS", 0))
-        {
-            rotation.retention =
-                (days != 0).then(|| Duration::from_secs(days.saturating_mul(86_400)));
+        if let Some(retention) = self.retention.or_else(|| {
+            number("VIGIL_RETENTION_DAYS", 0)
+                .map(|days| (days != 0).then(|| Duration::from_secs(days.saturating_mul(86_400))))
+        }) {
+            rotation = rotation.retention(retention);
         }
         let queue_size = self
             .queue_size
