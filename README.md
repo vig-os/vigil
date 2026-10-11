@@ -167,3 +167,18 @@ allowing protobuf
 default omission and integer spelling changes. Valid unterminated final records
 are delivered; unterminated garbage is dropped. Metrics (#7) and traces (#8) are
 planned extensions.
+
+## Semver
+
+Before the first publish, CI compares the stable API against the full SHA of
+its merge base with `origin/dev`, using `cargo-semver-checks --release-type minor`
+even while both versions are 0.0.0. It fails if no checks run. All Cargo features
+are checked with `vigil_unstable` off; unstable items have no semver protection.
+Run locally with `git fetch origin` followed by
+`nix develop -c python3 scripts/check_semver.py`.
+The gate refuses to compare when the merge base equals HEAD, including a
+workflow dispatch on `dev` or a release PR from `dev` to `main`; run it on a
+feature PR into `dev`. Self-comparison cannot prove compatibility.
+The public-API allowlist gate arrives with #42 (part 3/3).
+See [ADR-0004](docs/adr/0004-public-api-and-stability.md) for the stability policy
+and the architect-reviewed `semver:major` exception before publication.

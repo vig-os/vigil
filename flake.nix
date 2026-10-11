@@ -45,6 +45,7 @@
         # ────────────────────────────────────────────────────────────────────
         extraPackages = pkgs: [
           pkgs.cargo-deny
+          pkgs.cargo-semver-checks
           pkgs.opentelemetry-collector-contrib
           pkgs.python3
         ];
