@@ -1,4 +1,13 @@
 use super::{AuditError, AuditErrorKind};
+use validation::valid_text;
+
+#[path = "validation.rs"]
+mod validation;
+#[cfg_attr(not(test), allow(dead_code))] // B2/B3 consume this production boundary.
+#[path = "writer.rs"]
+mod writer;
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use writer::request;
 
 /// A before/after value. Use digests for personal or large values; retain the
 /// referenced data separately in the application's own store.
@@ -112,16 +121,6 @@ impl Entry {
         fields
     }
 }
-fn valid_text(text: &str) -> Result<(), AuditError> {
-    if text.is_empty() || text.contains('\0') {
-        return Err(AuditError::new(
-            AuditErrorKind::InvalidEntry,
-            "strings must be nonempty and contain no NUL",
-        ));
-    }
-    Ok(())
-}
-
 /// Checkpoint commitment to all leaves preceding its own sequence number.
 #[derive(Clone, Debug)]
 pub struct CheckpointFields {
@@ -228,7 +227,9 @@ impl Record {
     ///
     /// # Errors
     ///
-    /// Returns [`AuditErrorKind::InvalidEntry`] if any supplied text (including
+    /// Returns [`AuditErrorKind::InvalidConfig`] if the sequence exceeds
+    /// `i64::MAX` (the OTLP int64 bound), or [`AuditErrorKind::InvalidEntry`]
+    /// if any supplied text (including
     /// service, host, or before/after text) is empty or contains NUL, or
     /// [`AuditErrorKind::TooLarge`] if a canonical field exceeds `u32::MAX` bytes.
     pub fn new(context: RecordContext, entry: Entry) -> Result<Self, AuditError> {
@@ -240,7 +241,8 @@ impl Record {
     /// # Errors
     ///
     /// Returns [`AuditErrorKind::InvalidConfig`] if MMR size differs from the
-    /// sequence number, [`AuditErrorKind::InvalidEntry`] if service or host is
+    /// sequence number or either exceeds `i64::MAX`,
+    /// [`AuditErrorKind::InvalidEntry`] if service or host is
     /// empty or contains NUL, or [`AuditErrorKind::TooLarge`] if a canonical
     /// field exceeds `u32::MAX` bytes.
     pub fn checkpoint(
@@ -256,6 +258,12 @@ impl Record {
         Self::build(context, Kind::Checkpoint(fields))
     }
     fn build(context: RecordContext, kind: Kind) -> Result<Self, AuditError> {
+        if context.seq > i64::MAX as u64 {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                "sequence exceeds OTLP int64",
+            ));
+        }
         valid_text(&context.service)?;
         if let Some(host) = &context.host {
             valid_text(host)?;
@@ -339,3 +347,11 @@ fn encode(fields: Vec<(u8, Vec<u8>)>, omit_signature: bool) -> Vec<u8> {
     }
     bytes
 }
+
+#[path = "codec.rs"]
+mod codec;
+pub use codec::Checkpoint;
+
+#[cfg(test)]
+#[path = "roundtrip_tests.rs"]
+mod roundtrip_tests;

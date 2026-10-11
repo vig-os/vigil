@@ -1,6 +1,7 @@
 """Compare vigil output by meaning using the pinned Collector as reference reader."""
 
 import collections
+import gzip
 import json
 import os
 import pathlib
@@ -66,6 +67,32 @@ def records(messages):
     return result
 
 
+def json_lines(text):
+    """JSON Lines delimiters are LF, not Unicode NEL/line/paragraph separators."""
+    return [line for line in text.split("\n") if line]
+
+
+def raw_reader_cases():
+    """Shared #82 fixtures: the real Collector must drop each raw escape."""
+    fixtures = pathlib.Path(__file__).resolve().parents[1] / "tests/fixtures/audit"
+    base = json.loads(json_lines((fixtures / "codec.jsonl").read_text())[0])
+    for index, case in enumerate(
+        json.loads((fixtures / "raw-fields.json").read_text())
+    ):
+        message = json.loads(json.dumps(base))
+        resource = message["resourceLogs"][0]
+        resource["resource"]["attributes"].append(
+            {"key": "raw.parity.case", "value": {"stringValue": str(index)}}
+        )
+        if case["field"] == "bytesValue":
+            resource["resource"]["attributes"].append(
+                {"key": "raw.bytes", "value": {"bytesValue": "RAW"}}
+            )
+        else:
+            resource["scopeLogs"][0]["logRecords"][0][case["field"]] = "RAW"
+        yield json.dumps(message).replace('"RAW"', case["raw"]), case["accepted"]
+
+
 def main():
     subprocess.run(["otelcol-contrib", "--version"], check=True)
     with tempfile.TemporaryDirectory(prefix="vigil-conformance-") as temporary:
@@ -87,16 +114,36 @@ def main():
         )
         require(len(inputs) > 1, "rotation did not happen")
         # Empty lines and terminated garbage between valid neighbouring batches.
-        lines = inputs[0].read_text().splitlines()
+        lines = json_lines(inputs[0].read_text())
         require(lines, "first rotated file is empty")
         neighbour = inputs[1].read_text()
         inputs[0].write_text("\n" + "\n".join(lines) + "\n\ngarbage\n\n" + neighbour)
         inputs[1].write_text("")
-        expected = records(json.loads((directory / "manifest.json").read_text()))
+        parity = list(raw_reader_cases())
+        parity_path = directory / "logs-raw-fields.jsonl"
+        parity_path.write_text("\n".join(line for line, _ in parity) + "\n")
+        inputs.append(parity_path)
+        manifest = json.loads((directory / "manifest.json").read_text())
+        corpus = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "tests/fixtures/audit/roundtrip.jsonl.gz"
+        )
+        writer_lines = json_lines(gzip.decompress(corpus.read_bytes()).decode())
+        require(
+            len(writer_lines) == 256, "writer corpus must contain 256 generated lines"
+        )
+        writer_path = directory / "logs-writer-corpus.jsonl"
+        writer_path.write_text("\n".join(writer_lines) + "\n")
+        inputs.append(writer_path)
+        expected = records(
+            manifest
+            + [json.loads(line) for line, ok in parity if ok]
+            + [json.loads(line) for line in writer_lines]
+        )
         require(expected, "manifest must contain records")
         for path in inputs:
             require(
-                all(len(line) <= 1_000_000 for line in path.read_bytes().splitlines()),
+                all(len(line) <= 1_000_000 for line in path.read_bytes().split(b"\n")),
                 f"Oversized line in {path}",
             )
         manifest_records = [json.loads(key)[2] for key in expected]
@@ -175,11 +222,11 @@ service:
                 previous = -1
                 while time.monotonic() < deadline:
                     require(child.poll() is None, "Collector exited early")
-                    text = output.read_text() if output.exists() else ""
-                    count = len(text.splitlines())
-                    if count != previous:
-                        previous, stable_since = count, time.monotonic()
-                    if count > 0 and time.monotonic() - stable_since >= 2:
+                    # Poll byte length: an in-progress write may end mid UTF-8 scalar.
+                    size = output.stat().st_size if output.exists() else 0
+                    if size != previous:
+                        previous, stable_since = size, time.monotonic()
+                    if size > 0 and time.monotonic() - stable_since >= 2:
                         break
                     time.sleep(0.25)
                 else:
@@ -193,13 +240,13 @@ service:
                     child.wait()
                 log.seek(0)
                 print(log.read())
-        actual = records(json.loads(line) for line in output.read_text().splitlines())
+        actual = records(json.loads(line) for line in json_lines(output.read_text()))
         require(
             actual == expected,
             f"Lost/changed: {expected - actual}\nUnexpected: {actual - expected}",
         )
         print(
-            f"Conformant: {sum(actual.values())} records across {len(list(directory.glob('logs*.jsonl')))} input files; valid EOF delivered, garbage EOF dropped"
+            f"Conformant: {sum(actual.values())} records including {len(writer_lines)} generated writer cases across {len(list(directory.glob('logs*.jsonl')))} input files; valid EOF delivered, garbage EOF dropped"
         )
     # TODO: extend reference-reader conformance to metrics (#7) and traces (#8).
 

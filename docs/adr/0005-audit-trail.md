@@ -189,12 +189,118 @@ Each line is one `LogsData` with one `ResourceLogs`, one `ScopeLogs` and one `Lo
 
 Attributes. Integers are OTLP `intValue`, `audit.mmr_peaks` is an `arrayValue` of `stringValue`s, and everything else is a `stringValue`. Strings are UTF-8, must not be empty, and must not contain a NUL.
 
-**Integer decoding** (`intValue`, `timeUnixNano`, `observedTimeUnixNano`). OTLP/JSON writes 64-bit integers as decimal strings, and readers must accept JSON numbers too. vigil writes strings. A v1 reader accepts:
+**Integer decoding (amended 2026-10-11, B1 security review of PR #75).**
+`intValue`, `timeUnixNano` and `observedTimeUnixNano` accept only the encoder's
+canonical decimal strings: ASCII digits, no sign, whitespace, exponent or
+leading zero except `"0"`. Timestamps fit u64; audit intValue counters fit i64. JSON numbers are `InvalidField`, even
+below 2^53. The earlier permission to accept numbers is withdrawn: float-based
+readers round larger integers, so an audited value could be displayed differently
+(decisions 3/5). Unhashed signed-int64 context also uses canonical decimal strings.
 
-- a string of ASCII digits with no sign, no leading zeros (except `"0"`), no whitespace and no exponent;
-- or a JSON integer number with the same restrictions.
+**Collector bounds (amended 2026-10-11, B1 round 3).** All OTLP `intValue`s
+fit i64 (context may be negative); audit.seq and audit.mmr_size are nonnegative.
+Writers reject larger counters with `InvalidConfig`. Context `bytesValue` must
+decode with standard padded base64; nonzero unused trailing bits are accepted.
+The round-3 claim about ignoring CR/LF after JSON unescaping was incorrect
+and is withdrawn by the 2026-10-11 #82 amendment below.
 
-The value must fit in u64. Anything else, including a negative value, a fraction, `1e3` or `"+1"`, is `InvalidField`. So every value has exactly one decoding, and the hash covers that value.
+**Raw-reader parity (amended 2026-10-11, #82).** Source audit of the pinned
+Collector 0.151.0 (pdata v1.57.0) and the review's pdata v1.68.0:
+
+| All fields reachable from LogsData | pdata string handling |
+| --- | --- |
+| AnyValue.bytesValue, recursively in resource/scope/record attributes, arrays and kvlists | Raw ReadBytes, standard padded base64 |
+| LogRecord.traceId and spanId | Raw ReadStringAsSlice, hex (empty or exactly 32/16 digits) |
+| ResourceLogs/ScopeLogs.schemaUrl; Scope.name/version | Unescaped ReadString |
+| EntityRef.schemaUrl/type/idKeys/descriptionKeys | Unescaped ReadString |
+| KeyValue.key; AnyValue.stringValue; LogRecord.severityText/eventName | Unescaped ReadString |
+| Quoted intValue/doubleValue, timestamps, counts, flags, severityNumber | Unescaped numeric/enum readers |
+| boolValue, objects, arrays | Typed readers, not strings |
+
+Raw-read values must be strings with no JSON backslash escape, even if
+unescaping would produce valid base64/hex. No CR/LF stripping is performed;
+raw controls are already forbidden by framing. Base64 uses the standard
+alphabet with required padding; URL-safe alphabet, whitespace and escapes
+are invalid. Unknown fields (including aliases and protobuf string indices)
+remain rejected. Sources: pdata internal/generated_proto_{logrecord,anyvalue,
+resource,instrumentationscope,entityref,keyvalue,resourcelogs,scopelogs}.go,
+internal/bytesid.go and internal/json/iterator.go at both versions.
+
+**Closed messages (amended 2026-10-11, same review).** LogsData, ResourceLogs,
+ScopeLogs, Resource, Scope and all nested OTLP messages accept only their v1
+camelCase keys. Unknown keys, including Collector snake_case aliases, are
+`UnknownField`; otherwise one tool could ship records another silently ignores.
+Known resource/scope context stays unhashed. Duplicate keys remain `InvalidField`.
+Missing required fields are `MissingField` (missing fixed severity or observed
+time remains `InvalidField`), syntax/UTF-8/blank input is
+`Unparsable`, unsupported versions are `UnknownVersion`, and a mismatching
+canonical record hash is `HashMismatch`. Decoder errors retain these finding
+kinds for #13; writers can refuse them as `CorruptTrail` (decision 8).
+
+**Framing and bounds (amended 2026-10-11, same review).** Reject raw bytes below 0x20 anywhere
+in an audit payload (`InvalidField`), including interior LF, tabs and CR.
+Escaped controls inside JSON strings remain content. Allow one optional final LF,
+excluded from checkpoint anchors; double-final LF is rejected (round 3 amendment). Enforce the 1 000 000-byte
+JSON payload bound before parsing (`TooLarge`, verifier `InvalidField`), excluding
+that optional LF, and the JSON deserializer's 128-level nesting bound. These
+rules also cover Collector multi-record lines and unhashed scope/resource data.
+**Writer/reader invariant (2026-10-11, decided in review of PR #75).** The
+decoder stays strict (canonical-only). The invariant “every line the writer can
+emit verifies” is enforced by construction: ONE shared validation module defines
+the accepted domain, and BOTH the production mapping and `parse_line` call it.
+There are no duplicated domain rules. Finite double tokens are checked before
+JSON parsing loses their spelling, against the shared encoder’s shortest
+round-trip form. Correlation identifiers require lowercase hex. Keys must be nonempty, NUL-free and unique
+within each attribute/kvlist list; KeyValue values must be present, and AnyValue
+must contain exactly one value. Context string values may be empty or contain
+escaped controls, including NUL; authenticated text and keys must be nonempty and NUL-free.
+Full Unicode, including DEL, U+2028 and U+2029, is accepted without normalization.
+`MAX_CONTEXT_DEPTH = 16` counts container edges from an attribute's root AnyValue
+at depth zero, for both arrays and kvlists. This stays well below serde's 128
+JSON-level guard and pdata's limits (a kvlist consumes several JSON levels).
+`MAX_PAYLOAD_BYTES = 1_000_000` excludes one optional terminal framing LF.
+Unescaped bytes below 0x20 are refused; escaped controls remain content.
+
+The `pub(crate)` production `Record` → `ExportLogsServiceRequest` mapping is the
+boundary B2/B3 MUST use. Invalid context returns typed `InvalidConfig`; excessive
+size returns `TooLarge`, before any write. It preflights typed context with the same nesting guard before cloning or JSON
+projection, then validates the shared encoder's patched JSON tree before
+serialization. Excessive nesting never reaches the reader's parser limit. The current mapping materializes that tree and serializes
+once to check the byte budget, then returns the typed request for the eventual
+sink to encode; this deliberate extra projection keeps one set of body and
+non-finite-double rules. No truncation or context sanitization occurs. The shared
+encoder omits an absent body rather than emitting `body: null`.
+
+Property tests generate entries/checkpoints, absent details, empty strings,
+random keys including empty/duplicate/NUL keys, missing values, all AnyValue kinds,
+signed int64 extremes, depth at/beyond the limit, full Unicode and payloads
+at/beyond the size cap. Context strings include NUL; authenticated text excludes it
+by its domain rule, and NUL-containing keys exercise typed refusal. Every input either receives a typed writer refusal or
+round-trips to identical canonical record bytes and hash. A fixed-seed corpus
+of 256 accepted lines from that same generator runs through the real pinned
+Collector in CI; refused samples are exercised during corpus generation.
+This verifies individual records, not chain history (#13).
+
+| Input accepted by pdata | Vigil reader (canonical-only) | Writer boundary |
+| --- | --- | --- |
+| intValue `"+5"` or `"007"` | Reject noncanonical decimal | Emits canonical decimal |
+| Finite doubleValue `1`, `1E2`, or `1.50` | Reject noncanonical spelling | Emits serde_json shortest round-trip form (`1.0`, `100.0`, `1.5`) |
+| Uppercase traceId/spanId hex | Reject InvalidField | Emits lowercase hex |
+| Quoted finite doubleValue, e.g. `"1.5"` | Reject | Emits finite numbers, only non-finite strings |
+| Numeric timeUnixNano/observedTimeUnixNano | Reject | Emits decimal strings |
+| Tab between tokens | Reject raw control | Emits compact JSON with escaped content |
+| `trace_id` and other snake_case aliases | Reject | Emits camelCase |
+| Empty or NUL-containing context key | Reject InvalidField | Refuse InvalidConfig |
+| Duplicate keys in an attribute/kvlist list | Reject InvalidField | Refuse InvalidConfig |
+| KeyValue without value (`null`/absent), or empty AnyValue | Reject InvalidField/MissingField | Refuse InvalidConfig |
+| Context nesting above 16 container edges | Reject InvalidField (or Unparsable at parser guard) | Refuse InvalidConfig |
+| Payload above 1,000,000 bytes | Reject TooLarge/InvalidField | Refuse TooLarge |
+
+**Whitespace decision (2026-10-11, #82).** ASCII space between tokens and before
+or after the JSON value is accepted and preserved; anchors retain that spelling
+except for the framing LF. No normalization means two accepted payload spellings
+may have the same canonical record hash. Raw controls, including tabs, remain
+invalid. Hashes authenticate record content, not JSON whitespace or key order.
 
 | Attribute | Kinds | Content | Tag |
 |---|---|---|---|

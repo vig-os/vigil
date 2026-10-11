@@ -11,6 +11,13 @@ pub vigil::audit::AuditErrorKind::Poisoned
 pub vigil::audit::AuditErrorKind::Signer
 pub vigil::audit::AuditErrorKind::TooLarge
 pub vigil::audit::AuditErrorKind::TrailExists
+#[non_exhaustive] pub enum vigil::audit::FindingKind
+pub vigil::audit::FindingKind::HashMismatch
+pub vigil::audit::FindingKind::InvalidField
+pub vigil::audit::FindingKind::MissingField
+pub vigil::audit::FindingKind::UnknownField
+pub vigil::audit::FindingKind::UnknownVersion
+pub vigil::audit::FindingKind::Unparsable
 #[non_exhaustive] pub enum vigil::audit::Value
 pub vigil::audit::Value::Digest([u8; 32])
 pub vigil::audit::Value::Text(alloc::string::String)
@@ -18,10 +25,20 @@ impl vigil::audit::Value
 pub fn vigil::audit::Value::digest_of(bytes: &[u8]) -> Self
 pub struct vigil::audit::AuditError
 impl vigil::audit::AuditError
+pub fn vigil::audit::AuditError::finding_kind(&self) -> core::option::Option<vigil::audit::FindingKind>
 pub fn vigil::audit::AuditError::kind(&self) -> vigil::audit::AuditErrorKind
 impl core::error::Error for vigil::audit::AuditError
 impl core::fmt::Display for vigil::audit::AuditError
 pub fn vigil::audit::AuditError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct vigil::audit::Checkpoint
+impl vigil::audit::Checkpoint
+pub fn vigil::audit::Checkpoint::hash(&self) -> [u8; 32]
+pub fn vigil::audit::Checkpoint::key_id(&self) -> [u8; 32]
+pub fn vigil::audit::Checkpoint::line(&self) -> &str
+pub fn vigil::audit::Checkpoint::mmr_root(&self) -> [u8; 32]
+pub fn vigil::audit::Checkpoint::mmr_size(&self) -> u64
+pub fn vigil::audit::Checkpoint::parse(line: &str) -> core::result::Result<Self, vigil::audit::AuditError>
+pub fn vigil::audit::Checkpoint::seq(&self) -> u64
 pub struct vigil::audit::CheckpointFields
 impl vigil::audit::CheckpointFields
 pub fn vigil::audit::CheckpointFields::new(size: u64, root: [u8; 32], peaks: alloc::vec::Vec<[u8; 32]>, key: [u8; 32], signature: [u8; 64]) -> core::result::Result<Self, vigil::audit::AuditError>
@@ -56,6 +73,8 @@ pub fn vigil::audit::Record::genesis(trail: &[u8; 16]) -> [u8; 32]
 pub fn vigil::audit::Record::hash(&self) -> [u8; 32]
 pub fn vigil::audit::Record::new(context: vigil::audit::RecordContext, entry: vigil::audit::Entry) -> core::result::Result<Self, vigil::audit::AuditError>
 pub fn vigil::audit::Record::signing_message(&self) -> core::option::Option<alloc::vec::Vec<u8>>
+impl vigil::audit::Record
+pub fn vigil::audit::Record::parse_line(bytes: &[u8]) -> core::result::Result<alloc::vec::Vec<Self>, vigil::audit::AuditError>
 pub struct vigil::audit::RecordContext
 impl vigil::audit::RecordContext
 pub fn vigil::audit::RecordContext::host(self, host: impl core::convert::Into<alloc::string::String>) -> Self

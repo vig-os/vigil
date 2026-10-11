@@ -17,16 +17,18 @@ name = "vigil"
 
 [features]
 default = []
-audit = ["dep:blake3", "dep:ed25519-dalek", "dep:zeroize"]
+audit = ["dep:blake3", "dep:ed25519-dalek", "dep:zeroize", "dep:serde", "dep:base64"]
 
 [dependencies]
+base64 = { version = "0.22", optional = true }
 blake3 = { version = "1", optional = true, default-features = false, features = ["std", "pure"] }
 ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["std", "zeroize", "fast"] }
 zeroize = { version = "1", optional = true, default-features = false }
 opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["logs"] }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["logs", "gen-tonic-messages", "with-serde"] }
-serde_json = "1"
+serde = { version = "1", optional = true }
+serde_json = { version = "1", features = ["raw_value"] }
 rustix = { version = "1.1.5", features = ["fs", "system"] }
 opentelemetry-appender-tracing = "0.33"
 tracing = "0.1"

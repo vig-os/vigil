@@ -200,7 +200,19 @@ impl<S: LineSink + 'static> LogExporter for OtlpJsonLogExporter<S> {
 ///
 /// `ExportLogsServiceRequest` and `LogsData` share their wire shape (a repeated
 /// `resourceLogs` field 1), so the JSON is identical.
-fn encode_line(request: &ExportLogsServiceRequest) -> Result<String, String> {
+pub(crate) fn encode_line(request: &ExportLogsServiceRequest) -> Result<String, String> {
+    let json = encode_json(request)?;
+    let line = serde_json::to_string(&json).map_err(|e| e.to_string())?;
+    // Safety net: a non-finite double the patching missed would serialize as
+    // `null` and make the Collector drop the whole line. Refuse to write it.
+    if line.contains(r#""doubleValue":null"#) {
+        return Err("a non-finite doubleValue was not sanitized".to_owned());
+    }
+    Ok(line)
+}
+
+/// Projects the typed request using the encoder's body and non-finite rules.
+pub(crate) fn encode_json(request: &ExportLogsServiceRequest) -> Result<serde_json::Value, String> {
     let mut json = serde_json::to_value(request).map_err(|e| e.to_string())?;
     for (resource, json_resource) in request
         .resource_logs
@@ -209,13 +221,7 @@ fn encode_line(request: &ExportLogsServiceRequest) -> Result<String, String> {
     {
         patch_resource_logs(resource, json_resource);
     }
-    let line = serde_json::to_string(&json).map_err(|e| e.to_string())?;
-    // Safety net: a non-finite double the patching missed would serialize as
-    // `null` and make the Collector drop the whole line. Refuse to write it.
-    if line.contains(r#""doubleValue":null"#) {
-        return Err("a non-finite doubleValue was not sanitized".to_owned());
-    }
-    Ok(line)
+    Ok(json)
 }
 
 // Work on patched JSON: budgets include escaping and non-finite spellings.
@@ -657,6 +663,8 @@ fn patch_resource_logs(resource_logs: &ResourceLogs, json: &mut Json) {
 fn patch_record(record: &LogRecord, json: &mut Json) {
     if let Some(body) = &record.body {
         patch_any_value(body, &mut json["body"]);
+    } else if let Some(fields) = json.as_object_mut() {
+        fields.remove("body");
     }
     patch_key_values(&record.attributes, &mut json["attributes"]);
 }
