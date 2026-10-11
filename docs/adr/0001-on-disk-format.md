@@ -3,6 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-10-09
 - **Amended by [ADR-0006](0006-shipping.md)** (Accepted 2026-10-11): decision 9 is superseded for the optional `push` feature; decision 5 and the versioning stance gain a fixed time-first JSON key order.
+- **Amended:** 2026-10-11, [#50](https://github.com/vig-os/vigil/issues/50): the new section "Versioning stance at 1.0" states what 1.0 promises readers and what counts as a vigil major. It collects existing decisions and newly states one principle (a major is a renamed, removed or re-meant attribute; a purely additive semconv pin move is a minor). It builds on the stance below, which stays the record of how the Development spec is absorbed.
 - **Issues:** [#1](https://github.com/vig-os/vigil/issues/1), [#3](https://github.com/vig-os/vigil/issues/3), [#6](https://github.com/vig-os/vigil/issues/6)
 
 ## Context
@@ -34,6 +35,36 @@ Fleet tools need local, durable telemetry that a collector can ship later. The d
 - **Absorbing a spec change:** a change that is additive or only restricts the layout is taken in a minor release (pre-1.0: `0.x`), with a `### Changed` entry in `CHANGELOG.md` naming the spec revision. Files already on disk are not rewritten; readers cope because the line payload is OTLP/JSON, which is Stable. A change to the envelope itself (for example a different line framing) is a breaking release and bumps the minor in `0.x`, the major from 1.0, with a changelog entry and an ADR superseding this one.
 - **Semconv pinning:** where we emit conventions that are themselves Development (GenAI), we pin a commit and stamp it as the scope's `schemaUrl`, so a reader can tell which revision a file follows.
 - **After the spec stabilises:** we re-verify against the stable text, mark this ADR with the confirmed revision, and drop the caveat.
+
+### Versioning stance at 1.0
+
+*Added 2026-10-11 ([#50](https://github.com/vig-os/vigil/issues/50)). This section collects decisions that already stand in ADR-0001, [ADR-0002](0002-rotation-and-retention.md), [ADR-0004](0004-public-api-and-stability.md), [ADR-0005](0005-audit-trail.md) and [ADR-0006](0006-shipping.md), with one exception: the principle in rule 2 (attribute renames, removals and changes of meaning are a major; a purely additive pin move is a minor) is **newly stated here by #50**, not an earlier decision. The README "Stability" section repeats it for users.*
+
+vigil goes from 0.0.0 on `dev` straight to a published 1.0.0 ([ADR-0004](0004-public-api-and-stability.md) Context), so there is no 0.x: the first published file format is the one promised here, and the "minor in `0.x`" wording of the stance above does not apply to it. From 1.0.0 a breaking change is a **major**.
+
+**What vigil promises readers of its files** (against the specs as checked on 2026-10-09, see Context):
+
+- Every line is one complete `LogsData`, `MetricsData` or `TracesData` object in **OTLP/JSON**, as defined by the Stable OTLP spec, terminated by `\n`, one signal per file (decision 1).
+- The field encoding is exactly OTLP/JSON: 64-bit integers as decimal strings, hex `traceId`/`spanId`, integer enums, lowerCamelCase keys, base64 `bytesValue` (decision 3). `NaN` and `±Inf` are written in the spellings of decision 6, `timeUnixNano` is never `"0"` (decision 7), and no line exceeds `max_line_bytes`, with oversized records shortened or replaced by a diagnostic stub as marked in decision 10.
+- The JSON keys come in the fixed **time-first order** of [ADR-0006](0006-shipping.md) decision 3, because file shippers identify files by their first bytes.
+- Readers ignore unknown fields, as OTLP requires of them. An additive change to the spec is taken in a minor release (see below).
+
+**What vigil does not promise**: that the Development file-exporter spec stays as it is today; the order of the remaining keys, whitespace or attribute order across vigil versions (deterministic within one version only); that lines are in chronological order across processes or batches (see Consequences); the bytes of a Collector's copy of a file.
+
+**What counts as a vigil major** (a vigil 2.0.0, with a changelog entry and an ADR that supersedes this one):
+
+1. **A breaking on-disk change**: anything that makes a conforming reader of the 1.0 files misread, reject or lose data from later files. This covers a change to the envelope (line framing, the one-signal-per-file layout, a payload that is no longer OTLP/JSON), to the field encoding of decisions 3, 6, 7 and 10, and to the time-first key order of ADR-0006 decision 3, which that ADR makes a contract.
+2. **Renaming, removing or changing the meaning of an attribute vigil emits** (newly stated by #50). This is rule 1's "misread … lose data" test applied to attributes: a dashboard or query on the old name or meaning breaks. It holds whether the change comes from vigil or from a semantic-convention revision vigil adopts under `schemaUrl` ([#9](https://github.com/vig-os/vigil/issues/9)). A purely additive move is not a major (see "Semantic conventions" below).
+3. **An OpenTelemetry bump that changes stable behaviour** ([ADR-0004](0004-public-api-and-stability.md) decision 1). A bump that changes nothing stable is a minor, or a patch if upstream shipped only a patch. If a bump would change the behaviour users write code against (the special span fields `otel.name`, `otel.kind`, `otel.status_code` and `otel.status_description`, the span-status and error mapping, the span fields on log records, propagation semantics), vigil translates it in its own code, or the bump waits for a major. If it changes bytes on disk, rules 1 and 2 decide whether it is a minor or a major.
+
+**How upstream spec changes are absorbed**:
+
+- **The file-exporter spec** (Development): a change that is additive or only restricts the layout is taken in a **minor**, with a `### Changed` entry in `CHANGELOG.md` naming the spec revision. Files already on disk are not rewritten; readers cope because the payload is Stable OTLP/JSON. A change to the envelope is a **major** (rule 1).
+- **OTLP/JSON** (Stable): an additive change is taken in a minor. A change that breaks the Stable encoding is a major (rule 1).
+- **Semantic conventions**: where vigil emits conventions that are themselves Development (GenAI, MCP), it pins a commit and stamps it as `schemaUrl`, so a reader can tell from the file which revision it follows. The mechanics of the pin and its bumps are decided in [#9](https://github.com/vig-os/vigil/issues/9). By the principle of rule 2, a purely additive move (a new revision, new attributes, a moved `schemaUrl` string) is a **minor**, with a changelog entry naming the old and new `schemaUrl`; a revision that renames, removes or changes the meaning of an attribute vigil emits is a **major**. Before #9 lands vigil stamps no `schemaUrl`.
+- **After the spec stabilises**: unchanged. We re-verify against the stable text, mark this ADR with the confirmed revision, and drop the caveat.
+
+**The audit format is frozen separately** ([ADR-0005](0005-audit-trail.md) decision 12). Audit records are OTLP log lines, so this stance applies to their envelope. But their hashes cover a value-level canonical encoding, not the JSON bytes (ADR-0005, Alternatives considered), so a change in how the lines are serialized does not stop old trails from verifying. From 1.0.0 every vigil 1.x release verifies every trail written by any vigil ≥ 1.0.0 (`audit.v` = `1`) and writes v1 by default; any change to what is written is a v2 with its own ADR; making v2 the default is a major. A shipper that rewrites attribute values is outside that promise.
 
 ## Consequences
 

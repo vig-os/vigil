@@ -4,6 +4,56 @@
 
 > **Pre-alpha.** The design is settled; the code is being built. Logs are implemented; other signals and audit are being built. Track progress in the milestones.
 
+## Stability
+
+vigil publishes no 0.x: the first release is 1.0.0, so what follows is the 1.0
+promise. Logs are implemented today; the rest of the promised surface is still
+being built, and the pre-1.0 `dev` branch may change it.
+
+- **Semver.** The stable API is every public item built without `--cfg vigil_unstable`,
+  with any combination of Cargo features, and it names only vigil's own types, `std`
+  and the `tracing` family. OpenTelemetry types never appear in it, so an
+  OpenTelemetry upgrade inside vigil is a minor release.
+  Moving to `tracing` 0.2 or `tracing-subscriber` 0.4 would be a major. Removing a
+  feature or changing the default features is a major. See
+  [ADR-0004](docs/adr/0004-public-api-and-stability.md) decisions 1, 5 and 7. CI
+  already runs the semver compatibility gate ([Semver](#semver)); the gate that fails
+  on any OpenTelemetry type in the surface arrives with
+  [#42](https://github.com/vig-os/vigil/issues/42) (part 3/3).
+- **`vigil_unstable` is excluded.** Items behind `--cfg vigil_unstable` (the exporters,
+  sinks, the re-exported OpenTelemetry crates and `install_opentelemetry_globals`) may
+  change in any minor release. Applications that set the cfg should pin `~1.N`
+  ([ADR-0004](docs/adr/0004-public-api-and-stability.md) decision 4).
+- **On-disk format.** Every line is valid OTLP/JSON, one signal per file, with the
+  field encoding and time-first key order of
+  [ADR-0001](docs/adr/0001-on-disk-format.md) and [ADR-0006](docs/adr/0006-shipping.md)
+  decision 3. A breaking on-disk change, a renamed, removed or re-meant attribute
+  (the semantic-convention pin and `schemaUrl` are planned in
+  [#9](https://github.com/vig-os/vigil/issues/9); a purely additive pin move is a
+  minor) and an OpenTelemetry upgrade that changes stable behaviour are each a major
+  release. The file-exporter
+  spec is still *Development*; how vigil absorbs its changes is in
+  [ADR-0001, "Versioning stance at 1.0"](docs/adr/0001-on-disk-format.md#versioning-stance-at-10).
+- **Audit format.** Separately frozen: every vigil 1.x release verifies every trail written by
+  any vigil ≥ 1.0.0 (`audit.v` = `1`), and writes v1 by default
+  ([ADR-0005](docs/adr/0005-audit-trail.md) decision 12). Before 1.0 the low-level
+  `audit` API is provisional, see [Audit format](#audit-format-opt-in).
+- **MSRV.** Rust 1.95; raised only in a minor release, to a release at least six
+  months old, with a changelog entry. See [Rust version policy](#rust-version-policy).
+- **Platforms.** Linux and macOS (Unix targets only; rotation relies on `flock` and
+  atomic no-replace rename, [ADR-0002](docs/adr/0002-rotation-and-retention.md)).
+  CI builds and tests on Linux and checks `aarch64-apple-darwin` at the MSRV. A macOS
+  CI lane that runs the tests arrives with
+  [#46](https://github.com/vig-os/vigil/issues/46), so macOS is supported but not yet
+  tested in CI.
+- **Not covered.** The text of the `Console::Stderr` output (do not parse it; the file is
+  the machine-readable output); the order of JSON keys after the time-first ones,
+  whitespace and attribute order across versions; line order across processes and
+  batches; the concrete types behind `Error::source()`; numeric defaults no code names
+  (default histogram boundaries, span and cardinality limits, batch sizes), which may
+  change in a minor release with a changelog entry; and copies of files that a shipper
+  has rewritten.
+
 ## Rust version policy
 
 The MSRV is Rust 1.95 (`Cargo.toml`), independent of the devkit pin. Raises
@@ -12,7 +62,7 @@ be at least six months old on the vigil release date. Linux CI builds and tests
 all features at the MSRV and checks `aarch64-apple-darwin` at the same version.
 A second Linux lane builds and tests the latest stable (currently 1.99.0) through locked fenix, allowing warnings;
 advance its independent manifest pin in `flake.nix` on each stable release. The macOS lane
-uses the dev pin. Today MSRV and dev pin are both 1.95.0; the MSRV lane adds the
+([#46](https://github.com/vig-os/vigil/issues/46), not yet in CI) will use the dev pin. Today MSRV and dev pin are both 1.95.0; the MSRV lane adds the
 Apple-target check and diverges as soon as devkit advances past 1.95.
 See [ADR-0004 decision 11](docs/adr/0004-public-api-and-stability.md#11-msrv-policy).
 
