@@ -79,18 +79,23 @@ The plan in #10 and #12 built the chain and checkpoints "on tessera-core". The o
 The four sub-decisions are rules about what the writer returns and what the verifier reports, so the probe is an executable model of those rules, run against both the accepted rule ("Old") and the amended one ("New").
 
 - **The model.** `blake3` and `ed25519-dalek` with decision 14's features; records with `trail`, `seq`, kind, `prev_hash` and a domain-separated hash; checkpoints signed over a domain-separated message and checked with `verify_strict`; a trust policy with per-trail sections and `through=` bounds; and a verifier for chain, signatures, trust, revocation, anchors, receipts, waivers and `start_from`. MMR and OTLP encoding are left out, because none of the four rules depends on them.
-- **14 attack tests** (`cargo test --release`, exit 0, three runs). Each attack runs against both rules:
+- **20 attack tests** (`cargo test --release`, exit 0, three runs). Six of them were added after an independent adversarial review of the first draft: in-flight records below the highest receipt, a start read from the disk, receipts lost with a `resume`, a retired trail, a waiver below the start, and late adoption. Each attack runs against both rules:
   - forged records after the last receipt, signed by an honest `close()`: Old passes `--strict`, New reports `NoReceipt`;
   - a forged record before the first receipt: Old misses it, New reports it;
   - the stolen-key start: Old passes `--strict` with every anchor `OutOfRange`, New reports `UnanchoredStart`;
   - a key revoked on X only: under Old, Y forged with it passes `--strict`, under New the policy fails to load;
   - the honest cases (clean stop, waived crash orphan, anchored start, revocation on every trail) pass `--strict` under New.
-- **Mutation.** Six mutants of the New rules, each killed by at least one test:
+- **Mutation.** Twelve mutants of the New rules, each killed by at least one test:
   - no cross-section revocation check;
   - an unanchored start demoting to info;
   - the range ending at the last receipt, or starting at the first;
   - no `SeqGap` without a start;
-  - a waiver not pinned by its hash.
+  - a waiver not pinned by its hash;
+  - the live cut ignoring holes;
+  - `end=` not confirming a bound, or not enforced;
+  - `lost` lines accepted without a `resume`;
+  - waivers below the start not treated as inputs;
+  - the `from` line ignored.
 
   The last mutant first survived, because a later receipt masked it; the test was tightened until it failed.
 - **Multi-process close** (real processes, `std::fs::File::lock`, `sync_data`):
@@ -140,8 +145,10 @@ The four sub-decisions are rules about what the writer returns and what the veri
 - **Archiving** (moving sealed segments to WORM or off-host storage) is an operator action outside vigil. Any sealed segment may be moved: the live file always starts with a checkpoint that carries the state the writer needs (decision 8). The live file and the trail marker (decision 8, "Creating a trail") must stay. **Procedure** (amended, #66), so that the part that stays can be verified on its own (decision 11, `start_from`):
   1. Verify archive and live together, with the anchors and receipts (`vigil-audit verify <dir>`): no error.
   2. Choose the start: the opening checkpoint of the oldest segment that stays.
-  3. **Anchor the start:** copy its line (`vigil-audit checkpoints`) to the anchor store, outside the trail directory. Only an anchored start lets the verifier set aside the anchors, revocation pins and receipts below it (decision 11).
+  3. **Record and anchor the start:** copy its line (`vigil-audit checkpoints`) into the archive's own record (kept with the archive, outside the trail directory) and into the anchor store. Only an anchored start lets the verifier set aside the anchors, revocation pins, receipts and waivers below it (decision 11).
   4. Move the older segments.
+
+  **`--start-from` comes from that archive record, never from the trail directory**, just as `--expect-head` never does (decision 9). Where every checkpoint is anchored (for example with push, decision 10), any checkpoint read from the disk is "anchored". An attacker who deletes kept segments up to a later opening checkpoint would then make the anchors and receipts of the deleted records `OutOfRange`. With the recorded start, the same deletion is `StartMismatch`, because the start is no longer the first record (probe).
 
 ### 3. Record schema: OTLP log records with `audit.*` attributes
 
@@ -233,8 +240,14 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
     - **It runs from the start of what is verified to the head:** from `seq 0`, or from the start checkpoint (decision 11), through the last record in the files. It is **not** bounded by the receipts. Every record of kind `audit.record` in it that has no receipt is `NoReceipt`; checkpoints need none. Records after the last receipt are therefore reported, including those an honest `close()` signed (probe: the accepted rule "first to last receipt" passed `--strict` with two forged records after the last receipt; this rule reports both). So are records before the first receipt, for example ones appended right after `create`.
     - **Every receipt must match.** A receipt whose `seq` is not in the files, or whose hash differs, is `ReceiptMismatch`. A receipt above the head is how reconciliation sees a rollback. Receipts may include checkpoints, such as those `close()` and `checkpoint()` return (decision 9); they are checked like any receipt.
     - **Operator records need receipts too.** `vigil-audit rotate` and `resume` print a receipt line (`<seq> <blake3:hex>`) for the record they write, and the operator adds it to the receipts. `AuditConfig::resume` returns the `Receipt` with the trail. No action name is exempt, so a forged `vigil.audit.*` record is `NoReceipt` like any other.
-    - **Waivers, for an honest crash.** A writer killed after its fsync but before the application stored the receipt leaves a durable record with no receipt. It looks exactly like a forged append, so vigil cannot decide; an operator does, after checking the application's own store (typically: the action never committed). The receipts input accepts `waive <first>[..<last>] <blake3:hex> <reason>` (`Verifier::waive(first, last, hash, reason)`), where the hash is that of the record at `<last>`. Through the chain, the hash pins every waived record, so a waiver cannot be moved to other records: if the record at `<last>` differs, it is `ReceiptMismatch`. Each waiver is reported once as `ReceiptWaived` (info, naming the range and the reason), and its records are not `NoReceipt`. A waived range also serves a deployment that started storing receipts after the trail began.
-    - **Live trails.** On a running trail, records written after the receipts were exported are in flight: honest, but not yet reconcilable. By default the verifier treats the trail as stopped and reports them as `NoReceipt`. `--receipts-live` (`Verifier::receipts_live(true)`) ends the range at the highest receipt instead and reports the records above it once as `Unreconciled` (info, naming the range). `--strict` fails on `Unreconciled`, as on `UncoveredTail`. The export must be taken **before** the trail is read, so that every honest receipt is in the files and a receipt above the head still means a rollback. The rotation procedure (decision 9) and any review of a stopped trail never use `--receipts-live`.
+    - **Waivers, for an honest crash.** A writer killed after its fsync but before the application stored the receipt leaves a durable record with no receipt. It looks exactly like a forged append, so vigil cannot decide; an operator does. The receipts input accepts `waive <seq> <blake3:hex> <reason>` (`Verifier::waive(seq, hash, reason)`), **one record per line**. The hash pins the record, so a waiver cannot be moved to another one: if the record at `<seq>` differs, it is `ReceiptMismatch`. Each waiver is reported as `ReceiptWaived` (info, naming the record and the reason), and the record is not `NoReceipt`.
+      - **The review criterion**, written into the rustdoc and the README, because the attacker of threat model (a) can also kill a writer: one crash orphans at most one record per `record` call in flight in the killed process (at most its number of calling threads), and each orphan must match an action the application attempted, by actor, action and object, in its own request log. More orphans than calls in flight, or content that matches no attempted action, is tampering, not a crash. vigil cannot apply this criterion itself, since it does not see the application's log.
+    - **Late adoption.** A deployment that started storing receipts after the trail began gives one `from <seq> <blake3:hex> <reason>` line (`Verifier::receipts_from(seq, hash, reason)`): records up to and including that one are not reconciled. Its hash pins that history as it was when the decision was taken; a mismatch is `ReceiptMismatch`. It is reported once as `ReceiptWaived` (info).
+    - **Receipts lost with a `resume`.** Records lost with a deleted live file (decision 8) had receipts, and `seq` then continues from the named head, so new records reuse those `seq`s. Their old receipts would be `ReceiptMismatch` for good. The operator turns each such receipt into a `lost <seq> <blake3:hex> <reason>` line (`Verifier::lost(seq, hash, reason)`). It is `ReceiptLost` (a warning: plain verification passes, `--strict` fails like `Resumed`, see [#68](https://github.com/vig-os/vigil/issues/68)) if a `vigil.audit.resume` record in the trail names a head below its `seq`, and `ReceiptMismatch` otherwise. A `lost` line does not count as a receipt: the new record at that `seq` needs its own.
+    - **Live trails.** On a running trail, some records are in flight: `record` has returned `Ok` but the receipt is not stored yet, or not exported yet. They can sit **below** the highest receipt when another process or thread stored a later one first. By default the verifier treats the trail as stopped and reports every record without a receipt as `NoReceipt`. With `--receipts-live` (`Verifier::receipts_live(true)`), the range ends at the **longest fully reconciled prefix**: just before the first record without a receipt or waiver, and never above the highest receipt. Everything above it is reported once as `Unreconciled` (info, naming where it starts). With no receipts at all, the whole range is `Unreconciled`. `--strict` fails on `Unreconciled`, as on `UncoveredTail`.
+      - An honest hole closes once its receipt is stored. A forged record is a hole that never closes: `Unreconciled` keeps starting at the same `seq` across reviews, and stopped-trail reconciliation reports it as `NoReceipt` (probe).
+      - The export must be taken **before** the trail is read, so that every honest receipt is in the files and a receipt above the head still means a rollback. Receipts above the cut are still checked against their records.
+      - The rotation procedure (decision 9) and any review of a stopped trail never use `--receipts-live`.
   - **Anchors** ([#57](https://github.com/vig-os/vigil/issues/57), decision 10), which bound what a later checkpoint may claim.
 - **What cannot be detected without something kept outside the trail directory.** An attacker who can write the files can roll back or rewrite the uncovered tail, or roll back to any checkpoint. If afterwards a writer starts without `expect_head` and signs, the result is a consistent trail that verifies clean. Only anchors ([#57](https://github.com/vig-os/vigil/issues/57) and decision 10), receipts held by the application, or `expect_head` reveal it. The rustdoc of `AuditConfig::open` says so and recommends `expect_head` for regulated deployments.
 - **Against an attacker who holds a trusted key,** only anchors, receipts and `expect_head` help (decision 9).
@@ -383,6 +396,8 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
 
      **The expected head** (amended, #66). `AuditTrail::close(self) -> Result<Checkpoint, AuditError>` always writes a checkpoint signed by the handle's signer and returns it. The application stores that checkpoint (its `line`) with its receipts, as it stores every `Receipt`. Closes are serialised by the directory lock, so after every writer has stopped, **the expected head is the highest `seq` among all receipts and close checkpoints the application holds, across all its processes**. Probe: 8 real processes appending under `File::lock`, 20 runs: the highest returned `seq` was always the disk head, and that head was a close checkpoint.
 
+     `close` consumes the handle even when it fails (for example with kind `Signer`; it then writes nothing), so an application retries by opening the trail again and closing that handle.
+
      **A writer that returned no close checkpoint** (killed, dropped without `close`, or `close` failed because the signer was down) may have left records above everything held; `Drop`'s best-effort checkpoint is not returned either. Then start the application once more with `expect_head` from its highest held receipt or checkpoint, and stop it cleanly: that `close()` returns the head. Probe: a SIGKILLed writer left records above every held receipt, and one restarted writer's `close()` returned exactly the disk head.
   2. Verify the trail against the anchors and the receipts, including the close checkpoints, without `--receipts-live` (decision 5). A record that a `close()` signed but the application never wrote is `NoReceipt` here, before any new key covers it; a crash orphan is waived here after review. Choose the bound: the last checkpoint known good. After a clean stop, that is the expected head of step 1, the final `close()` checkpoint. After a suspected compromise, it is the last checkpoint that matches an anchor.
   3. Generate the new key (`vigil-audit keygen`) and deploy it to every writer, removing the old key file.
@@ -396,13 +411,15 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
 
   A key that was never trusted, or one removed from the file, makes its checkpoints `UntrustedKey`.
 - **Trust file format** (for `TrustPolicy::from_file` and `--trust`). UTF-8 lines; blank lines and lines starting with `#` are ignored:
-  - `trail <32 hex> [comment]` starts a section and pins that trail id (decision 8). At least one is required.
+  - `trail <32 hex> [end=<seq>:<blake3:hex>] [comment]` starts a section and pins that trail id (decision 8). At least one is required. A trail id that starts two sections is a parse error (amended, #66).
+  - **`end=` retires a trail** (amended, #66): the trail must end exactly at that record. A different record at that `seq`, or any record above it, is `TrailEnded` (an error). A retired trail on WORM storage cannot be written to, so `rotate` cannot write a confirming checkpoint there. Instead, a bound equal to the `end=` record counts as confirmed: no record, by any key, may follow it.
   - `ed25519 <64 hex> [through=<seq>:<blake3:hex>] [comment]` lists a key trusted **for the trail of the section it is in**. A key line before the first `trail` line is a parse error.
   - **Revocation scope** (amended, #66). **A key revoked on one trail is revoked on every trail that lists it.** A trust file in which a key carries `through=` in one section and no `through=` in another is a parse error (`TrustPolicy::from_file`, and the builder's build step, fail with `AuditErrorKind::InvalidConfig`, naming the key and the sections). Otherwise a stolen key revoked only on trail X still forges trail Y, which then verifies clean (probe: `--strict` passed on Y; at most `NoReceipt` with receipts).
-    - **Bounds do not combine across trails.** A `seq` means something only within its trail, so each section carries its own bound, a checkpoint of that trail, and its own confirming checkpoint (the *pinned*, *confirmed* and *bounded* rules above, per trail). Revoking a shared key therefore means running the rotation procedure on every trail that lists it, including a trail no longer written to: its `rotate` writes the confirming checkpoint.
+    - **Bounds do not combine across trails.** A `seq` means something only within its trail, so each section carries its own bound, a checkpoint of that trail, and its own confirmation (the *pinned*, *confirmed* and *bounded* rules above, per trail). Revoking a shared key therefore means running the rotation procedure on every trail that lists it that is still written to. A retired trail gets `end=` at its last record and the key's bound at the same record (probe).
+    - **The check covers one trust file.** The verifier sees only the trust file it is given, so a key revoked in X's file and still trusted in a separate file for Y is not caught. **Every trail a key signs for belongs in one trust file**, which the rustdoc of `TrustPolicy` and the README require. A deployment that keeps one file per trail must use one key per trail.
     - **A key appears at most once per section.** A second line for the same key in one section is a parse error, so a bound can never be silently overridden by a later line.
     - **Keys that must be revoked independently must be different keys.** A shared key has one lifecycle across its trails; that is the cost of the rule, and the rustdoc of `TrustPolicy` says so.
-  - `TrustPolicy::new()` with `.trail(id)`, which returns a section builder with `.key(public_key)` and `.key_through(public_key, seq, hash)`, builds the same in code.
+  - `TrustPolicy::new()` with `.trail(id)`, which returns a section builder with `.key(public_key)`, `.key_through(public_key, seq, hash)` and `.end(seq, hash)`, builds the same in code, with the same checks at its build step.
 - **Keep the trust file outside the trail directory,** for example in the verifier's configuration or a reviewed repository. The marker `audit.trail` lives in the writable directory, so it is never a trust input.
 
 ### 10. Anchoring (optional)
@@ -423,6 +440,7 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
   - `Verifier::new(trust)` with:
     - `.anchor(Checkpoint)`;
     - `.start_from(Checkpoint)`, for a trail whose older segments are archived: a checkpoint supplies `seq`, `prev_hash` and peaks. Amended, #66:
+      - **Where it comes from:** the archive's own record (decision 2's procedure), never the trail directory.
       - **Accepted** when the first record in the files is a checkpoint at the start's `seq` with exactly the start's hash, signed by a key trusted for the trail at that `seq`. Otherwise `StartMismatch` (an error), and the verifier does not use it.
       - **A signature alone never demotes anything.** Below the start, nothing can be checked against records. An anchor, a revocation pin (`through=<seq>:<hash>`), a receipt or a waiver below the start is:
         - **`OutOfRange` (info)** if the start is **anchored**: an anchor with the same trail, `seq` and hash is given (`.anchor`, `--anchor`). The anchor is the operator's out-of-band statement that the history below was verified before it was archived (decision 2's procedure), so `--strict` passes and archiving never makes verification fail for good;
@@ -434,7 +452,7 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
       - **The revocation rules above the start still apply:** a *confirmed* and *bounded* check needs only records above the bound.
       - **The archive is verified on its own.** `vigil-audit verify <archive dir> <live dir>`, or `verify_files` over both sets, checks everything in one run, with no start. The operator verifies the archive once before moving it, keeps the start checkpoint line with it, and anchors that line (decision 2's procedure).
     - `.receipts(impl IntoIterator<Item = (u64, [u8; 32])>)`: reconcile records against the application's receipts (decision 5);
-    - `.waive(first, last, hash, reason)` and `.receipts_live(bool)`: an operator's waiver for records with no receipt, and live reconciliation (decision 5);
+    - `.waive(seq, hash, reason)`, `.receipts_from(seq, hash, reason)`, `.lost(seq, hash, reason)` and `.receipts_live(bool)`: an operator's waiver for one record, late adoption, receipts lost with a `resume`, and live reconciliation (decision 5);
     - `.trail(id)`: narrow to one pinned trail;
     - `.max_age(Duration)`: report `StaleHead` (an error) when the newest trusted checkpoint is older than this, measured against the verifier's clock (decision 5);
     - `.verify_dir(&Path)` and `.verify_files(impl IntoIterator<Item = PathBuf>)`, the latter for copies shipped through a Collector.
@@ -446,9 +464,9 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
   - `findings()`;
   - `is_valid()`: no finding of severity `Error`.
 - **Finding.** `Finding` exposes `kind()`, `severity()`, `file()`, `line()`, `seq()` and `detail()`, the last naming expected and found values. `FindingKind` is `#[non_exhaustive]`:
-  - errors: `Unparsable`, `UnknownVersion`, `UnknownField`, `MissingField`, `InvalidField`, `HashMismatch`, `ChainBroken`, `SeqGap`, `SeqConflict` (two different records with one `seq`), `TrailMismatch`, `MmrMismatch`, `BadSignature`, `UntrustedKey`, `RevocationMismatch`, `RevocationUnconfirmed`, `SegmentStructure`, `AnchorMismatch`, `StartMismatch`, `UnanchoredStart` (an input below a start that is not anchored, decision 11), `StaleHead`, `NoReceipt`, `ReceiptMismatch`;
-  - warnings: `TornWrite`, `Resumed`, `ClockWentBackwards`, `DuplicateRecord` (the same record twice: a Collector can redeliver a line, and in vigil's own files a duplicated line changes no content);
-  - info: `UncoveredTail`, `OutOfRange` (an input below an anchored start), `Unreconciled` (records above the highest receipt with `--receipts-live`), `ReceiptWaived` (an operator's waiver, decision 5).
+  - errors: `Unparsable`, `UnknownVersion`, `UnknownField`, `MissingField`, `InvalidField`, `HashMismatch`, `ChainBroken`, `SeqGap`, `SeqConflict` (two different records with one `seq`), `TrailMismatch`, `MmrMismatch`, `BadSignature`, `UntrustedKey`, `RevocationMismatch`, `RevocationUnconfirmed`, `SegmentStructure`, `AnchorMismatch`, `StartMismatch`, `UnanchoredStart` (an input below a start that is not anchored, decision 11), `TrailEnded` (a record at or above a retired trail's `end=` that does not match it, decision 9), `StaleHead`, `NoReceipt`, `ReceiptMismatch`;
+  - warnings: `TornWrite`, `Resumed`, `ReceiptLost` (a receipt lost with a `resume`, decision 5), `ClockWentBackwards`, `DuplicateRecord` (the same record twice: a Collector can redeliver a line, and in vigil's own files a duplicated line changes no content);
+  - info: `UncoveredTail`, `OutOfRange` (an input below an anchored start), `Unreconciled` (records above the reconciled prefix with `--receipts-live`), `ReceiptWaived` (an operator's waiver or `from` line, decision 5).
 - **How it verifies.** Records are ordered by `seq`, from vigil's segment order or from any order in shipped copies. Every record is checked; nothing stops at the first error. The first error in `seq` order is the **first broken link**, reported with file, line, `seq`, expected and found hash.
 - **Locking and offline use.** The verifier takes no lock and verifies a snapshot, using ADR-0002 decision 12's retry. Following ADR-0037 §1, it needs only the trail files, the trust file and local anchors: no network.
 - **CLI** (`vigil-audit`, std-only argument parsing, `required-features = ["audit"]`):
@@ -465,8 +483,11 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
 
 - **Receipts file** (`--receipts`, amended, #66). UTF-8 lines; blank lines and lines starting with `#` are ignored:
   - `<seq> <blake3:hex>`: a receipt, a record's or a checkpoint's (decision 5);
-  - `waive <first>[..<last>] <blake3:hex of the record at last> <reason>`: an operator's waiver (decision 5); the reason is required and is the rest of the line;
-  - any other line, or two receipts with one `seq` and different hashes, is a usage error (exit 2).
+  - `waive <seq> <blake3:hex> <reason>`: an operator's waiver for one record (decision 5);
+  - `from <seq> <blake3:hex> <reason>`: late adoption, at most once (decision 5);
+  - `lost <seq> <blake3:hex> <reason>`: a receipt lost with a `resume` (decision 5);
+  - in each, the reason is required and is the rest of the line;
+  - any other line, two receipts with one `seq` and different hashes, two `waive` lines for one `seq`, or a second `from` line is a usage error (exit 2). A `lost` line and a receipt may share a `seq`.
 
   Like the trust file, it is kept outside the trail directory. `rotate`, `resume` and `checkpoint` print what the operator adds to it: a receipt line for each record written, and the checkpoint line.
 - **Exit codes.** `0`: no error findings. With `--strict`, also no warnings, no uncovered tail and no `Unreconciled`. `1`: at least one error finding (or, with `--strict`, a warning, an uncovered tail or `Unreconciled`). `2`: usage or I/O error.
@@ -511,17 +532,22 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
     - A forged record between `create` and the application's first record: `NoReceipt`.
     - A receipt above the head (rollback), or with a different hash: `ReceiptMismatch`.
     - A `rotate` or `resume` record without its printed receipt: `NoReceipt`; with it, no finding.
-    - A crash orphan: `NoReceipt`; with a `waive` line naming it, `ReceiptWaived` (info) and `--strict` passes; the same waiver after the record at its `seq` is replaced: `ReceiptMismatch`.
+    - A crash orphan: `NoReceipt`; with a `waive` line naming it, `ReceiptWaived` (info) and `--strict` passes; the same waiver after the record at its `seq` is replaced, with no later receipt to mask it: `ReceiptMismatch`.
+    - Late adoption: records before the first receipt are `NoReceipt`; with a `from` line, `ReceiptWaived` and `--strict` passes; a `from` line with a wrong hash: `ReceiptMismatch`.
+    - Receipts lost with a `resume`: as plain receipts, `ReceiptMismatch`; as `lost` lines, `ReceiptLost` (warning), exit 0 without `--strict`; a `lost` line with no `vigil.audit.resume` record naming a lower head: `ReceiptMismatch`.
     - Records written after the receipts export: `NoReceipt` by default; with `--receipts-live`, one `Unreconciled` (info), exit 0 without `--strict` and 1 with it; a receipt above the head is still `ReceiptMismatch` with `--receipts-live`.
-    - Receipts-file parsing: an unknown line, a `waive` line without a reason, and two different hashes for one `seq` exit 2.
+    - An in-flight record below the highest receipt (process A's receipt not stored, process B's stored): with `--receipts-live`, `Unreconciled` from A's `seq` and exit 0; a hole that stays open across later receipts keeps `Unreconciled` at the same `seq`, and is `NoReceipt` without `--receipts-live`. `--receipts-live` with no receipts: everything `Unreconciled`.
+    - Receipts-file parsing: an unknown line, a `waive`, `from` or `lost` line without a reason, two different hashes for one `seq`, two waivers for one `seq` and a second `from` line exit 2.
   - **Trust scoping.** A key line before any `trail` line fails to parse. `--trail` with an unpinned id exits 2.
   - **Revocation scope** (#66, decision 9).
     - One key under trails X and Y, `through=` on X only: the trust file fails to parse (`InvalidConfig`), and so does the builder. (Against the accepted rule, Y forged with that key passes `--strict`.)
-    - The same key listed twice in one section: parse error.
+    - The same key listed twice in one section, or one trail id in two sections: parse error.
+    - A retired trail: with `end=` at its last record and the key's bound at the same record, it verifies clean with no confirming checkpoint; a record forged after it is `TrailEnded` (and `UntrustedKey` for a forged checkpoint); without `end=`, the bound is `RevocationUnconfirmed`.
     - The key revoked on both trails, each rotated to its own new key: both verify clean; a record and a checkpoint forged on Y with the old key above Y's bound: `UntrustedKey`; Y cut back to its bound and forged above it: `RevocationUnconfirmed` and `UntrustedKey`.
   - **Archiving and `start_from`** (#66, decision 11).
     - Archive and live verified together report the same findings as before the move.
-    - Following decision 2's procedure (start anchored): anchors, revocation pins and receipts below the start are `OutOfRange` (info) and `--strict` passes.
+    - Following decision 2's procedure (start anchored): anchors, revocation pins, receipts and waivers below the start are `OutOfRange` (info) and `--strict` passes; with an unanchored start, a waiver below it is `UnanchoredStart`.
+    - Every checkpoint anchored, the start recorded at the archive boundary, then kept segments deleted up to a later opening checkpoint: `StartMismatch`.
     - The stolen-key attack: cut just above the newest anchor, sign a start there with the not yet revoked key, rewrite and re-sign above it, move the rest away, verify with every anchor and that start: `UnanchoredStart` for each anchor, exit 1. (Fails against the accepted rule, which passes `--strict`.)
     - An honest but unanchored start with an anchor or receipt below it: `UnanchoredStart`; with nothing below it: no error.
     - A start whose hash differs from the first record, that is not the first record, that is not a checkpoint, or that is signed by a key not trusted at its `seq`: `StartMismatch`.
@@ -613,22 +639,22 @@ The four threat models: **(a)** an attacker who can write the trail files but ho
 **Receipts range: start of the verified range through the head (decision 5).**
 - (a) Every chained append is `NoReceipt` wherever it sits: before the first receipt, between receipts, or after the last one under an honest `close()`. A rollback is `ReceiptMismatch` for every receipt above the new head.
 - (b) A rewrite of a receipted record is `ReceiptMismatch`, since the receipt's hash cannot be re-signed into agreement. A stolen key adds nothing against receipts.
-- (c) A crash orphan is `NoReceipt` until an operator reviews it and adds a hash-pinned `waive` line; then `ReceiptWaived` (info), so a crash never fails verification for good. In-flight records on a live trail are not misreported if `--receipts-live` is used, which `--strict` refuses to call complete.
+- (c) A crash orphan is `NoReceipt` until an operator reviews it and adds a hash-pinned `waive` line for it; then `ReceiptWaived` (info), so a crash never fails verification for good. With `--receipts-live`, in-flight records, including those below the highest receipt, are `Unreconciled` (info), never `NoReceipt`; `--strict` refuses to call that complete.
 - (d) Receipts from all processes are merged; the range does not depend on which process wrote what.
-- **Not detectable:** with `--receipts-live`, records above the highest receipt until the next reconciliation (reported as `Unreconciled`); and anything an attacker who can also write receipts adds.
+- **Not detectable:** with `--receipts-live`, whether a record above the reconciled prefix is honest, until its hole closes or the trail stops (reported as `Unreconciled`); a forged record that an operator waives because it imitates an action the application attempted, under a writer the attacker killed (the review criterion bounds how many); and anything an attacker who can also write the receipts adds.
 
 **`start_from`: only an anchored start demotes (decision 11).**
-- (a) A forged start needs a trusted signature: `StartMismatch`. Replaying a genuine older checkpoint as the start demotes nothing unless it is anchored, and an anchored start is a checkpoint the operator verified.
+- (a) A forged start needs a trusted signature: `StartMismatch`. The start comes from the archive's record, never from the disk, so deleting kept segments up to a later checkpoint is `StartMismatch` too, even where every checkpoint is anchored (probe).
 - (b) A start signed with the stolen key is accepted by signature, but every anchor, pin and receipt below it is `UnanchoredStart`, an error: the attack that passed `--strict` under the accepted rule now fails (probe). Anchors and receipts above the start are checked as usual.
 - (c) A start is a sealed checkpoint, written through the staging file and settled after any crash (decision 8), so no crash changes it. Verifying the live directory alone without a start is `SeqGap`, an operator error rather than a crash effect, and the verifier still checks everything after the gap.
 - (d) Not affected: the start is a property of the verified files, not of the writers.
-- **Not detectable:** a stolen-key rewrite above an unanchored start with no anchor or receipt above it. This is the same limit as for a trail that was never archived (decision 9: against a stolen key, only anchors and receipts help).
+- **Not detectable:** a stolen-key rewrite above an unanchored start with no anchor or receipt above it. This is the same limit as for a trail that was never archived (decision 9: against a stolen key, only anchors and receipts help). Nor an operator who takes the start from the disk against the rule.
 
 **Revocation scope: revoked on one trail means revoked on all (decision 9).**
 - (a) Not applicable: revocation concerns keys, and the trust file is kept outside the trail directory.
-- (b) A trust file that revokes the stolen key on X but trusts it on Y no longer loads, so Y cannot verify clean with forged records signed by that key (probe). Once Y is bounded too, forged checkpoints above Y's bound are `UntrustedKey`, and a cut back to the bound is `RevocationUnconfirmed`.
+- (b) A trust file that revokes the stolen key on X but trusts it on Y no longer loads, so Y cannot verify clean with forged records signed by that key (probe). Once Y is bounded too, forged checkpoints above Y's bound are `UntrustedKey`, and a cut back to the bound is `RevocationUnconfirmed`. A retired trail is bounded at its `end=`, and anything appended to it is `TrailEnded` (probe).
 - (c), (d) Not applicable: the rule is checked when the trust file is parsed.
-- **Not detectable:** forgeries on any trail between the key's compromise and the bound chosen for that trail. Each bound must be the last checkpoint that matches an anchor on that trail (step 2), and only anchors date a compromise.
+- **Not detectable:** forgeries on any trail between the key's compromise and the bound chosen for that trail. Each bound must be the last checkpoint that matches an anchor on that trail (step 2), and only anchors date a compromise. Nor a trail kept in a separate trust file that still trusts the key: the rule holds within the one trust file the verifier is given.
 
 ## Consequences
 
@@ -658,11 +684,11 @@ The four threat models: **(a)** an attacker who can write the trail files but ho
 - **What the #66 amendment costs** (decision 16):
   - **Applications store one more thing.** Each process stores the `Checkpoint` that `close()` returns next to its receipts, and a rotation needs every writer to have closed (or one restart and close). An application that drops the handle instead of closing it makes rotation take that extra step.
   - **`close` consumes the handle.** An application holding `Arc<AuditTrail>` must reach the last reference (`Arc::into_inner`) to close. A `close(&self)` that left the handle usable afterwards could not make the returned checkpoint the last thing written.
-  - **Receipts cover everything, so a crash costs a review.** Every crash between a durable write and the stored receipt leaves a `NoReceipt` until an operator waives it, and operator records need their printed receipts added. A deployment that started storing receipts late waives the earlier range once.
-  - **Live reconciliation is a separate, explicitly weaker mode** (`--receipts-live`), which `--strict` never accepts, and it requires a fixed order: export receipts, then read the trail.
-  - **Archiving needs an anchor.** The operator anchors the start before moving segments. A start that was not anchored cannot set aside the anchors, pins or receipts below it, so such a verification fails until the start is anchored (or the archive is verified together with the live files).
-  - **A shared key has one lifecycle.** Revoking it means rotating every trail that lists it, including retired ones. Deployments that want independent lifecycles use one key per trail.
-  - **More surface to keep stable in 1.x:** `close`'s return type, `Verifier::waive` and `receipts_live`, the `waive` line of the receipts file, `--receipts-live`, and the finding kinds `UnanchoredStart`, `Unreconciled` and `ReceiptWaived`. `FindingKind` is `#[non_exhaustive]`, and no new `AuditErrorKind` is needed (the trust-file rule reuses `InvalidConfig`), so ADR-0004's rules hold.
+  - **Receipts cover everything, so a crash costs a review.** Every crash between a durable write and the stored receipt leaves a `NoReceipt` until an operator waives it, one line per record, against the application's request log. Operator records need their printed receipts added. A deployment that started storing receipts late adds one `from` line, and receipts lost with a `resume` become `lost` lines.
+  - **Live reconciliation is a separate, explicitly weaker mode** (`--receipts-live`), which `--strict` never accepts, and it requires a fixed order: export receipts, then read the trail. It stops at the first open hole, so one slow or crashed writer holds back the reconciled prefix until its receipt is stored or waived.
+  - **Archiving needs an anchor and a record.** The operator records and anchors the start before moving segments, and later verifications take the start from that record. A start that was not anchored cannot set aside the anchors, pins or receipts below it, so such a verification fails until the start is anchored (or the archive is verified together with the live files).
+  - **A shared key has one lifecycle and one trust file.** Revoking it means rotating every live trail that lists it and pinning `end=` on every retired one, all in the same trust file. Deployments that want independent lifecycles, or one trust file per trail, use one key per trail.
+  - **More surface to keep stable in 1.x:** `close`'s return type, `Verifier::waive`, `receipts_from`, `lost` and `receipts_live`, the `waive`, `from` and `lost` lines of the receipts file, the trust file's `end=`, `--receipts-live`, and the finding kinds `UnanchoredStart`, `TrailEnded`, `ReceiptLost`, `Unreconciled` and `ReceiptWaived`. `FindingKind` is `#[non_exhaustive]`, and no new `AuditErrorKind` is needed (the trust-file rule reuses `InvalidConfig`), so ADR-0004's rules hold.
   - **Deferred to [#68](https://github.com/vig-os/vigil/issues/68):** an honest crash's `TornWrite` (and a `Resumed`) still makes `--strict` fail for good, because `--strict` fails on every warning and nothing records a reviewer's acceptance. That rule belongs to the core, not to the four sub-decisions; #68 decides it before #13 implements `--strict`, and may reuse the waiver's shape.
 
 ## Alternatives considered
@@ -698,6 +724,11 @@ The four threat models: **(a)** an attacker who can write the trail files but ho
 - **#66: exempting `vigil.audit.*` actions from `NoReceipt`.** The attacker writes the action name, so a forged `vigil.audit.resume` record would escape. Printing receipts for operator records costs the operator one line per command. Rejected.
 - **#66: treating records after the last receipt as a warning by default.** The common case of the attack, an honest close over a forged tail, would pass plain verification. The opt-in `--receipts-live` mode gives live reviews the weaker answer explicitly. Rejected.
 - **#66: crash orphans as a permanent `NoReceipt`, or silently tolerated if they are the last record before a checkpoint.** The first breaks threat model (c); the second is the forged-append loophole again, since a forged record looks the same. Rejected for a hash-pinned waiver, reported as info.
+- **#66: range waivers** (`waive <first>..<last>`). An attacker who can kill a writer can append any number of records before the restart, and one range line would waive them all. One line per record, checked against the application's request log, keeps the operator's decision as narrow as a crash. Rejected; the one legitimate range, late adoption, gets its own single `from` line.
+- **#66: `--receipts-live` ending at the highest receipt.** A record in flight below it (one process's receipt stored before another's) would be `NoReceipt`, an error on an honest live trail (review probe). Rejected for the longest fully reconciled prefix.
+- **#66: leaving receipts lost with a `resume` as `ReceiptMismatch`.** A structural loss the operator has already decided on would then fail plain verification for good, and dropping the receipts from the input would hide the loss. Rejected for `lost` lines, reported as a warning.
+- **#66: requiring `rotate` on a retired trail.** It cannot write to WORM storage, so a shared key could then never be revoked cleanly on any trail that lists it. Rejected for `end=`, which is stronger: nothing at all may follow the retired head.
+- **#66: checking revocation across several trust files.** The verifier would need every trust file in the deployment, which it cannot know it has. Rejected for one trust file per key, as a documented rule.
 - **#66: a start trusted by its signature alone, with `OutOfRange` as info** (the accepted text before #66). It lets a stolen key disable every anchor (probe). Rejected.
 - **#66: requiring the start to live on WORM storage.** The verifier cannot see where a file lives; a rule it cannot check is documentation, not verification. Anchoring the start gives the same assurance in a form the verifier checks. Rejected.
 - **#66: always an error below a start, anchored or not.** Archiving would then fail verification for good, or force operators to drop their old anchors and receipts from the input, which hides them instead of reporting them. Rejected for the anchored-start rule.
