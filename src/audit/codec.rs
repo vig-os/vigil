@@ -444,7 +444,7 @@ impl Record {
     /// policy remains deferred to #68. Receipt reconciliation across resume is
     /// separate and deferred to #70. JSON nesting is limited to 128 levels.
     /// Only canonical camelCase message keys and decimal-string int64 fields
-    /// are accepted. Raw ASCII controls are InvalidField (escaped string controls are content).
+    /// are accepted. Raw bytes below 0x20 are InvalidField; escaped controls and DEL are content.
     /// JSON payloads over 1,000,000 bytes, excluding one optional final LF, fail
     /// with TooLarge/InvalidField before parsing. No input is normalized.
     pub fn parse_line(bytes: &[u8]) -> Result<Vec<Self>, AuditError> {
@@ -455,7 +455,7 @@ impl Record {
                 FindingKind::InvalidField,
             ));
         }
-        if bytes.iter().any(|b| b.is_ascii_control()) {
+        if bytes.iter().any(|b| *b < 0x20) {
             return Err(corrupt());
         }
         let json = decode_complete_json(bytes).map_err(|e| {

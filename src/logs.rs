@@ -200,7 +200,7 @@ impl<S: LineSink + 'static> LogExporter for OtlpJsonLogExporter<S> {
 ///
 /// `ExportLogsServiceRequest` and `LogsData` share their wire shape (a repeated
 /// `resourceLogs` field 1), so the JSON is identical.
-fn encode_line(request: &ExportLogsServiceRequest) -> Result<String, String> {
+pub(crate) fn encode_line(request: &ExportLogsServiceRequest) -> Result<String, String> {
     let mut json = serde_json::to_value(request).map_err(|e| e.to_string())?;
     for (resource, json_resource) in request
         .resource_logs
@@ -657,6 +657,8 @@ fn patch_resource_logs(resource_logs: &ResourceLogs, json: &mut Json) {
 fn patch_record(record: &LogRecord, json: &mut Json) {
     if let Some(body) = &record.body {
         patch_any_value(body, &mut json["body"]);
+    } else if let Some(fields) = json.as_object_mut() {
+        fields.remove("body");
     }
     patch_key_values(&record.attributes, &mut json["attributes"]);
 }

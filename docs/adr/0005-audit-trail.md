@@ -237,13 +237,35 @@ time remains `InvalidField`), syntax/UTF-8/blank input is
 canonical record hash is `HashMismatch`. Decoder errors retain these finding
 kinds for #13; writers can refuse them as `CorruptTrail` (decision 8).
 
-**Framing and bounds (amended 2026-10-11, same review).** Reject raw ASCII controls anywhere
+**Framing and bounds (amended 2026-10-11, same review).** Reject raw bytes below 0x20 anywhere
 in an audit payload (`InvalidField`), including interior LF, tabs and CR.
 Escaped controls inside JSON strings remain content. Allow one optional final LF,
 excluded from checkpoint anchors; double-final LF is rejected (round 3 amendment). Enforce the 1 000 000-byte
 JSON payload bound before parsing (`TooLarge`, verifier `InvalidField`), excluding
 that optional LF, and the JSON deserializer's 128-level nesting bound. These
 rules also cover Collector multi-record lines and unhashed scope/resource data.
+**Writer/reader invariant (amended 2026-10-11, B1 round 5).** Every line the
+writer can emit verifies: validated records, projected to OTLP and serialized
+through the shared encoder, must decode to identical canonical record bytes
+and hashes. The payload limit is checked before emission; oversized records
+are refused, never truncated. [RFC 8259 §7](https://www.rfc-editor.org/rfc/rfc8259#section-7) permits DEL (U+007F) in strings, as do
+the encoder and pdata, so the decoder accepts it. Only unescaped bytes below
+0x20 are forbidden (apart from the final framing LF); escaped controls remain
+content. The shared encoder omits an absent protobuf body rather than emitting
+`body: null`, honoring the audit body's required absence. Property tests cover
+entries/checkpoints, full Unicode, control and scalar boundaries, nested AnyValue
+kinds, signed int64 extremes, bytes and payloads near the one-million-byte cap.
+A reproducible 256-line corpus from the same generator is checked by the real
+pinned Collector in CI. This checks individual records, not chain history (#13).
+
+| Deliberate v1 rejection accepted by pdata | Why the writer never emits it |
+| --- | --- |
+| intValue `"+5"` or `"007"` | Canonical signed decimal, no plus or leading zeros |
+| Quoted finite doubleValue, e.g. `"1.5"` | Finite doubles are JSON numbers; only NaN/Infinity are strings |
+| Numeric timeUnixNano/observedTimeUnixNano | UInt64 timestamps are canonical decimal strings |
+| Tab between tokens | Encoder emits compact JSON, with controls escaped inside strings |
+| `trace_id` and other snake_case aliases | Encoder emits canonical camelCase keys |
+
 **Whitespace decision (2026-10-11, #82).** ASCII space between tokens and before
 or after the JSON value is accepted and preserved; anchors retain that spelling
 except for the framing LF. No normalization means two accepted payload spellings

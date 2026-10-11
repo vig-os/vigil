@@ -352,3 +352,7 @@ fn encode(fields: Vec<(u8, Vec<u8>)>, omit_signature: bool) -> Vec<u8> {
 #[path = "codec.rs"]
 mod codec;
 pub use codec::Checkpoint;
+
+#[cfg(test)]
+#[path = "roundtrip_tests.rs"]
+mod roundtrip_tests;

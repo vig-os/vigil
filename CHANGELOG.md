@@ -15,8 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Docs: README "Stability" section and ADR-0001 "Versioning stance at 1.0", covering the semver and on-disk format promises, what counts as a major, how upstream spec changes are absorbed, MSRV, platforms and the separately frozen audit format ([#50](https://github.com/vig-os/vigil/issues/50)).
 
 - Property tests cover log bounding, truncation, and segment naming and ordering ([#48](https://github.com/vig-os/vigil/issues/48)).
-- Strict audit v1 OTLP decoding and checkpoint parsing: duplicate-key rejection after unescaping, fixed display fields, canonical integers and hash checks, with Collector multi-record support ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
-- Strict audit v1 OTLP decoding and checkpoint parsing: duplicate-key rejection after unescaping, closed camelCase messages, fixed display fields, bounded decimal-string integers, raw-field escape rejection and validated base64/hex, single-line framing/size bounds and typed verifier findings, with Collector multi-record support ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
+- Strict audit v1 OTLP decoding and checkpoint anchors: closed messages, canonical numbers, hash checks, raw-field parity, framing/size bounds and typed findings; production-encoder round-trip properties cover Unicode/DEL and a fixed-seed Collector corpus ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 
 - Opt-in `audit` v1 format primitives: validated entries, canonical encoding, domain-separated record hashes and checkpoint signatures, resumable tessera-compatible MMR, and raw-hex key parsing (seed/public-key ambiguity documented); BSD-3-Clause exceptions are scoped to the three reviewed crypto crates ([#12](https://github.com/vig-os/vigil/issues/12), [#11](https://github.com/vig-os/vigil/issues/11)).
 - Independent MSRV and latest-stable CI build and test all features, verify `rust-version`, and check the Apple target at the MSRV ([#45](https://github.com/vig-os/vigil/issues/45)).
@@ -64,6 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Bind label-only semver approval to the PR number and head, grant explicit read permissions, and detect concurrent relabels and write-role approvals; document label rename behavior and the removal merge window ([#42](https://github.com/vig-os/vigil/issues/42)).
 
+- Omit absent log bodies from OTLP JSON instead of serializing null, so audit records produced by the shared encoder satisfy the required body absence ([#11](https://github.com/vig-os/vigil/issues/11)).
 - Isolate subscriber-installing library tests in child processes; CI also runs plain Cargo tests for all targets and features with default and single test threads ([#42](https://github.com/vig-os/vigil/issues/42)).
 
 ### Security
