@@ -337,7 +337,12 @@ unfinished, rerun full CI to supply the required evidence. Reruns read live stat
 Enable `audit` for the I/O-free ADR-0005 format primitives: entries, canonical
 record encoding, hashes, MMR commitments, checkpoint signatures and strict
 OTLP decoding. `Record::parse_line` accepts Collector multi-record lines and
-checks v1 field rules, duplicate keys after unescaping and record hashes.
+checks closed camelCase messages at every level, duplicate keys after unescaping
+and record hashes. Int64 values require canonical decimal strings; JSON numbers
+are rejected to prevent rounding by other readers. Raw CR (including CRLF) is
+rejected; escaped CR is content. Payloads over 1,000,000 bytes (excluding an
+optional final LF) are refused before parsing; nesting is limited to 128 levels.
+`AuditError::finding_kind` retains verifier categories for malformed lines.
 `Checkpoint::parse` retains one checkpoint line for an external anchor; parsing
 does not check signatures, trust, chain links or MMR history. Empty/whitespace
 lines are errors, not torn writes. Incomplete input also fails decoding; crash

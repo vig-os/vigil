@@ -1,10 +1,26 @@
 use super::*;
+use crate::audit::FindingKind;
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value as Json};
 use std::{collections::BTreeMap, fmt};
 
 fn corrupt() -> AuditError {
-    AuditError::new(AuditErrorKind::CorruptTrail, "invalid audit v1 OTLP record")
+    finding(FindingKind::InvalidField)
+}
+fn finding(kind: FindingKind) -> AuditError {
+    AuditError::decoding(AuditErrorKind::CorruptTrail, kind)
+}
+fn message(v: &Json, allowed: &[&str]) -> Result<(), AuditError> {
+    if object(v)?
+        .keys()
+        .any(|key| !allowed.contains(&key.as_str()))
+    {
+        return Err(finding(FindingKind::UnknownField));
+    }
+    Ok(())
+}
+fn required<'a>(v: &'a Json, key: &str) -> Result<&'a Json, AuditError> {
+    v.get(key).ok_or_else(|| finding(FindingKind::MissingField))
 }
 fn mapped<T>(result: Result<T, AuditError>) -> Result<T, AuditError> {
     result.map_err(|_| corrupt())
@@ -84,11 +100,7 @@ fn text(v: &Json) -> Result<&str, AuditError> {
     Ok(s)
 }
 fn integer(v: &Json) -> Result<u64, AuditError> {
-    let s = match v {
-        Json::String(s) => s.to_owned(),
-        Json::Number(n) if n.is_u64() => n.to_string(),
-        _ => return Err(corrupt()),
-    };
+    let s = v.as_str().ok_or_else(corrupt)?;
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) || (s.len() > 1 && s.starts_with('0'))
     {
         return Err(corrupt());
@@ -96,11 +108,11 @@ fn integer(v: &Json) -> Result<u64, AuditError> {
     s.parse().map_err(|_| corrupt())
 }
 fn scalar<'a>(v: &'a Json, key: &str) -> Result<&'a Json, AuditError> {
+    message(v, &[key])?;
     let fields = object(v)?;
-    if fields.len() != 1 {
-        return Err(corrupt());
-    }
-    fields.get(key).ok_or_else(corrupt)
+    fields
+        .get(key)
+        .ok_or_else(|| finding(FindingKind::MissingField))
 }
 fn string(v: &Json) -> Result<&str, AuditError> {
     text(scalar(v, "stringValue")?)
@@ -127,12 +139,13 @@ type Attributes<'a> = BTreeMap<&'a str, &'a Json>;
 fn attributes(v: &Json) -> Result<Attributes<'_>, AuditError> {
     let mut result = BTreeMap::new();
     for a in array(v)? {
+        message(a, &["key", "value"])?;
         let fields = object(a)?;
-        if fields.len() != 2 {
-            return Err(corrupt());
-        }
-        let key = text(&a["key"])?;
-        let value = fields.get("value").ok_or_else(corrupt)?;
+        let key = text(required(a, "key")?)?;
+        let value = fields
+            .get("value")
+            .ok_or_else(|| finding(FindingKind::MissingField))?;
+        any_value(value)?;
         if result.insert(key, value).is_some() {
             return Err(corrupt());
         }
@@ -140,7 +153,9 @@ fn attributes(v: &Json) -> Result<Attributes<'_>, AuditError> {
     Ok(result)
 }
 fn take<'a>(attrs: &mut Attributes<'a>, key: &str) -> Result<&'a Json, AuditError> {
-    attrs.remove(key).ok_or_else(corrupt)
+    attrs
+        .remove(key)
+        .ok_or_else(|| finding(FindingKind::MissingField))
 }
 fn value(
     attrs: &mut Attributes<'_>,
@@ -154,9 +169,103 @@ fn value(
         _ => Err(corrupt()),
     }
 }
+fn schema_url(v: &Json) -> Result<(), AuditError> {
+    if v.get("schemaUrl").is_some_and(|v| !v.is_string()) {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+fn context_message(v: &Json, resource: bool) -> Result<(), AuditError> {
+    message(
+        v,
+        if resource {
+            &["attributes", "droppedAttributesCount", "entityRefs"]
+        } else {
+            &["name", "version", "attributes", "droppedAttributesCount"]
+        },
+    )?;
+    for key in ["name", "version"] {
+        if v.get(key).is_some_and(|v| !v.is_string()) {
+            return Err(corrupt());
+        }
+    }
+    if let Some(count) = v.get("droppedAttributesCount")
+        && count.as_u64().is_none_or(|n| n > u32::MAX.into())
+    {
+        return Err(corrupt());
+    }
+    if let Some(attrs) = v.get("attributes") {
+        attributes(attrs)?;
+    }
+    if let Some(refs) = v.get("entityRefs") {
+        for entity in array(refs)? {
+            message(entity, &["schemaUrl", "type", "idKeys", "descriptionKeys"])?;
+            schema_url(entity)?;
+            if entity.get("type").is_some_and(|v| !v.is_string()) {
+                return Err(corrupt());
+            }
+            for key in ["idKeys", "descriptionKeys"] {
+                if let Some(keys) = entity.get(key)
+                    && array(keys)?.iter().any(|v| !v.is_string())
+                {
+                    return Err(corrupt());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+fn any_value(v: &Json) -> Result<(), AuditError> {
+    message(
+        v,
+        &[
+            "stringValue",
+            "boolValue",
+            "intValue",
+            "doubleValue",
+            "bytesValue",
+            "arrayValue",
+            "kvlistValue",
+        ],
+    )?;
+    if object(v)?.len() > 1 {
+        return Err(corrupt());
+    }
+    for (key, val) in object(v)? {
+        match key.as_str() {
+            "arrayValue" | "kvlistValue" => {
+                message(val, &["values"])?;
+                if let Some(values) = val.get("values") {
+                    if key == "arrayValue" {
+                        for value in array(values)? {
+                            any_value(value)?;
+                        }
+                    } else {
+                        attributes(values)?;
+                    }
+                }
+            }
+            "stringValue" | "bytesValue" if val.is_string() => {}
+            "boolValue" if val.is_boolean() => {}
+            "intValue"
+                if val.as_str().is_some_and(|s| {
+                    integer(val).is_ok() || s.parse::<i64>().is_ok_and(|n| n.to_string() == s)
+                }) => {}
+            "doubleValue"
+                if val.is_number()
+                    || ["NaN", "Infinity", "-Infinity"].contains(&val.as_str().unwrap_or("")) => {}
+            _ => return Err(corrupt()),
+        }
+    }
+    Ok(())
+}
 fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditError> {
-    for key in object(log)?.keys() {
-        if ![
+    if log.get("body").is_some() {
+        return Err(corrupt());
+    }
+    message(
+        log,
+        &[
             "timeUnixNano",
             "observedTimeUnixNano",
             "eventName",
@@ -167,13 +276,9 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
             "spanId",
             "flags",
             "droppedAttributesCount",
-        ]
-        .contains(&key.as_str())
-        {
-            return Err(corrupt());
-        }
-    }
-    let time = integer(&log["timeUnixNano"])?;
+        ],
+    )?;
+    let time = integer(required(log, "timeUnixNano")?)?;
     if integer(&log["observedTimeUnixNano"])? != time
         || log["severityNumber"].as_u64() != Some(9)
         || log["severityText"].as_str() != Some("INFO")
@@ -183,7 +288,7 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
     if let Some(v) = log.get("droppedAttributesCount")
         && v.as_u64() != Some(0)
     {
-        return Err(corrupt());
+        return Err(finding(FindingKind::UnknownField));
     }
     // Correlation metadata is permitted, but is never authenticated record content.
     for (key, width) in [("traceId", 32), ("spanId", 16)] {
@@ -199,20 +304,50 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
     {
         return Err(corrupt());
     }
-    let mut attrs = attributes(&log["attributes"])?;
+    let mut attrs = attributes(required(log, "attributes")?)?;
+    if attrs.keys().any(|key| {
+        ![
+            "audit.v",
+            "audit.trail",
+            "audit.seq",
+            "audit.prev_hash",
+            "audit.hash",
+            "audit.actor",
+            "audit.action",
+            "audit.object",
+            "audit.reason",
+            "audit.details",
+            "audit.before",
+            "audit.before_digest",
+            "audit.after",
+            "audit.after_digest",
+            "audit.mmr_size",
+            "audit.mmr_root",
+            "audit.mmr_peaks",
+            "audit.key_id",
+            "audit.sig",
+        ]
+        .contains(key)
+    }) {
+        return Err(finding(FindingKind::UnknownField));
+    }
     if integer(scalar(take(&mut attrs, "audit.v")?, "intValue")?)? != 1 {
-        return Err(corrupt());
+        return Err(finding(FindingKind::UnknownVersion));
     }
     let trail = hex_array(string(take(&mut attrs, "audit.trail")?)?)?;
     let seq = integer(scalar(take(&mut attrs, "audit.seq")?, "intValue")?)?;
     let previous = digest(take(&mut attrs, "audit.prev_hash")?)?;
     let claimed = digest(take(&mut attrs, "audit.hash")?)?;
-    let service = string(resource.get("service.name").ok_or_else(corrupt)?)?;
+    let service = string(
+        resource
+            .get("service.name")
+            .ok_or_else(|| finding(FindingKind::MissingField))?,
+    )?;
     let mut context = RecordContext::new(trail, seq, time, service, previous);
     if let Some(host) = resource.get("host.name") {
         context = context.host(string(host)?);
     }
-    let record = match log["eventName"].as_str() {
+    let record = match required(log, "eventName")?.as_str() {
         Some("audit.record") => {
             let mut entry = Entry::new(
                 string(take(&mut attrs, "audit.actor")?)?,
@@ -253,8 +388,11 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
         }
         _ => return Err(corrupt()),
     };
-    if !attrs.is_empty() || record.hash() != claimed {
+    if !attrs.is_empty() {
         return Err(corrupt());
+    }
+    if record.hash() != claimed {
+        return Err(finding(FindingKind::HashMismatch));
     }
     Ok(record)
 }
@@ -263,7 +401,7 @@ impl Record {
     ///
     /// Rejects duplicate JSON keys after unescaping, unknown record attributes or
     /// fields, invalid v1 values, empty/whitespace input, and mismatching record
-    /// hashes with CorruptTrail. Collector lines containing multiple resources,
+    /// hashes with CorruptTrail and a verifier finding via AuditError::finding_kind. Collector lines containing multiple resources,
     /// scopes and records are accepted. Resource/scope context other than service
     /// and host names, and correlation metadata, is unhashed.
     ///
@@ -271,14 +409,44 @@ impl Record {
     /// signatures or trust (#13). It does not classify incomplete input as a torn
     /// write: recovery needs file position and adjacent links (B2); strict warning
     /// policy remains deferred to #68. Receipt reconciliation across resume is
-    /// separate and deferred to #70. Serde's default nesting limit applies.
+    /// separate and deferred to #70. JSON nesting is limited to 128 levels.
+    /// Only canonical camelCase message keys and decimal-string int64 fields
+    /// are accepted. Raw CR bytes are InvalidField (escaped string CR is content).
+    /// JSON payloads over 1,000,000 bytes, excluding one optional final LF, fail
+    /// with TooLarge/InvalidField before parsing. No input is normalized.
     pub fn parse_line(bytes: &[u8]) -> Result<Vec<Self>, AuditError> {
-        let json = decode_complete_json(bytes).map_err(|_| corrupt())?;
+        let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+        if bytes.len() > 1_000_000 {
+            return Err(AuditError::decoding(
+                AuditErrorKind::TooLarge,
+                FindingKind::InvalidField,
+            ));
+        }
+        if bytes.contains(&b'\r') {
+            return Err(corrupt());
+        }
+        let json = decode_complete_json(bytes).map_err(|e| {
+            finding(if e.is_data() {
+                FindingKind::InvalidField
+            } else {
+                FindingKind::Unparsable
+            })
+        })?;
+        message(&json, &["resourceLogs"])?;
         let mut records = Vec::new();
-        for resource in array(&json["resourceLogs"])? {
-            let attrs = attributes(&resource["resource"]["attributes"])?;
-            for scope in array(&resource["scopeLogs"])? {
-                for log in array(&scope["logRecords"])? {
+        for resource in array(required(&json, "resourceLogs")?)? {
+            message(resource, &["resource", "scopeLogs", "schemaUrl"])?;
+            schema_url(resource)?;
+            let context = required(resource, "resource")?;
+            context_message(context, true)?;
+            let attrs = attributes(required(context, "attributes")?)?;
+            for scope in array(required(resource, "scopeLogs")?)? {
+                message(scope, &["scope", "logRecords", "schemaUrl"])?;
+                schema_url(scope)?;
+                if let Some(context) = scope.get("scope") {
+                    context_message(context, false)?;
+                }
+                for log in array(required(scope, "logRecords")?)? {
                     records.push(parse_record(log, &attrs)?);
                 }
             }

@@ -44,20 +44,9 @@ fn codec_golden_and_checkpoint_anchor() {
     assert!(Checkpoint::parse(GOLDEN.lines().next().unwrap()).is_err());
 }
 #[test]
-fn codec_collector_shape_numbers_and_context() {
+fn codec_collector_shape_and_context() {
     let mut v = fixture(false);
     let expected = Record::parse_line(v.to_string().as_bytes()).unwrap()[0].canonical();
-    for key in ["timeUnixNano", "observedTimeUnixNano"] {
-        log(&mut v)[key] = json!(123);
-    }
-    for key in ["audit.v", "audit.seq"] {
-        let n = attr(&mut v, key)["intValue"]
-            .as_str()
-            .unwrap()
-            .parse::<u64>()
-            .unwrap();
-        attr(&mut v, key)["intValue"] = json!(n);
-    }
     log(&mut v)["attributes"].as_array_mut().unwrap().reverse();
     for (key, value) in [
         ("traceId", json!("11".repeat(16))),
@@ -300,9 +289,9 @@ fn codec_optional_values_u64_boundary_and_nonzero_checkpoint() {
         .as_array_mut()
         .unwrap()
         .retain(|a| a["key"] != "host.name");
-    log(&mut v)["timeUnixNano"] = json!(u64::MAX);
+    log(&mut v)["timeUnixNano"] = json!(u64::MAX.to_string());
     log(&mut v)["observedTimeUnixNano"] = json!(u64::MAX.to_string());
-    attr(&mut v, "audit.seq")["intValue"] = json!(u64::MAX);
+    attr(&mut v, "audit.seq")["intValue"] = json!(u64::MAX.to_string());
     attr(&mut v, "audit.hash")["stringValue"] = json!(digest_string(&record.hash()));
     log(&mut v)["attributes"]
         .as_array_mut()
@@ -372,4 +361,193 @@ fn codec_optional_values_u64_boundary_and_nonzero_checkpoint() {
         .unwrap()
         .pop();
     rejected(&v);
+}
+
+#[test]
+fn codec_rejects_collector_alias_forgery() {
+    let mut v = fixture(false);
+    let mut forged = log(&mut v).clone();
+    forged["attributes"][4]["value"]["stringValue"] = json!("mallory");
+    v["resourceLogs"][0]["scopeLogs"][0]["log_records"] = json!([forged]);
+    assert!(
+        Record::parse_line(v.to_string().as_bytes()).is_err(),
+        "Collector alias forgery was silently accepted"
+    );
+}
+
+#[test]
+fn codec_closed_messages_and_nested_context() {
+    let mut base = fixture(false);
+    base["resourceLogs"][0]["resource"]["entityRefs"] =
+        json!([{"schemaUrl":"s","type":"host","idKeys":["host.name"],"descriptionKeys":[]}]);
+    base["resourceLogs"][0]["scopeLogs"][0]["scope"]["attributes"] = json!([
+        {"key":"context","value":{"kvlistValue":{"values":[{"key":"nested","value":
+            {"arrayValue":{"values":[{"stringValue":"context"}]}}}]}}}]);
+    assert!(Record::parse_line(base.to_string().as_bytes()).is_ok());
+    for (pointer, aliases) in [
+        ("", &["resource_logs"][..]),
+        ("/resourceLogs/0", &["scope_logs", "schema_url"][..]),
+        (
+            "/resourceLogs/0/scopeLogs/0",
+            &["log_records", "schema_url"][..],
+        ),
+        (
+            "/resourceLogs/0/resource",
+            &["dropped_attributes_count", "entity_refs"][..],
+        ),
+        (
+            "/resourceLogs/0/resource/entityRefs/0",
+            &["schema_url", "id_keys", "description_keys"][..],
+        ),
+        (
+            "/resourceLogs/0/scopeLogs/0/scope",
+            &["dropped_attributes_count"][..],
+        ),
+        (
+            "/resourceLogs/0/resource/attributes/0",
+            &["key_strindex"][..],
+        ),
+        (
+            "/resourceLogs/0/resource/attributes/0/value",
+            &[
+                "string_value",
+                "int_value",
+                "bool_value",
+                "double_value",
+                "bytes_value",
+                "array_value",
+                "kvlist_value",
+            ][..],
+        ),
+        (
+            "/resourceLogs/0/scopeLogs/0/scope/attributes/0/value/kvlistValue",
+            &[][..],
+        ),
+        (
+            "/resourceLogs/0/scopeLogs/0/scope/attributes/0/value/kvlistValue/values/0/value/arrayValue",
+            &[][..],
+        ),
+        (
+            "/resourceLogs/0/scopeLogs/0/logRecords/0",
+            &[
+                "time_unix_nano",
+                "observed_time_unix_nano",
+                "severity_number",
+                "severity_text",
+                "event_name",
+                "trace_id",
+                "span_id",
+                "dropped_attributes_count",
+            ][..],
+        ),
+    ] {
+        for key in aliases.iter().copied().chain(["forged"]) {
+            let mut v = base.clone();
+            v.pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(key.into(), json!([]));
+            let error = Record::parse_line(v.to_string().as_bytes()).unwrap_err();
+            assert_eq!(
+                error.finding_kind(),
+                Some(FindingKind::UnknownField),
+                "{pointer}/{key}"
+            );
+        }
+    }
+}
+#[test]
+fn codec_decimal_strings_only() {
+    for key in ["timeUnixNano", "observedTimeUnixNano"] {
+        let mut v = fixture(false);
+        log(&mut v)[key] = json!(123);
+        rejected(&v);
+    }
+    for (cp, key) in [
+        (false, "audit.v"),
+        (false, "audit.seq"),
+        (true, "audit.mmr_size"),
+    ] {
+        let mut v = fixture(cp);
+        attr(&mut v, key)["intValue"] = json!(0);
+        rejected(&v);
+    }
+}
+#[test]
+fn codec_cr_framing() {
+    let line = GOLDEN.lines().nth(1).unwrap();
+    for suffix in ["\r", "\r\n"] {
+        assert!(Checkpoint::parse(&format!("{line}{suffix}")).is_err());
+    }
+    assert!(Checkpoint::parse(&format!("{line}\n")).is_ok());
+    // JSON escapes are content, not framing CR bytes.
+    let mut v = fixture(false);
+    attr(&mut v, "audit.actor")["stringValue"] = json!("α\r");
+    let record = Record::new(
+        RecordContext::new([0x11; 16], 0, 123, "svc", Record::genesis(&[0x11; 16])).host("host"),
+        Entry::new("α\r", "sample.modify", "id:1")
+            .reason("reason")
+            .before(Value::Text("old".into()))
+            .after(Value::digest_of(b"new"))
+            .details("{}"),
+    )
+    .unwrap();
+    attr(&mut v, "audit.hash")["stringValue"] = json!(digest_string(&record.hash()));
+    assert!(Record::parse_line(v.to_string().as_bytes()).is_ok());
+}
+#[test]
+fn codec_line_size_bound() {
+    let line = GOLDEN.lines().nth(1).unwrap();
+    let mut bytes = line.as_bytes().to_vec();
+    bytes.resize(1_000_000, b' ');
+    assert!(Record::parse_line(&bytes).is_ok());
+    bytes.push(b'\n');
+    assert!(Record::parse_line(&bytes).is_ok());
+    bytes.pop();
+    bytes.push(b' ');
+    let error = Record::parse_line(&bytes).unwrap_err();
+    assert_eq!(error.kind(), AuditErrorKind::TooLarge);
+    assert_eq!(error.finding_kind(), Some(FindingKind::InvalidField));
+}
+#[test]
+fn codec_verifier_finding_kinds() {
+    for (raw, kind) in [
+        ("", FindingKind::Unparsable),
+        ("{", FindingKind::Unparsable),
+        ("{}", FindingKind::MissingField),
+        (
+            r#"{"resourceLogs":[],"resourceLogs":[]}"#,
+            FindingKind::InvalidField,
+        ),
+    ] {
+        assert_eq!(
+            Record::parse_line(raw.as_bytes())
+                .unwrap_err()
+                .finding_kind(),
+            Some(kind)
+        );
+    }
+    let mut v = fixture(false);
+    attr(&mut v, "audit.v")["intValue"] = json!("2");
+    assert_eq!(
+        Record::parse_line(v.to_string().as_bytes())
+            .unwrap_err()
+            .finding_kind(),
+        Some(FindingKind::UnknownVersion)
+    );
+    attr(&mut v, "audit.v")["intValue"] = json!("1");
+    attr(&mut v, "audit.actor")["stringValue"] = json!("mallory");
+    assert_eq!(
+        Record::parse_line(v.to_string().as_bytes())
+            .unwrap_err()
+            .finding_kind(),
+        Some(FindingKind::HashMismatch)
+    );
+    let error = Record::new(
+        RecordContext::new([0; 16], 0, 0, "", [0; 32]),
+        Entry::new("a", "b", "c"),
+    )
+    .unwrap_err();
+    assert_eq!(error.finding_kind(), None);
 }

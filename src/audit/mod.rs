@@ -39,18 +39,52 @@ pub enum AuditErrorKind {
     InvalidConfig,
 }
 
+/// Decoder findings shared with the ADR-0005 verifier (#13).
+/// These describe individual lines, not signature trust or trail history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FindingKind {
+    /// Bytes are not one complete JSON value (including blank input).
+    Unparsable,
+    /// The declared audit version is unsupported.
+    UnknownVersion,
+    /// A message or record contains a field outside the v1 allowlist.
+    UnknownField,
+    /// A required field is absent.
+    MissingField,
+    /// A field is ambiguous, wrongly typed or outside its allowed values.
+    InvalidField,
+    /// The declared record hash differs from the canonical hash.
+    HashMismatch,
+}
+
 /// An audit failure with a matchable category and diagnostic context.
 #[derive(Debug)]
 pub struct AuditError {
     kind: AuditErrorKind,
     detail: String,
+    finding: Option<FindingKind>,
 }
 impl AuditError {
     pub(crate) fn new(kind: AuditErrorKind, detail: impl Into<String>) -> Self {
         Self {
             kind,
             detail: detail.into(),
+            finding: None,
         }
+    }
+    pub(crate) fn decoding(kind: AuditErrorKind, finding: FindingKind) -> Self {
+        Self {
+            kind,
+            finding: Some(finding),
+            detail: format!("{finding:?}: invalid audit v1 OTLP line"),
+        }
+    }
+    /// Returns the decoder's verifier finding, when this is a parsing failure.
+    /// Writers may continue to handle these as CorruptTrail; size violations
+    /// use TooLarge. Storage, signing and configuration errors return None.
+    pub fn finding_kind(&self) -> Option<FindingKind> {
+        self.finding
     }
     /// Returns the category without exposing dependency types.
     pub fn kind(&self) -> AuditErrorKind {

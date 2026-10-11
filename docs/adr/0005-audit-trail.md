@@ -189,12 +189,32 @@ Each line is one `LogsData` with one `ResourceLogs`, one `ScopeLogs` and one `Lo
 
 Attributes. Integers are OTLP `intValue`, `audit.mmr_peaks` is an `arrayValue` of `stringValue`s, and everything else is a `stringValue`. Strings are UTF-8, must not be empty, and must not contain a NUL.
 
-**Integer decoding** (`intValue`, `timeUnixNano`, `observedTimeUnixNano`). OTLP/JSON writes 64-bit integers as decimal strings, and readers must accept JSON numbers too. vigil writes strings. A v1 reader accepts:
+**Integer decoding (amended 2026-10-11, B1 security review of PR #75).**
+`intValue`, `timeUnixNano` and `observedTimeUnixNano` accept only the encoder's
+canonical decimal strings: ASCII digits, no sign, whitespace, exponent or
+leading zero except `"0"`, fitting u64. JSON numbers are `InvalidField`, even
+below 2^53. The earlier permission to accept numbers is withdrawn: float-based
+readers round larger integers, so an audited value could be displayed differently
+(decisions 3/5). Unhashed signed-int64 context also uses canonical decimal strings.
 
-- a string of ASCII digits with no sign, no leading zeros (except `"0"`), no whitespace and no exponent;
-- or a JSON integer number with the same restrictions.
+**Closed messages (amended 2026-10-11, same review).** LogsData, ResourceLogs,
+ScopeLogs, Resource, Scope and all nested OTLP messages accept only their v1
+camelCase keys. Unknown keys, including Collector snake_case aliases, are
+`UnknownField`; otherwise one tool could ship records another silently ignores.
+Known resource/scope context stays unhashed. Duplicate keys remain `InvalidField`.
+Missing required fields are `MissingField` (missing fixed severity or observed
+time remains `InvalidField`), syntax/UTF-8/blank input is
+`Unparsable`, unsupported versions are `UnknownVersion`, and a mismatching
+canonical record hash is `HashMismatch`. Decoder errors retain these finding
+kinds for #13; writers can refuse them as `CorruptTrail` (decision 8).
 
-The value must fit in u64. Anything else, including a negative value, a fraction, `1e3` or `"+1"`, is `InvalidField`. So every value has exactly one decoding, and the hash covers that value.
+**Framing and bounds (amended 2026-10-11, same review).** Reject raw CR anywhere
+in an audit line (`InvalidField`), including CRLF endings; never copy CR into
+checkpoint anchors or normalize input. Escaped `\r` inside a JSON string remains
+authenticated content. Allow one optional final LF. Enforce the 1 000 000-byte
+JSON payload bound before parsing (`TooLarge`, verifier `InvalidField`), excluding
+that optional LF, and the JSON deserializer's 128-level nesting bound. These
+rules also cover Collector multi-record lines and unhashed scope/resource data.
 
 | Attribute | Kinds | Content | Tag |
 |---|---|---|---|
