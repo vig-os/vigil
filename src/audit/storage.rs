@@ -174,7 +174,7 @@ fn sealed(state: &State) -> Result<(), AuditError> {
 }
 fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditError> {
     let old = cache.file.metadata().map_err(io_error)?;
-    let live = rfs::statat(dir, "audit.jsonl", rfs::AtFlags::empty()).map_err(|e| {
+    let live = rfs::statat(dir, "audit.jsonl", rfs::AtFlags::SYMLINK_NOFOLLOW).map_err(|e| {
         if e == rustix::io::Errno::NOENT {
             corrupt("missing live file")
         } else {

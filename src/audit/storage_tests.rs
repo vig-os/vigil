@@ -487,7 +487,9 @@ fn child_role() {
                 Ok(())
             },
         );
-        if role == "directory" || role == "delete" {
+        if role == "symlink" {
+            bad(result, AuditErrorKind::Io);
+        } else if role == "directory" || role == "delete" {
             bad(result, AuditErrorKind::CorruptTrail);
         } else {
             result.unwrap();
@@ -514,7 +516,7 @@ fn six_processes_serialize_one_trail() {
 }
 #[test]
 fn waiting_process_rechecks_replaced_file_and_directory_and_deleted_live() {
-    for role in ["file", "directory", "delete"] {
+    for role in ["file", "directory", "delete", "symlink"] {
         let d = Temp::new();
         let first = fixture(&d.0);
         let mut child = child(&d.0, role);
@@ -524,11 +526,15 @@ fn waiting_process_rechecks_replaced_file_and_directory_and_deleted_live() {
         fs::write(d.0.join("go"), b"").unwrap();
         wait_for(&d.0.join("waiting"));
         let stale;
-        if role == "file" {
+        if role == "file" || role == "symlink" {
             let mut mmr = Mmr::new();
             mmr.push(first.hash()).unwrap();
             rotated(&d.0, &first, &mut mmr, 0);
             stale = d.0.join("audit-20260101T000000.000000000Z_000000.jsonl");
+            if role == "symlink" {
+                fs::remove_file(d.0.join("audit.jsonl")).unwrap();
+                std::os::unix::fs::symlink(&stale, d.0.join("audit.jsonl")).unwrap();
+            }
         } else if role == "directory" {
             let old = d.0.join("old");
             // Swap the whole directory while retaining a bounded cleanup owner.
