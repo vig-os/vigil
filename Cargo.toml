@@ -32,3 +32,7 @@ codegen-units = 1
 
 [dev-dependencies]
 log = "0.4"
+
+[[example]]
+name = "flock"
+test = true

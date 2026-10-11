@@ -107,18 +107,37 @@ const DAY: u64 = 86_400;
 /// ```
 /// use std::time::Duration;
 /// let cfg = vigil::rotate::RotationConfig::default();
-/// assert_eq!(cfg.max_bytes, 50 * 1024 * 1024);
-/// assert_eq!(cfg.retention, Some(Duration::from_secs(90 * 86_400)));
+/// let cfg = cfg.max_bytes(50 * 1024 * 1024).retention(None);
+/// let cfg = cfg.retention(Some(Duration::from_secs(90 * 86_400)));
+/// assert_eq!(cfg, vigil::rotate::RotationConfig::default());
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotationConfig {
     /// Rotate before a write that would make the live file larger than this.
     /// A single line bigger than the limit is still written, alone in a fresh
     /// file. Default: 50 MiB.
-    pub max_bytes: u64,
+    max_bytes: u64,
     /// Delete rotated segments whose last write is older than this. `None`
     /// keeps every segment. Default: 90 days.
-    pub retention: Option<Duration>,
+    retention: Option<Duration>,
+}
+
+impl RotationConfig {
+    /// Rotate before a write exceeds this many bytes (default 50 MiB).
+    /// Zero clamps to one. A single larger line is written alone.
+    #[must_use]
+    pub fn max_bytes(mut self, bytes: u64) -> Self {
+        self.max_bytes = bytes.max(1);
+        self
+    }
+
+    /// Keep rotated segments for this duration (default 90 days).
+    /// `None` keeps everything; `Some(Duration::ZERO)` prunes at the next prune.
+    #[must_use]
+    pub fn retention(mut self, retention: Option<Duration>) -> Self {
+        self.retention = retention;
+        self
+    }
 }
 
 impl Default for RotationConfig {
@@ -255,7 +274,7 @@ static REGISTRY: LazyLock<Mutex<HashMap<PathBuf, Weak<DirLock>>>> =
 /// use vigil::rotate::{RotatingFile, RotationConfig, segments};
 ///
 /// let dir = std::env::temp_dir().join(format!("vigil-doc-rotate-{}", std::process::id()));
-/// let cfg = RotationConfig { max_bytes: 64, retention: None };
+/// let cfg = RotationConfig::default().max_bytes(64).retention(None);
 /// let log = Arc::new(RotatingFile::open(&dir, "logs", cfg)?);
 /// for i in 0..10 {
 ///     log.append(format!(r#"{{"i":{i}}}"#).as_bytes())?;

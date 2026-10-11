@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ADR-0004 configuration and composition APIs: `Config::layer`, `Console`, `Config::filter_env`, `Config::default_filter`, `Guard::dir`, and typed `InitErrorKind` errors; duration-based `Config::retention` and validated `RotationConfig` builders ([#42](https://github.com/vig-os/vigil/issues/42), [#36](https://github.com/vig-os/vigil/issues/36)).
+
 - Supply-chain CI gates vulnerabilities, unmaintained crates, licenses, OpenTelemetry compatibility lines and dependency sources with flake-pinned cargo-deny, enforce advisory DB freshness and run weekly on `dev` ([#47](https://github.com/vig-os/vigil/issues/47)).
 
 - Collector reference-reader conformance in CI compares complete rich log records across two resources, rotation, empty lines, garbage input and unterminated valid/garbage lines; it also exercises large tracing records and diagnostic stubs ([#6](https://github.com/vig-os/vigil/issues/6), [#30](https://github.com/vig-os/vigil/issues/30)).
@@ -29,9 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** one successful pipeline permanently occupies the process slot, including after shutdown. Filters apply per layer; empty filter variables count as unset, and explicit `retention(None)` overrides environment retention ([#42](https://github.com/vig-os/vigil/issues/42)).
+- **Breaking:** make `RotationConfig` fields private and remove `Copy` ([#42](https://github.com/vig-os/vigil/issues/42)).
+
 ### Deprecated
 
 ### Removed
+
+- **Breaking:** remove `Config::retention_days`; use `Config::retention(Option<Duration>)` ([#42](https://github.com/vig-os/vigil/issues/42)).
 
 ### Fixed
 

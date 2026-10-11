@@ -20,7 +20,7 @@ tracing::info!(user = "alice", "opened study");
 ```
 
 Logs are available now; metrics, traces and audit are planned. Keep the guard
-alive until shutdown to flush queued logs. The batch queue holds 65,536 records by default (512 per export, every second).
+alive until shutdown to flush queued logs. `let _ = vigil::init(..)` drops it immediately. The batch queue holds 65,536 records by default (512 per export, every second).
 Memory is bounded by queue size times record size; overflow drops records with
 a stderr warning. `VIGIL_QUEUE_SIZE` or `Config::queue_size` changes the bound
 (minimum 1, cap 1,048,576). Oversized environment and builder values clamp to
@@ -38,7 +38,10 @@ Invalid numeric environment values emit a warning naming the variable and value
 and use the default, except queue values above the cap clamp to the cap.
 Empty `VIGIL_*` values are unset without warnings; relative `XDG_STATE_HOME`
 and `HOME` are ignored, with rejected values explained if no path is available. `VIGIL_MAX_BYTES` has a minimum of 1 byte and defaults to 50 MiB and `VIGIL_RETENTION_DAYS` to 90
-(`0` keeps everything). Explicit `Config` values override environment values.
+(`0` keeps everything). `Config::retention(Option<Duration>)` uses durations:
+`None` keeps everything, while `Some(Duration::ZERO)` prunes rotated segments
+at the next prune. Explicit `retention(None)` overrides the environment.
+Explicit `Config` values override environment values.
 `Config::revision` or `VIGIL_VCS_REVISION` supplies the producer commit.
 Storage initialization failures emit one warning and fall back to stderr;
 a second initialization returns an error before creating storage. An existing
@@ -54,7 +57,19 @@ records: the first error is reported on stderr, followed by cumulative dropped-r
 summaries at most once per minute during failing exports and at shutdown if needed.
 After the guard drops, events are discarded with one stderr warning.
 `VIGIL_DIR` must be absolute; relative values warn and use the default resolution.
-Invalid `RUST_LOG` values warn once and use `info`.
+Empty `RUST_LOG` values count as unset. Invalid values warn and use the default.
+`Config::filter_env("FLOCK_LOG").default_filter("flk=info,flock=info")`
+selects another variable and default; an invalid default returns `InvalidFilter`.
+`Config::console(Console::Stderr)` adds human-readable stderr with the same
+filter and terminal-only ANSI. Its format may change; do not parse it.
+`Config::layer` composes into your own `tracing_subscriber::registry()` with
+per-layer filters, so your other layers keep their own filtering.
+See `examples/flock.rs`. `Guard::dir()` gives the actual directory, or `None`
+for stderr fallback. One successful `init` or `layer` permanently occupies
+the process slot; later attempts return `AlreadyRunning`, even after shutdown.
+A previously set global or scoped default subscriber returns `ForeignSubscriber`,
+even after the scope ends; compose a layer
+into that subscriber's Registry instead. Failed attempts release the slot.
 
 ## Why not an existing crate
 

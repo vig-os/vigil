@@ -18,10 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file = Arc::new(RotatingFile::open(
         &dir,
         "logs",
-        RotationConfig {
-            max_bytes: 1,
-            retention: None,
-        },
+        RotationConfig::default().max_bytes(1).retention(None),
     )?);
     let memory = MemorySink::new();
     let (resource, records) = common::golden_records();
