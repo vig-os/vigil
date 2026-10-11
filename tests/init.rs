@@ -21,11 +21,9 @@ fn child() {
         cfg.dir(&dir).max_bytes(1_000_000).retention(None)
     };
     let guard = cfg.init().unwrap();
-    assert!(
-        vigil::init("again")
-            .unwrap_err()
-            .to_string()
-            .contains("global tracing subscriber")
+    assert_eq!(
+        vigil::init("again").unwrap_err().kind(),
+        vigil::InitErrorKind::AlreadyRunning
     );
     assert!(vigil::init("../bad").is_err());
     let span = tracing::info_span!("inside");
