@@ -186,3 +186,34 @@ jobs:
           dev-profile-path: ${{ inputs.dev-profile-path }}
       - name: Build and test all features
         run: nix develop .#latest-stable -c python3 scripts/check_rust_version.py latest-stable
+
+  performance:
+    name: Performance (advisory)
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 30
+    # Includes measurement/toolchain failures: this lane never gates CI Summary.
+    continue-on-error: true
+    env:
+      CARGO_TARGET_DIR: target/performance
+      CARGO_BUILD_JOBS: '3'
+      VIGIL_BENCH_QUICK: '1'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+      - name: Measure public API workloads
+        run: nix develop -c cargo bench --locked --bench performance
+      - name: Report against committed baseline
+        if: ${{ !cancelled() }}
+        run: |
+          nix develop -c python3 scripts/check_performance.py \
+            --results "$CARGO_TARGET_DIR/criterion"

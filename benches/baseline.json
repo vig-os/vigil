@@ -1,0 +1,13 @@
+{
+  "environment": "2026-10-11; shared KVM AMD Ryzen 7 9800X3D, 12 vCPUs; NixOS Linux 6.18.55 x86_64; Rust 1.95.0 (59807616e), LLVM 22.1.2; /tmp tmpfs, cached writes, no fsync; release thin LTO, codegen-units=1; Criterion 0.8.2 full mode 100 samples, warmup 3s, measurement target 5s",
+  "mean_ns": {
+    "append/1_processes": 12145640.155,
+    "append/8_processes": 175035028.87,
+    "init/pipeline": 152256.13572465983,
+    "export/pipeline": 14003112.680000002,
+    "split/pipeline": 57829001.4,
+    "rotation/100": 36098.41959492841,
+    "rotation/1000": 234910.06838736986,
+    "rotation/10000": 2616647.784000001
+  }
+}

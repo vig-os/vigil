@@ -312,3 +312,106 @@ protect against an attacker who can read them and rewrite the trail. Pin trail
 identities and keep trust policy and application receipts outside the writable
 trail directory; stop all writers before rotating keys. Use digests rather than
 personal data, retaining the referenced values in the application's own store.
+
+## Performance
+
+The public API benchmark suite measures directory-locked appends, the complete
+`Config::init` → `tracing` → batch processor → OTLP/JSON → rotating file pipeline,
+one-time initialization, and rotation with 100 / 1,000 / 10,000 existing segments.
+It uses Criterion 0.8.2 as a dev dependency for statistical estimates and JSON
+results. Default features are disabled to avoid plotting and parallel analysis
+dependencies; its Apache-2.0/MIT dependency graph passes the existing `deny.toml`
+policy without license exceptions.
+
+Reference measurements (2026-10-11): shared KVM VM, AMD Ryzen 7 9800X3D,
+12 exposed vCPUs, Linux 6.18.55 / NixOS, x86_64, Rust 1.95.0
+(59807616e, LLVM 22.1.2), release profile with thin LTO and one codegen unit.
+Scratch files are in `/tmp` on tmpfs; these numbers measure cached filesystem
+operations, **not durable storage latency** (`append` does not call `fsync`).
+The committed means are in [benches/baseline.json](benches/baseline.json).
+
+| Workload | Reference mean | Consumer budget |
+| --- | ---: | ---: |
+| Append, 1 process (4,096 records) | 12.15 ms; 337k records/s | ≥150k records/s |
+| Append, 8 processes (32,768 total) | 175.04 ms; 187k records/s aggregate | ≥75k records/s aggregate |
+| Export, 256-byte bodies | 14.00 ms; 293k records/s | ≥125k records/s |
+| Export with near-cap splitting, 4 KiB bodies | 57.83 ms; 71k records/s | ≥30k records/s |
+| `Config::init`, fresh process/directory | 0.152 ms | ≤0.5 ms |
+| Rotation, 100 existing segments | 0.036 ms | ≤0.1 ms |
+| Rotation, 1,000 existing segments | 0.235 ms | ≤0.7 ms |
+| Rotation, 10,000 existing segments | 2.617 ms | ≤7 ms |
+
+Budgets are consumer capacity-planning targets on comparable hardware and a
+local filesystem with cached writes, using the workloads above. They reserve
+at least 2× headroom for ordinary variance and application work; they are not
+per-record deadlines or p99 guarantees. Provision below these rates, measure
+on your actual disk, and monitor queue losses. A shared directory serializes
+all signals, so eight writers share the aggregate budget, not eight times it.
+Slow disks, CPU contention, large attributes, retention scans and uncached
+metadata can exceed these budgets. Initialization is a one-time cost per
+process; initialize after fork.
+
+Measurement details:
+
+- Append: each fresh child opens its own `RotatingFile`, reports ready, then
+  waits for the parent to release it. One or eight children each append 4,096
+  256-byte payloads with rotation disabled. Timing includes lock waits, writes,
+  release of the children and their exit, excluding process spawn/open and
+  file cleanup. The parent checks the total persisted byte count.
+- Export: 4,096 tracing events with 256-byte bodies, queue size 8,192, console
+  off and explicit info filter. Timing includes event production, serialization,
+  splitting, writes and `Guard::flush`; setup, shutdown and output verification
+  are excluded. The splitting workload uses 4,096-byte bodies so 512-record SDK
+  batches exceed the 1,000,000-byte line cap. It verifies that lines approach
+  the cap (>900,000 bytes), every line is bounded and valid JSON, and all records
+  survive. These are records/s, including the asynchronous worker's completion.
+- Init: a fresh child times only `Config::init` with a new state directory;
+  spawn, shutdown and cleanup are excluded. A successful pipeline permanently
+  occupies its process slot, so reinitializing within a benchmark is invalid.
+- Rotation: preseed valid segment names outside timing; `max_bytes(1)` forces
+  each append to rotate. Retention is disabled to isolate the scan needed to
+  select the next segment name. Remove the new segment outside timing to keep
+  the existing count fixed. Default retention adds a separate metadata scan.
+  Rotation is about 72× slower at 10,000 segments than at 100.
+  The measured growth makes tiny segments unsuitable for sustained traffic:
+  choose a larger size and keep segment counts bounded. At 10,000 segments the
+  rotation cost alone already dominates the ordinary append cost.
+
+Reproduce inside the dev shell:
+
+```sh
+export CARGO_TARGET_DIR="$HOME/.cache/vigil-target/feature-49-perf-budgets"
+export CARGO_BUILD_JOBS=3
+nix develop -c cargo bench --locked --bench performance
+nix develop -c python3 scripts/check_performance.py \
+  --results "$CARGO_TARGET_DIR/criterion"
+```
+
+The full reference run uses 100 samples, a 3-second warmup and a 5-second
+measurement target per workload. Child startup and fixture cleanup increase
+wall time beyond the timed work. Set `VIGIL_BENCH_QUICK=1` for CI's 10 samples,
+1-second warmup and 1-second measurement target (Criterion can extend that
+when a workload is slower). `cargo test --all-targets` validates each workload
+once. Run long local commands under `watcher-s1 --silence 10m -- …`; CI has a
+30-minute job timeout, including child processes.
+
+The **Performance (advisory)** CI job compares each Criterion mean elapsed time
+with the committed baseline. A ratio **>=2.0×** (equivalently throughput at most
+half the baseline) produces a `REGRESSION` row in the job summary and a warning
+annotation. Missing or invalid measurements are reported as unavailable with a
+failed measurement step. The whole job is `continue-on-error`, so neither
+runner noise nor measurement infrastructure turns **CI Summary** red.
+
+On a flag, the reviewer repeats the full benchmark on reference hardware,
+comparing the base and proposed commits under the same conditions. A confirmed
+regression must be fixed before merge, or receive an explicit maintainer-approved
+budget change with an issue describing the consumer impact. Do not reset the
+baseline merely to clear a flag. To update intentionally, run the full suite,
+then the command below, review every changed mean, update this table and its
+hardware/date notes, and commit the baseline and documentation together:
+
+```sh
+nix develop -c python3 scripts/check_performance.py \
+  --results "$CARGO_TARGET_DIR/criterion" --update \
+  --environment 'date; CPU/vCPUs; OS/kernel; rustc/LLVM; storage; full mode'
+```
