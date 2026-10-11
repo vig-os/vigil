@@ -67,7 +67,8 @@ per-layer filters, so your other layers keep their own filtering.
 See `examples/flock.rs`. `Guard::dir()` gives the actual directory, or `None`
 for stderr fallback. One successful `init` or `layer` permanently occupies
 the process slot; later attempts return `AlreadyRunning`, even after shutdown.
-A foreign global subscriber returns `ForeignSubscriber`; compose a layer
+A previously set global or scoped default subscriber returns `ForeignSubscriber`,
+even after the scope ends; compose a layer
 into that subscriber's Registry instead. Failed attempts release the slot.
 
 ## Why not an existing crate

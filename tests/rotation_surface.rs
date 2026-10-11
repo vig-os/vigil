@@ -5,6 +5,11 @@ use vigil::rotate::{RotatingFile, RotationConfig, segments};
 fn rotation_builder_clamps_zero_and_retention_none_keeps_segments() {
     let dir = std::env::temp_dir().join(format!("vigil-builder-{}", std::process::id()));
     let config = RotationConfig::default().max_bytes(0).retention(None);
+    assert_eq!(
+        config,
+        RotationConfig::default().max_bytes(1).retention(None),
+        "zero and one must produce the same configuration, not merely similar rotations"
+    );
     let copy = config.clone();
     assert_eq!(config, copy);
     let file = RotatingFile::open(&dir, "logs", config).unwrap();

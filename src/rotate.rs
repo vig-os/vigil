@@ -109,6 +109,7 @@ const DAY: u64 = 86_400;
 /// let cfg = vigil::rotate::RotationConfig::default();
 /// let cfg = cfg.max_bytes(50 * 1024 * 1024).retention(None);
 /// let cfg = cfg.retention(Some(Duration::from_secs(90 * 86_400)));
+/// assert_eq!(cfg, vigil::rotate::RotationConfig::default());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotationConfig {

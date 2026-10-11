@@ -8,8 +8,12 @@ fn child() {
         return;
     };
     let dir = std::path::PathBuf::from(std::env::var_os("VIGIL_COMPOSE_DIR").unwrap());
-    if mode == "foreign" {
-        tracing_subscriber::registry().init();
+    if matches!(mode.as_str(), "foreign" | "scoped") {
+        if mode == "foreign" {
+            tracing_subscriber::registry().init();
+        } else {
+            tracing::subscriber::with_default(tracing_subscriber::registry(), || {});
+        }
         assert_eq!(
             Config::new("compose").dir(&dir).init().unwrap_err().kind(),
             InitErrorKind::ForeignSubscriber
@@ -20,6 +24,9 @@ fn child() {
             .layer::<tracing_subscriber::Registry>()
             .unwrap();
         assert_eq!(guard.dir(), Some(dir.as_path()));
+        let error = Config::new("again").init().unwrap_err();
+        assert_eq!(error.kind(), InitErrorKind::AlreadyRunning);
+        assert!(!error.to_string().contains("global"));
         return;
     }
     assert_eq!(
@@ -95,7 +102,12 @@ fn child() {
 
 #[test]
 fn per_layer_filters_and_process_reservation() {
-    for (mode, filter) in [("compose", ""), ("invalid_env", "["), ("foreign", "")] {
+    for (mode, filter) in [
+        ("compose", ""),
+        ("invalid_env", "["),
+        ("foreign", ""),
+        ("scoped", ""),
+    ] {
         let dir = std::env::temp_dir().join(format!("vigil-compose-{}-{mode}", std::process::id()));
         let out = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "child", "--nocapture"])
@@ -110,7 +122,7 @@ fn per_layer_filters_and_process_reservation() {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        if mode != "foreign" {
+        if !matches!(mode, "foreign" | "scoped") {
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert_eq!(stderr.matches("vigil only").count(), 1, "{stderr}");
             assert_eq!(stderr.matches("sdk diagnostic").count(), 1, "{stderr}");

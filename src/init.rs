@@ -46,8 +46,9 @@ pub enum InitErrorKind {
     /// A vigil pipeline exists or another call has reserved the process slot.
     /// Reuse the pipeline; shutdown does not permit a second one.
     AlreadyRunning,
-    /// Another crate installed the global subscriber. Compose with `layer`
-    /// into its Registry instead, or remove the other initialization.
+    /// A global or scoped default subscriber was set, even if that scope
+    /// has ended. Compose with `layer` into a consumer-owned Registry,
+    /// or initialize in a fresh process.
     ForeignSubscriber,
     /// The service name violates the rule documented by `Config::new`.
     InvalidServiceName,
@@ -96,7 +97,7 @@ impl Reservation {
             .map_err(|_| {
                 InitError::new(
                     InitErrorKind::AlreadyRunning,
-                    "vigil pipeline already running; global tracing subscriber remains installed",
+                    "vigil pipeline already initialized in this process",
                 )
             })
     }
@@ -184,7 +185,11 @@ pub fn init(service: impl Into<String>) -> Result<Guard, InitError> {
 }
 
 /// Logging configuration. Explicit builder values win over environment values;
-/// environment values win over defaults. Invalid numeric environment values warn on stderr and use defaults. `RUST_LOG` selects levels (default `info`). Storage defaults to
+/// environment values win over defaults. Invalid numeric environment values warn on
+/// stderr and use defaults. `filter_env` selects the filter variable (default
+/// `RUST_LOG`); `default_filter` selects its fallback (default `info`). Unset or
+/// empty filter variables use the fallback; invalid values warn and use it.
+/// An invalid fallback returns `InvalidFilter`. Storage defaults to
 /// `$XDG_STATE_HOME/<service>`, then `$HOME/.local/state/<service>`.
 #[derive(Debug)]
 pub struct Config {
@@ -294,30 +299,32 @@ impl Config {
     ///
     /// Tests use one process per test with nextest, or one shared pipeline
     /// per binary. A successful pipeline permanently occupies the process slot.
+    /// An earlier scoped default (`set_default` or `with_default`) in the same
+    /// binary causes `ForeignSubscriber`, even after its scope has ended.
     ///
     /// # Errors
     /// Returns `AlreadyRunning`, `ForeignSubscriber`, `InvalidServiceName`
     /// or `InvalidFilter`. A failed attempt releases its pipeline reservation.
     pub fn init(self) -> Result<Guard, InitError> {
-        self.init_with(|| {})
+        self.init_with(|_| {})
     }
 
-    fn init_with(self, before_install: impl FnOnce()) -> Result<Guard, InitError> {
+    fn init_with(self, before_install: impl FnOnce(&Guard)) -> Result<Guard, InitError> {
         if PIPELINE.load(Ordering::Acquire) {
             return Err(InitError::new(
                 InitErrorKind::AlreadyRunning,
-                "vigil pipeline already running; global tracing subscriber remains installed",
+                "vigil pipeline already initialized in this process",
             ));
         }
         if tracing::dispatcher::has_been_set() {
             return Err(InitError::new(
                 InitErrorKind::ForeignSubscriber,
-                "cannot install global tracing subscriber: another subscriber is set",
+                "cannot install global tracing subscriber: a global or scoped default was already set",
             ));
         }
         let reservation = Reservation::acquire()?;
         let (layer, guard) = self.build_layer::<Registry>()?;
-        before_install();
+        before_install(&guard);
         if let Err(source) =
             tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
         {
@@ -346,6 +353,8 @@ impl Config {
     /// post-shutdown filtering and the optional console. Other layers retain
     /// their own filters. Tests use nextest (one process per test), or share
     /// one pipeline per binary; dropping its guard stops it permanently.
+    /// Earlier scoped defaults also prevent `init`, even after scope exit;
+    /// compose with `layer` instead or use a fresh test process.
     ///
     /// # Errors
     /// Returns `AlreadyRunning`, `InvalidServiceName` or `InvalidFilter`.
@@ -716,17 +725,53 @@ mod dropped_stub_tests {
 mod install_race_tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn storage_handles(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter_map(|fd| std::fs::read_link(fd).ok())
+            .filter(|target| target.starts_with(dir))
+            .collect()
+    }
+
     #[test]
     fn foreign_subscriber_winning_install_releases_reservation() {
         let dir = std::env::temp_dir().join(format!("vigil-install-race-{}", std::process::id()));
+        let mut provider = None;
         let error = Config::new("race")
             .dir(&dir)
-            .init_with(|| {
+            .init_with(|guard| {
+                provider = guard.provider.clone();
+                #[cfg(target_os = "linux")]
+                {
+                    let handles = storage_handles(&dir);
+                    assert!(
+                        handles.contains(&dir),
+                        "test must observe the directory lock handle"
+                    );
+                    assert!(
+                        handles.contains(&dir.join("logs.jsonl")),
+                        "test must observe the live log handle"
+                    );
+                }
                 tracing::subscriber::set_global_default(tracing_subscriber::registry()).unwrap();
             })
             .unwrap_err();
         assert_eq!(error.kind(), InitErrorKind::ForeignSubscriber);
         assert!(std::error::Error::source(&error).is_some());
+        #[cfg(target_os = "linux")]
+        assert!(
+            storage_handles(&dir).is_empty(),
+            "lost install must close storage handles"
+        );
+        assert!(
+            matches!(
+                provider.unwrap().shutdown_with_timeout(Duration::ZERO),
+                Err(opentelemetry_sdk::error::OTelSdkError::AlreadyShutdown)
+            ),
+            "lost install must shut down the provider even when another clone exists"
+        );
         let (_, guard) = Config::new("retry").dir(&dir).layer::<Registry>().unwrap();
         assert_eq!(guard.dir(), Some(dir.as_path()));
         drop(guard);
