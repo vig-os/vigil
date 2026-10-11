@@ -25,6 +25,7 @@ use tracing_subscriber::{
 };
 
 use crate::{
+    lifecycle::{FlushError, Losses, Overflow, ReportingProcessor, ShutdownCapture},
     logs::OtlpJsonLogExporter,
     rotate::{RotatingFile, RotationConfig},
 };
@@ -133,6 +134,7 @@ pub struct Guard {
     provider: Option<SdkLoggerProvider>,
     stopped: Arc<AtomicBool>,
     dir: Option<PathBuf>,
+    losses: Arc<Losses>,
 }
 impl Guard {
     /// The actual log directory, or `None` when storage fell back to stderr.
@@ -140,15 +142,91 @@ impl Guard {
         self.dir.as_deref()
     }
 }
+impl Guard {
+    /// Export queued records without stopping the pipeline, waiting up to five
+    /// seconds. Use nextest for one pipeline per test process, or share one
+    /// `static LazyLock<Guard>` per binary, call `flush` after recording, and
+    /// read only records carrying a field unique to that test. A static guard
+    /// never drops: do not call shutdown in the shared-pipeline shape.
+    /// An earlier scoped default in the binary prevents `init` even after
+    /// scope exit; use `layer` or a fresh process. See [`init`] for nextest.
+    ///
+    /// ```no_run
+    /// use std::sync::LazyLock;
+    /// static GUARD: LazyLock<vigil::Guard> = LazyLock::new(|| {
+    ///     vigil::Config::new("tests")
+    ///         .dir(std::env::temp_dir().join(format!("vigil-tests-{}", std::process::id())))
+    ///         .init().expect("test pipeline")
+    /// });
+    /// let guard = &*GUARD;
+    /// tracing::info!(test_case = "unique_test", "record");
+    /// guard.flush()?;
+    /// let lines = vigil::rotate::read_since(guard.dir().expect("test storage"), "logs", None)?;
+    /// assert!(lines.iter().any(|line| line.contains("unique_test")));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    /// Returns timeout, SDK/sink failure or data loss since the previous flush.
+    /// Queue overflow is flagged but uncounted: true log loss is at least one
+    /// record greater than `lost(Signal::Logs)` when overflow was seen.
+    pub fn flush(&self) -> Result<(), FlushError> {
+        match &self.provider {
+            Some(provider) => self.losses.finish(provider.force_flush()),
+            None => Ok(()),
+        }
+    }
+
+    /// Flush and stop the pipeline with a five-second timeout. Drop then does
+    /// nothing. Stderr fallback succeeds. The process slot remains occupied.
+    ///
+    /// # Errors
+    /// Returns timeout, SDK/sink failure or data loss. See `FlushError::lost`.
+    pub fn shutdown(self) -> Result<(), FlushError> {
+        self.shutdown_with_timeout(Duration::from_secs(5))
+    }
+
+    /// Flush and stop with an explicit timeout. Queued records may be lost
+    /// on timeout; the SDK worker may continue until storage unblocks.
+    ///
+    /// # Errors
+    /// Returns timeout, SDK/sink failure or data loss. See `FlushError::lost`.
+    pub fn shutdown_with_timeout(mut self, timeout: Duration) -> Result<(), FlushError> {
+        self.stop(timeout)
+    }
+
+    fn stop(&mut self, timeout: Duration) -> Result<(), FlushError> {
+        self.stopped.store(true, Ordering::Release);
+        self.losses.shutting_down.store(true, Ordering::Release);
+        let Some(provider) = self.provider.take() else {
+            return Ok(());
+        };
+        let forward = tracing::dispatcher::get_default(Clone::clone);
+        let losses = self.losses.clone();
+        let result = std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    tracing::subscriber::with_default(ShutdownCapture { forward, losses }, || {
+                        provider.shutdown_with_timeout(timeout)
+                    })
+                })
+                .join()
+                .unwrap_or_else(|_| {
+                    Err(opentelemetry_sdk::error::OTelSdkError::InternalFailure(
+                        "log shutdown thread panicked".into(),
+                    ))
+                })
+        });
+        self.losses.finish(result)
+    }
+}
 impl Drop for Guard {
     fn drop(&mut self) {
-        self.stopped.store(true, Ordering::Release);
-        if let Some(provider) = &self.provider
-            && let Err(error) = provider.shutdown_with_timeout(Duration::from_secs(5))
-        {
+        if let Err(error) = self.stop(Duration::from_secs(5)) {
             let _ = writeln!(
                 std::io::stderr(),
-                "vigil: log shutdown failed: {error}; remaining records may be lost"
+                "vigil: log shutdown failed: {error}; dropped records: {}; remaining records may be lost",
+                error.lost(crate::Signal::Logs)
             );
         }
     }
@@ -172,6 +250,22 @@ impl Drop for Guard {
 /// #![deny(unused_must_use)]
 /// vigil::init("example").unwrap();
 /// ```
+///
+/// With nextest, each test initializes once and explicitly shuts down before
+/// reading its output:
+///
+/// ```no_run
+/// let dir = std::env::temp_dir().join(format!("vigil-test-{}", std::process::id()));
+/// let guard = vigil::Config::new("test").dir(&dir).init()?;
+/// tracing::info!(test_case = "unique_test", "record");
+/// guard.shutdown()?;
+/// let lines = vigil::rotate::read_since(&dir, "logs", None)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// Under cargo test, share one `static LazyLock<Guard>` per binary, never shut
+/// it down, and call `Guard::flush` before reading only records with a field
+/// unique to the test. See [`Guard::flush`] for the shared-static example.
 ///
 /// Tracing spans alone do not populate OTLP trace/span IDs; distributed trace
 /// context integration is planned for the metrics and traces release.
@@ -301,6 +395,9 @@ impl Config {
     ///
     /// Tests use one process per test with nextest, or one shared pipeline
     /// per binary. A successful pipeline permanently occupies the process slot.
+    /// See [`init`] for the nextest example and [`Guard::flush`] for a shared
+    /// static guard; each shared test flushes and selects its unique field,
+    /// and none shuts down the shared guard.
     /// An earlier scoped default (`set_default` or `with_default`) in the same
     /// binary causes `ForeignSubscriber`, even after its scope has ended.
     ///
@@ -358,6 +455,21 @@ impl Config {
     /// Earlier scoped defaults also prevent `init`, even after scope exit;
     /// compose with `layer` instead or use a fresh test process.
     ///
+    /// With nextest, each test builds its Registry, records, shuts down, and
+    /// reads its own directory. With cargo test, one `static LazyLock<Guard>`
+    /// per binary stays alive and each test calls `flush` before reading only
+    /// records carrying its unique test field; no test shuts it down.
+    /// See [`Guard::flush`] for the shared-static example.
+    ///
+    /// ```no_run
+    /// use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    /// let (layer, guard) = vigil::Config::new("test").layer()?;
+    /// tracing_subscriber::registry().with(layer).init();
+    /// tracing::info!(test_case = "unique_test", "record");
+    /// guard.shutdown()?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
     /// # Errors
     /// Returns `AlreadyRunning`, `InvalidServiceName` or `InvalidFilter`.
     /// Failed attempts release the reservation. Shutdown does not.
@@ -409,6 +521,7 @@ impl Config {
                 default
             }),
         };
+        let losses = Arc::new(Losses::default());
         let stopped = Arc::new(AtomicBool::new(false));
         let warned = AtomicBool::new(false);
         let active = stopped.clone();
@@ -494,8 +607,10 @@ impl Config {
                 }
                 let provider = SdkLoggerProvider::builder()
                     .with_resource(Resource::builder_empty().with_attributes(attrs).build())
-                    .with_log_processor(
-                        BatchLogProcessor::builder(ReportingExporter {
+                    .with_log_processor(ReportingProcessor {
+                        losses: losses.clone(),
+                        inner: BatchLogProcessor::builder(ReportingExporter {
+                            losses: losses.clone(),
                             inner: OtlpJsonLogExporter::new(Arc::new(file)),
                             failures: Mutex::new(Failures::default()),
                         })
@@ -507,7 +622,7 @@ impl Config {
                                 .build(),
                         )
                         .build(),
-                    )
+                    })
                     .build();
                 let bridge = OpenTelemetryTracingBridge::new(&NamedProvider(provider.clone()));
                 let console = (self.console == Console::Stderr).then(|| {
@@ -520,6 +635,7 @@ impl Config {
                     Guard {
                         provider: Some(provider),
                         stopped,
+                        losses: losses.clone(),
                         dir,
                     },
                 )
@@ -537,6 +653,7 @@ impl Config {
                     Guard {
                         provider: None,
                         stopped,
+                        losses: losses.clone(),
                         dir: None,
                     },
                 )
@@ -548,7 +665,7 @@ impl Config {
             .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
                 !meta.target().starts_with("opentelemetry")
             }));
-        Ok((diagnostics().and_then(destination).boxed(), guard))
+        Ok((diagnostics(losses).and_then(destination).boxed(), guard))
     }
 }
 // The upstream bridge requests an empty scope; supply a named scope to avoid
@@ -607,22 +724,26 @@ impl Failures {
 struct ReportingExporter {
     inner: OtlpJsonLogExporter<Arc<RotatingFile>>,
     failures: Mutex<Failures>,
+    losses: Arc<Losses>,
 }
 impl LogExporter for ReportingExporter {
     async fn export(&self, batch: LogBatch<'_>) -> opentelemetry_sdk::error::OTelSdkResult {
-        let count = batch.iter().count();
         let result = self.inner.export(batch).await;
-        let replaced = self.inner.take_dropped_records();
-        let lost = if result.is_err() { count } else { replaced };
+        let lost = self.inner.take_dropped_records();
+        self.losses.add(lost as u64);
+        if result.is_err() {
+            self.losses.failed.store(true, Ordering::Release);
+        }
         if lost != 0 {
             let mut failures = self
                 .failures
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             failures.dropped = failures.dropped.saturating_add(lost);
-            if failures
-                .last_report
-                .is_none_or(|last| last.elapsed() >= Duration::from_secs(60))
+            if !self.losses.shutting_down.load(Ordering::Acquire)
+                && failures
+                    .last_report
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(60))
             {
                 if let Err(error) = result {
                     let _ = writeln!(
@@ -643,24 +764,18 @@ impl LogExporter for ReportingExporter {
         self.inner.set_resource(resource);
     }
     fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
-        let mut failures = self
-            .failures
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if failures.dropped != failures.reported {
-            failures.report();
-        }
         self.inner.shutdown_with_timeout(timeout)
     }
 }
 
-fn diagnostics<S>() -> PipelineLayer<S>
+fn diagnostics<S>(losses: Arc<Losses>) -> PipelineLayer<S>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
 {
     tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_ansi(false)
+        .and_then(Overflow(losses))
         .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
             meta.target().starts_with("opentelemetry") && *meta.level() <= tracing::Level::WARN
         }))
@@ -681,6 +796,7 @@ mod dropped_stub_tests {
                 RotatingFile::open(&dir, "logs", RotationConfig::default()).unwrap(),
             )),
             failures: Mutex::new(Failures::default()),
+            losses: Arc::new(Losses::default()),
         };
         let provider = SdkLoggerProvider::builder().build();
         let logger = provider.logger("summary");
@@ -718,7 +834,10 @@ mod dropped_stub_tests {
                 .shutdown_with_timeout(Duration::from_secs(1))
                 .is_ok()
         );
-        assert_eq!(exporter.failures.lock().unwrap().reported, 2);
+        assert_eq!(exporter.failures.lock().unwrap().reported, 1);
+        let loss = exporter.losses.finish(Ok(())).unwrap_err();
+        assert_eq!(loss.kind(), crate::FlushErrorKind::DataLost);
+        assert_eq!(loss.lost(crate::Signal::Logs), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
@@ -778,5 +897,61 @@ mod install_race_tests {
         assert_eq!(guard.dir(), Some(dir.as_path()));
         drop(guard);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use opentelemetry_sdk::logs::{LogProcessor, SdkLogRecord};
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Debug)]
+    struct Processor {
+        stopped: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl LogProcessor for Processor {
+        fn emit(&self, _: &mut SdkLogRecord, _: &InstrumentationScope) {}
+        fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+        fn shutdown_with_timeout(
+            &self,
+            timeout: Duration,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            assert!(
+                self.stopped.load(Ordering::Acquire),
+                "stop recording before draining"
+            );
+            assert_eq!(timeout, Duration::from_millis(17));
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stop_consumes_provider_before_drop_and_stops_recording_first() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut guard = Guard {
+            provider: Some(
+                SdkLoggerProvider::builder()
+                    .with_log_processor(Processor {
+                        stopped: stopped.clone(),
+                        calls: calls.clone(),
+                    })
+                    .build(),
+            ),
+            stopped,
+            dir: None,
+            losses: Arc::new(Losses::default()),
+        };
+        guard.flush().unwrap();
+        assert!(!guard.stopped.load(Ordering::Acquire));
+        guard.stop(Duration::from_millis(17)).unwrap();
+        assert!(guard.provider.is_none());
+        drop(guard);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }

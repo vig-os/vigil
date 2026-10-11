@@ -5,7 +5,9 @@
 pub mod audit;
 
 mod init;
+mod lifecycle;
 pub use init::{Config, Console, Guard, InitError, InitErrorKind, init};
+pub use lifecycle::{FlushError, FlushErrorKind, Signal};
 
 pub mod logs;
 pub mod rotate;
