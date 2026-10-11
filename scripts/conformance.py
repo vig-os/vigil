@@ -66,6 +66,27 @@ def records(messages):
     return result
 
 
+def raw_reader_cases():
+    """Shared #82 fixtures: the real Collector must drop each raw escape."""
+    fixtures = pathlib.Path(__file__).resolve().parents[1] / "tests/fixtures/audit"
+    base = json.loads((fixtures / "codec.jsonl").read_text().splitlines()[0])
+    for index, case in enumerate(
+        json.loads((fixtures / "raw-fields.json").read_text())
+    ):
+        message = json.loads(json.dumps(base))
+        resource = message["resourceLogs"][0]
+        resource["resource"]["attributes"].append(
+            {"key": "raw.parity.case", "value": {"stringValue": str(index)}}
+        )
+        if case["field"] == "bytesValue":
+            resource["resource"]["attributes"].append(
+                {"key": "raw.bytes", "value": {"bytesValue": "RAW"}}
+            )
+        else:
+            resource["scopeLogs"][0]["logRecords"][0][case["field"]] = "RAW"
+        yield json.dumps(message).replace('"RAW"', case["raw"]), case["accepted"]
+
+
 def main():
     subprocess.run(["otelcol-contrib", "--version"], check=True)
     with tempfile.TemporaryDirectory(prefix="vigil-conformance-") as temporary:
@@ -92,7 +113,12 @@ def main():
         neighbour = inputs[1].read_text()
         inputs[0].write_text("\n" + "\n".join(lines) + "\n\ngarbage\n\n" + neighbour)
         inputs[1].write_text("")
-        expected = records(json.loads((directory / "manifest.json").read_text()))
+        parity = list(raw_reader_cases())
+        parity_path = directory / "logs-raw-fields.jsonl"
+        parity_path.write_text("\n".join(line for line, _ in parity) + "\n")
+        inputs.append(parity_path)
+        manifest = json.loads((directory / "manifest.json").read_text())
+        expected = records(manifest + [json.loads(line) for line, ok in parity if ok])
         require(expected, "manifest must contain records")
         for path in inputs:
             require(

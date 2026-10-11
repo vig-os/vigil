@@ -510,7 +510,7 @@ fn codec_context_int64_and_base64() {
         [false, {"intValue":"-9223372036854775809"}], [false, {"bytesValue":"!!!"}],
         [false, {"bytesValue":"YQ"}], [false, {"bytesValue":"YQ==="}], [false, {"bytesValue":"Y Q=="}],
         [false, {"bytesValue":"____"}], [true, {"bytesValue":""}], [true, {"bytesValue":"YQ=="}],
-        [true, {"bytesValue":"YR=="}], [true, {"bytesValue":"Y\r\nQ=="}],
+        [true, {"bytesValue":"YR=="}], [false, {"bytesValue":"Y\r\nQ=="}],
         [true, {"intValue":"9223372036854775807"}], [true, {"intValue":"-9223372036854775808"}]
     ]);
     for case in cases.as_array().unwrap() {
@@ -541,4 +541,38 @@ fn codec_writer_int64_bounds() {
             AuditErrorKind::InvalidConfig
         );
     }
+}
+
+#[test]
+fn codec_raw_reader_parity() {
+    let cases: Json =
+        serde_json::from_str(include_str!("../../tests/fixtures/audit/raw-fields.json")).unwrap();
+    let mut mismatches = Vec::new();
+    for case in cases.as_array().unwrap() {
+        let mut v = fixture(false);
+        let field = case["field"].as_str().unwrap();
+        if field == "bytesValue" {
+            v["resourceLogs"][0]["resource"]["attributes"].as_array_mut().unwrap().push(json!({"key":"raw", "value":{"arrayValue":{"values":[{"kvlistValue":{"values":[{"key":"nested","value":{"bytesValue":"RAW"}}]}}]}}}));
+        } else {
+            log(&mut v)[field] = json!("RAW");
+        }
+        let line = v
+            .to_string()
+            .replace("\"RAW\"", case["raw"].as_str().unwrap());
+        if Record::parse_line(line.as_bytes()).is_ok() != case["accepted"].as_bool().unwrap() {
+            mismatches.push(case.clone());
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "raw reader mismatches: {mismatches:?}"
+    );
+}
+#[test]
+fn codec_anchor_whitespace_is_preserved() {
+    let line = GOLDEN.lines().nth(1).unwrap();
+    let spaced = line.replacen('{', "{ ", 1) + " ";
+    let cp = Checkpoint::parse(&(spaced.clone() + "\n")).unwrap();
+    assert_eq!(cp.line(), spaced);
+    assert_eq!(cp.hash(), Checkpoint::parse(line).unwrap().hash());
 }

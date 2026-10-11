@@ -200,8 +200,31 @@ readers round larger integers, so an audited value could be displayed differentl
 **Collector bounds (amended 2026-10-11, B1 round 3).** All OTLP `intValue`s
 fit i64 (context may be negative); audit.seq and audit.mmr_size are nonnegative.
 Writers reject larger counters with `InvalidConfig`. Context `bytesValue` must
-decode with standard padded base64, like pdata: CR/LF inside the decoded JSON
-string are ignored and nonzero unused trailing bits are accepted.
+decode with standard padded base64; nonzero unused trailing bits are accepted.
+The round-3 claim about ignoring CR/LF after JSON unescaping was incorrect
+and is withdrawn by the 2026-10-11 #82 amendment below.
+
+**Raw-reader parity (amended 2026-10-11, #82).** Source audit of the pinned
+Collector 0.151.0 (pdata v1.57.0) and the review's pdata v1.68.0:
+
+| All fields reachable from LogsData | pdata string handling |
+| --- | --- |
+| AnyValue.bytesValue, recursively in resource/scope/record attributes, arrays and kvlists | Raw ReadBytes, standard padded base64 |
+| LogRecord.traceId and spanId | Raw ReadStringAsSlice, hex (empty or exactly 32/16 digits) |
+| ResourceLogs/ScopeLogs.schemaUrl; Scope.name/version | Unescaped ReadString |
+| EntityRef.schemaUrl/type/idKeys/descriptionKeys | Unescaped ReadString |
+| KeyValue.key; AnyValue.stringValue; LogRecord.severityText/eventName | Unescaped ReadString |
+| Quoted intValue/doubleValue, timestamps, counts, flags, severityNumber | Unescaped numeric/enum readers |
+| boolValue, objects, arrays | Typed readers, not strings |
+
+Raw-read values must be strings with no JSON backslash escape, even if
+unescaping would produce valid base64/hex. No CR/LF stripping is performed;
+raw controls are already forbidden by framing. Base64 uses the standard
+alphabet with required padding; URL-safe alphabet, whitespace and escapes
+are invalid. Unknown fields (including aliases and protobuf string indices)
+remain rejected. Sources: pdata internal/generated_proto_{logrecord,anyvalue,
+resource,instrumentationscope,entityref,keyvalue,resourcelogs,scopelogs}.go,
+internal/bytesid.go and internal/json/iterator.go at both versions.
 
 **Closed messages (amended 2026-10-11, same review).** LogsData, ResourceLogs,
 ScopeLogs, Resource, Scope and all nested OTLP messages accept only their v1
@@ -221,6 +244,11 @@ excluded from checkpoint anchors; double-final LF is rejected (round 3 amendment
 JSON payload bound before parsing (`TooLarge`, verifier `InvalidField`), excluding
 that optional LF, and the JSON deserializer's 128-level nesting bound. These
 rules also cover Collector multi-record lines and unhashed scope/resource data.
+**Whitespace decision (2026-10-11, #82).** ASCII space between tokens and before
+or after the JSON value is accepted and preserved; anchors retain that spelling
+except for the framing LF. No normalization means two accepted payload spellings
+may have the same canonical record hash. Raw controls, including tabs, remain
+invalid. Hashes authenticate record content, not JSON whitespace or key order.
 
 | Attribute | Kinds | Content | Tag |
 |---|---|---|---|

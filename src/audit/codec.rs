@@ -44,6 +44,19 @@ impl<'de> Deserialize<'de> for Unique {
         decoder.deserialize_any(UniqueVisitor)
     }
 }
+/// Collector 0.151.0/pdata 1.57.0 (also checked against pdata 1.68.0):
+/// | Fields reachable from LogsData | String reader |
+/// | --- | --- |
+/// | AnyValue.bytesValue, at any nesting level | raw ReadBytes / standard base64 |
+/// | LogRecord.traceId, spanId | raw ReadStringAsSlice / hex |
+/// | ResourceLogs/ScopeLogs.schemaUrl; Scope.name/version | unescaped ReadString |
+/// | EntityRef.schemaUrl/type/idKeys/descriptionKeys | unescaped ReadString |
+/// | KeyValue.key; AnyValue.stringValue; LogRecord.severityText/eventName | unescaped ReadString |
+/// | Quoted intValue/doubleValue, times, counts, flags, severityNumber | unescaped numeric/enum readers |
+/// | boolValue, objects and arrays | typed readers, not strings |
+/// Sources: pdata internal/generated_proto_{logrecord,anyvalue,resource,
+/// instrumentationscope,entityref,keyvalue,resourcelogs,scopelogs}.go,
+/// internal/bytesid.go and internal/json/iterator.go. Unknown fields are rejected.
 struct UniqueVisitor;
 impl<'de> Visitor<'de> for UniqueVisitor {
     type Value = Unique;
@@ -86,7 +99,15 @@ impl<'de> Visitor<'de> for UniqueVisitor {
             if values.contains_key(&key) {
                 return Err(de::Error::custom("duplicate object key"));
             }
-            let Unique(value) = map.next_value()?;
+            let value = if ["bytesValue", "traceId", "spanId"].contains(&key.as_str()) {
+                let raw = map.next_value::<&serde_json::value::RawValue>()?;
+                if raw.get().contains('\\') {
+                    return Err(de::Error::custom("escape in raw-read field"));
+                }
+                Json::String(serde_json::from_str(raw.get()).map_err(de::Error::custom)?)
+            } else {
+                map.next_value::<Unique>()?.0
+            };
             values.insert(key, value);
         }
         Ok(Unique(Json::Object(values)))
@@ -256,7 +277,7 @@ fn any_value(v: &Json) -> Result<(), AuditError> {
                         &alphabet::STANDARD,
                         GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true),
                     );
-                    engine.decode(s.replace(['\r', '\n'], "")).is_ok()
+                    engine.decode(s).is_ok()
                 }) => {}
             "boolValue" if val.is_boolean() => {}
             "intValue"
