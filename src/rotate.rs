@@ -2645,14 +2645,16 @@ mod prop_tests {
             prop_assert_eq!(parse_segment(&next, &signal), Some((stamp.as_str(), counter + 1)));
         }
         #[test]
-        fn segment_total_order(a in 0u64..4_000_000_000, b in 0u64..4_000_000_000, x in 0u64..10_000_000, y in 0u64..10_000_000) {
-            let sa = stamp_at(a, 0);
-            let sb = stamp_at(b, 0);
+        fn segment_total_order(a in 0u64..4_000_000_000, b in 0u64..4_000_000_000, an in 1u32..1_000_000_000, bn in 1u32..1_000_000_000, x in 0u64..10_000_000, y in 0u64..10_000_000) {
+            let sa = stamp_at(a, an);
+            let sb = stamp_at(b, bn);
             let pa = PathBuf::from(format!("logs-{sa}_{x:06}.jsonl"));
             let pb = PathBuf::from(format!("logs-{sb}_{y:06}.jsonl"));
             let same_stamp = PathBuf::from(format!("logs-{sa}_{y:06}.jsonl"));
+            let other_nanos = PathBuf::from(format!("logs-{}_{y:06}.jsonl", stamp_at(a, bn)));
+            prop_assert_eq!(segment_key(&pa, "logs").cmp(&segment_key(&other_nanos, "logs")), (an, x).cmp(&(bn, y)));
             prop_assert_eq!(segment_key(&pa, "logs").cmp(&segment_key(&same_stamp, "logs")), x.cmp(&y));
-            prop_assert_eq!(segment_key(&pa, "logs").cmp(&segment_key(&pb, "logs")), (a, x).cmp(&(b, y)));
+            prop_assert_eq!(segment_key(&pa, "logs").cmp(&segment_key(&pb, "logs")), (a, an, x).cmp(&(b, bn, y)));
         }
         #[test]
         fn signal_validation(signal in ".{0,40}") {

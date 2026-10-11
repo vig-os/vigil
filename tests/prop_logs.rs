@@ -1,4 +1,6 @@
 //! Generated exporter inputs, checked against independent wire-level invariants.
+//! Equal-sized truncation candidates have no specified tie-break in ADR-0001;
+//! tests allow either maximum while requiring exact overflow and determinism.
 mod common;
 use common::*;
 use opentelemetry::{
@@ -71,12 +73,18 @@ fn envelopes(lines: &[String]) -> std::collections::BTreeSet<String> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]
-    fn bounding_split_and_determinism(bodies in prop::collection::vec(prop_oneof![Just(String::new()), ".{0,40}", ".{500,1800}"], 2..12), cap in 900usize..2200) {
-        let batch: Vec<_> = bodies.iter().enumerate().map(|(i, body)| rec(&scope(if i % 2 == 0 {"a"} else {"b"}, "1"), |r| {
+    fn bounding_split_and_determinism(bodies in prop::collection::vec(prop_oneof![Just(String::new()), ".{0,40}", ".{500,1800}"], 2..12), cap in 900usize..2200, names in prop::collection::btree_set("[a-z]{1,8}", 3..7)) {
+        let names: Vec<_> = names.into_iter().collect();
+        let mut bodies = bodies;
+        while bodies.len() < names.len() { bodies.push("healthy".into()); }
+        bodies.extend(["healthy neighbour".into(), "x".repeat(3000)]);
+        let batch: Vec<_> = bodies.iter().enumerate().map(|(i, body)| rec(&opentelemetry::InstrumentationScope::builder(names[i % names.len()].clone()).with_version("1").build(), |r| {
             r.set_timestamp(at(100 + i as u64, 0));
             r.set_event_name("immutable_event");
             r.set_body(body.clone().into());
             r.add_attribute("id", i as i64);
+            r.add_attribute("preserved", format!("attribute-{i}"));
+            r.add_attribute("flag", i % 2 == 0);
         })).collect();
         let lines = encode(&batch, cap);
         prop_assert_eq!(&lines, &encode(&batch, cap));
@@ -84,20 +92,33 @@ proptest! {
         prop_assert_eq!(envelopes(&lines), envelopes(&encode(&batch, 100_000)));
         let output = records(&lines);
         prop_assert_eq!(output.len(), bodies.len());
+        let healthy: std::collections::BTreeMap<_, _> = batch.iter().enumerate().filter_map(|(i, record)| {
+            let single = encode(std::slice::from_ref(record), 100_000);
+            (single[0].len() <= cap).then(|| (i, records(&single).remove(0)))
+        }).collect();
         let mut ids = Vec::new();
         for r in output {
             prop_assert_eq!(&r["eventName"], "immutable_event");
-            ids.push(attr(&r, "id")["intValue"].as_str().unwrap().parse::<usize>().unwrap());
+            let id = attr(&r, "id")["intValue"].as_str().unwrap().parse::<usize>().unwrap();
+            if let Some(original) = healthy.get(&id) {
+                // Compare serialized fields, including attribute array order and every value.
+                prop_assert_eq!(r["body"].to_string().into_bytes(), original["body"].to_string().into_bytes());
+                prop_assert_eq!(r["attributes"].to_string().into_bytes(), original["attributes"].to_string().into_bytes());
+            }
+            ids.push(id);
         }
         ids.sort_unstable();
         prop_assert_eq!(ids, (0..bodies.len()).collect::<Vec<_>>());
     }
     #[test]
-    fn largest_first_exact_overflow(big in 1400usize..2600, small in 1usize..100, overflow in 150usize..400) {
+    fn largest_first_exact_overflow(big in 1400usize..2600, small in 1usize..100, overflow in 150usize..400, large_position in 0usize..3, gap in 0usize..100, reverse_insertion in any::<bool>()) {
+        let sizes = std::array::from_fn::<_, 3, _>(|i| if i == large_position { big } else if i == (large_position + 1) % 3 { big - gap } else { small });
         let batch = [rec(&scope("a", "1"), |r| {
             r.set_body("m".repeat(small).into());
             r.set_event_name("event");
-            r.add_attribute("payload", "x".repeat(big));
+            let mut positions = vec![0, 1, 2];
+            if reverse_insertion { positions.reverse(); }
+            for i in positions { r.add_attribute(format!("value-{i}"), "x".repeat(sizes[i])); }
             r.add_attribute("number", 42i64);
         })];
         let full = encode(&batch, 100_000);
@@ -108,10 +129,17 @@ proptest! {
         attrs.push(json!({"key":"vigil.original_size","value":{"intValue":original.to_string()}}));
         let cap = marked.to_string().len() - overflow;
         let lines = encode(&batch, cap);
+        prop_assert_eq!(&lines, &encode(&batch, cap));
         prop_assert_eq!(lines[0].len(), cap);
         let out = records(&lines);
         prop_assert_eq!(&out[0]["body"]["stringValue"], &"m".repeat(small));
-        prop_assert_eq!(attr(&out[0], "payload")["stringValue"].as_str().unwrap().len(), big - overflow);
+        let after: Vec<_> = (0..3).map(|i| attr(&out[0], &format!("value-{i}"))["stringValue"].as_str().unwrap().len()).collect();
+        let removed: Vec<_> = sizes.iter().zip(&after).map(|(before, after)| before - after).collect();
+        prop_assert_eq!(removed.iter().sum::<usize>(), overflow);
+        // ADR-0001 does not specify which equal-sized value wins a tie.
+        // Exactly one of the largest values must absorb this overflow.
+        prop_assert_eq!(removed.iter().filter(|&&n| n != 0).count(), 1);
+        for i in 0..3 { if sizes[i] < big { prop_assert_eq!(removed[i], 0); } }
         prop_assert_eq!(&out[0]["eventName"], "event");
         prop_assert_eq!(attr(&out[0], "number"), &json!({"intValue":"42"}));
         prop_assert_eq!(attr(&out[0], "vigil.original_size")["intValue"].as_str().unwrap(), original.to_string());
