@@ -368,3 +368,7 @@ pub use codec::Checkpoint;
 #[cfg(test)]
 #[path = "roundtrip_tests.rs"]
 mod roundtrip_tests;
+
+#[cfg_attr(not(test), allow(dead_code))] // Internal reader; B2b/#11 adds writes, B3 adds the public sink.
+#[path = "storage.rs"]
+pub(crate) mod storage;

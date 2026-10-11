@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Internal audit trail scanning with shared directory locks, incremental state and stale-inode protection ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
+
 - Audit amendment 2 format support: authenticated repair digests and checkpoint MMR counts independent of resume sequence gaps, with reserved context names and creation-only empty MMR validation ([#79](https://github.com/vig-os/vigil/issues/79)).
 
 - Public API performance benchmarks, disk-based consumer budgets and same-runner CI regression reports ([#49](https://github.com/vig-os/vigil/issues/49)).

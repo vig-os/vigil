@@ -262,6 +262,50 @@ fn warn_slow_lock(path: &Path, elapsed: Duration, warned: &AtomicBool, out: &mut
 static REGISTRY: LazyLock<Mutex<HashMap<PathBuf, Weak<DirLock>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Shared locked-section boundary for telemetry and audit storage.
+///
+/// Lock order is registry (released before locking), directory gate, flock,
+/// then caller state. Audit uses its own directory and never nests a logs
+/// lock; a future log mirror (#11) must run after releasing the audit lock.
+#[derive(Clone)]
+pub(crate) struct Directory {
+    lock: Arc<DirLock>,
+    path: PathBuf,
+}
+impl Directory {
+    #[cfg(all(test, feature = "audit"))]
+    pub(crate) fn shares_lock(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lock, &other.lock)
+    }
+
+    pub(crate) fn open(dir: &Path) -> io::Result<Self> {
+        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        let dir = fs::canonicalize(dir)?;
+        tighten(&dir, 0o700)?;
+        let lock = {
+            let mut registry = lock_ignore_poison(&REGISTRY);
+            registry.retain(|_, w| w.strong_count() > 0);
+            match registry.get(&dir).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(DirLock::open(&dir)?);
+                    registry.insert(dir.clone(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        Ok(Self { lock, path: dir })
+    }
+
+    /// Rechecks the directory identity after waiting; all I/O in `f` must use
+    /// this descriptor. Returning from `f` releases both locks, including on error.
+    #[cfg_attr(not(feature = "audit"), allow(dead_code))]
+    pub(crate) fn with_lock<T>(&self, f: impl FnOnce(&File) -> T) -> io::Result<T> {
+        let (dir, _unlock) = self.lock.lock_current(&self.path)?;
+        Ok(f(&dir))
+    }
+}
+
 /// Appends whole lines to `<dir>/<signal>.jsonl`, rotating by size and pruning
 /// by age, correctly when many processes write the same file.
 ///
@@ -318,21 +362,8 @@ impl RotatingFile {
     /// error from creating the directory or file.
     pub fn open(dir: &Path, signal: &str, cfg: RotationConfig) -> io::Result<Self> {
         validate_signal(signal)?;
-        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-        let dir = fs::canonicalize(dir)?;
-        tighten(&dir, 0o700)?;
-        let lock = {
-            let mut registry = lock_ignore_poison(&REGISTRY);
-            registry.retain(|_, w| w.strong_count() > 0);
-            match registry.get(&dir).and_then(Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(DirLock::open(&dir)?);
-                    registry.insert(dir.clone(), Arc::downgrade(&lock));
-                    lock
-                }
-            }
-        };
+        let directory = Directory::open(dir)?;
+        let Directory { lock, path: dir } = directory;
         Self::with_lock(lock, dir, signal, cfg)
     }
 
@@ -668,7 +699,7 @@ fn rotate_with(
     }
 }
 
-fn rotated_names_at(dir: &File, signal: &str) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn rotated_names_at(dir: &File, signal: &str) -> io::Result<Vec<PathBuf>> {
     let mut names = Vec::new();
     for entry in rfs::Dir::read_from(dir)? {
         let entry = entry?;
