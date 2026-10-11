@@ -63,14 +63,41 @@ fn time_first_order_preserves_golden_content() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    let new: Vec<serde_json::Value> = actual
+    let mut new: Vec<serde_json::Value> = actual
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
+    for line in &mut new {
+        for resource in line["resourceLogs"].as_array_mut().unwrap() {
+            resource["resource"]["attributes"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|attribute| attribute["key"] != "service.instance.id");
+        }
+    }
     assert_eq!(old, new);
     for line in actual.lines() {
         let observed = &serde_json::from_str::<serde_json::Value>(line).unwrap()["resourceLogs"][0]
             ["scopeLogs"][0]["logRecords"][0]["observedTimeUnixNano"];
         assert!(line[..128.min(line.len())].contains(observed.as_str().unwrap()));
     }
+}
+
+#[test]
+fn instance_identity_is_the_only_golden_content_change() {
+    let before: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/logs-before-7.jsonl")).unwrap();
+    let mut after: serde_json::Value = serde_json::from_str(&golden_output()).unwrap();
+    for resource in after["resourceLogs"].as_array_mut().unwrap() {
+        let attrs = resource["resource"]["attributes"].as_array_mut().unwrap();
+        let index = attrs
+            .iter()
+            .position(|a| a["key"] == "service.instance.id")
+            .unwrap();
+        assert_eq!(
+            attrs.remove(index)["value"]["stringValue"],
+            "123e4567-e89b-42d3-a456-426614174000"
+        );
+    }
+    assert_eq!(before, after);
 }

@@ -242,6 +242,7 @@ fn output_is_sorted_and_stable_across_runs() {
             "host.name",
             "res_inf",
             "res_nan",
+            "service.instance.id",
             "service.name"
         ]
     );

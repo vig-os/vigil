@@ -154,6 +154,13 @@ A previously set global or scoped default subscriber returns `ForeignSubscriber`
 even after the scope ends; compose a layer
 into that subscriber's Registry instead. Failed attempts release the slot.
 
+Each pipeline generates a random UUID v4 `service.instance.id`, shared by all
+its resource records. It is not configurable; concurrent producers get distinct
+identities. If OS randomness is unavailable, initialization falls back to stderr
+with a warning naming the instance identity generation failure. The synchronous log processor
+explicitly sets its queue size, batch size and delay; `OTEL_BLRP_*` variables do
+not configure vigil.
+
 `Guard::flush()` exports queued logs with a five-second timeout; `shutdown()`
 uses the same timeout and `shutdown_with_timeout(Duration)` accepts another.
 They return

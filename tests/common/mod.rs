@@ -103,6 +103,10 @@ pub fn golden_records() -> (Resource, Vec<Rec>) {
 
     let resource = resource(vec![
         KeyValue::new("service.name", "vigil-golden"),
+        KeyValue::new(
+            "service.instance.id",
+            "123e4567-e89b-42d3-a456-426614174000",
+        ),
         KeyValue::new("host.name", "test-host"),
         KeyValue::new("deployment.environment", "ci"),
         KeyValue::new("res_inf", f64::INFINITY),
