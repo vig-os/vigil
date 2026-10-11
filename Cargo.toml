@@ -41,6 +41,7 @@ lto = "thin"
 codegen-units = 1
 
 [dev-dependencies]
+flate2 = "1"
 # Exercise consumer feature unification in every ordinary test run.
 serde_json = { version = "1", features = ["preserve_order"] }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }

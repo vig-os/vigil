@@ -501,3 +501,29 @@ fn r2_corpus_contains_normal_and_resume_checkpoints() {
         "normal={normal}, resume={resume}"
     );
 }
+
+#[test]
+fn verify_committed_writer_corpus() {
+    let compressed = include_bytes!("../../tests/fixtures/audit/roundtrip.jsonl.gz");
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::GzDecoder::new(compressed.as_slice()),
+        &mut bytes,
+    )
+    .unwrap();
+    assert_eq!(
+        blake3::hash(&bytes).to_hex().as_str(),
+        include_str!("../../tests/fixtures/audit/roundtrip.blake3").trim()
+    );
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert_eq!(text.lines().count(), 256);
+    for line in text.lines() {
+        let records = Record::parse_line(line.as_bytes()).unwrap();
+        assert_eq!(records.len(), 1);
+        let json = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            line,
+            crate::ordered_json::encode(&json, "", crate::ordered_json::LOGS).unwrap()
+        );
+    }
+}
