@@ -42,8 +42,10 @@ pub(crate) struct State {
     pub(crate) head: Head,
     pub(crate) mmr: Mmr,
     offset: u64,
-    length: u64,
+    pub(crate) length: u64,
     checkpoint: bool,
+    pub(crate) checkpoint_time: u64,
+    pub(crate) since_checkpoint: u64,
     newline: bool,
     gap: Option<blake3::Hasher>,
     pending_resume: bool,
@@ -51,6 +53,15 @@ pub(crate) struct State {
     checkpoint_previous: [u8; 32],
 }
 impl State {
+    /// Advances from known writer output, never from a reread of our own bytes.
+    pub(crate) fn after(&self, record: &Record, length: u64) -> Result<Self, AuditError> {
+        let mut next = Some(self.clone());
+        apply(record, &mut next)?;
+        let mut next = next.ok_or_else(|| corrupt("missing written state"))?;
+        next.offset = length;
+        next.length = length;
+        Ok(next)
+    }
     /// Includes the repair LF that B2b will prepend to an unterminated tail.
     pub(crate) fn repair_digest(&self) -> Option<[u8; 32]> {
         self.gap.as_ref().map(|gap| {
@@ -81,6 +92,25 @@ pub(crate) struct TrailReader {
     cache: Mutex<Cache>,
 }
 impl TrailReader {
+    /// Reads the marker, settles staging and scans in one acquisition.
+    pub(crate) fn open_marked(
+        path: &Path,
+        expected: Option<Head>,
+        prepare: impl FnOnce(&File) -> Result<[u8; 16], AuditError>,
+    ) -> Result<Self, AuditError> {
+        let directory = Directory::open(path).map_err(io_error)?;
+        let (trail, cache) = directory
+            .with_lock(|dir| {
+                let trail = prepare(dir)?;
+                Ok::<_, AuditError>((trail, initial(dir, trail, expected)?))
+            })
+            .map_err(io_error)??;
+        Ok(Self {
+            directory,
+            trail,
+            cache: Mutex::new(cache),
+        })
+    }
     /// Scans an existing trail after B2b's staging settlement. `trail` comes
     /// from the checked marker. No signature trust is inferred from disk.
     pub(crate) fn open(
@@ -120,7 +150,7 @@ impl TrailReader {
     pub(crate) fn with_current<T>(
         &self,
         settle: impl FnOnce(&File) -> Result<(), AuditError>,
-        f: impl FnOnce(&File, &File, &State) -> Result<T, AuditError>,
+        f: impl FnOnce(&File, &mut File, &mut State) -> Result<T, AuditError>,
     ) -> Result<T, AuditError> {
         self.directory
             .with_lock(|dir| {
@@ -130,7 +160,20 @@ impl TrailReader {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 refresh(dir, self.trail, &mut cache)?;
-                f(dir, &cache.file, &cache.state)
+                let old = cache.file.metadata().map_err(io_error)?;
+                let Cache { file, state, .. } = &mut *cache;
+                let result = f(dir, file, state);
+                let new = cache.file.metadata().map_err(io_error)?;
+                if (old.dev(), old.ino()) != (new.dev(), new.ino()) {
+                    cache.sealed_before = crate::rotate::rotated_names_at(dir, "audit")
+                        .map_err(io_error)?
+                        .pop();
+                }
+                let result = result?;
+                // A successful write must advance the retained head before the
+                // lock is released, so an immediate rollback cannot reuse it.
+                refresh(dir, self.trail, &mut cache)?;
+                Ok(result)
             })
             .map_err(io_error)?
     }
@@ -141,7 +184,7 @@ fn corrupt(detail: &str) -> AuditError {
 fn io_error(error: io::Error) -> AuditError {
     AuditError::new(AuditErrorKind::Io, error.to_string())
 }
-fn existing(dir: &File, name: &Path, writable: bool) -> Result<File, AuditError> {
+pub(crate) fn existing(dir: &File, name: &Path, writable: bool) -> Result<File, AuditError> {
     let access = if writable {
         OFlags::RDWR | OFlags::APPEND
     } else {
@@ -268,7 +311,7 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
 const MAX_READ_BYTES: u64 = MAX_PAYLOAD_BYTES as u64 + 2; // LF plus one excess byte.
 
 /// Bounded reads: each payload is capped even when it is only a fragment.
-fn scan(
+pub(crate) fn scan(
     file: &File,
     trail: [u8; 16],
     mut state: Option<State>,
@@ -485,6 +528,16 @@ fn apply(record: &Record, state: &mut Option<State>) -> Result<(), AuditError> {
         offset: 0,
         length: 0,
         checkpoint: matches!(record.kind, Kind::Checkpoint(_)),
+        checkpoint_time: if matches!(record.kind, Kind::Checkpoint(_)) {
+            record.context.time
+        } else {
+            state.as_ref().map_or(0, |s| s.checkpoint_time)
+        },
+        since_checkpoint: if matches!(record.kind, Kind::Checkpoint(_)) {
+            0
+        } else {
+            state.as_ref().map_or(1, |s| s.since_checkpoint + 1)
+        },
         newline: true,
         gap: None,
         pending_resume: pending,

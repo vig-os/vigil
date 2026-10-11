@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Internal durable audit writer with shared checkpoint cadence, staged segment sealing and recovery, repair attestations, signer-outage handling and fsync poisoning ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
+
 - Internal audit trail scanning with shared directory locks, incremental state, stale-inode protection and resume-aware segment boundaries ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - Random UUID v4 `service.instance.id` on the shared resource built by `init` and `layer`, keeping concurrent producers distinct; entropy failures degrade to stderr with a warning naming the cause, and explicit synchronous log batch settings are tested against `OTEL_BLRP_*` overrides ([#7](https://github.com/vig-os/vigil/issues/7)).
 

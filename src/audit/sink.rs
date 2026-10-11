@@ -1,0 +1,647 @@
+//! Internal durable writer; the public trail surface follows in #11 B3.
+use super::{
+    format::{Kind, request},
+    storage::{Head, State, TrailReader, existing, scan},
+    *,
+};
+use crate::rotate::{self, Directory};
+use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+use rustix::fs::{self as rfs, AtFlags, Mode, OFlags};
+use std::{
+    fs::File,
+    io::{Read, Write},
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+pub(crate) struct Config {
+    pub(crate) service: String,
+    pub(crate) checkpoint_every: u64,
+    pub(crate) checkpoint_interval: Duration,
+    pub(crate) max_bytes: u64,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            service: "vigil".into(),
+            checkpoint_every: 1000,
+            checkpoint_interval: Duration::from_secs(60),
+            max_bytes: 10 * 1024 * 1024,
+        }
+    }
+}
+pub(crate) struct Sink {
+    reader: TrailReader,
+    trail: [u8; 16],
+    signer: Arc<dyn Signer>,
+    config: Config,
+    poisoned: AtomicBool,
+    reported: AtomicBool,
+    unsigned_records: AtomicU64,
+    closed: bool,
+}
+fn error(kind: AuditErrorKind, text: impl Into<String>) -> AuditError {
+    AuditError::new(kind, text)
+}
+fn io_error(e: impl std::fmt::Display) -> AuditError {
+    error(AuditErrorKind::Io, e.to_string())
+}
+fn corrupt(text: &str) -> AuditError {
+    error(AuditErrorKind::CorruptTrail, text)
+}
+fn exists(dir: &File, name: &str) -> Result<bool, AuditError> {
+    match rfs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => Ok(true),
+        Err(rustix::io::Errno::NOENT) => Ok(false),
+        Err(e) => Err(io_error(e)),
+    }
+}
+fn poison_check(dir: &File) -> Result<(), AuditError> {
+    if exists(dir, "audit.poison")? {
+        Err(error(AuditErrorKind::Poisoned, "audit.poison exists"))
+    } else {
+        Ok(())
+    }
+}
+fn new_file(dir: &File, name: &str, mode: Mode) -> Result<File, AuditError> {
+    rfs::openat(
+        dir,
+        name,
+        OFlags::WRONLY
+            | OFlags::CREATE
+            | OFlags::EXCL
+            | OFlags::APPEND
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW,
+        mode,
+    )
+    .map(File::from)
+    .map_err(io_error)
+}
+fn marker(dir: &File) -> Result<[u8; 16], AuditError> {
+    if !exists(dir, "audit.trail")? {
+        return Err(error(AuditErrorKind::MissingTrail, "missing audit.trail"));
+    }
+    let file = existing(dir, Path::new("audit.trail"), false)?;
+    let mut bytes = Vec::new();
+    file.take(34).read_to_end(&mut bytes).map_err(io_error)?;
+    if bytes.len() != 33
+        || bytes[32] != b'\n'
+        || !bytes[..32]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    {
+        return Err(corrupt("noncanonical trail marker"));
+    }
+    let mut trail = [0; 16];
+    let digit = |b| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+    for (byte, pair) in trail.iter_mut().zip(bytes[..32].chunks_exact(2)) {
+        *byte = digit(pair[0]) * 16 + digit(pair[1]);
+    }
+    Ok(trail)
+}
+fn clock() -> Result<u64, AuditError> {
+    #[cfg(test)]
+    if let Some(time) = hooks::TIME.with(std::cell::Cell::get) {
+        hooks::CHECK_CLOCK.with(|check| {
+            if let Some(check) = check.borrow().as_ref() {
+                check();
+            }
+        });
+        hooks::event("clock").map_err(io_error)?;
+        return Ok(time);
+    }
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io_error)?
+            .as_nanos(),
+    )
+    .map_err(io_error)
+}
+fn line(record: &Record) -> Result<Vec<u8>, AuditError> {
+    let context = AnyValue {
+        value: Some(any_value::Value::StringValue("vigil".into())),
+    };
+    let request = request(record, context)?;
+    let mut bytes = crate::logs::encode_line(&request)
+        .map_err(io_error)?
+        .into_bytes();
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+fn sync_io(file: &File, site: &'static str) -> std::io::Result<()> {
+    #[cfg(test)]
+    hooks::event(site)?;
+    if site.ends_with("dir") || site == "marker" {
+        file.sync_all()
+    } else {
+        file.sync_data()
+    }
+}
+fn sync(file: &File, site: &'static str, poisoned: &AtomicBool) -> Result<(), AuditError> {
+    sync_io(file, site).map_err(|e| {
+        poisoned.store(true, Ordering::Relaxed);
+        // #90: no pre-write length at staging/directory sites; marker creation has no handle.
+        io_error(e)
+    })
+}
+fn write_io(file: &File, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        hooks::event("write")?;
+        if let Some(cap) = hooks::SHORT.with(std::cell::Cell::take) {
+            (&*file).write_all(&bytes[..cap.min(bytes.len())])?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "injected short write",
+            ));
+        }
+    }
+    rotate::write_once(&mut &*file, bytes)
+}
+fn truncate_io(file: &File, length: u64) -> std::io::Result<()> {
+    #[cfg(test)]
+    hooks::event("truncate")?;
+    file.set_len(length)
+}
+fn append(
+    dir: &File,
+    file: &File,
+    bytes: &[u8],
+    site: &'static str,
+    poisoned: &AtomicBool,
+) -> Result<(), AuditError> {
+    let length = file.metadata().map_err(io_error)?.len();
+    let write = write_io(file, bytes).map_err(io_error);
+    let result = write.and_then(|()| sync(file, site, poisoned));
+    if let Err(original) = result {
+        let rollback = truncate_io(file, length);
+        if let Err(truncate) = rollback {
+            // Persist the barrier before releasing the directory lock (d6).
+            if let Ok(mut marker) = new_file(dir, "audit.poison", Mode::RUSR | Mode::WUSR) {
+                let _ = write!(marker, "{original}; rollback: {truncate}");
+            }
+        }
+        return Err(original);
+    }
+    Ok(())
+}
+fn linked_live(dir: &File) -> Result<bool, AuditError> {
+    let live = existing(dir, Path::new("audit.jsonl"), false)?;
+    rotate::has_segment_link(dir, "audit", &rfs::fstat(&live).map_err(io_error)?).map_err(io_error)
+}
+fn predecessor(dir: &File, trail: [u8; 16]) -> Result<Option<State>, AuditError> {
+    let mut state = None;
+    for name in rotate::rotated_names_at(dir, "audit").map_err(io_error)? {
+        state = Some(scan(
+            &existing(dir, &name, false)?,
+            trail,
+            state,
+            true,
+            None,
+            &mut false,
+        )?);
+    }
+    if exists(dir, "audit.jsonl")? && !linked_live(dir)? {
+        state = Some(scan(
+            &existing(dir, Path::new("audit.jsonl"), false)?,
+            trail,
+            state,
+            true,
+            None,
+            &mut false,
+        )?);
+    }
+    Ok(state)
+}
+fn settle(dir: &File, trail: [u8; 16], poisoned: &AtomicBool) -> Result<(), AuditError> {
+    // #90: order of poison check vs settlement, and settlement on poisoned handles.
+    for (name, count) in [(".audit-next.jsonl", 1), (".audit-resume.jsonl", 2)] {
+        if !exists(dir, name)? {
+            continue;
+        }
+        let staged = existing(dir, Path::new(name), false)?;
+        let mut bytes = Vec::new();
+        (&staged)
+            .take(2_000_003)
+            .read_to_end(&mut bytes)
+            .map_err(io_error)?;
+        let records: Option<Vec<Record>> = bytes.strip_suffix(b"\n").and_then(|payload| {
+            payload
+                .split(|b| *b == b'\n')
+                .map(|part| {
+                    let mut records = Record::parse_line(part).ok()?;
+                    if records.len() == 1 {
+                        records.pop()
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        });
+        let prior = predecessor(dir, trail)?;
+        let valid = records.as_ref().is_some_and(|records| {
+            if records.len() != count {
+                return false;
+            }
+            let first = &records[0];
+            if !matches!(first.kind, Kind::Checkpoint(_)) {
+                return false;
+            }
+            let seq = prior.as_ref().map_or(0, |s| s.head.seq.saturating_add(1));
+            let previous = prior
+                .as_ref()
+                .map_or_else(|| Record::genesis(&trail), |s| s.head.hash);
+            if first.context.previous != previous
+                || (count == 1 && first.context.seq != seq)
+                || (count == 2 && first.context.seq < seq)
+            {
+                return false;
+            }
+            if count == 2
+                && !matches!(&records[1].kind, Kind::Entry(e) if e.action == "vigil.audit.resume")
+            {
+                return false;
+            }
+            scan(&staged, trail, prior.clone(), true, None, &mut false).is_ok()
+        });
+        if valid {
+            if exists(dir, "audit.jsonl")? {
+                #[cfg(test)]
+                hooks::event("seal-rename").map_err(io_error)?;
+                if linked_live(dir)? {
+                    rfs::unlinkat(dir, "audit.jsonl", AtFlags::empty()).map_err(io_error)?;
+                } else {
+                    rotate::rotate(dir, "audit", Path::new("audit.jsonl")).map_err(io_error)?;
+                }
+            }
+            #[cfg(test)]
+            hooks::event("promote").map_err(io_error)?;
+            rotate::rename_no_replace(dir, Path::new(name), Path::new("audit.jsonl"))
+                .map_err(io_error)?;
+            // #90: shared poisoning after a directory failure has no pre-write length.
+            sync(dir, "settle-promote-dir", poisoned)?;
+        } else {
+            rfs::unlinkat(dir, name, AtFlags::empty()).map_err(io_error)?;
+            // #90: shared poisoning after a directory failure has no pre-write length.
+            sync(dir, "settle-discard-dir", poisoned)?;
+        }
+    }
+    Ok(())
+}
+impl Sink {
+    pub(crate) fn create(
+        path: &Path,
+        signer: Arc<dyn Signer>,
+        config: Config,
+    ) -> Result<Self, AuditError> {
+        let directory = Directory::open(path).map_err(io_error)?;
+        let head = directory
+            .with_lock(|dir| {
+                if [
+                    "audit.trail",
+                    "audit.jsonl",
+                    ".audit-next.jsonl",
+                    ".audit-resume.jsonl",
+                    "audit.poison",
+                ]
+                .into_iter()
+                .map(|name| exists(dir, name))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .any(|v| v)
+                    || !rotate::rotated_names_at(dir, "audit")
+                        .map_err(io_error)?
+                        .is_empty()
+                {
+                    return Err(error(AuditErrorKind::TrailExists, "audit data exists"));
+                }
+                let mut trail = [0; 16];
+                getrandom::fill(&mut trail).map_err(io_error)?;
+                let poisoned = AtomicBool::new(false);
+                let mut marker = new_file(dir, "audit.trail", Mode::RUSR)?;
+                rotate::write_once(&mut marker, format!("{}\n", hex(&trail)).as_bytes())
+                    .map_err(io_error)?;
+                // #90: marker fsync during create has no handle to poison.
+                sync(&marker, "marker", &poisoned)?;
+                sync(dir, "marker-dir", &poisoned)?;
+                let context = RecordContext::new(
+                    trail,
+                    0,
+                    clock()?,
+                    &config.service,
+                    Record::genesis(&trail),
+                );
+                let cp = Self::signed(&*signer, context, &Mmr::new())?;
+                Self::stage(dir, &line(&cp)?, &poisoned)?;
+                #[cfg(test)]
+                hooks::event("promote").map_err(io_error)?;
+                rotate::rename_no_replace(
+                    dir,
+                    Path::new(".audit-next.jsonl"),
+                    Path::new("audit.jsonl"),
+                )
+                .map_err(io_error)?;
+                sync(dir, "promote-dir", &poisoned)?;
+                Ok(Head {
+                    seq: 0,
+                    hash: cp.hash(),
+                })
+            })
+            .map_err(io_error)??;
+        Self::open(path, signer, config, Some(head))
+    }
+    pub(crate) fn open(
+        path: &Path,
+        signer: Arc<dyn Signer>,
+        config: Config,
+        expected: Option<Head>,
+    ) -> Result<Self, AuditError> {
+        let poisoned = AtomicBool::new(false);
+        let mut trail = None;
+        // Read the marker under the same lock that settles and scans.
+        let reader = TrailReader::open_marked(path, expected, |dir| {
+            poison_check(dir)?;
+            let id = marker(dir)?;
+            settle(dir, id, &poisoned)?;
+            trail = Some(id);
+            Ok(id)
+        })?;
+        Ok(Self {
+            reader,
+            trail: trail.ok_or_else(|| corrupt("missing marker identity"))?,
+            signer,
+            config,
+            poisoned,
+            reported: AtomicBool::new(false),
+            unsigned_records: AtomicU64::new(0),
+            closed: false,
+        })
+    }
+    fn signed(
+        signer: &dyn Signer,
+        context: RecordContext,
+        mmr: &Mmr,
+    ) -> Result<Record, AuditError> {
+        let key = signer.public_key();
+        let fields =
+            CheckpointFields::new(mmr.size(), mmr.root(), mmr.peaks().to_vec(), key, [0; 64])?;
+        let unsigned = Record::checkpoint(context.clone(), fields)?;
+        let message = unsigned
+            .signing_message()
+            .ok_or_else(|| corrupt("checkpoint without signing message"))?;
+        let signature = signer
+            .sign(&message)
+            .map_err(|e| error(AuditErrorKind::Signer, e.to_string()))?;
+        Record::checkpoint(
+            context,
+            CheckpointFields::new(mmr.size(), mmr.root(), mmr.peaks().to_vec(), key, signature)?,
+        )
+    }
+    fn context(&self, state: &State, time: u64) -> Result<RecordContext, AuditError> {
+        let seq = state
+            .head
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| error(AuditErrorKind::InvalidConfig, "sequence overflow"))?;
+        let mut context =
+            RecordContext::new(self.trail, seq, time, &self.config.service, state.head.hash);
+        context.repaired = state.repair_digest();
+        Ok(context)
+    }
+    fn checkpoint_record(&self, state: &State, time: u64) -> Result<Record, AuditError> {
+        Self::signed(&*self.signer, self.context(state, time)?, &state.mmr)
+    }
+    fn stage(dir: &File, bytes: &[u8], poisoned: &AtomicBool) -> Result<(), AuditError> {
+        let mut file = new_file(dir, ".audit-next.jsonl", Mode::RUSR | Mode::WUSR)?;
+        rotate::write_once(&mut file, bytes).map_err(io_error)?;
+        // #90: staging truncation and shared poisoning without a pre-write length.
+        sync(&file, "staging", poisoned)?;
+        sync(dir, "staging-dir", poisoned)
+    }
+    fn prepare(&self, dir: &File) -> Result<(), AuditError> {
+        // #90: checkpoint/close/Drop on poisoned handles or with audit.poison.
+        poison_check(dir)?;
+        settle(dir, self.trail, &self.poisoned)
+    }
+    fn signer_failed(&self) {
+        if !self.reported.swap(true, Ordering::Relaxed) {
+            eprintln!("vigil audit: checkpoint signer unavailable; retrying on next append");
+        }
+    }
+    pub(crate) fn record(&self, entry: &Entry) -> Result<Head, AuditError> {
+        self.record_impl(entry, false)
+    }
+    /// One internal path for all reserved actions, including resume and key rotation (B3).
+    pub(crate) fn record_internal(&self, entry: &Entry) -> Result<Head, AuditError> {
+        self.record_impl(entry, true)
+    }
+    fn record_impl(&self, entry: &Entry, internal: bool) -> Result<Head, AuditError> {
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(error(AuditErrorKind::Poisoned, "handle durability failure"));
+        }
+        self.reader.with_current(
+            |dir| {
+                if self.poisoned.load(Ordering::Relaxed) {
+                    return Err(error(AuditErrorKind::Poisoned, "handle durability failure"));
+                }
+                self.prepare(dir)
+            },
+            |dir, live, state| {
+                let time = clock()?;
+                let mut record = if internal {
+                    Record::new_internal(self.context(state, time)?, entry.clone())?
+                } else {
+                    Record::new(self.context(state, time)?, entry.clone())?
+                };
+                let mut bytes = line(&record)?; // Validate before rotation changes disk.
+                let mut file = live.try_clone().map_err(io_error)?;
+                let mut current = state.clone();
+                let mut signer_down = false;
+                if state
+                    .length
+                    .saturating_add(bytes.len() as u64)
+                    .saturating_add(u64::from(state.needs_newline()))
+                    > self.config.max_bytes
+                {
+                    match self.rotate(dir, live, state, time) {
+                        Ok(()) => {
+                            file = live.try_clone().map_err(io_error)?;
+                            current = state.clone();
+                            record = if internal {
+                                Record::new_internal(self.context(&current, time)?, entry.clone())?
+                            } else {
+                                Record::new(self.context(&current, time)?, entry.clone())?
+                            };
+                            bytes = line(&record)?;
+                        }
+                        Err(e) if e.kind() == AuditErrorKind::Signer => {
+                            self.signer_failed();
+                            signer_down = true;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                let receipt = Head {
+                    seq: record.context.seq,
+                    hash: record.hash(),
+                };
+                let due = current.since_checkpoint.saturating_add(1)
+                    >= self.config.checkpoint_every
+                    || time < current.checkpoint_time
+                    || u128::from(time - current.checkpoint_time.min(time))
+                        >= self.config.checkpoint_interval.as_nanos();
+                let mut checkpoint = None;
+                if due || signer_down {
+                    let mut mmr = current.mmr.clone();
+                    mmr.push(record.hash())?;
+                    let context = RecordContext::new(
+                        self.trail,
+                        receipt.seq + 1,
+                        time,
+                        &self.config.service,
+                        receipt.hash,
+                    );
+                    match Self::signed(&*self.signer, context, &mmr) {
+                        Ok(cp) => {
+                            bytes.extend(line(&cp)?);
+                            checkpoint = Some(cp);
+                            signer_down = false;
+                        }
+                        Err(e) if e.kind() == AuditErrorKind::Signer => {
+                            self.signer_failed();
+                            signer_down = true;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                if current.needs_newline() {
+                    bytes.insert(0, b'\n');
+                }
+                let length = current.length + bytes.len() as u64;
+                let mut next = current.after(&record, length)?;
+                if let Some(cp) = checkpoint {
+                    next = next.after(&cp, length)?;
+                }
+                append(dir, &file, &bytes, "record-data", &self.poisoned)?;
+                *live = file;
+                *state = next;
+                if signer_down {
+                    self.unsigned_records.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(receipt)
+            },
+        )
+    }
+    fn rotate(
+        &self,
+        dir: &File,
+        live: &mut File,
+        state: &mut State,
+        time: u64,
+    ) -> Result<(), AuditError> {
+        let closing = self.checkpoint_record(state, time)?;
+        let mut mmr = state.mmr.clone();
+        mmr.push(closing.hash())?;
+        let opening = Self::signed(
+            &*self.signer,
+            RecordContext::new(
+                self.trail,
+                closing.context.seq + 1,
+                time,
+                &self.config.service,
+                closing.hash(),
+            ),
+            &mmr,
+        )?;
+        let opening_bytes = line(&opening)?;
+        Self::stage(dir, &opening_bytes, &self.poisoned)?;
+        let mut bytes = line(&closing)?;
+        if state.needs_newline() {
+            bytes.insert(0, b'\n');
+        }
+        let closed = state.after(&closing, state.length + bytes.len() as u64)?;
+        let opened = closed.after(&opening, opening_bytes.len() as u64)?;
+        append(dir, live, &bytes, "closing-data", &self.poisoned)?;
+        *state = closed;
+        #[cfg(test)]
+        hooks::event("seal-rename").map_err(io_error)?;
+        rotate::rotate(dir, "audit", Path::new("audit.jsonl")).map_err(io_error)?;
+        #[cfg(test)]
+        hooks::event("promote").map_err(io_error)?;
+        rotate::rename_no_replace(
+            dir,
+            Path::new(".audit-next.jsonl"),
+            Path::new("audit.jsonl"),
+        )
+        .map_err(io_error)?;
+        // #90: shared poisoning without a pre-write length.
+        sync(dir, "promote-dir", &self.poisoned)?;
+        *live = existing(dir, Path::new("audit.jsonl"), true)?;
+        *state = opened;
+        Ok(())
+    }
+    pub(crate) fn checkpoint(&self) -> Result<Record, AuditError> {
+        self.reader.with_current(
+            |dir| self.prepare(dir),
+            |dir, file, state| {
+                let cp = self.checkpoint_record(state, clock()?)?;
+                let mut bytes = line(&cp)?;
+                if state.needs_newline() {
+                    bytes.insert(0, b'\n');
+                }
+                let next = state.after(&cp, state.length + bytes.len() as u64)?;
+                append(dir, file, &bytes, "checkpoint-data", &self.poisoned)?;
+                *state = next;
+                Ok(cp)
+            },
+        )
+    }
+    pub(crate) fn close(mut self) -> Result<Record, AuditError> {
+        // Consumed even on signer failure: Drop must never retry a failed close.
+        self.closed = true;
+        self.checkpoint()
+    }
+}
+impl Drop for Sink {
+    fn drop(&mut self) {
+        // #90: best-effort settlement/checkpoint behavior after poisoning.
+        if !self.closed {
+            let _ = self.checkpoint();
+        }
+    }
+}
+#[cfg(test)]
+mod hooks {
+    use std::{
+        cell::{Cell, RefCell},
+        io,
+    };
+    thread_local! {
+        pub(super) static CHECK_CLOCK: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
+        pub(super) static TIME: Cell<Option<u64>> = const { Cell::new(None) };
+        pub(super) static SHORT: Cell<Option<usize>> = const { Cell::new(None) };
+        pub(super) static FAIL: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+        pub(super) static EVENTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    }
+    pub(super) fn event(site: &'static str) -> io::Result<()> {
+        EVENTS.with(|events| events.borrow_mut().push(site));
+        FAIL.with(|fail| {
+            let mut fail = fail.borrow_mut();
+            if fail.first() == Some(&site) {
+                fail.remove(0);
+                Err(io::Error::other(format!("injected {site}")))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+#[cfg(test)]
+#[path = "sink_tests.rs"]
+mod tests;

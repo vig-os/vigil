@@ -240,7 +240,7 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
             if let Some(v) = value(&mut attrs, "audit.after", "audit.after_digest")? {
                 entry = entry.after(v);
             }
-            mapped(Record::new(context, entry))?
+            mapped(Record::new_internal(context, entry))?
         }
         Some("audit.checkpoint") => {
             let size = integer(scalar(take(&mut attrs, "audit.mmr_size")?, "intValue")?)?;

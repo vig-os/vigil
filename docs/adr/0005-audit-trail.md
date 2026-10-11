@@ -512,6 +512,9 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
 - **When one is written:**
   - (a) after a record, when `checkpoint_every` records (default 1 000) have been written since the last checkpoint;
   - (b) after a record, when `checkpoint_interval` (default 60 s) has passed since the last checkpoint;
+
+    **ADR-0005 amendment (2026-10-12, #11): shared checkpoint cadence.** Cadence is a property of the trail, not a handle. Both the record count and the time baseline use the latest checkpoint on disk, including checkpoints another process wrote and refresh observes. After `open`, the baseline is the latest checkpoint found by the scan (at least the creation checkpoint). Elapsed time is the record's wall-clock time, read inside the lock, minus that checkpoint's `timeUnixNano`; a clock reading earlier than the checkpoint makes a checkpoint due immediately. This errs toward more signatures rather than an unbounded unsigned tail after a clock step back. There is no handle-local monotonic clock; the injectable clock is the wall-clock source inside the lock.
+
   - (c) at rotation;
   - (d) on `AuditTrail::checkpoint()` and `close()`. `Drop` also tries, best effort (amended, #90: not on a poisoned handle or while `audit.poison` exists; decision 6).
 
@@ -531,6 +534,9 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
 - **Creating a trail is explicit.** `AuditConfig::create(signer)` (or `vigil-audit create --key <keyfile> --service <name> <dir>`) creates a new trail:
   1. It draws the **trail id**: 16 bytes from `getrandom`, never derived from anything in the directory, the key or the clock. So a trail re-created after deletion always has a new id, even with the same key.
   2. It writes the marker file `audit.trail` (`0400`, holding the id) and fsyncs it and the directory.
+
+     **ADR-0005 amendment (2026-10-12, #11): marker encoding.** The marker holds exactly 32 lowercase hex characters encoding the 16-byte trail id, followed by one LF: 33 bytes, nothing else. Readers accept only that exact form; uppercase, a missing or extra LF, surrounding whitespace, or the wrong length is `CorruptTrail`. This matches the `audit.trail` attribute (decision 3) and the trust file's `trail <32 hex>` spelling (decision 9), so an operator can `cat` the marker into the trust file without converting it. One canonical form fails closed (decision 1). The marker is never a trust input (decision 9).
+
   3. It writes the creation checkpoint at `seq 0` (`mmr_size` 0, `prev_hash` = the genesis value) through the staging file, as in sealing steps 2, 5 and 6.
   4. It returns the id (`AuditTrail::trail()`; the CLI prints it). The operator **pins** the id in the verifier's trust file, which is kept outside the trail directory (decision 9).
 

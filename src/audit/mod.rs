@@ -9,6 +9,8 @@
 mod format;
 mod mmr;
 mod signing;
+#[allow(dead_code)] // Internal writer; public facade follows in #11 B3.
+mod sink;
 #[cfg_attr(not(test), allow(dead_code))] // Internal reader; writes follow in #11.
 pub(crate) mod storage;
 pub use format::{Checkpoint, CheckpointFields, Entry, Record, RecordContext, Value};
@@ -25,7 +27,7 @@ pub enum AuditErrorKind {
     Poisoned,
     /// Encoded data exceeds a format field or JSON payload limit.
     TooLarge,
-    /// An entry contains an empty string or NUL.
+    /// An entry contains invalid text or a reserved action.
     InvalidEntry,
     /// Existing trail bytes violate the format or chain.
     CorruptTrail,

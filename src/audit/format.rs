@@ -184,7 +184,7 @@ pub(super) enum Kind {
 pub struct RecordContext {
     pub(super) trail: [u8; 16],
     pub(super) seq: u64,
-    time: u64,
+    pub(super) time: u64,
     service: String,
     host: Option<String>,
     pub(super) repaired: Option<[u8; 32]>,
@@ -240,9 +240,20 @@ impl Record {
     /// Returns [`AuditErrorKind::InvalidConfig`] if the sequence exceeds
     /// `i64::MAX` (the OTLP int64 bound), or [`AuditErrorKind::InvalidEntry`]
     /// if any supplied text (including
-    /// service, host, or before/after text) is empty or contains NUL, or
+    /// service, host, or before/after text) is empty or contains NUL, or the
+    /// action starts with the reserved `vigil.audit.` prefix, or
     /// [`AuditErrorKind::TooLarge`] if a canonical field exceeds `u32::MAX` bytes.
     pub fn new(context: RecordContext, entry: Entry) -> Result<Self, AuditError> {
+        if entry.action.starts_with("vigil.audit.") {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidEntry,
+                "reserved action prefix",
+            ));
+        }
+        Self::new_internal(context, entry)
+    }
+    /// Shared internal construction path for reserved actions and decoding.
+    pub(crate) fn new_internal(context: RecordContext, entry: Entry) -> Result<Self, AuditError> {
         entry.validate()?;
         Self::build(context, Kind::Entry(entry))
     }
