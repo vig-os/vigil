@@ -25,7 +25,7 @@ use tracing_subscriber::{
 };
 
 use crate::{
-    lifecycle::{FlushError, Losses, Overflow, ReportingProcessor, ShutdownCapture},
+    lifecycle::{AfterShutdown, FlushError, Losses, Overflow, ReportingProcessor, ShutdownCapture},
     logs::OtlpJsonLogExporter,
     rotate::{RotatingFile, RotationConfig},
 };
@@ -523,20 +523,18 @@ impl Config {
         };
         let losses = Arc::new(Losses::default());
         let stopped = Arc::new(AtomicBool::new(false));
-        let warned = AtomicBool::new(false);
         let active = stopped.clone();
         let shutdown_filter = tracing_subscriber::filter::dynamic_filter_fn(move |_, _| {
-            if !active.load(Ordering::Acquire) {
-                return true;
-            }
-            if !warned.swap(true, Ordering::Relaxed) {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "vigil: event after shutdown; further events will be dropped silently"
-                );
-            }
-            false
+            !active.load(Ordering::Acquire)
         });
+        let after_shutdown = AfterShutdown {
+            stopped: stopped.clone(),
+            warned: AtomicBool::new(false),
+        }
+        .with_filter(filter.clone())
+        .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+            !meta.target().starts_with("opentelemetry")
+        }));
         let dir = self
             .dir
             .or_else(|| {
@@ -665,7 +663,13 @@ impl Config {
             .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
                 !meta.target().starts_with("opentelemetry")
             }));
-        Ok((diagnostics(losses).and_then(destination).boxed(), guard))
+        Ok((
+            diagnostics(losses)
+                .and_then(after_shutdown)
+                .and_then(destination)
+                .boxed(),
+            guard,
+        ))
     }
 }
 // The upstream bridge requests an empty scope; supply a named scope to avoid

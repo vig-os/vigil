@@ -171,6 +171,24 @@ impl LogProcessor for ReportingProcessor {
     }
 }
 
+// Warnings belong in on_event: constructing a shutdown capture rebuilds
+// callsite interest, which evaluates enabled filters without emitting anything.
+pub(crate) struct AfterShutdown {
+    pub(crate) stopped: Arc<AtomicBool>,
+    pub(crate) warned: AtomicBool,
+}
+impl<S: Subscriber> Layer<S> for AfterShutdown {
+    fn on_event(&self, _: &Event<'_>, _: Context<'_, S>) {
+        if self.stopped.load(Ordering::Acquire) && !self.warned.swap(true, Ordering::Relaxed) {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "vigil: event after shutdown; further events will be dropped silently"
+            );
+        }
+    }
+}
+
 pub(crate) struct Overflow(pub(crate) Arc<Losses>);
 impl<S: Subscriber> Layer<S> for Overflow {
     fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
