@@ -24,11 +24,12 @@ One crate, two layers:
 - **`audit` feature** (opt-in). A separate, **lossless** audit trail of user actions on a device (who did what, when, and why) in the spirit of 21 CFR Part 11 §11.10(e). Records are still OTLP log records, hash-chained, with Merkle roots per segment and **ed25519-signed checkpoints**. They're built on [`tessera-core`](https://github.com/vig-os/tessera) primitives, so data provenance and audit provenance share one proof system.
 
 ```rust,no_run
-let _guard = vigil::Config::new("my-service")
+let guard = vigil::Config::new("my-service")
     .version(env!("CARGO_PKG_VERSION"))
     .init()?;
 tracing::info!(user = "alice", "opened study");
-# Ok::<(), vigil::InitError>(())
+guard.shutdown()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Logs are available now; metrics, traces and audit are planned. Keep the guard
@@ -82,6 +83,60 @@ the process slot; later attempts return `AlreadyRunning`, even after shutdown.
 A previously set global or scoped default subscriber returns `ForeignSubscriber`,
 even after the scope ends; compose a layer
 into that subscriber's Registry instead. Failed attempts release the slot.
+
+`Guard::flush()` exports queued logs without stopping the pipeline, with a
+five-second timeout. `shutdown()` uses the same timeout;
+`shutdown_with_timeout(Duration)` lets a caller choose it. These return
+`FlushError` with `Timeout`, `Failed` or `DataLost` (in that precedence order).
+`lost(Signal::Logs)` counts failed exports and diagnostic replacements since
+the previous flush. Shutdown also adds queue overflow since startup.
+Flush can only flag overflow; the actual loss is at least one record greater
+than its returned count when overflow was flagged. These counts are lower
+bounds: compiling WARN out removes the SDK overflow event, and concurrent
+records during shutdown may arrive after its counter or worker has stopped.
+A failed durable log line counts its records even if another copy was delivered;
+records on earlier successful lines are excluded. Records emitted after shutdown
+begins are rejected with one warning and are not counted. Stderr fallback returns
+success. Explicit shutdown makes Drop a no-op and returns countable losses without
+printing them again; Drop reports remaining losses on stderr.
+
+## Testing consumers
+
+Use `cargo nextest run` for one process per test. Each test creates one
+pipeline, records its events, calls `guard.shutdown()`, then reads its files
+with `rotate::read_since`. Dropping the guard stops the pipeline; another
+test in the same process cannot initialize it again. An earlier `set_default` or
+`with_default` in that binary also makes `init` return `ForeignSubscriber`, even
+after its scope ends; use a fresh process or compose with `Config::layer`.
+
+```rust,no_run
+let dir = std::env::temp_dir().join(format!("vigil-test-{}", std::process::id()));
+let guard = vigil::Config::new("tests").dir(&dir).init()?;
+tracing::info!(test_case = "my_unique_test", "record under test");
+guard.shutdown()?;
+let lines = vigil::rotate::read_since(&dir, "logs", None)?;
+assert!(lines.iter().any(|line| line.contains("my_unique_test")));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Under `cargo test`, keep one shared pipeline per test binary instead.
+A static guard never drops, so each test calls `flush` and selects only
+records with a field unique to that test. No test calls shutdown:
+
+```rust,no_run
+use std::sync::LazyLock;
+static GUARD: LazyLock<vigil::Guard> = LazyLock::new(|| {
+    vigil::Config::new("tests")
+        .dir(std::env::temp_dir().join(format!("vigil-tests-{}", std::process::id())))
+        .init().expect("test pipeline")
+});
+let guard = &*GUARD;
+tracing::info!(test_case = "my_unique_test", "record under test");
+guard.flush()?;
+let lines = vigil::rotate::read_since(guard.dir().expect("test storage"), "logs", None)?;
+assert!(lines.iter().any(|line| line.contains("my_unique_test")));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 ## Why not an existing crate
 

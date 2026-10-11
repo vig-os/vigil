@@ -107,9 +107,9 @@ const DAY: u64 = 86_400;
 /// ```
 /// use std::time::Duration;
 /// let cfg = vigil::rotate::RotationConfig::default();
-/// let cfg = cfg.max_bytes(50 * 1024 * 1024).retention(None);
-/// let cfg = cfg.retention(Some(Duration::from_secs(90 * 86_400)));
-/// assert_eq!(cfg, vigil::rotate::RotationConfig::default());
+/// let cfg = cfg.max_bytes(1024).retention(Some(Duration::from_secs(7 * 86_400)));
+/// assert_ne!(cfg, vigil::rotate::RotationConfig::default());
+/// assert_eq!(cfg.clone().max_bytes(0), cfg.max_bytes(1));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotationConfig {
