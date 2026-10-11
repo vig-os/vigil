@@ -3,6 +3,10 @@
 //! This module never creates a data file, writes bytes or checks signatures.
 //! Cached records are not revalidated after same-length in-place rewrites
 //! (ADR-0005 decision 8); offline verification (#13) detects such changes.
+//! Refresh also skips segment contents named at or before the retained old live
+//! inode (or its cached filename bound if archived). Inserting a forged older
+//! segment can therefore pass refresh while fresh open rejects it; fresh open
+//! scans all present history. The cache does not authenticate historical edits.
 use super::{
     AuditError, AuditErrorKind, Record,
     format::{Kind, validation::MAX_PAYLOAD_BYTES},
@@ -137,11 +141,16 @@ fn corrupt(detail: &str) -> AuditError {
 fn io_error(error: io::Error) -> AuditError {
     AuditError::new(AuditErrorKind::Io, error.to_string())
 }
-fn existing(dir: &File, name: &Path) -> Result<File, AuditError> {
+fn existing(dir: &File, name: &Path, writable: bool) -> Result<File, AuditError> {
+    let access = if writable {
+        OFlags::RDWR | OFlags::APPEND
+    } else {
+        OFlags::RDONLY
+    };
     rfs::openat(
         dir,
         name,
-        OFlags::RDWR | OFlags::APPEND | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        access | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )
     .map(File::from)
@@ -167,11 +176,10 @@ fn initial(dir: &File, trail: [u8; 16], expected: Option<Head>) -> Result<Cache,
     let mut found = false;
     let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
     for name in &names {
-        let file = existing(dir, name)?;
+        let file = existing(dir, name, false)?;
         chain = Some(scan(&file, trail, chain, true, expected, &mut found)?);
-        sealed(chain.as_ref().ok_or_else(|| corrupt("empty segment"))?)?;
     }
-    let file = existing(dir, Path::new("audit.jsonl"))?;
+    let file = existing(dir, Path::new("audit.jsonl"), true)?;
     let state = scan(&file, trail, chain, true, expected, &mut found)?;
     if expected.is_some() && !found {
         return Err(AuditError::new(
@@ -185,14 +193,9 @@ fn initial(dir: &File, trail: [u8; 16], expected: Option<Head>) -> Result<Cache,
         sealed_before: names.last().cloned(),
     })
 }
-fn sealed(state: &State) -> Result<(), AuditError> {
+fn sealed(state: &State) -> bool {
     // A complete JSON checkpoint without LF is still a record (ADR-0005 d5).
-    if !state.checkpoint || state.gap.is_some() || state.pending_resume {
-        return Err(corrupt(
-            "rotation segment lacks a complete closing checkpoint",
-        ));
-    }
-    Ok(())
+    state.checkpoint && state.gap.is_none() && !state.pending_resume
 }
 fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditError> {
     let old = cache.file.metadata().map_err(io_error)?;
@@ -231,7 +234,6 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
         None,
         &mut found,
     )?;
-    sealed(&state)?;
     // Locate the old descriptor by metadata, never by rereading historical
     // contents. If archived, the previous sealed name remains a lower bound.
     let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
@@ -250,11 +252,10 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
         }) {
             continue;
         }
-        let file = existing(dir, name)?;
+        let file = existing(dir, name, false)?;
         state = scan(&file, trail, Some(state), true, None, &mut found)?;
-        sealed(&state)?;
     }
-    let file = existing(dir, Path::new("audit.jsonl"))?;
+    let file = existing(dir, Path::new("audit.jsonl"), true)?;
     let state = scan(&file, trail, Some(state), true, None, &mut found)?;
     *cache = Cache {
         file,
@@ -285,6 +286,11 @@ fn scan(
     let mut reader = BufReader::new(file);
     let mut offset = start;
     let mut first = opening;
+    // ADR-0005 lines 524–525: resume renames the old live file AS IS. Lines
+    // 406/411/770 allow its trailing fragment and require writer/verifier parity.
+    // Defer an unclosed predecessor's boundary until the successor's immediate
+    // resume validates head/hash/lost_through below; file= is informational (525).
+    let mut boundary_resume = opening && state.as_ref().is_some_and(|s| !sealed(s));
     let mut gap = None::<blake3::Hasher>;
     if !opening
         && let Some(s) = &state
@@ -325,7 +331,7 @@ fn scan(
         }
         let records = match Record::parse_line(payload) {
             Ok(records) => records,
-            Err(_) if !first && fragment(payload) => {
+            Err(_) if !first && !boundary_resume && fragment(payload) => {
                 gap.get_or_insert_with(|| {
                     let mut h = blake3::Hasher::new();
                     h.update(b"vigil.audit.v1.repaired\0");
@@ -359,7 +365,16 @@ fn scan(
         {
             return Err(corrupt("missing or mismatched repair attestation"));
         }
+        if boundary_resume
+            && !first
+            && !matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume")
+        {
+            return Err(corrupt("unclosed segment lacks matching immediate resume"));
+        }
         apply(record, &mut state)?;
+        if !first {
+            boundary_resume = false;
+        }
         let s = state.as_mut().ok_or_else(|| corrupt("missing head"))?;
         if expected == Some(s.head) {
             *found = true;
@@ -372,7 +387,7 @@ fn scan(
         return Err(corrupt("empty live file or missing opening checkpoint"));
     }
     let mut state = state.ok_or_else(|| corrupt("missing head"))?;
-    if state.pending_resume {
+    if state.pending_resume || boundary_resume {
         return Err(corrupt("resume checkpoint lacks its declaration"));
     }
     state.length = offset;

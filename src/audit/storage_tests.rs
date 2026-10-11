@@ -550,3 +550,127 @@ fn callback_lock_reentry_returns_would_block() {
     fixture(&d.0);
     finish(&mut child(&d.0, "reentrant"));
 }
+
+fn resumed(path: &Path, last: &Record, mmr: &mut Mmr, id: usize, lost: u64) -> Record {
+    fs::rename(path.join("audit.jsonl"), segment(path, id)).unwrap();
+    let opening = cp(lost + 1, last.hash(), mmr);
+    let resume = Record::new(
+        context(lost + 2, opening.hash()),
+        Entry::new("operator", "vigil.audit.resume", "trail")
+            .reason("incident")
+            .details(format!(
+                "head={}:{} lost_through={lost} file={}",
+                last.context.seq,
+                crate::audit::digest_string(&last.hash()),
+                segment(path, id).file_name().unwrap().to_str().unwrap()
+            )),
+    )
+    .unwrap();
+    write_records(path, &[&opening, &resume]);
+    mmr.push(opening.hash()).unwrap();
+    mmr.push(resume.hash()).unwrap();
+    resume
+}
+fn resume_layout(torn: bool, lost: u64) {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let last = entry(&first);
+    append(&d.0.join("audit.jsonl"), &last);
+    let reader = open(&d.0);
+    let lagging = open(&d.0);
+    let mut mmr = seeded(&first);
+    mmr.push(last.hash()).unwrap();
+    if torn {
+        append_bytes(&d.0.join("audit.jsonl"), b"{\"torn\":");
+    }
+    let bytes = fs::read(d.0.join("audit.jsonl")).unwrap();
+    let resume = resumed(&d.0, &last, &mut mmr, 0, lost);
+    assert_eq!(head(&reader), Head::of(&resume));
+    assert_eq!(
+        head(&TrailReader::open(&d.0, TRAIL, Some(Head::of(&resume))).unwrap()),
+        Head::of(&resume)
+    );
+    assert_eq!(fs::read(segment(&d.0, 0)).unwrap(), bytes);
+    let next = rotated(&d.0, &resume, &mut mmr, 1);
+    assert_eq!(head(&lagging), Head::of(&next));
+    assert_eq!(head(&open(&d.0)), Head::of(&next));
+}
+#[test]
+fn resume_after_rollback_accepts_unclosed_segment() {
+    resume_layout(false, 7);
+}
+#[test]
+fn resume_after_torn_tail_accepts_unchanged_segment() {
+    resume_layout(true, 1);
+}
+#[test]
+fn missing_closure_requires_matching_immediate_resume() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let last = entry(&first);
+    append(&d.0.join("audit.jsonl"), &last);
+    let reader = open(&d.0);
+    let mut mmr = seeded(&first);
+    mmr.push(last.hash()).unwrap();
+    let resume = resumed(&d.0, &last, &mut mmr, 0, 1);
+    assert_eq!(head(&open(&d.0)), Head::of(&resume));
+    let opening = cp(2, last.hash(), &seeded_pair(&first, &last));
+    for records in [vec![&opening], vec![&opening, &entry(&opening)]] {
+        write_records(&d.0, &records);
+        reject(reader.with_current(|_| Ok(()), |_, _, _| Ok(())));
+        corrupt_open(&d.0);
+    }
+    let wrong = Record::new(
+        context(3, opening.hash()),
+        Entry::new("operator", "vigil.audit.resume", "trail")
+            .details("head=1:blake3:00 lost_through=1 file=-"),
+    )
+    .unwrap();
+    write_records(&d.0, &[&opening, &wrong]);
+    reject(reader.with_current(|_| Ok(()), |_, _, _| Ok(())));
+    corrupt_open(&d.0);
+}
+fn seeded_pair(first: &Record, last: &Record) -> Mmr {
+    let mut mmr = seeded(first);
+    mmr.push(last.hash()).unwrap();
+    mmr
+}
+#[test]
+fn older_named_fork_is_outside_cached_history_validation() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let reader = open(&d.0);
+    let mut mmr = seeded(&first);
+    let last = rotated(&d.0, &first, &mut mmr, 1);
+    fs::write(segment(&d.0, 0), line(&first)).unwrap();
+    assert_eq!(head(&reader), Head::of(&last));
+    corrupt_open(&d.0);
+}
+#[test]
+fn sealed_segment_is_read_only_even_when_live_is_writable() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let reader = open(&d.0);
+    let mut mmr = seeded(&first);
+    let last = rotated(&d.0, &first, &mut mmr, 0);
+    fs::set_permissions(segment(&d.0, 0), fs::Permissions::from_mode(0o400)).unwrap();
+    assert_eq!(head(&reader), Head::of(&last));
+    assert_eq!(head(&open(&d.0)), Head::of(&last));
+}
+#[test]
+fn intervening_segment_without_closure_or_resume_is_rejected() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let reader = open(&d.0);
+    let mut mmr = seeded(&first);
+    let opening = rotated(&d.0, &first, &mut mmr, 0);
+    let last = entry(&opening);
+    append(&d.0.join("audit.jsonl"), &last);
+    mmr.push(last.hash()).unwrap();
+    fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 1)).unwrap();
+    let next = cp(last.context.seq + 1, last.hash(), &mmr);
+    write_records(&d.0, &[&next, &entry(&next)]);
+    reject(reader.with_current(|_| Ok(()), |_, _, _| Ok(())));
+    corrupt_open(&d.0);
+}
