@@ -1,7 +1,7 @@
 //! Audit v1 format primitives and strict OTLP decoding (ADR-0005), enabled by `audit`.
 //!
-//! This layer performs no I/O and makes no durability or authentication claim
-//! about supplied identities. The durable trail API follows in #11; offline
+//! Public format primitives perform no I/O and make no durability or authentication
+//! claim about supplied identities. The internal reader validates existing storage. The durable trail API follows in #11; offline
 //! trail verification follows in #13. Storage must honour flushes. Local keys
 //! cannot protect a trail against an attacker who can read keys and rewrite it.
 //! These low-level building blocks are provisional until the 1.0 format freeze.
@@ -9,6 +9,8 @@
 mod format;
 mod mmr;
 mod signing;
+#[cfg_attr(not(test), allow(dead_code))] // Internal reader; writes follow in #11.
+pub(crate) mod storage;
 pub use format::{Checkpoint, CheckpointFields, Entry, Record, RecordContext, Value};
 pub use mmr::Mmr;
 pub use signing::{KeySeed, Signer, SignerError, checkpoint_message, verify_signature};

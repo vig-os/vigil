@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 /// Sixteen leaves ample room below serde's 128 JSON levels even for kvlists.
 pub(super) const MAX_CONTEXT_DEPTH: usize = 16;
 /// Maximum encoded payload bytes, excluding the optional final framing LF.
-pub(super) const MAX_PAYLOAD_BYTES: usize = 1_000_000;
+pub(crate) const MAX_PAYLOAD_BYTES: usize = 1_000_000;
 /// Constructs the canonical invalid-field finding.
 pub(super) fn corrupt() -> AuditError {
     finding(FindingKind::InvalidField)

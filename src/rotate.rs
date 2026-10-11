@@ -213,7 +213,8 @@ impl DirLock {
         })
     }
 
-    fn lock_current(&self, path: &Path) -> io::Result<(MutexGuard<'_, File>, Unlock)> {
+    fn lock_current(&self, path: &Path) -> io::Result<(MutexGuard<'_, File>, Unlock, Entered)> {
+        let entered = Entered::new(self as *const Self as usize)?;
         let start = Instant::now();
         let mut dir = lock_ignore_poison(&self.gate);
         // A directory can be renamed away while we wait for its lock. Retry
@@ -225,7 +226,7 @@ impl DirLock {
             let locked = dir.metadata()?;
             match fs::metadata(path) {
                 Ok(current) if (locked.dev(), locked.ino()) == (current.dev(), current.ino()) => {
-                    return Ok((dir, unlock));
+                    return Ok((dir, unlock, entered));
                 }
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -261,6 +262,51 @@ fn warn_slow_lock(path: &Path, elapsed: Duration, warned: &AtomicBool, out: &mut
 
 static REGISTRY: LazyLock<Mutex<HashMap<PathBuf, Weak<DirLock>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Shared locked-section boundary for telemetry and audit storage.
+///
+/// Lock order is registry (released before locking), directory gate, flock,
+/// then caller state. Audit uses its own directory and never nests a logs
+/// lock; a future log mirror (#11) must run after releasing the audit lock.
+/// Same-directory callback reentry returns `io::ErrorKind::WouldBlock`.
+#[derive(Clone)]
+pub(crate) struct Directory {
+    lock: Arc<DirLock>,
+    path: PathBuf,
+}
+impl Directory {
+    #[cfg(all(test, feature = "audit"))]
+    pub(crate) fn shares_lock(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lock, &other.lock)
+    }
+
+    pub(crate) fn open(dir: &Path) -> io::Result<Self> {
+        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        let dir = fs::canonicalize(dir)?;
+        tighten(&dir, 0o700)?;
+        let lock = {
+            let mut registry = lock_ignore_poison(&REGISTRY);
+            registry.retain(|_, w| w.strong_count() > 0);
+            match registry.get(&dir).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(DirLock::open(&dir)?);
+                    registry.insert(dir.clone(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        Ok(Self { lock, path: dir })
+    }
+
+    /// Rechecks the directory identity after waiting; all I/O in `f` must use
+    /// this descriptor. Returning from `f` releases both locks, including on error.
+    #[cfg_attr(not(feature = "audit"), allow(dead_code))]
+    pub(crate) fn with_lock<T>(&self, f: impl FnOnce(&File) -> T) -> io::Result<T> {
+        let (dir, _unlock, _entered) = self.lock.lock_current(&self.path)?;
+        Ok(f(&dir))
+    }
+}
 
 /// Appends whole lines to `<dir>/<signal>.jsonl`, rotating by size and pruning
 /// by age, correctly when many processes write the same file.
@@ -314,25 +360,13 @@ impl RotatingFile {
     ///
     /// # Errors
     ///
-    /// `InvalidInput` unless `signal` matches `[a-z0-9_]+`; otherwise any I/O
-    /// error from creating the directory or file.
+    /// `InvalidInput` unless `signal` matches `[a-z0-9_]+` and is not the reserved
+    /// name `audit`; otherwise any I/O error from creating the directory or file.
+    /// Reentry under the same directory lock returns `WouldBlock`.
     pub fn open(dir: &Path, signal: &str, cfg: RotationConfig) -> io::Result<Self> {
         validate_signal(signal)?;
-        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-        let dir = fs::canonicalize(dir)?;
-        tighten(&dir, 0o700)?;
-        let lock = {
-            let mut registry = lock_ignore_poison(&REGISTRY);
-            registry.retain(|_, w| w.strong_count() > 0);
-            match registry.get(&dir).and_then(Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(DirLock::open(&dir)?);
-                    registry.insert(dir.clone(), Arc::downgrade(&lock));
-                    lock
-                }
-            }
-        };
+        let directory = Directory::open(dir)?;
+        let Directory { lock, path: dir } = directory;
         Self::with_lock(lock, dir, signal, cfg)
     }
 
@@ -344,7 +378,7 @@ impl RotatingFile {
     ) -> io::Result<Self> {
         let live_path = dir.join(format!("{signal}.jsonl"));
         let live = {
-            let (handle, _unlock) = lock.lock_current(&dir)?;
+            let (handle, _unlock, _entered) = lock.lock_current(&dir)?;
             let live = Live::open(&handle, Path::new(&format!("{signal}.jsonl")), signal)?;
             if let Some(keep) = cfg.retention {
                 prune_at(&handle, signal, keep);
@@ -388,7 +422,7 @@ impl RotatingFile {
         buf.extend_from_slice(line);
         buf.push(b'\n');
 
-        let (dir, _unlock) = self.lock.lock_current(&self.dir)?;
+        let (dir, _unlock, _entered) = self.lock.lock_current(&self.dir)?;
         let name = PathBuf::from(format!("{}.jsonl", self.signal));
         let mut live = lock_ignore_poison(&self.live);
 
@@ -429,6 +463,29 @@ impl RotatingFile {
 /// clone of the lock descriptor (same open file description).
 struct Unlock(File);
 
+thread_local! { static HELD: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) }; }
+// Thread-local membership is checked before the non-reentrant gate mutex.
+struct Entered(usize);
+impl Entered {
+    fn new(key: usize) -> io::Result<Self> {
+        HELD.with_borrow_mut(|held| {
+            if held.contains(&key) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "directory lock reentry",
+                ));
+            }
+            held.push(key);
+            Ok(Self(key))
+        })
+    }
+}
+impl Drop for Entered {
+    fn drop(&mut self) {
+        HELD.with_borrow_mut(|held| held.retain(|key| *key != self.0));
+    }
+}
+
 impl Drop for Unlock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
@@ -440,9 +497,10 @@ fn lock_ignore_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Signal names are `[a-z0-9_]+`: no `-`, `.` or `/`, so a live file name can
-/// never parse as a segment of another signal.
+/// never parse as a segment of another signal. `audit` is reserved for audit trails.
 fn validate_signal(signal: &str) -> io::Result<()> {
-    let ok = !signal.is_empty()
+    let ok = signal != "audit"
+        && !signal.is_empty()
         && signal
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
@@ -451,7 +509,7 @@ fn validate_signal(signal: &str) -> io::Result<()> {
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("invalid signal name {signal:?}: expected [a-z0-9_]+"),
+            format!("invalid signal name {signal:?}: expected [a-z0-9_]+ except reserved audit"),
         ))
     }
 }
@@ -668,7 +726,7 @@ fn rotate_with(
     }
 }
 
-fn rotated_names_at(dir: &File, signal: &str) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn rotated_names_at(dir: &File, signal: &str) -> io::Result<Vec<PathBuf>> {
     let mut names = Vec::new();
     for entry in rfs::Dir::read_from(dir)? {
         let entry = entry?;
@@ -688,7 +746,7 @@ fn is_segment_name(name: &str, signal: &str) -> bool {
 }
 
 /// Sort key `(stamp, counter)` of a segment path (chronological).
-fn segment_key(path: &Path, signal: &str) -> (String, u64) {
+pub(crate) fn segment_key(path: &Path, signal: &str) -> (String, u64) {
     path.file_name()
         .and_then(|n| n.to_str())
         .and_then(|n| parse_segment(n, signal))
@@ -1263,6 +1321,7 @@ mod tests {
     fn rejects_bad_signal_names() {
         let d = tmp("badsig");
         for s in [
+            "audit",
             "",
             ".",
             "..",
@@ -2658,12 +2717,12 @@ mod prop_tests {
         }
         #[test]
         fn signal_validation(signal in ".{0,40}") {
-            let valid = !signal.is_empty() && signal.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_');
+            let valid = signal != "audit" && !signal.is_empty() && signal.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_');
             prop_assert_eq!(validate_signal(&signal).is_ok(), valid);
         }
         #[test]
         fn valid_signals(signal in "[a-z0-9_]{1,40}") {
-            prop_assert!(validate_signal(&signal).is_ok());
+            prop_assert_eq!(validate_signal(&signal).is_ok(), signal != "audit");
         }
     }
 }
