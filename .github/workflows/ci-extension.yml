@@ -115,7 +115,7 @@ jobs:
           - map: default
             cargo-args: --no-default-features
           - map: preserve-order
-            cargo-args: --no-default-features --features test-preserve-order
+            cargo-args: --no-default-features --features audit,test-preserve-order
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -136,6 +136,11 @@ jobs:
         run: |
           nix develop -c cargo test --locked $CARGO_ARGS --test golden
           nix develop -c cargo test --locked $CARGO_ARGS --lib ordered
+      - name: Verify audit shuffle, hashes and committed corpus with preserve-order
+        if: ${{ matrix.map == 'preserve-order' }}
+        env:
+          RUSTFLAGS: --cfg vigil_unstable
+        run: nix develop -c cargo test --locked --features audit,test-preserve-order --lib audit
 
   conformance:
     if: ${{ !inputs.label-only }}

@@ -71,6 +71,9 @@ use serde_json::Value as Json;
 
 use crate::sink::LineSink;
 
+/// Maximum container edges from a root log AnyValue at depth zero.
+pub(crate) const MAX_LOG_VALUE_DEPTH: usize = 16;
+
 /// How non-finite `doubleValue`s are spelled: `"NaN"`, `"Infinity"`,
 /// `"-Infinity"`.
 ///
@@ -94,6 +97,10 @@ pub(crate) const NON_FINITE: [&str; 3] = ["NaN", "Infinity", "-Infinity"];
 /// See the [module documentation](self) for the format guarantees and an
 /// example. Oversized records shorten their largest strings first, and carry `vigil.truncated` and `vigil.original_size`
 /// (original single-record line bytes, including the envelope).
+/// Values support at most 16 nested array/map edges from a root value at depth
+/// zero. A record with a deeper body or attribute is omitted and counted in
+/// runtime-loss diagnostics; healthy neighbors are written normally. The guard
+/// runs before recursive SDK conversion, normalization or JSON projection.
 /// The exporter needs no async runtime: the SDK's batch processor
 /// calls it from its own thread and the future it returns is already complete.
 #[derive(Debug)]
@@ -149,16 +156,20 @@ impl<S: LineSink> OtlpJsonLogExporter<S> {
         let mut lost = batch.iter().count();
         let result = (|| {
             let Some(resource_logs) = group_batch(batch, &self.resource) else {
-                lost = 0;
                 return Ok(());
             };
+            let accepted = resource_logs
+                .scope_logs
+                .iter()
+                .map(|scope| scope.log_records.len())
+                .sum();
             let request = ExportLogsServiceRequest {
                 resource_logs: vec![resource_logs],
             };
-            let json = encode_json(&request)
+            let json = project_json(&request)
                 .map_err(|e| OTelSdkError::InternalFailure(format!("encoding log batch: {e}")))?;
             let line = encode_projected(&json).map_err(OTelSdkError::InternalFailure)?;
-            let lines = counted_lines(&line, &json, self.max_line_bytes, lost)
+            let lines = counted_lines(&line, &json, self.max_line_bytes, accepted)
                 .map_err(OTelSdkError::InternalFailure)?;
             for line in lines {
                 self.sink.write_line(line.text.as_bytes()).map_err(|e| {
@@ -217,8 +228,39 @@ fn encode_projected(json: &Json) -> Result<String, String> {
     Ok(line)
 }
 
-/// Projects the typed request using the encoder's body and non-finite rules.
+/// Projects a typed request, refusing values beyond the log depth bound.
+#[cfg(any(test, feature = "audit"))]
 pub(crate) fn encode_json(request: &ExportLogsServiceRequest) -> Result<Json, String> {
+    let values = request.resource_logs.iter().flat_map(|resource| {
+        resource
+            .resource
+            .iter()
+            .flat_map(|r| r.attributes.iter().filter_map(|kv| kv.value.as_ref()))
+            .chain(resource.scope_logs.iter().flat_map(|scope| {
+                scope
+                    .scope
+                    .iter()
+                    .flat_map(|s| s.attributes.iter().filter_map(|kv| kv.value.as_ref()))
+                    .chain(scope.log_records.iter().flat_map(|record| {
+                        record
+                            .body
+                            .iter()
+                            .chain(record.attributes.iter().filter_map(|kv| kv.value.as_ref()))
+                    }))
+            }))
+    });
+    if !values.into_iter().all(|value| proto_depth_ok(value, 0)) {
+        return Err(format!(
+            "log value exceeds maximum depth {MAX_LOG_VALUE_DEPTH}"
+        ));
+    }
+    project_json(request)
+}
+
+// The exporter checks SDK values before converting them; resource and scope
+// SDK attributes contain only scalars/primitive arrays. Audit enters via the
+// guarded encode_json above, so every recursive projection has bounded depth.
+fn project_json(request: &ExportLogsServiceRequest) -> Result<Json, String> {
     // Maps hold the upstream OTLP projection and non-finite patches only.
     // Explicit ordered serialization owns all final field ordering.
     let mut json = serde_json::to_value(request).map_err(|e| e.to_string())?;
@@ -565,6 +607,37 @@ fn cut_string(text: &mut String, overflow: usize, base64: bool) {
     text.truncate(end);
 }
 
+fn sdk_depth_ok(value: &opentelemetry::logs::AnyValue, depth: usize) -> bool {
+    use opentelemetry::logs::AnyValue as SdkValue;
+    if depth > MAX_LOG_VALUE_DEPTH {
+        return false;
+    }
+    match value {
+        SdkValue::ListAny(values) => values.iter().all(|value| sdk_depth_ok(value, depth + 1)),
+        SdkValue::Map(values) => values.values().all(|value| sdk_depth_ok(value, depth + 1)),
+        _ => true,
+    }
+}
+
+#[cfg(any(test, feature = "audit"))]
+fn proto_depth_ok(value: &AnyValue, depth: usize) -> bool {
+    if depth > MAX_LOG_VALUE_DEPTH {
+        return false;
+    }
+    match &value.value {
+        Some(Value::ArrayValue(array)) => array
+            .values
+            .iter()
+            .all(|value| proto_depth_ok(value, depth + 1)),
+        Some(Value::KvlistValue(list)) => list
+            .values
+            .iter()
+            .filter_map(|kv| kv.value.as_ref())
+            .all(|value| proto_depth_ok(value, depth + 1)),
+        _ => true,
+    }
+}
+
 // ---- grouping and normalization -------------------------------------------
 
 /// Group a batch by scope, deterministically, or `None` for an empty batch.
@@ -584,6 +657,13 @@ fn group_batch(
     type Key = (String, String, String, String);
     let mut scopes: BTreeMap<Key, ScopeLogs> = BTreeMap::new();
     for (record, instrumentation) in batch.iter() {
+        if !record.body().is_none_or(|value| sdk_depth_ok(value, 0))
+            || !record
+                .attributes_iter()
+                .all(|(_, value)| sdk_depth_ok(value, 0))
+        {
+            continue;
+        }
         // The target overrides only the scope name.
         let name = record
             .target()
@@ -1101,6 +1181,72 @@ mod loss_tests {
     }
 
     #[test]
+    fn overdeep_sdk_records_are_counted_before_conversion() {
+        use opentelemetry::logs::AnyValue as SdkValue;
+        for depth in [MAX_LOG_VALUE_DEPTH, MAX_LOG_VALUE_DEPTH + 1, 10_000] {
+            for map in [false, true] {
+                for attribute in [false, true] {
+                    let provider = SdkLoggerProvider::builder().build();
+                    let logger = provider.logger("depth");
+                    let scope = opentelemetry::InstrumentationScope::builder("depth").build();
+                    let mut value = SdkValue::from("leaf");
+                    for _ in 0..depth {
+                        value = if map {
+                            SdkValue::Map(Box::new(
+                                [(opentelemetry::Key::from("nested"), value)].into(),
+                            ))
+                        } else {
+                            SdkValue::ListAny(Box::new(vec![value]))
+                        };
+                    }
+                    let mut record = logger.create_log_record();
+                    record.set_observed_timestamp(std::time::UNIX_EPOCH);
+                    if attribute {
+                        record.add_attribute("nested", value);
+                    } else {
+                        record.set_body(value);
+                    }
+                    // The exporter borrows SDK input. Its caller's derived
+                    // recursive Drop is upstream; keep that input alive for
+                    // this test process, including the 10,000-edge fixture.
+                    let record = Box::leak(Box::new(record));
+                    let mut healthy = logger.create_log_record();
+                    healthy.set_observed_timestamp(std::time::UNIX_EPOCH);
+                    healthy.set_body("healthy".into());
+                    let sink = crate::sink::MemorySink::new();
+                    let exporter = OtlpJsonLogExporter::new(sink.clone());
+                    let accepted = depth == MAX_LOG_VALUE_DEPTH;
+                    exporter
+                        .export_batch(&LogBatch::new(&[(record, &scope), (&healthy, &scope)]))
+                        .unwrap();
+                    let lines = sink.lines();
+                    assert_eq!(lines.len(), 1);
+                    let json: Json = serde_json::from_str(&lines[0]).unwrap();
+                    assert_eq!(
+                        json["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        if accepted { 2 } else { 1 }
+                    );
+                    assert!(lines[0].contains("healthy"));
+                    assert_eq!(exporter.take_dropped_records(), usize::from(!accepted));
+                    assert_eq!(exporter.take_dropped_records(), 0);
+                    if !accepted {
+                        let sink = crate::sink::MemorySink::new();
+                        let exporter = OtlpJsonLogExporter::new(sink.clone());
+                        exporter
+                            .export_batch(&LogBatch::new(&[(record, &scope)]))
+                            .unwrap();
+                        assert!(sink.lines().is_empty());
+                        assert_eq!(exporter.take_dropped_records(), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn failed_split_line_counts_only_missing_records_and_written_stubs() {
         for stub_first in [false, true] {
             let exporter = OtlpJsonLogExporter::new(FailSecond::default()).with_max_line_bytes(800);
@@ -1204,8 +1350,31 @@ mod ordered_tests {
     }
 
     #[test]
-    fn encoding_does_not_add_a_nesting_limit() {
-        assert!(encode_line(&nested_request(140)).unwrap().contains("leaf"));
+    fn encoding_obeys_depth_bound() {
+        for depth in [MAX_LOG_VALUE_DEPTH, MAX_LOG_VALUE_DEPTH + 1, 10_000] {
+            let mut request = nested_request(depth);
+            let result = encode_line(&request);
+            assert_eq!(result.is_ok(), depth == MAX_LOG_VALUE_DEPTH);
+            if depth > MAX_LOG_VALUE_DEPTH {
+                assert!(result.unwrap_err().contains("maximum depth"));
+            }
+            // Tear down this owned prost fixture iteratively; its generated
+            // Drop is outside the borrowed encoder's depth contract.
+            let body = request.resource_logs[0].scope_logs[0].log_records[0]
+                .body
+                .take()
+                .unwrap();
+            let mut pending = vec![body];
+            while let Some(mut value) = pending.pop() {
+                match value.value.take() {
+                    Some(Value::ArrayValue(array)) => pending.extend(array.values),
+                    Some(Value::KvlistValue(list)) => {
+                        pending.extend(list.values.into_iter().filter_map(|kv| kv.value))
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     fn assert_split_preserves_record(mut request: ExportLogsServiceRequest) {
@@ -1228,9 +1397,8 @@ mod ordered_tests {
     }
 
     #[test]
-    fn splitting_preserves_deep_nesting_and_finite_doubles() {
-        // Straddle the old JSON parser's 128-container limit, then go far beyond.
-        for depth in [39, 40, 41, 140] {
+    fn splitting_preserves_bounded_nesting_and_finite_doubles() {
+        for depth in [0, MAX_LOG_VALUE_DEPTH - 1, MAX_LOG_VALUE_DEPTH] {
             assert_split_preserves_record(nested_request(depth));
         }
         let mut request = nested_request(0);

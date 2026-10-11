@@ -18,6 +18,7 @@ pub(crate) fn encode(value: &Value, context: &str, rules: Rules) -> Result<Strin
         value,
         context,
         rules,
+        priority: None,
     })
     .map_err(|e| e.to_string())
 }
@@ -26,44 +27,89 @@ struct Ordered<'a> {
     value: &'a Value,
     context: &'a str,
     rules: Rules,
+    priority: Option<&'static [&'static str]>,
+}
+
+impl Ordered<'_> {
+    fn priority(&self) -> &'static [&'static str] {
+        self.priority.unwrap_or_else(|| {
+            self.rules
+                .iter()
+                .find(|(name, _)| *name == self.context)
+                .map_or(&[][..], |(_, keys)| *keys)
+        })
+    }
 }
 
 impl Serialize for Ordered<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self.value {
             Value::Object(fields) => {
-                let first = self
-                    .rules
-                    .iter()
-                    .find(|(name, _)| *name == self.context)
-                    .map_or(&[][..], |(_, keys)| *keys);
-                let mut fields: Vec<_> = fields.iter().collect();
-                fields.sort_unstable_by_key(|(key, _)| {
-                    (
-                        first.iter().position(|k| k == key).unwrap_or(first.len()),
-                        key.as_str(),
-                    )
-                });
                 let mut map = serializer.serialize_map(Some(fields.len()))?;
-                for (key, value) in fields {
+                let entry = |map: &mut S::SerializeMap, key: &String, value: &Value| {
                     map.serialize_entry(
                         key,
                         &Ordered {
                             value,
                             context: key,
                             rules: self.rules,
+                            priority: None,
                         },
-                    )?;
+                    )
+                };
+                // AnyValue wrappers usually have one field: no ordering work.
+                if fields.len() <= 1 {
+                    for (key, value) in fields {
+                        entry(&mut map, key, value)?;
+                    }
+                    return map.end();
+                }
+                let first = self.priority();
+                // KeyValue and other two-field objects need one comparison.
+                if first.is_empty() && fields.len() == 2 {
+                    let mut fields = fields.iter();
+                    if let (Some(a), Some(b)) = (fields.next(), fields.next()) {
+                        let (a, b) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+                        entry(&mut map, a.0, a.1)?;
+                        entry(&mut map, b.0, b.1)?;
+                        return map.end();
+                    }
+                }
+                // Priority lookup avoids collecting/sorting the envelope and
+                // record fields. The remaining keys only need lexical order.
+                for key in first {
+                    if let Some((key, value)) = fields.get_key_value(*key) {
+                        entry(&mut map, key, value)?;
+                    }
+                }
+                let remaining = || {
+                    fields
+                        .iter()
+                        .filter(|(key, _)| !first.contains(&key.as_str()))
+                };
+                if fields.keys().is_sorted() {
+                    for (key, value) in remaining() {
+                        entry(&mut map, key, value)?;
+                    }
+                } else {
+                    let mut remaining: Vec<_> = remaining().collect();
+                    remaining.sort_unstable_by_key(|(key, _)| key.as_str());
+                    for (key, value) in remaining {
+                        entry(&mut map, key, value)?;
+                    }
                 }
                 map.end()
             }
             Value::Array(values) => {
                 let mut seq = serializer.serialize_seq(Some(values.len()))?;
+                // Every array element shares its containing field's rules.
+                let priority = self.priority();
                 for value in values {
                     seq.serialize_element(&Ordered {
                         value,
                         context: self.context,
                         rules: self.rules,
+                        priority: Some(priority),
                     })?;
                 }
                 seq.end()
