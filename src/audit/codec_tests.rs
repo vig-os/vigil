@@ -628,3 +628,46 @@ fn repaired_digest_roundtrips_and_rejects_tampering() {
         );
     }
 }
+
+#[test]
+fn codec_shuffled_keys_preserve_canonical_hash() {
+    fn reverse_keys(value: &Json) -> String {
+        match value {
+            Json::Object(map) => format!(
+                "{{{}}}",
+                map.iter()
+                    .rev()
+                    .map(|(key, value)| {
+                        format!(
+                            "{}:{}",
+                            serde_json::to_string(key).unwrap(),
+                            reverse_keys(value)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            Json::Array(values) => format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(reverse_keys)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            scalar => scalar.to_string(),
+        }
+    }
+    for line in GOLDEN.lines() {
+        let original = Record::parse_line(line.as_bytes()).unwrap();
+        let json: Json = serde_json::from_str(line).unwrap();
+        let shuffled = reverse_keys(&json);
+        assert_ne!(shuffled, line);
+        let decoded = Record::parse_line(shuffled.as_bytes()).unwrap();
+        assert_eq!(decoded.len(), original.len());
+        for (before, after) in original.iter().zip(&decoded) {
+            assert_eq!(before.canonical(), after.canonical());
+            assert_eq!(before.hash(), after.hash());
+        }
+    }
+}

@@ -406,7 +406,30 @@ Slow disks, CPU contention, large attributes, retention scans and uncached
 metadata can exceed these budgets. Initialization is a one-time cost per
 process; initialize after fork.
 
-Measurement details:
+### Ordered-writer instruction budget (#64)
+
+Alongside the [#49](https://github.com/vig-os/vigil/issues/49) disk budgets,
+[#64](https://github.com/vig-os/vigil/issues/64) targeted **≤1.05× base
+instructions per golden-batch export**. On 2026-10-11, `perf stat -e
+instructions:u` measured **629,241 base versus 665,921 head instructions/export
+(1.058×)**, narrowly missing that target. Base was dev `cffecf0`; head was
+`2eed87c`. Identical release harnesses constructed the fixed golden batch once,
+then exported it 10,000 times to a discard sink per process; the numbers average
+three runs per revision, amortizing initialization. These instruction counts
+are separate from the disk elapsed-time budgets and CI timing advisory.
+
+A scratch-only ablation without the SDK depth guard measured **629,063 base
+versus 664,066 head instructions/export (1.056×)**, so most residual overhead
+comes from explicit ordered emission. Fast paths emit single-field objects
+directly, compare two-field objects once, resolve priority rules once per array,
+and avoid collecting/sorting already alphabetically ordered maps after priority
+lookup. The remaining work preserves explicit priority-key emission around the
+upstream OTLP projection and the required depth validation. Further removal
+would require duplicating the upstream OTLP serializer or bypassing the depth
+guard; the shared serializer and bounded-input contract are retained. Both
+builds and all six perf runs for each comparison exited 0.
+
+### Measurement details
 
 - Append: each fresh child opens its own `RotatingFile`, reports ready, then
   waits for the parent to release it. One or eight children each append 4,096

@@ -42,7 +42,11 @@ To regenerate, set `VIGIL_CORPUS_PATH` to a fresh output path and run
 `cargo test --lib --features audit regenerate_writer_corpus -- --ignored --nocapture`
 in the dev shell. Compress that output with Python `gzip.compress(..., mtime=0)`
 and update the digest from the printed BLAKE3. The ignored test is an explicit
-fixture-writing utility; both verification tests run normally in CI.
+fixture-writing utility; the fixed-seed digest and committed gzip verification
+tests run normally in CI.
+The committed gzip test decodes all 256 lines with `Record::parse_line` and
+checks their time-first ordering. The #64 regeneration changes only JSON key
+order; canonical protobuf bytes and audit hashes remain unchanged.
 
 The production mapping and reader share context validation. The generator now
 includes empty/duplicate/NUL/random keys, absent KeyValue/AnyValue values, empty

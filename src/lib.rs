@@ -75,3 +75,5 @@ mod tests {
         assert_eq!(super::VERSION, env!("CARGO_PKG_VERSION"));
     }
 }
+
+mod ordered_json;
