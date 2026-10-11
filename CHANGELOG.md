@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Opt-in `audit` v1 format primitives: validated entries, canonical encoding, domain-separated record hashes and checkpoint signatures, resumable tessera-compatible MMR, and raw-hex key parsing (seed/public-key ambiguity documented); BSD-3-Clause exceptions are scoped to the three reviewed crypto crates ([#12](https://github.com/vig-os/vigil/issues/12), [#11](https://github.com/vig-os/vigil/issues/11)).
 - Independent MSRV and latest-stable CI build and test all features, verify `rust-version`, and check the Apple target at the MSRV ([#45](https://github.com/vig-os/vigil/issues/45)).
+- Fallible `Guard::flush`, `shutdown` and `shutdown_with_timeout`, with `FlushError`, `FlushErrorKind` and `Signal` reporting period loss lower bounds, timeout precedence and queue overflow on every flush independently of consumer filters; Drop prints only unreported losses and shutdown falls back inline if thread creation fails (ADR-0004 decisions 2, 3 and 5; [#42](https://github.com/vig-os/vigil/issues/42)).
 
 - ADR-0004 configuration and composition APIs: `Config::layer`, `Console`, `Config::filter_env`, `Config::default_filter`, `Guard::dir`, and typed `InitErrorKind` errors; duration-based `Config::retention` and validated `RotationConfig` builders ([#42](https://github.com/vig-os/vigil/issues/42), [#36](https://github.com/vig-os/vigil/issues/36)).
 - Semver CI compares the stable API against the merge base with `dev`, excludes unstable items despite inherited Cargo flags and rejects self-comparisons and zero-check passes ([#43](https://github.com/vig-os/vigil/issues/43)).
@@ -39,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Shutdown stops recording before draining; explicit shutdown reports losses to the caller without repeating them on stderr, and Drop reports them once. Failed durable log lines count only records not already written, plus diagnostic replacements (ADR-0003 decisions 3, 4 and 23; [#42](https://github.com/vig-os/vigil/issues/42)).
+
 - **Breaking:** one successful pipeline permanently occupies the process slot, including after shutdown. Filters apply per layer; empty filter variables count as unset, and explicit `retention(None)` overrides environment retention ([#42](https://github.com/vig-os/vigil/issues/42)).
 - **Breaking:** make `RotationConfig` fields private and remove `Copy` ([#42](https://github.com/vig-os/vigil/issues/42)).
 
@@ -49,5 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** remove `Config::retention_days`; use `Config::retention(Option<Duration>)` ([#42](https://github.com/vig-os/vigil/issues/42)).
 
 ### Fixed
+
+- Isolate subscriber-installing library tests in child processes; CI also runs plain Cargo tests for all targets and features with default and single test threads ([#42](https://github.com/vig-os/vigil/issues/42)).
 
 ### Security

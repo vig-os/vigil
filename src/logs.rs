@@ -123,33 +123,41 @@ impl<S: LineSink> OtlpJsonLogExporter<S> {
     }
 
     // The initialization wrapper combines replacements and failed exports in
-    // its bounded cumulative runtime-loss diagnostics.
+    // its bounded cumulative runtime-loss diagnostics. This includes records
+    // in failed/unwritten lines and successfully written diagnostic stubs.
     pub(crate) fn take_dropped_records(&self) -> usize {
         self.dropped_records.swap(0, Ordering::Relaxed)
     }
 
     fn export_batch(&self, batch: &LogBatch<'_>) -> OTelSdkResult {
-        let Some(resource_logs) = group_batch(batch, &self.resource) else {
-            return Ok(());
-        };
-        let line = encode_line(&ExportLogsServiceRequest {
-            resource_logs: vec![resource_logs],
-        })
-        .map_err(|e| OTelSdkError::InternalFailure(format!("encoding log batch: {e}")))?;
-        let mut dropped = 0;
-        let lines = bounded_lines_counted(&line, self.max_line_bytes, &mut dropped)
-            .map_err(OTelSdkError::InternalFailure)?;
+        // Count only records whose original durable copy is missing. Earlier
+        // successful lines in a split batch must not be counted on a later error.
+        let mut lost = batch.iter().count();
+        let result = (|| {
+            let Some(resource_logs) = group_batch(batch, &self.resource) else {
+                lost = 0;
+                return Ok(());
+            };
+            let line = encode_line(&ExportLogsServiceRequest {
+                resource_logs: vec![resource_logs],
+            })
+            .map_err(|e| OTelSdkError::InternalFailure(format!("encoding log batch: {e}")))?;
+            let lines = counted_lines(&line, self.max_line_bytes, lost)
+                .map_err(OTelSdkError::InternalFailure)?;
+            for line in lines {
+                self.sink.write_line(line.text.as_bytes()).map_err(|e| {
+                    OTelSdkError::InternalFailure(format!("writing log batch: {e}"))
+                })?;
+                lost -= line.records - line.stubs;
+            }
+            Ok(())
+        })();
         let _ = self
             .dropped_records
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                Some(count.saturating_add(dropped))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_add(lost))
             });
-        for line in lines {
-            self.sink
-                .write_line(line.as_bytes())
-                .map_err(|e| OTelSdkError::InternalFailure(format!("writing log batch: {e}")))?;
-        }
-        Ok(())
+        result
     }
 }
 
@@ -203,13 +211,30 @@ fn bounded_lines(line: &str, limit: usize) -> Result<Vec<String>, String> {
     bounded_lines_counted(line, limit, &mut 0)
 }
 
+#[cfg(test)]
 fn bounded_lines_counted(
     line: &str,
     limit: usize,
     dropped: &mut usize,
 ) -> Result<Vec<String>, String> {
+    let lines = counted_lines(line, limit, 0)?;
+    *dropped = dropped.saturating_add(lines.iter().map(|line| line.stubs).sum::<usize>());
+    Ok(lines.into_iter().map(|line| line.text).collect())
+}
+
+struct CountedLine {
+    text: String,
+    records: usize,
+    stubs: usize,
+}
+
+fn counted_lines(line: &str, limit: usize, records: usize) -> Result<Vec<CountedLine>, String> {
     if line.len() <= limit {
-        return Ok(vec![line.to_owned()]);
+        return Ok(vec![CountedLine {
+            text: line.to_owned(),
+            records,
+            stubs: 0,
+        }]);
     }
     let request: Json = serde_json::from_str(line).map_err(|e| e.to_string())?;
     let mut lines = Vec::new();
@@ -220,6 +245,8 @@ fn bounded_lines_counted(
         );
         let mut current = resource_prefix.clone();
         let mut has_scopes = false;
+        let mut records = 0;
+        let mut stubs = 0;
         for scope in resource["scopeLogs"].as_array().into_iter().flatten() {
             let scope_prefix = array_prefix(scope, "logRecords");
             // Closing the record array, scope, scope array, resource, resource
@@ -228,7 +255,6 @@ fn bounded_lines_counted(
             let mut open = false;
             for record in scope["logRecords"].as_array().into_iter().flatten() {
                 let (text, replaced) = fit_record(record, overhead, limit)?;
-                *dropped = dropped.saturating_add(usize::from(replaced));
                 let extra = if open {
                     1
                 } else {
@@ -239,7 +265,13 @@ fn bounded_lines_counted(
                         current.push_str("]}");
                     }
                     current.push_str("]}]}");
-                    lines.push(current);
+                    lines.push(CountedLine {
+                        text: current,
+                        records,
+                        stubs,
+                    });
+                    records = 0;
+                    stubs = 0;
                     current = resource_prefix.clone();
                     has_scopes = false;
                     open = false;
@@ -255,6 +287,8 @@ fn bounded_lines_counted(
                     current.push(',');
                 }
                 current.push_str(&text);
+                records += 1;
+                stubs += usize::from(replaced);
             }
             if open {
                 current.push_str("]}");
@@ -262,7 +296,11 @@ fn bounded_lines_counted(
         }
         if has_scopes {
             current.push_str("]}]}");
-            lines.push(current);
+            lines.push(CountedLine {
+                text: current,
+                records,
+                stubs,
+            });
         }
     }
     Ok(lines)
@@ -994,5 +1032,67 @@ mod size_tests {
             exporter.with_max_line_bytes(usize::MAX).max_line_bytes,
             1_048_575
         );
+    }
+}
+
+#[cfg(test)]
+mod loss_tests {
+    use super::*;
+    use opentelemetry::logs::{LogRecord as _, Logger as _, LoggerProvider as _};
+    use opentelemetry_sdk::logs::SdkLoggerProvider;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct FailSecond(Mutex<Vec<String>>);
+    impl LineSink for FailSecond {
+        fn write_line(&self, line: &[u8]) -> std::io::Result<()> {
+            let mut written = self.0.lock().unwrap();
+            if !written.is_empty() {
+                return Err(std::io::Error::other("durable line rejected"));
+            }
+            written.push(String::from_utf8(line.to_vec()).unwrap());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_split_line_counts_only_missing_records_and_written_stubs() {
+        for stub_first in [false, true] {
+            let exporter = OtlpJsonLogExporter::new(FailSecond::default()).with_max_line_bytes(800);
+            let provider = SdkLoggerProvider::builder().build();
+            let logger = provider.logger("loss");
+            let scope = opentelemetry::InstrumentationScope::builder("loss").build();
+            let mut records: Vec<_> = (0..3)
+                .map(|_| {
+                    let mut record = logger.create_log_record();
+                    record.set_observed_timestamp(std::time::SystemTime::now());
+                    record.set_body("x".repeat(450).into());
+                    record
+                })
+                .collect();
+            if stub_first {
+                for index in 0..100 {
+                    records[0].add_attribute(format!("integer-{index}"), 42_i64);
+                }
+            }
+            let batch: Vec<_> = records.iter().map(|record| (record, &scope)).collect();
+            assert!(exporter.export_batch(&LogBatch::new(&batch)).is_err());
+            let written = exporter.sink.0.lock().unwrap();
+            assert_eq!(written.len(), 1);
+            let data: Json = serde_json::from_str(&written[0]).unwrap();
+            assert_eq!(
+                data["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(written[0].contains("vigil.dropped"), stub_first);
+            assert_eq!(
+                exporter.take_dropped_records(),
+                if stub_first { 3 } else { 2 }
+            );
+            assert_eq!(exporter.take_dropped_records(), 0);
+        }
     }
 }
