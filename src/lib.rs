@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod init;
-pub use init::{Config, Guard, InitError, init};
+pub use init::{Config, Console, Guard, InitError, InitErrorKind, init};
 
 pub mod logs;
 pub mod rotate;

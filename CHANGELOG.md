@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** ADR-0004 decisions 2 and 3 add consumer-owned Registry composition, configurable filter variables/defaults, stderr console output, the permanent one-pipeline rule, `Guard::dir`, and typed initialization errors; empty filter variables now count as unset ([#42](https://github.com/vig-os/vigil/issues/42), [#36](https://github.com/vig-os/vigil/issues/36)).
 - **Breaking:** apply ADR-0004 decisions 2 and 5: replace `Config::retention_days` with `retention(Option<Duration>)`; make `RotationConfig` fields private, add validated builders, and remove `Copy` ([#42](https://github.com/vig-os/vigil/issues/42)).
 
 ### Deprecated

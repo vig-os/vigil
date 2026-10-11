@@ -1,8 +1,8 @@
 //! Process-wide tracing initialization.
 use std::{
     env, fmt,
-    io::Write,
-    path::PathBuf,
+    io::{IsTerminal, Write},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -18,27 +18,109 @@ use opentelemetry_sdk::{
         BatchConfigBuilder, BatchLogProcessor, LogBatch, LogExporter, SdkLogger, SdkLoggerProvider,
     },
 };
-use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, registry::Registry, reload};
+use tracing_subscriber::{
+    EnvFilter, Layer,
+    layer::SubscriberExt,
+    registry::{LookupSpan, Registry},
+};
 
 use crate::{
     logs::OtlpJsonLogExporter,
     rotate::{RotatingFile, RotationConfig},
 };
 
-/// A programming error: invalid service name or an already installed subscriber.
+/// A mistake the caller can correct in code. Environmental failures degrade
+/// to stderr. Concrete error sources are not part of the stability promise;
+/// downcasting them is unsupported.
 #[derive(Debug)]
-pub struct InitError(String);
+pub struct InitError {
+    kind: InitErrorKind,
+    message: String,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
 
-const MAX_QUEUE_SIZE: usize = 1_048_576;
-type LogLayer = Box<dyn Layer<Registry> + Send + Sync>;
-type BaseSubscriber = tracing_subscriber::layer::Layered<LogLayer, Registry>;
-type DestinationLayer = Box<dyn Layer<BaseSubscriber> + Send + Sync>;
-impl fmt::Display for InitError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+/// Why initialization failed.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitErrorKind {
+    /// A vigil pipeline exists or another call has reserved the process slot.
+    /// Reuse the pipeline; shutdown does not permit a second one.
+    AlreadyRunning,
+    /// Another crate installed the global subscriber. Compose with `layer`
+    /// into its Registry instead, or remove the other initialization.
+    ForeignSubscriber,
+    /// The service name violates the rule documented by `Config::new`.
+    InvalidServiceName,
+    /// The configured default filter cannot be parsed.
+    InvalidFilter,
+}
+
+/// Human-readable stderr output. Its format may change; never parse it.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Console {
+    /// No additional console layer (the default).
+    #[default]
+    Off,
+    /// Human-readable stderr, with ANSI only when stderr is a terminal.
+    Stderr,
+}
+
+impl InitError {
+    /// The caller-actionable category of this error.
+    pub fn kind(&self) -> InitErrorKind {
+        self.kind
+    }
+
+    fn new(kind: InitErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            source: None,
+        }
     }
 }
-impl std::error::Error for InitError {}
+
+const MAX_QUEUE_SIZE: usize = 1_048_576;
+static PIPELINE: AtomicBool = AtomicBool::new(false);
+type PipelineLayer<S> = Box<dyn Layer<S> + Send + Sync + 'static>;
+
+// A failed attempt releases the reservation; successful pipelines retain it
+// forever, including after shutdown.
+struct Reservation(bool);
+impl Reservation {
+    fn acquire() -> Result<Self, InitError> {
+        PIPELINE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self(true))
+            .map_err(|_| {
+                InitError::new(
+                    InitErrorKind::AlreadyRunning,
+                    "vigil pipeline already running; global tracing subscriber remains installed",
+                )
+            })
+    }
+    fn commit(mut self) {
+        self.0 = false;
+    }
+}
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.0 {
+            PIPELINE.store(false, Ordering::Release);
+        }
+    }
+}
+impl fmt::Display for InitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for InitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|source| &**source as _)
+    }
+}
 
 /// Owns the batch processor. Keep this alive until logging is finished.
 /// Drop waits up to five seconds, including time blocked on the directory lock.
@@ -49,6 +131,13 @@ impl std::error::Error for InitError {}
 pub struct Guard {
     provider: Option<SdkLoggerProvider>,
     stopped: Arc<AtomicBool>,
+    dir: Option<PathBuf>,
+}
+impl Guard {
+    /// The actual log directory, or `None` when storage fell back to stderr.
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
 }
 impl Drop for Guard {
     fn drop(&mut self) {
@@ -66,6 +155,7 @@ impl Drop for Guard {
 
 /// Initialize logs with default configuration. See [`Config`] for overrides.
 ///
+/// `let _ = vigil::init(..)` drops the guard immediately.
 /// Keep the returned guard alive: dropping it drains and shuts down the batch
 /// processor. Its default 65,536-record queue uses memory proportional to
 /// queue size times record size. Overflow drops records with a stderr warning.
@@ -86,7 +176,9 @@ impl Drop for Guard {
 /// context integration is planned for the metrics and traces release.
 ///
 /// # Errors
-/// Returns an error for an invalid service name or an existing global subscriber.
+/// Returns `AlreadyRunning`, `ForeignSubscriber`, `InvalidServiceName`
+/// or `InvalidFilter`. Use nextest for one process per test, or share one
+/// pipeline per test binary.
 pub fn init(service: impl Into<String>) -> Result<Guard, InitError> {
     Config::new(service).init()
 }
@@ -103,6 +195,9 @@ pub struct Config {
     retention: Option<Option<Duration>>,
     version: Option<String>,
     revision: Option<String>,
+    filter_env: String,
+    default_filter: String,
+    console: Console,
 }
 impl Config {
     /// Configure a service. Names may contain ASCII letters, digits, `-`, `_`,
@@ -117,6 +212,9 @@ impl Config {
             retention: None,
             version: None,
             revision: None,
+            filter_env: "RUST_LOG".into(),
+            default_filter: "info".into(),
+            console: Console::Off,
         }
     }
     /// Full state directory; overrides `VIGIL_DIR`.
@@ -169,16 +267,107 @@ impl Config {
         self.revision = Some(revision.into());
         self
     }
-    /// Install the global subscriber and start the batch processor.
+    /// Read log directives from this environment variable (default `RUST_LOG`).
+    /// Unset or empty values use `default_filter`; invalid values warn and
+    /// use that default.
+    #[must_use]
+    pub fn filter_env(mut self, name: impl Into<String>) -> Self {
+        self.filter_env = name.into();
+        self
+    }
+    /// Filter when the selected environment variable is unset or empty
+    /// (default `info`). Invalid directives return `InvalidFilter`.
+    #[must_use]
+    pub fn default_filter(mut self, directives: impl Into<String>) -> Self {
+        self.default_filter = directives.into();
+        self
+    }
+    /// Add a human-readable stderr layer with the same filter. The format
+    /// is for people and may change in any release; files are machine-readable.
+    #[must_use]
+    pub fn console(mut self, console: Console) -> Self {
+        self.console = console;
+        self
+    }
+    /// Install the global subscriber and LogTracer using the same pipeline
+    /// as `layer`. Keep the guard alive; `let _ = ...` drops it immediately.
+    ///
+    /// Tests use one process per test with nextest, or one shared pipeline
+    /// per binary. A successful pipeline permanently occupies the process slot.
     ///
     /// # Errors
-    /// Returns an error for an invalid service name or existing global subscriber.
+    /// Returns `AlreadyRunning`, `ForeignSubscriber`, `InvalidServiceName`
+    /// or `InvalidFilter`. A failed attempt releases its pipeline reservation.
     pub fn init(self) -> Result<Guard, InitError> {
-        if tracing::dispatcher::has_been_set() {
-            return Err(InitError(
-                "cannot install global tracing subscriber: already set".into(),
+        self.init_with(|| {})
+    }
+
+    fn init_with(self, before_install: impl FnOnce()) -> Result<Guard, InitError> {
+        if PIPELINE.load(Ordering::Acquire) {
+            return Err(InitError::new(
+                InitErrorKind::AlreadyRunning,
+                "vigil pipeline already running; global tracing subscriber remains installed",
             ));
         }
+        if tracing::dispatcher::has_been_set() {
+            return Err(InitError::new(
+                InitErrorKind::ForeignSubscriber,
+                "cannot install global tracing subscriber: another subscriber is set",
+            ));
+        }
+        let reservation = Reservation::acquire()?;
+        let (layer, guard) = self.build_layer::<Registry>()?;
+        before_install();
+        if let Err(source) =
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
+        {
+            drop(guard); // Shutdown and close storage after losing the install race.
+            return Err(InitError {
+                kind: InitErrorKind::ForeignSubscriber,
+                message: format!("cannot install global tracing subscriber: {source}"),
+                source: Some(Box::new(source)),
+            });
+        }
+        reservation.commit();
+        if tracing_log::LogTracer::init().is_err() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "vigil: a `log` logger is already installed; `log` records won't reach vigil"
+            );
+        }
+        Ok(guard)
+    }
+
+    /// Build a pipeline for a consumer-owned `Registry`, without installing
+    /// the global subscriber or LogTracer. The consumer installs its Registry;
+    /// `SubscriberInitExt::init()` also installs LogTracer.
+    ///
+    /// Includes per-layer filtering, SDK diagnostics, recursion exclusion,
+    /// post-shutdown filtering and the optional console. Other layers retain
+    /// their own filters. Tests use nextest (one process per test), or share
+    /// one pipeline per binary; dropping its guard stops it permanently.
+    ///
+    /// # Errors
+    /// Returns `AlreadyRunning`, `InvalidServiceName` or `InvalidFilter`.
+    /// Failed attempts release the reservation. Shutdown does not.
+    ///
+    /// # Panics
+    /// Adding this layer panics unless `S` is `Registry` or a stack of
+    /// layers built on it: per-layer filters require Registry bookkeeping.
+    pub fn layer<S>(self) -> Result<(Box<dyn Layer<S> + Send + Sync + 'static>, Guard), InitError>
+    where
+        S: tracing::Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
+    {
+        let reservation = Reservation::acquire()?;
+        let result = self.build_layer()?;
+        reservation.commit();
+        Ok(result)
+    }
+
+    fn build_layer<S>(self) -> Result<(PipelineLayer<S>, Guard), InitError>
+    where
+        S: tracing::Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
+    {
         if self.service.is_empty()
             || self.service == "."
             || self.service == ".."
@@ -187,20 +376,26 @@ impl Config {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
         {
-            return Err(InitError(
-                "invalid service name: expected ASCII letters, digits, '-', '_' or '.'".into(),
+            return Err(InitError::new(
+                InitErrorKind::InvalidServiceName,
+                "invalid service name: expected ASCII letters, digits, '-', '_' or '.'",
             ));
         }
-        // Reserve the global subscriber before storage or provider side effects.
-        // The reload handle attaches the destination once storage is ready.
-        let filter = match env::var_os("RUST_LOG") {
-            None => EnvFilter::new("info"),
+        let default = EnvFilter::try_new(&self.default_filter).map_err(|source| InitError {
+            kind: InitErrorKind::InvalidFilter,
+            message: format!("invalid default filter: {source}"),
+            source: Some(Box::new(source)),
+        })?;
+        let filter = match env::var_os(&self.filter_env).filter(|value| !value.is_empty()) {
+            None => default,
             Some(value) => EnvFilter::try_new(value.to_string_lossy()).unwrap_or_else(|error| {
                 let _ = writeln!(
                     std::io::stderr(),
-                    "vigil: invalid RUST_LOG={value:?}: {error}; using info"
+                    "vigil: invalid {}={value:?}: {error}; using {}",
+                    self.filter_env,
+                    self.default_filter
                 );
-                EnvFilter::new("info")
+                default
             }),
         };
         let stopped = Arc::new(AtomicBool::new(false));
@@ -218,23 +413,6 @@ impl Config {
             }
             false
         });
-        let (layer, handle) = reload::Layer::new(None::<DestinationLayer>);
-        let subscriber = tracing_subscriber::registry().with(diagnostics()).with(
-            layer
-                .with_filter(shutdown_filter)
-                .with_filter(filter)
-                .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
-                    !meta.target().starts_with("opentelemetry")
-                })),
-        );
-        tracing::subscriber::set_global_default(subscriber)
-            .map_err(|e| InitError(format!("cannot install global tracing subscriber: {e}")))?;
-        if tracing_log::LogTracer::init().is_err() {
-            let _ = writeln!(
-                std::io::stderr(),
-                "vigil: a `log` logger is already installed; `log` records won't reach vigil"
-            );
-        }
         let dir = self
             .dir
             .or_else(|| {
@@ -281,10 +459,10 @@ impl Config {
             || "<unresolved state directory>".into(),
             |p| p.display().to_string(),
         );
-        let file = dir
+        let file = dir.as_ref()
             .ok_or_else(|| std::io::Error::other(format!("neither XDG_STATE_HOME nor HOME provides an absolute path; rejected XDG_STATE_HOME={:?}, HOME={:?}", env::var_os("XDG_STATE_HOME"), env::var_os("HOME"))))
-            .and_then(|dir| RotatingFile::open(&dir, "logs", rotation));
-        match file {
+            .and_then(|dir| RotatingFile::open(dir, "logs", rotation));
+        let (destination, guard): (PipelineLayer<S>, Guard) = match file {
             Ok(file) => {
                 let mut attrs = vec![
                     KeyValue::new("service.name", self.service),
@@ -321,33 +499,45 @@ impl Config {
                     )
                     .build();
                 let bridge = OpenTelemetryTracingBridge::new(&NamedProvider(provider.clone()));
-                let guard = Guard {
-                    provider: Some(provider),
-                    stopped: stopped.clone(),
-                };
-                handle
-                    .reload(Some(bridge.boxed()))
-                    .map_err(|e| InitError(format!("cannot configure tracing subscriber: {e}")))?;
-                Ok(guard)
+                let console = (self.console == Console::Stderr).then(|| {
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(std::io::stderr)
+                        .with_ansi(std::io::stderr().is_terminal())
+                });
+                (
+                    bridge.and_then(console).boxed(),
+                    Guard {
+                        provider: Some(provider),
+                        stopped,
+                        dir,
+                    },
+                )
             }
             Err(error) => {
-                let fallback = tracing_subscriber::fmt::layer()
-                    .with_writer(std::io::stderr)
-                    .with_ansi(false)
-                    .boxed();
-                handle
-                    .reload(Some(fallback))
-                    .map_err(|e| InitError(format!("cannot configure tracing subscriber: {e}")))?;
                 let _ = writeln!(
                     std::io::stderr(),
                     "vigil: cannot open log storage at {path_description}: {error}; falling back to stderr"
                 );
-                Ok(Guard {
-                    provider: None,
-                    stopped,
-                })
+                (
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(std::io::stderr)
+                        .with_ansi(std::io::stderr().is_terminal())
+                        .boxed(),
+                    Guard {
+                        provider: None,
+                        stopped,
+                        dir: None,
+                    },
+                )
             }
-        }
+        };
+        let destination = destination
+            .with_filter(shutdown_filter)
+            .with_filter(filter)
+            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                !meta.target().starts_with("opentelemetry")
+            }));
+        Ok((diagnostics().and_then(destination).boxed(), guard))
     }
 }
 // The upstream bridge requests an empty scope; supply a named scope to avoid
@@ -453,7 +643,10 @@ impl LogExporter for ReportingExporter {
     }
 }
 
-fn diagnostics() -> LogLayer {
+fn diagnostics<S>() -> PipelineLayer<S>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
+{
     tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_ansi(false)
@@ -516,5 +709,27 @@ mod dropped_stub_tests {
         );
         assert_eq!(exporter.failures.lock().unwrap().reported, 2);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod install_race_tests {
+    use super::*;
+
+    #[test]
+    fn foreign_subscriber_winning_install_releases_reservation() {
+        let dir = std::env::temp_dir().join(format!("vigil-install-race-{}", std::process::id()));
+        let error = Config::new("race")
+            .dir(&dir)
+            .init_with(|| {
+                tracing::subscriber::set_global_default(tracing_subscriber::registry()).unwrap();
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), InitErrorKind::ForeignSubscriber);
+        assert!(std::error::Error::source(&error).is_some());
+        let (_, guard) = Config::new("retry").dir(&dir).layer::<Registry>().unwrap();
+        assert_eq!(guard.dir(), Some(dir.as_path()));
+        drop(guard);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
