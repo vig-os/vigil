@@ -27,6 +27,16 @@ class SelfComparisonTests(unittest.TestCase):
 
 
 class RustdocFlagTests(unittest.TestCase):
+    @patch.dict(
+        os.environ,
+        {
+            "GITHUB_EVENT_PATH": "/outer-pr-context-must-not-be-read.json",
+            "GITHUB_REPOSITORY": "outer/repository",
+            "GITHUB_TOKEN": "outer-token-must-not-be-used",
+            "GITHUB_STEP_SUMMARY": "/outer-summary-must-not-be-written.md",
+            "GITHUB_OUTPUT": "/outer-output-must-not-be-written",
+        },
+    )
     def test_unstable_removal_is_excluded_for_every_flag_source(self):
         """Removing a cfg-gated function must pass for every inherited source.
 
@@ -41,6 +51,16 @@ class RustdocFlagTests(unittest.TestCase):
             repo = root / "repo"
             repo.mkdir()
             env = os.environ.copy()
+            # This temporary repository has no PR. Never read the surrounding
+            # CI event, use its credential, or write its step outputs.
+            for key in (
+                "GITHUB_EVENT_PATH",
+                "GITHUB_REPOSITORY",
+                "GITHUB_TOKEN",
+                "GITHUB_STEP_SUMMARY",
+                "GITHUB_OUTPUT",
+            ):
+                env.pop(key, None)
             env.update(
                 GIT_AUTHOR_NAME="Semver fixture",
                 GIT_AUTHOR_EMAIL="fixture@example.invalid",
