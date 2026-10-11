@@ -4,6 +4,7 @@
 //! The parent test re-executes this test binary through `sh` with
 //! `ulimit -f 2` (1024 bytes) and SIGXFSZ ignored, so the kernel returns a
 //! short write instead of killing the child.
+#![cfg(vigil_unstable)]
 #![cfg(unix)]
 
 use std::process::{Command, Stdio};
@@ -37,17 +38,21 @@ fn a_fragment_from_a_real_short_write_does_not_swallow_the_next_line() {
     let path = dir.join("logs.jsonl");
 
     let exe = std::env::current_exe().unwrap();
-    let status = Command::new("sh")
+    let output = Command::new("sh")
         .arg("-c")
         .arg(r#"ulimit -f 2 && trap '' XFSZ && exec "$0" --exact child_phase --test-threads=1"#)
         .arg(exe)
         .env(CHILD_ENV, &path)
         // File-size limits also apply to inherited regular stdout/stderr files.
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
         .unwrap();
-    assert!(status.success(), "limited child failed: {status}");
+    assert!(output.status.success(), "limited child failed: {output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+        "{output:?}"
+    );
 
     // The kernel cut the second line off at the 1024-byte limit: no newline.
     let bytes = std::fs::read(&path).unwrap();

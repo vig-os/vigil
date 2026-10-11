@@ -1,3 +1,6 @@
+//! **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+//! Libraries using this API require their applications to set the cfg.
+//!
 //! An OpenTelemetry [`LogExporter`] that writes OTLP/JSON Lines.
 //!
 //! Each export batch becomes bounded lines, each a `LogsData` message in the
@@ -14,12 +17,14 @@
 //!   serializing, so identical input gives identical bytes.
 //! * **`timeUnixNano` is filled.** The `tracing` bridge only sets the observed
 //!   time; when `timeUnixNano` is `0` it is copied from `observedTimeUnixNano`.
-//! * **Non-finite doubles survive.** See [`NON_FINITE`].
+//! * **Non-finite doubles survive.** They use `"NaN"`, `"Infinity"` and `"-Infinity"`.
 //!
 //! [OTLP/JSON encoding]: https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding
 //! [file exporter]: https://opentelemetry.io/docs/specs/otel/protocol/file-exporter/
 //!
 //! ```
+//! # #[cfg(vigil_unstable)]
+//! # fn main() -> Result<(), serde_json::Error> {
 //! use opentelemetry::logs::{LogRecord as _, Logger as _, LoggerProvider as _, Severity};
 //! use opentelemetry_sdk::logs::SdkLoggerProvider;
 //! use vigil::logs::OtlpJsonLogExporter;
@@ -42,6 +47,9 @@
 //! assert_eq!(record["body"]["stringValue"], "hello");
 //! assert_eq!(record["severityNumber"], 9);
 //! # Ok::<(), serde_json::Error>(())
+//! # }
+//! # #[cfg(not(vigil_unstable))]
+//! # fn main() {}
 //! ```
 
 use std::borrow::Cow;
@@ -76,8 +84,10 @@ use crate::sink::LineSink;
 /// `opentelemetry-proto`'s own deserializer rejects these strings, so the
 /// lines cannot be read back through its types; read them with `serde_json`
 /// or the Collector.
-pub const NON_FINITE: [&str; 3] = ["NaN", "Infinity", "-Infinity"];
+pub(crate) const NON_FINITE: [&str; 3] = ["NaN", "Infinity", "-Infinity"];
 
+/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+///
 /// Writes each log export batch as bounded OTLP/JSON `LogsData` lines to a
 /// [`LineSink`].
 ///
@@ -87,6 +97,7 @@ pub const NON_FINITE: [&str; 3] = ["NaN", "Infinity", "-Infinity"];
 /// The exporter needs no async runtime: the SDK's batch processor
 /// calls it from its own thread and the future it returns is already complete.
 #[derive(Debug)]
+#[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
 pub struct OtlpJsonLogExporter<S: LineSink> {
     sink: S,
     resource: ResourceAttributesWithSchema,
@@ -111,6 +122,7 @@ impl<S: LineSink> OtlpJsonLogExporter<S> {
     /// 1,000,000). Clamped to 1..=1,048,575 for the Collector's 1 MiB limit.
     /// If the envelope alone cannot fit, export returns an explicit error.
     #[must_use]
+    #[cfg(any(test, vigil_unstable))]
     pub fn with_max_line_bytes(mut self, max_line_bytes: usize) -> Self {
         self.max_line_bytes = max_line_bytes.clamp(1, 1_048_575);
         self
@@ -118,6 +130,8 @@ impl<S: LineSink> OtlpJsonLogExporter<S> {
 
     /// The sink lines are written to.
     #[must_use]
+    #[cfg(vigil_unstable)]
+    #[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
     pub fn sink(&self) -> &S {
         &self.sink
     }
@@ -620,7 +634,7 @@ fn sort_any_value(value: &mut AnyValue) {
 
 /// Patch the serialized `json` of `resource_logs`, walking the typed tree and
 /// the JSON in parallel, replacing the `null` that serde writes for a
-/// non-finite `doubleValue` with its [`NON_FINITE`] spelling.
+/// non-finite `doubleValue` as `"NaN"`, `"Infinity"` or `"-Infinity"`.
 fn patch_resource_logs(resource_logs: &ResourceLogs, json: &mut Json) {
     if let Some(resource) = &resource_logs.resource {
         patch_key_values(&resource.attributes, &mut json["resource"]["attributes"]);

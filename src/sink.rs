@@ -1,3 +1,6 @@
+//! **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+//! Libraries using this API require their applications to set the cfg.
+//!
 //! The seam between serialization and storage: a [`LineSink`] takes one
 //! complete line at a time.
 //!
@@ -6,12 +9,21 @@
 //! is the plain single-file sink, [`MemorySink`] is the in-memory one for tests.
 
 use std::fmt;
+#[cfg(any(test, vigil_unstable))]
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
+#[cfg(any(test, vigil_unstable))]
+use std::io::Write;
+#[cfg(any(test, vigil_unstable))]
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
+#[cfg(any(test, vigil_unstable))]
+use std::sync::{Mutex, PoisonError};
 
+/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+///
 /// Receives finished lines, one per call.
+#[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
 pub trait LineSink: Send + Sync + fmt::Debug {
     /// Append one complete line; `line` has no trailing `'\n'`.
     ///
@@ -43,6 +55,8 @@ impl<T: LineSink + ?Sized> LineSink for Arc<T> {
     }
 }
 
+/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+///
 /// Appends lines to one file, each with a single `write(2)` on an `O_APPEND`
 /// descriptor.
 ///
@@ -69,6 +83,8 @@ impl<T: LineSink + ?Sized> LineSink for Arc<T> {
 /// **Readers must skip empty and unparsable lines.**
 ///
 /// ```
+/// # #[cfg(vigil_unstable)]
+/// # fn main() -> Result<(), std::io::Error> {
 /// use vigil::sink::{AppendFile, LineSink};
 ///
 /// let dir = std::env::temp_dir().join(format!("vigil-doc-{}", std::process::id()));
@@ -81,13 +97,19 @@ impl<T: LineSink + ?Sized> LineSink for Arc<T> {
 /// );
 /// std::fs::remove_dir_all(&dir)?;
 /// # Ok::<(), std::io::Error>(())
+/// # }
+/// # #[cfg(not(vigil_unstable))]
+/// # fn main() {}
 /// ```
+#[cfg(any(test, vigil_unstable))]
 #[derive(Debug)]
+#[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
 pub struct AppendFile {
     file: File,
     path: PathBuf,
 }
 
+#[cfg(any(test, vigil_unstable))]
 impl AppendFile {
     /// Open (creating if needed) `path` for appending.
     ///
@@ -108,11 +130,14 @@ impl AppendFile {
 
     /// The path this sink appends to.
     #[must_use]
+    #[cfg(vigil_unstable)]
+    #[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
     pub fn path(&self) -> &Path {
         &self.path
     }
 }
 
+#[cfg(any(test, vigil_unstable))]
 impl LineSink for AppendFile {
     fn write_line(&self, line: &[u8]) -> io::Result<()> {
         append_line(&self.file, line, &self.path)
@@ -121,6 +146,7 @@ impl LineSink for AppendFile {
 
 /// The two file operations `append_line` needs, so tests can substitute a
 /// fake for a real file.
+#[cfg(any(test, vigil_unstable))]
 trait Appender {
     /// The last byte of the file, or `None` if it is empty.
     fn last_byte(&self) -> io::Result<Option<u8>>;
@@ -128,6 +154,7 @@ trait Appender {
     fn append(&self, buf: &[u8]) -> io::Result<usize>;
 }
 
+#[cfg(any(test, vigil_unstable))]
 impl Appender for File {
     fn last_byte(&self) -> io::Result<Option<u8>> {
         use std::os::unix::fs::FileExt;
@@ -155,6 +182,7 @@ impl Appender for File {
 /// writer can slip in front of) and nothing else is appended (it would likely
 /// fail for the same reason): the error says what happened, and the next
 /// write's prefix terminates the fragment.
+#[cfg(any(test, vigil_unstable))]
 fn append_line(out: &impl Appender, line: &[u8], path: &Path) -> io::Result<()> {
     let needs_prefix = out.last_byte()?.is_some_and(|b| b != b'\n');
     let mut buf = Vec::with_capacity(line.len() + 2);
@@ -178,13 +206,18 @@ fn append_line(out: &impl Appender, line: &[u8], path: &Path) -> io::Result<()> 
     Ok(())
 }
 
+/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+///
 /// Collects lines in memory. Cheap to clone; clones share the same buffer, so a
 /// test can hand one clone to an exporter and read lines back from another.
+#[cfg(any(test, vigil_unstable))]
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
 pub struct MemorySink {
     lines: Arc<Mutex<Vec<String>>>,
 }
 
+#[cfg(any(test, vigil_unstable))]
 impl MemorySink {
     /// An empty sink.
     #[must_use]
@@ -202,6 +235,7 @@ impl MemorySink {
     }
 }
 
+#[cfg(any(test, vigil_unstable))]
 impl LineSink for MemorySink {
     fn write_line(&self, line: &[u8]) -> io::Result<()> {
         let line = std::str::from_utf8(line)

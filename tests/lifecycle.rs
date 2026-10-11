@@ -181,6 +181,10 @@ fn run(mode: &str, filter: &str) -> std::process::Output {
         .env("RUST_LOG", filter)
         .output()
         .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1 passed;"),
+        "{out:?}"
+    );
     fs::remove_dir_all(dir).unwrap();
     assert!(
         out.status.success(),

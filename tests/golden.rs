@@ -5,6 +5,7 @@
 //! (unless blessing), so a build whose source filter drops the directory
 //! cannot pass by skipping it.
 
+#![cfg(vigil_unstable)]
 mod common;
 
 use common::{export, golden_records};

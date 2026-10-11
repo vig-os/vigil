@@ -110,7 +110,7 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(workflow.count("cargo test --locked --bench performance"), 1)
         self.assertNotIn("cargo test --locked --all-targets", workflow)
         self.assertEqual(
-            workflow.count("cargo test --locked --lib --bins --tests --examples"), 2
+            workflow.count("cargo test --locked --lib --bins --tests --examples"), 3
         )
 
     def test_documented_append_headroom_distinguishes_vm_and_ci(self):

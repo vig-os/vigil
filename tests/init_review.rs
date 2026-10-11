@@ -104,6 +104,10 @@ fn run(mode: &str, envs: &[(&str, &str)]) -> (std::path::PathBuf, std::process::
         })
     });
     let output = cmd.output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+        "{output:?}"
+    );
     if let Some(locker) = locker {
         locker.join().unwrap();
     }

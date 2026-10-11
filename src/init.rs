@@ -258,7 +258,9 @@ impl Drop for Guard {
 
 /// Initialize logs with default configuration. See [`Config`] for overrides.
 ///
-/// `let _ = vigil::init(..)` drops the guard immediately.
+/// `let _ = vigil::init(..)` drops the guard immediately. Bind `let _guard = ...`
+/// to keep logging alive. An unset or empty `RUST_LOG` uses `info`; builders may
+/// choose another filter variable and default.
 /// Keep the returned guard alive: dropping it drains and shuts down the batch
 /// processor. Its default 65,536-record queue uses memory proportional to
 /// queue size times record size. Overflow drops records with a stderr warning.
