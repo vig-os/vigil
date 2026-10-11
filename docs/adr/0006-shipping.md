@@ -46,7 +46,7 @@ The architect's review of this ADR found that Probe F's config loses data when t
 | S5 | disk queue, `max_elapsed_time: 0`, `block_on_overflow: true` | as S4, 3 runs | 3000/3000 each | 0 | 0 |
 | S6 | as S5 but `max_elapsed_time: 5s` (stand-in for the 5 min default) | backend down 8 s, no restart | 8/20 | **12** | 0 |
 | S7 | as S5 | as S6 | 20/20 | 0 | 0 |
-| S8 | as S5, and S4's settings | 3000 records with rotation, **no** kill or restart, 4 variants | 3000/3000 each | 0 | 0 |
+| S8 | S4's settings (disk and memory queue, `block_on_overflow` off) | 3000 records with rotation, **no** kill or restart, 4 variants | 3000/3000 each | 0 | 0 |
 
 - **S1:** the receiver commits its offsets once a line is handed to the pipeline, and the default sending queue lives in memory, so whatever was queued or retrying at shutdown is gone. S2/S3 fix this with a disk queue and unbounded retry.
 - **S4:** after a restart the receiver reads its backlog faster than the exporter sends; the full queue rejects data ("sending queue is full", `rejected_items`), the receiver does not retry rejected data, and its offsets move on. `block_on_overflow: true` turns that into backpressure (S5).
@@ -145,13 +145,13 @@ The reference config (shipped and tested in [#60](https://github.com/vig-os/vigi
 ```yaml
 extensions:
   file_storage/vigil:
-    directory: ${env:VIGIL_SHIPPER_STATE}   # persistent; holds read offsets and the sending queues
+    directory: ${env:SHIPPER_STORAGE_DIR}   # persistent; holds read offsets and the sending queues
     create_directory: true
 receivers:
   otlpjsonfile/logs:                        # likewise /metrics and /traces
-    include:                                # one pair per vigil service; VIGIL_STATE_ROOT e.g. ~/.local/state, never empty
-      - ${env:VIGIL_STATE_ROOT}/flock/logs.jsonl
-      - ${env:VIGIL_STATE_ROOT}/flock/logs-*.jsonl
+    include:                                # one pair per vigil service; SHIPPER_STATE_ROOT: absolute path, e.g. /home/u/.local/state
+      - ${env:SHIPPER_STATE_ROOT}/flock/logs.jsonl
+      - ${env:SHIPPER_STATE_ROOT}/flock/logs-*.jsonl
     start_at: beginning
     include_file_name: false
     storage: file_storage/vigil
@@ -168,7 +168,7 @@ service:
     traces:  { receivers: [otlpjsonfile/traces],  exporters: [otlp_http/traces] }
 ```
 
-The full form (three receivers, three exporters, three pipelines) passes `otelcol-contrib validate` (0.151.0). The rules:
+The full form (three receivers, three exporters, three pipelines) passes `otelcol-contrib validate` (0.151.0). `SHIPPER_STATE_ROOT` and `SHIPPER_STORAGE_DIR` are the shipper's own variables, not ones vigil reads. The Collector does not expand `~`, so both are absolute paths. The rules:
 
 - **The receiver's `storage` is required.** Without it a restart re-sends everything (F1: 100 duplicates). With it, restarts and rotations while the Collector is down lose and duplicate nothing (F3, F5).
 - **Each exporter needs a disk `sending_queue` with `block_on_overflow: true` and `max_elapsed_time: 0`.** The memory queue loses everything queued or retrying at shutdown (S1: 20/20 lost). Without `block_on_overflow` a backlog overflows the queue and is rejected for good (S4: up to 356/3000 lost). Any finite retry cap drops data during an outage longer than it (S6: 12/20 lost with 5 s; the default is 5 min). With all three: S2, S3, S5, S7 lost and duplicated nothing. While the backend stays down, the queue fills, the receiver stops reading, and the backlog waits in vigil's own files, bounded only by retention.
@@ -185,6 +185,7 @@ The full form (three receivers, three exporters, three pipelines) passes `otelco
 
 | Mode | Effect | Mitigation |
 |---|---|---|
+| A vigil service missing from `include` | that service is silently never shipped | The deployment adds each service when it installs it (#15); #60's README lists the step. |
 | Backend down longer than retention | loss | Alert on shipper backlog. Retention (90 days by default) is the buffer. |
 | Backend rejects old or out-of-order records (decision 1) | loss, logged by the shipper as a permanent error | Backend acceptance windows. |
 | SIGKILL, crash or power loss between enqueue and offset save, or between send and queue removal | a few duplicates (S4: up to 10/3000) ✓ | Stop with SIGTERM (systemd's default). Backends that drop exact duplicates absorb them; not probed. |
@@ -284,7 +285,7 @@ let guard = vigil::Config::new("flock")
 ## Consequences
 
 - **Two supported paths, one format.**
-  - **Hosts with the Collector** get shipping from the files with no loss and no duplicates across backend outages and clean restarts. A crash can re-send a few records, and old records are subject to the backend's acceptance window (decision 1). with a documented, tested config.
+  - **Hosts with the Collector** get shipping from the files with no loss and no duplicates across backend outages and clean restarts. A crash can re-send a few records, and old records are subject to the backend's acceptance window (decision 1). The config is documented and tested.
   - **Hosts with Alloy** (the fleet) use `push` until Alloy can read OTLP files; push is live but loses data while the agent is down, and the files keep it.
   - The fleet rollout (#15) chooses per host and may land after 1.0.
 - **A shipper bug now costs data silently.** F2/F4 and Probe K lost records with no error anywhere, and S1/S4/S6 lost them with only shipper log lines; #60's conformance test is what keeps the reference config honest. Hand-written configs that drop a rule above will lose or duplicate data, so the README states the rules, not just the YAML.
