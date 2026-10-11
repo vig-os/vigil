@@ -170,8 +170,9 @@ impl TrailReader {
                         .pop();
                 }
                 let result = result?;
-                // A successful write must advance the retained head before the
-                // lock is released, so an immediate rollback cannot reuse it.
+                // Writer callbacks retain known writes directly, including after a later
+                // rename failure. This refresh also supports reader/test callbacks
+                // that append without updating State; for writers it is a no-op.
                 refresh(dir, self.trail, &mut cache)?;
                 Ok(result)
             })

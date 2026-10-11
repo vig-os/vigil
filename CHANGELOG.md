@@ -10,7 +10,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Internal durable audit writer with shared checkpoint cadence, staged segment sealing and recovery, repair attestations, signer-outage handling and fsync poisoning ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
-
 - Internal audit trail scanning with shared directory locks, incremental state, stale-inode protection and resume-aware segment boundaries ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - Random UUID v4 `service.instance.id` on the shared resource built by `init` and `layer`, keeping concurrent producers distinct; entropy failures degrade to stderr with a warning naming the cause, and explicit synchronous log batch settings are tested against `OTEL_BLRP_*` overrides ([#7](https://github.com/vig-os/vigil/issues/7)).
 
@@ -50,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI extension runs `nix flake check -L` (clippy, fmt, nextest, doctests, docs) so `CI Summary` gates on the Rust checks; workaround for vig-os/devkit#1811 ([#18](https://github.com/vig-os/vigil/issues/18)).
 
 ### Changed
+
+- Audit `Record::new` rejects actions starting with `vigil.audit.` with `InvalidEntry`, reserving that prefix for internal records ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 
 - Deny missing public documentation and missing error/panic sections across stable and unstable APIs with all features in flake and CI checks ([#44](https://github.com/vig-os/vigil/issues/44)).
 - Apply ADR-0006 decision 3 time-first JSON key order to logs ([#64](https://github.com/vig-os/vigil/issues/64)).

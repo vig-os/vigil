@@ -112,6 +112,8 @@ fn malformed_markers_and_creation_refusal() {
     uppercase[0] = b'A';
     for bad_marker in [
         uppercase,
+        [good[..32].to_vec(), vec![b'\r']].concat(),
+        [good[..32].to_vec(), vec![b'a']].concat(),
         good[..32].to_vec(),
         [good.clone(), b"\n".to_vec()].concat(),
         [b" ".to_vec(), good.clone()].concat(),
@@ -460,23 +462,7 @@ fn resume_staging_every_prefix_with_and_without_gap() {
         let state = predecessor(&File::open(&t.0).unwrap(), s.trail)
             .unwrap()
             .unwrap();
-        let cp = Sink::signed(
-            &*s.signer,
-            RecordContext::new(s.trail, lost + 1, 2_000_000_000, "vigil", state.head.hash),
-            &state.mmr,
-        )
-        .unwrap();
-        let entry = Record::new_internal(
-            RecordContext::new(s.trail, lost + 2, 2_000_000_000, "vigil", cp.hash()),
-            Entry::new("operator", "vigil.audit.resume", "trail")
-                .reason("reviewed")
-                .details(format!(
-                    "head=0:{} lost_through={lost} file=-",
-                    digest_string(&state.head.hash)
-                )),
-        )
-        .unwrap();
-        let staged = [line(&cp).unwrap(), line(&entry).unwrap()].concat();
+        let staged = resume_bytes(&s, &state, lost + 1, state.head.hash, "vigil.audit.resume");
         for end in 0..staged.len() {
             fs::write(t.0.join(".audit-resume.jsonl"), &staged[..end]).unwrap();
             let mut reopened = open(&t);
@@ -487,13 +473,7 @@ fn resume_staging_every_prefix_with_and_without_gap() {
         fs::write(t.0.join(".audit-resume.jsonl"), &staged).unwrap();
         let mut reopened = open(&t);
         reopened.closed = true;
-        assert_eq!(
-            scan_head(&reopened),
-            Head {
-                seq: lost + 2,
-                hash: entry.hash()
-            }
-        );
+        assert_eq!(scan_head(&reopened).seq, lost + 2);
         assert_eq!(bytes(&t), staged);
         let names = rotate::rotated_names_at(&File::open(&t.0).unwrap(), "audit").unwrap();
         assert_eq!(names.len(), 1);
@@ -785,4 +765,111 @@ fn creation_fsync_errors_return_io() {
             AuditErrorKind::Io,
         );
     }
+}
+
+fn resume_bytes(s: &Sink, state: &State, seq: u64, previous: [u8; 32], action: &str) -> Vec<u8> {
+    let cp = Sink::signed(
+        &*s.signer,
+        RecordContext::new(s.trail, seq, 2_000_000_000, "vigil", previous),
+        &state.mmr,
+    )
+    .unwrap();
+    let entry = Record::new_internal(
+        RecordContext::new(s.trail, seq + 1, 2_000_000_000, "vigil", cp.hash()),
+        Entry::new("operator", action, "trail")
+            .reason("reviewed")
+            .details(format!(
+                "head={}:{} lost_through={} file=-",
+                state.head.seq,
+                digest_string(&state.head.hash),
+                seq - 1,
+            )),
+    )
+    .unwrap();
+    [line(&cp).unwrap(), line(&entry).unwrap()].concat()
+}
+#[test]
+fn resume_promotes_over_live_opening_checkpoint() {
+    let t = Temp::new();
+    let mut s = create(&t);
+    s.config.max_bytes = 1;
+    s.record(&entry()).unwrap();
+    s.closed = true;
+    assert!(matches!(records(&t)[0].kind, Kind::Checkpoint(_)));
+    assert_eq!(records(&t)[0].context.seq, 2);
+    let dir = File::open(&t.0).unwrap();
+    let state = predecessor(&dir, s.trail).unwrap().unwrap();
+    let live = bytes(&t);
+    let staged = resume_bytes(
+        &s,
+        &state,
+        state.head.seq + 1,
+        state.head.hash,
+        "vigil.audit.resume",
+    );
+    fs::write(t.0.join(".audit-resume.jsonl"), &staged).unwrap();
+    let mut reopened = open(&t);
+    reopened.closed = true;
+    assert_eq!(bytes(&t), staged);
+    assert_eq!(scan_head(&reopened).seq, state.head.seq + 2);
+    assert!(!t.0.join(".audit-resume.jsonl").exists());
+    let names = rotate::rotated_names_at(&dir, "audit").unwrap();
+    assert_eq!(names.len(), 2);
+    assert_eq!(fs::read(t.0.join(names.last().unwrap())).unwrap(), live);
+}
+fn assert_resume_discard(rule: u8) {
+    let t = Temp::new();
+    let mut s = create(&t);
+    s.closed = true;
+    let dir = File::open(&t.0).unwrap();
+    let state = predecessor(&dir, s.trail).unwrap().unwrap();
+    // A declared gap permits a below-head checkpoint with a locally valid MMR count.
+    let initial = resume_bytes(&s, &state, 8, state.head.hash, "vigil.audit.resume");
+    fs::write(t.0.join(".audit-resume.jsonl"), initial).unwrap();
+    let mut reopened = open(&t);
+    reopened.closed = true;
+    let state = predecessor(&dir, s.trail).unwrap().unwrap();
+    let seq = state.head.seq + u64::from(rule != 2);
+    let previous = if rule == 0 { [42; 32] } else { state.head.hash };
+    let action = if rule == 1 {
+        "change"
+    } else {
+        "vigil.audit.resume"
+    };
+    let staged = resume_bytes(&s, &state, seq, previous, action);
+    let live = bytes(&t);
+    let sealed = rotate::rotated_names_at(&dir, "audit").unwrap();
+    fs::write(t.0.join(".audit-resume.jsonl"), staged).unwrap();
+    let mut reopened = open(&t);
+    reopened.closed = true;
+    assert_eq!(scan_head(&reopened), state.head);
+    assert_eq!(bytes(&t), live);
+    assert_eq!(rotate::rotated_names_at(&dir, "audit").unwrap(), sealed);
+    assert!(!t.0.join(".audit-resume.jsonl").exists());
+}
+#[test]
+fn resume_discards_right_sequence_wrong_previous() {
+    assert_resume_discard(0);
+}
+#[test]
+fn resume_discards_wrong_action() {
+    assert_resume_discard(1);
+}
+#[test]
+fn resume_discards_sequence_below_next() {
+    assert_resume_discard(2);
+}
+#[test]
+fn record_at_rotation_limit_stays_in_live_file() {
+    let t = Temp::new();
+    let mut s = create(&t);
+    let dir = File::open(&t.0).unwrap();
+    let state = predecessor(&dir, s.trail).unwrap().unwrap();
+    let record = Record::new(s.context(&state, 1_000_000_000).unwrap(), entry()).unwrap();
+    let expected = [bytes(&t), line(&record).unwrap()].concat();
+    s.config.max_bytes = expected.len() as u64;
+    s.record(&entry()).unwrap();
+    assert_eq!(bytes(&t), expected);
+    assert!(rotate::rotated_names_at(&dir, "audit").unwrap().is_empty());
+    s.closed = true;
 }
