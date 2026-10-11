@@ -774,3 +774,32 @@ fn resume_rejects_attested_fragment_between_opening_and_declaration() {
     write(&d.0, [line(&opening), gap.to_vec(), line(&resume)].concat());
     reject_both(&reader, &d.0);
 }
+
+#[test]
+fn resume_rejects_loss_bound_above_opening_bound() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let opening = cp(7, first.hash(), &seeded(&first));
+    let wrong = declaration(&opening, 0, first.hash(), 7, None);
+    write_records(&d.0, &[&first, &opening, &wrong]);
+    corrupt_open(&d.0);
+}
+#[test]
+fn resume_rejects_head_sequence_below_predecessor_with_right_hash() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let predecessor = entry(&first);
+    let opening = cp(7, predecessor.hash(), &seeded_pair(&first, &predecessor));
+    let wrong = declaration(&opening, 0, predecessor.hash(), 6, None);
+    write_records(&d.0, &[&first, &predecessor, &opening, &wrong]);
+    corrupt_open(&d.0);
+}
+#[test]
+fn archived_resume_rejects_head_sequence_above_opening_with_right_hash() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let opening = cp(7, first.hash(), &seeded(&first));
+    let wrong = declaration(&opening, 8, first.hash(), 6, None);
+    write_records(&d.0, &[&opening, &wrong]);
+    corrupt_open(&d.0);
+}
