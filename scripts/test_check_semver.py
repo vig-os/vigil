@@ -136,7 +136,17 @@ class LiveReviewTests(unittest.TestCase):
             )
 
     def test_write_triage_and_unknown_permissions_fail(self):
-        for permission in ({"permission": "write"}, {"role_name": "triage"}, {}):
+        for permission in (
+            {
+                "permission": "write",
+                "role_name": "write",
+                "user": {
+                    "permissions": {"push": True, "admin": False, "maintain": False}
+                },
+            },
+            {"role_name": "triage"},
+            {},
+        ):
             self.permission = permission
             with (
                 self.subTest(permission=permission),
@@ -188,6 +198,26 @@ class LiveReviewTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "state changed"):
             current_labels(self.event, "vig-os/vigil", racing)
+
+    def test_racing_reapplication_with_unchanged_labels_fails(self):
+        def racing(path):
+            if path.endswith("/permission"):
+                self.events += [
+                    dict(self.events[0], id=2, event="unlabeled"),
+                    dict(self.events[0], id=3, actor={"login": "writer"}),
+                ]
+            # Separate HTTP snapshots: the visible label set stays unchanged.
+            return json.loads(json.dumps(self.get(path)))
+
+        with self.assertRaisesRegex(ValueError, "state changed"):
+            current_labels(self.event, "vig-os/vigil", racing)
+
+    def test_unrelated_label_renamed_into_major_has_no_approval(self):
+        # REST events retain the apply-time name, verified on PR #81.
+        self.events[0]["label"]["name"] = "previous-unrelated-name"
+        with self.assertRaisesRegex(ValueError, "verifiable latest labeled event"):
+            current_labels(self.event, "vig-os/vigil", self.get)
+        self.assertFalse(any("/permission" in path for path in self.calls))
 
     def test_pagination_includes_later_events(self):
         calls = []

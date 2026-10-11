@@ -20,11 +20,13 @@ REQUIRED = {
     "CI Extension / Supply chain (cargo-deny)",
     "CI Extension / MSRV (Linux and Apple target)",
     "CI Extension / Latest stable (Linux)",
+    "CI Extension / Performance comparison",
 }
 
 
 def verify_evidence(event, repository, get=github_api):
-    """Require the latest full run for this head to have passed every heavy lane."""
+    """Require the latest full run for this PR and head to have passed every heavy lane."""
+    number = event["pull_request"]["number"]
     head = event["pull_request"]["head"]["sha"]
     runs = paginated(
         f"repos/{repository}/actions/workflows/ci.yml/runs?head_sha={head}&event=pull_request",
@@ -34,12 +36,17 @@ def verify_evidence(event, repository, get=github_api):
     candidates = [
         run
         for run in runs
-        if run["head_sha"] == head and run["event"] == "pull_request"
+        if run["head_sha"] == head
+        and run["event"] == "pull_request"
+        and any(
+            pr.get("number") == number and pr.get("head", {}).get("sha") == head
+            for pr in run.get("pull_requests", [])
+        )
     ]
     latest = max(candidates, key=lambda run: run["run_number"], default=None)
     if not latest or latest["status"] != "completed":
         raise ValueError(
-            "Label-only summary requires a completed full CI run for this head"
+            "Label-only summary requires a completed full CI run for this PR and head"
         )
     jobs = paginated(
         f"repos/{repository}/actions/runs/{latest['id']}/jobs", get, "jobs"

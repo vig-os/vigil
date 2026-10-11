@@ -36,7 +36,7 @@ def stable_environment():
 
 
 def github_api(path):
-    """Read public repository metadata with the job's read-only token."""
+    """Read repository metadata with the job's read-only token."""
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         raise ValueError("Semver review requires GITHUB_TOKEN")

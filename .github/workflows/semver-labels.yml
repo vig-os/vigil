@@ -14,12 +14,12 @@ concurrency:
 
 permissions:
   contents: read
-  packages: read
-  pull-requests: read
-  actions: read
 
 jobs:
   extension:
+    permissions:
+      contents: read
+      pull-requests: read
     name: ${{ github.event.label.name == 'semver:major' && 'CI Extension' || 'Unrelated label' }}
     if: github.event.label.name == 'semver:major'
     uses: ./.github/workflows/ci-extension.yml
@@ -28,6 +28,10 @@ jobs:
     secrets: inherit
 
   summary:
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
     # An unrelated label must not create a skipped check with the required
     # CI Summary name and thereby supersede a failed full CI summary.
     name: ${{ github.event.label.name == 'semver:major' && 'CI Summary' || 'Unrelated label summary' }}

@@ -98,7 +98,7 @@ jobs:
         run: nix develop -c env RUSTFLAGS="--cfg vigil_unstable" cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Unstable exporter and sink tests
         run: |
-          nix develop -c env RUSTFLAGS="--cfg vigil_unstable" cargo test --locked --all-targets --all-features
+          nix develop -c env RUSTFLAGS="--cfg vigil_unstable" cargo test --locked --lib --bins --tests --examples --all-features
           nix develop -c env RUSTFLAGS="--cfg vigil_unstable" cargo test --locked --doc --all-features
       - name: Run nix flake check
         run: nix flake check -L
@@ -150,12 +150,15 @@ jobs:
         run: nix develop -c python3 scripts/check_supply_chain.py
 
   semver:
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       labels: ${{ steps.review.outputs.labels }}
     # Run after every heavy lane, even on failure/skip, so the final verdict
     # reads labels at the end of full CI rather than before a long build.
     # Stop superseded runs promptly; always() would hold the concurrency slot.
-    needs: [extension, conformance, supply-chain, msrv, latest-stable]
+    needs: [extension, conformance, supply-chain, msrv, latest-stable, performance]
     if: ${{ !cancelled() }}
     name: Semver compatibility
     runs-on: ${{ fromJSON(inputs.runner-json) }}
@@ -225,6 +228,7 @@ jobs:
         run: nix develop .#latest-stable -c python3 scripts/check_rust_version.py latest-stable
 
   performance:
+    if: ${{ !inputs.label-only }}
     name: Performance comparison
     runs-on: ${{ fromJSON(inputs.runner-json) }}
     timeout-minutes: 30

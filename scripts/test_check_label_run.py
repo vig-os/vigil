@@ -7,10 +7,11 @@ from check_label_run import REQUIRED, verify_evidence
 
 class EvidenceTests(unittest.TestCase):
     def setUp(self):
-        self.event = {"pull_request": {"head": {"sha": "abc"}}}
+        self.event = {"pull_request": {"number": 81, "head": {"sha": "abc"}}}
         self.runs = [
             {
                 "head_sha": "abc",
+                "pull_requests": [{"number": 81, "head": {"sha": "abc"}}],
                 "event": "pull_request",
                 "run_number": 1,
                 "status": "completed",
@@ -52,3 +53,26 @@ class EvidenceTests(unittest.TestCase):
                 self.runs = [dict(self.runs[0], **{field: value})]
                 with self.assertRaises(ValueError):
                     verify_evidence(self.event, "vig-os/vigil", self.get)
+
+    def test_other_pr_with_same_head_and_missing_pr_metadata_fail(self):
+        for prs in (
+            [],
+            [{"number": 82, "head": {"sha": "abc"}}],
+            [{"number": 81, "head": {"sha": "other"}}],
+        ):
+            with self.subTest(prs=prs):
+                self.runs[0]["pull_requests"] = prs
+                with self.assertRaisesRegex(ValueError, "this PR and head"):
+                    verify_evidence(self.event, "vig-os/vigil", self.get)
+
+    def test_newer_other_pr_run_does_not_hide_this_pr_evidence(self):
+        self.runs.append(
+            dict(
+                self.runs[0],
+                run_number=2,
+                id=2,
+                status="in_progress",
+                pull_requests=[{"number": 82, "head": {"sha": "abc"}}],
+            )
+        )
+        verify_evidence(self.event, "vig-os/vigil", self.get)
