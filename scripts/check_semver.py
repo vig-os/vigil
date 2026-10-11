@@ -8,6 +8,8 @@ import re
 import subprocess
 import sys
 import tomllib
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 
 def checks_ran(output):
@@ -33,12 +35,94 @@ def stable_environment():
     return env
 
 
-def event_labels(path):
-    """Read labels from the PR event; non-PR runs have no exception."""
-    if not path:
+def github_api(path):
+    """Read public repository metadata with the job's read-only token."""
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise ValueError("Semver review requires GITHUB_TOKEN")
+    request = Request(
+        "https://api.github.com/" + path,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    with urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
+def paginated(path, get=github_api, key=None):
+    """Read all pages, so a later unauthorized reapplication cannot be missed."""
+    items = []
+    page = 1
+    while True:
+        separator = "&" if "?" in path else "?"
+        batch = get(f"{path}{separator}per_page=100&page={page}")
+        if key:
+            batch = batch[key]
+        items.extend(batch)
+        if len(batch) < 100:
+            return items
+        page += 1
+
+
+def current_labels(event, repository, get=github_api):
+    """Verify live labels and the latest labeler's current admin/maintain role."""
+    pr = event.get("pull_request")
+    if not pr:
         return set()
-    event = json.loads(Path(path).read_text())
-    return {label["name"] for label in event.get("pull_request", {}).get("labels", [])}
+    if not re.fullmatch(r"[A-Za-z_0-9.-]+/[A-Za-z_0-9.-]+", repository):
+        raise ValueError("Invalid GITHUB_REPOSITORY")
+    base = f"repos/{repository}"
+    path = f"{base}/pulls/{int(pr['number'])}"
+    live = get(path)
+    if live["head"]["sha"] != pr["head"]["sha"]:
+        raise ValueError("Semver review refuses a stale PR head")
+    labels = {label["name"] for label in live["labels"]}
+    if "semver:major" not in labels:
+        return labels
+    events = paginated(f"{base}/issues/{int(pr['number'])}/events", get)
+    changes = [
+        item
+        for item in events
+        if item.get("event") in {"labeled", "unlabeled"}
+        and item.get("label", {}).get("name") == "semver:major"
+    ]
+    latest = max(changes, key=lambda item: item["id"], default=None)
+    if not latest or latest["event"] != "labeled" or not latest.get("actor"):
+        raise ValueError("semver:major has no verifiable latest labeled event")
+    actor = latest["actor"]["login"]
+    permission = get(f"{base}/collaborators/{quote(actor, safe='')}/permission")
+    roles = permission.get("user", {}).get("permissions", {})
+    if not (
+        permission.get("permission") == "admin"
+        or permission.get("role_name") in {"admin", "maintain"}
+        or roles.get("admin") is True
+        or roles.get("maintain") is True
+    ):
+        raise ValueError(
+            f"semver:major latest labeler {actor} must have admin or maintain permission"
+        )
+    # Fail closed if a removal/reapplication raced the permission lookup.
+    final = get(path)
+    final_events = paginated(f"{base}/issues/{int(pr['number'])}/events", get)
+    final_changes = [
+        item
+        for item in final_events
+        if item.get("event") in {"labeled", "unlabeled"}
+        and item.get("label", {}).get("name") == "semver:major"
+    ]
+    if (
+        final["head"]["sha"] != live["head"]["sha"]
+        or {label["name"] for label in final["labels"]} != labels
+        or max(final_changes, key=lambda item: item["id"], default=None) != latest
+    ):
+        raise ValueError(
+            "Semver review state changed during verification; rerun required"
+        )
+    print(f"Current semver:major label verified: {actor} has admin/maintain permission")
+    return labels
 
 
 def evaluate(output, status, labels, version, summary=None):
@@ -58,7 +142,7 @@ def evaluate(output, status, labels, version, summary=None):
     if not result or status != 1:
         return status or 1
     major, minor = map(int, result.groups())
-    reviewed = "semver:major" in labels and version.startswith("0.")
+    reviewed = "semver:major" in labels and version == "0.0.0"
     complete = major > 0 and minor == 0 and len(findings) == major
     if summary:
         with Path(summary).open("a") as report:
@@ -115,10 +199,28 @@ def main():
     )
     print(result.stdout, end="", flush=True)
     version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+    try:
+        event_path = os.environ.get("GITHUB_EVENT_PATH")
+        event = json.loads(Path(event_path).read_text()) if event_path else {}
+        labels = current_labels(event, os.environ.get("GITHUB_REPOSITORY", ""))
+    except (ValueError, KeyError, OSError) as error:
+        message = f"Semver label review failed: {error}"
+        print(message, file=sys.stderr)
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with Path(summary).open("a") as report:
+                report.write(message + "\n")
+        # Retain every finding even when authorization fails.
+        evaluate(result.stdout, result.returncode, set(), version, summary)
+        return 1
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if output_path:
+        with Path(output_path).open("a") as output:
+            output.write("labels=" + json.dumps(sorted(labels)) + "\n")
     return evaluate(
         result.stdout,
         result.returncode,
-        event_labels(os.environ.get("GITHUB_EVENT_PATH")),
+        labels,
         version,
         os.environ.get("GITHUB_STEP_SUMMARY"),
     )

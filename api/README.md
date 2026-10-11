@@ -2,7 +2,7 @@
 
 `public-api.txt` is the all-features stable surface, including hidden items, on
 the flake-pinned compiler.
-`allowlist.json` names its justified items and their accepted ADRs. Audit format
+`allowlist.json` names its justified item paths, required declaration kinds and accepted ADRs. Audit format
 primitives are covered by ADR-0005 and #12, in addition to ADR-0004's lifecycle,
 composition and rotating-file surface. Standard trait implementations belong to
 the listed type's contract. Exporters, sinks and OpenTelemetry re-exports require
@@ -20,7 +20,11 @@ Both commands enforce the allowlist before writing anything. The check builds
 rustdoc JSON with `RUSTC_BOOTSTRAP=1`, all features and controlled stable compiler
 and rustdoc flags, then runs `cargo public-api --rustdoc-json … -sss`. It repeats
 with `--document-hidden-items`, checks public re-export targets in JSON as well
-as printed paths, and rejects empty/root-only surfaces. Rustdoc sees expanded
+as printed paths, explicitly rejects public `extern crate` items for forbidden
+upstreams (including aliases and hidden items), and rejects empty/root-only
+surfaces. Each public declaration must match its independently allowlisted kind:
+a macro or extern crate cannot reuse an approved function or constant name.
+`--update` only writes the snapshot; it never changes the kind allowlist. Rustdoc sees expanded
 macros, so generated items and signatures receive the same checks. Hidden and
 `__private` upstream re-exports are forbidden, rather than macro escape hatches.
 

@@ -2,11 +2,12 @@
 
 import contextlib
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
 
-from check_semver import checks_ran, evaluate, event_labels
+from check_semver import checks_ran, evaluate, current_labels, paginated
 
 
 class CheckCountTests(unittest.TestCase):
@@ -77,11 +78,123 @@ class MajorExceptionTests(unittest.TestCase):
     def test_published_version_has_no_exception(self):
         self.assertEqual(evaluate(self.output, 1, {"semver:major"}, "1.0.0"), 1)
 
-    def test_event_labels(self):
-        with tempfile.TemporaryDirectory() as directory:
-            event = Path(directory) / "event.json"
-            event.write_text('{"pull_request":{"labels":[{"name":"semver:major"}]}}')
-            self.assertEqual(event_labels(event), {"semver:major"})
-            event.write_text("{}")
-            self.assertEqual(event_labels(event), set())
-        self.assertEqual(event_labels(None), set())
+    def test_other_zero_versions_have_no_exception(self):
+        for version in ("0.1.0", "0.0.1", "0.0.0-alpha", "1.0.0"):
+            with self.subTest(version=version):
+                self.assertEqual(evaluate(self.output, 1, {"semver:major"}, version), 1)
+
+
+class LiveReviewTests(unittest.TestCase):
+    def setUp(self):
+        self.event = {
+            "pull_request": {
+                "number": 81,
+                "head": {"sha": "abc"},
+                "labels": [{"name": "stale-payload"}],
+            }
+        }
+        self.live = {"head": {"sha": "abc"}, "labels": [{"name": "semver:major"}]}
+        self.events = [
+            {
+                "id": 1,
+                "event": "labeled",
+                "label": {"name": "semver:major"},
+                "actor": {"login": "owner"},
+            }
+        ]
+        self.permission = {"permission": "admin"}
+        self.calls = []
+
+    def get(self, path):
+        self.calls.append(path)
+        if "/events?" in path:
+            return self.events
+        if path.endswith("/permission"):
+            return self.permission
+        return self.live
+
+    def test_live_addition_ignores_stale_payload(self):
+        self.assertEqual(
+            current_labels(self.event, "vig-os/vigil", self.get), {"semver:major"}
+        )
+
+    def test_live_removal_ignores_stale_green_payload(self):
+        self.event["pull_request"]["labels"] = [{"name": "semver:major"}]
+        self.live["labels"] = []
+        self.assertEqual(current_labels(self.event, "vig-os/vigil", self.get), set())
+        self.assertEqual(len(self.calls), 1)
+
+    def test_admin_and_maintain_are_accepted(self):
+        for permission in (
+            {"permission": "admin"},
+            {"permission": "write", "role_name": "maintain"},
+            {"user": {"permissions": {"maintain": True}}},
+        ):
+            self.permission = permission
+            self.assertIn(
+                "semver:major", current_labels(self.event, "vig-os/vigil", self.get)
+            )
+
+    def test_write_triage_and_unknown_permissions_fail(self):
+        for permission in ({"permission": "write"}, {"role_name": "triage"}, {}):
+            self.permission = permission
+            with (
+                self.subTest(permission=permission),
+                self.assertRaisesRegex(ValueError, "admin or maintain"),
+            ):
+                current_labels(self.event, "vig-os/vigil", self.get)
+
+    def test_latest_reapplication_must_be_authorized(self):
+        self.events += [
+            dict(self.events[0], id=2, event="unlabeled"),
+            dict(self.events[0], id=3, actor={"login": "writer"}),
+        ]
+        self.permission = {"permission": "write"}
+        with self.assertRaisesRegex(ValueError, "writer"):
+            current_labels(self.event, "vig-os/vigil", self.get)
+        self.assertTrue(any("/writer/permission" in path for path in self.calls))
+
+    def test_missing_removed_and_actorless_events_fail(self):
+        for events in (
+            [],
+            [dict(self.events[0], event="unlabeled")],
+            [dict(self.events[0], actor=None)],
+        ):
+            self.events = events
+            with (
+                self.subTest(events=events),
+                self.assertRaisesRegex(ValueError, "verifiable"),
+            ):
+                current_labels(self.event, "vig-os/vigil", self.get)
+
+    def test_stale_head_fails(self):
+        self.live["head"]["sha"] = "new"
+        with self.assertRaisesRegex(ValueError, "stale PR head"):
+            current_labels(self.event, "vig-os/vigil", self.get)
+
+    def test_api_failure_is_not_an_approval(self):
+        def unavailable(path):
+            raise OSError("API unavailable")
+
+        with self.assertRaises(OSError):
+            current_labels(self.event, "vig-os/vigil", unavailable)
+
+    def test_racing_removal_fails(self):
+        def racing(path):
+            if path.endswith("/permission"):
+                self.live["labels"] = []
+            # Model separate HTTP response objects.
+            return json.loads(json.dumps(self.get(path)))
+
+        with self.assertRaisesRegex(ValueError, "state changed"):
+            current_labels(self.event, "vig-os/vigil", racing)
+
+    def test_pagination_includes_later_events(self):
+        calls = []
+
+        def get(path):
+            calls.append(path)
+            return list(range(100)) if path.endswith("&page=1") else [100]
+
+        self.assertEqual(paginated("events", get), list(range(101)))
+        self.assertEqual(len(calls), 2)

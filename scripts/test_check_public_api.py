@@ -15,7 +15,13 @@ from check_public_api import own_paths, validate
 
 class PublicApiTests(unittest.TestCase):
     def setUp(self):
-        self.allowed = {"vigil", "vigil::Config", "vigil::Config::layer"}
+        self.allowed = {
+            "vigil": "mod",
+            "vigil::Config": "struct",
+            "vigil::Config::layer": "fn",
+            "vigil::VERSION": "const",
+            "vigil::init": "fn",
+        }
         self.document = {
             "external_crates": {"1": {"name": "opentelemetry"}, "2": {"name": "bytes"}},
             "index": {},
@@ -79,12 +85,51 @@ class PublicApiTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Forbidden upstream re-export"):
             validate(self.listing, self.document, self.allowed)
 
+    def test_public_extern_crate_plain_and_hidden_fail(self):
+        for attrs in ([], ["#[doc(hidden)]"]):
+            self.document["index"]["9"] = {
+                "visibility": "public",
+                "attrs": attrs,
+                "inner": {
+                    "extern_crate": {"name": "VERSION", "rename": "opentelemetry"}
+                },
+            }
+            with (
+                self.subTest(attrs=attrs),
+                self.assertRaisesRegex(ValueError, "extern crate"),
+            ):
+                validate(
+                    self.listing + "pub extern crate vigil::VERSION\n",
+                    self.document,
+                    self.allowed,
+                )
+
+    def test_extern_alias_cannot_impersonate_an_allowed_crate(self):
+        self.document["index"]["9"] = {
+            "visibility": "public",
+            "inner": {"extern_crate": {"name": "std", "rename": "opentelemetry"}},
+        }
+        with self.assertRaisesRegex(ValueError, "extern crate: opentelemetry"):
+            validate(self.listing, self.document, self.allowed)
+
+    def test_kinds_cannot_reuse_an_approved_path(self):
+        for declaration in (
+            "pub macro vigil::init",
+            "pub extern crate vigil::VERSION",
+            "pub struct vigil::init",
+        ):
+            with (
+                self.subTest(declaration=declaration),
+                self.assertRaisesRegex(ValueError, "kind mismatch"),
+            ):
+                validate(self.listing + declaration + "\n", self.document, self.allowed)
+
     def test_private_macro_path_fails(self):
         with self.assertRaisesRegex(ValueError, "Private macro"):
             validate(
                 self.listing + "pub mod vigil::__private\n",
                 self.document,
-                self.allowed | {"vigil::__private"},
+                self.allowed | {"vigil::__private": "mod"},
             )
 
 
@@ -102,7 +147,7 @@ class SnapshotTests(unittest.TestCase):
                     [
                         {
                             "justification": "ADR-0004",
-                            "items": ["vigil", "vigil::init"],
+                            "items": {"vigil": "mod", "vigil::init": "fn"},
                         }
                     ]
                 )

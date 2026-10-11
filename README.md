@@ -322,8 +322,15 @@ and the `semver:major` exception before publication. Only the architect/owner
 applies that label after reviewing every major finding and its ADR justification
 in the PR body. The job runs the same minor-release check, lists every major
 finding in its summary, and accepts them only with the label on a pre-publish
-version. Zero checks, tool failures and missing labels still fail. Labels come
-from the PR event payload; a new PR event/run is required after label changes.
+version exactly `0.0.0`. Zero checks, tool failures and missing labels still fail.
+The gate reads current labels through the GitHub API after the heavy CI lanes,
+and verifies that the most recent `semver:major` application was by an account
+with current admin or maintain permission. API failures fail closed. Adding or
+removing the label automatically reevaluates semver and CI Summary without
+rebuilding the heavy lanes; that summary requires successful full-run evidence
+for the same PR head. A pending or failed full run cannot become green through
+a label change. Label changes cancel superseded CI runs; if heavy jobs were
+unfinished, rerun full CI to supply the required evidence. Reruns read live state, so an old payload cannot retain approval.
 
 ## Audit format (opt-in)
 

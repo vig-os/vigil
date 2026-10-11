@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Public API performance benchmarks, disk-based consumer budgets and same-runner CI regression reports ([#49](https://github.com/vig-os/vigil/issues/49)).
 - Stable public API snapshot and ADR allowlist gates, including hidden exports and expanded macros; reviewed pre-publish `semver:major` findings remain visible in CI summaries ([#42](https://github.com/vig-os/vigil/issues/42)).
+- Stable public API snapshot and ADR allowlist gates, including declaration kinds, hidden exports and expanded macros; reviewed pre-publish `semver:major` findings remain visible in CI summaries ([#42](https://github.com/vig-os/vigil/issues/42)).
 
 - Docs: README "Stability" section and ADR-0001 "Versioning stance at 1.0", covering the semver and on-disk format promises, what counts as a major, how upstream spec changes are absorbed, MSRV, platforms and the separately frozen audit format ([#50](https://github.com/vig-os/vigil/issues/50)).
 

@@ -1,0 +1,61 @@
+# Label changes do not rebuild the crate. Full CI remains in ci.yml; its semver
+# job also reads live review state after all heavy jobs finish.
+name: Semver label review
+
+on:  # yamllint disable-line rule:truthy
+  pull_request:
+    types: [labeled, unlabeled]
+
+concurrency:
+  # Share full CI's group for this label: an older run must not publish a
+  # stale green summary after removal. Unrelated labels never cancel full CI.
+  group: ${{ github.event.label.name == 'semver:major' && format('ci-CI-{0}', github.ref) || format('semver-unrelated-{0}', github.ref) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+  pull-requests: read
+  actions: read
+
+jobs:
+  extension:
+    name: ${{ github.event.label.name == 'semver:major' && 'CI Extension' || 'Unrelated label' }}
+    if: github.event.label.name == 'semver:major'
+    uses: ./.github/workflows/ci-extension.yml
+    with:
+      label-only: true
+    secrets: inherit
+
+  summary:
+    # An unrelated label must not create a skipped check with the required
+    # CI Summary name and thereby supersede a failed full CI summary.
+    name: ${{ github.event.label.name == 'semver:major' && 'CI Summary' || 'Unrelated label summary' }}
+    needs: [extension]
+    if: always() && github.event.label.name == 'semver:major'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require a successful semver evaluation
+        env:
+          RESULT: ${{ needs.extension.result }}
+        run: test "$RESULT" = success
+      - name: Require full CI evidence for this head and current label authorization
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REVIEWED_LABELS: ${{ needs.extension.outputs.labels }}
+        run: |
+          python3 scripts/check_label_run.py
+          python3 - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from check_semver import current_labels
+          labels = current_labels(json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text()), os.environ['GITHUB_REPOSITORY'])
+          if labels != set(json.loads(os.environ['REVIEWED_LABELS'])):
+              raise SystemExit('Labels changed after the semver evaluation; rerun required')
+          PY

@@ -29,6 +29,25 @@ def own_paths(listing):
     return set(re.findall(pattern, listing)) | set(re.findall(pattern, simplified))
 
 
+def item_kinds(listing):
+    """Read declared kinds separately from paths mentioned in signatures/impls."""
+    declarations = {}
+    for line in listing.splitlines():
+        line = re.sub(r"^(?:#\[[^\]]+\]\s*)+", "", line)
+        if not line.startswith("pub "):
+            continue
+        match = re.match(
+            r"pub (?:(mod|struct|enum|trait|fn|const|static|type|macro|extern crate) )?"
+            r"(vigil(?:::[A-Za-z_][A-Za-z_0-9]*)*)",
+            line,
+        )
+        if not match:
+            raise ValueError(f"Unrecognized public item declaration: {line}")
+        kind, path = match.groups()
+        declarations.setdefault(path, set()).add(kind or "variant")
+    return declarations
+
+
 def validate(listing, document, allowed):
     """Reject empty listings, unjustified items and forbidden dependency paths."""
     if "pub mod vigil\n" not in listing or len(own_paths(listing)) < 2:
@@ -52,7 +71,21 @@ def validate(listing, document, allowed):
                 if crate not in ALLOWED_CRATES:
                     raise ValueError(f"Forbidden upstream re-export: {crate}")
 
-    unknown = own_paths(listing) - allowed
+    for item in document["index"].values():
+        external = item["inner"].get("extern_crate")
+        if item["visibility"] == "public" and external:
+            # The pinned rustdoc records the exported alias in `name` and
+            # its original crate name in `rename` (None when unaliased).
+            crate = (external.get("rename") or external["name"]).replace("-", "_")
+            if crate not in ALLOWED_CRATES:
+                raise ValueError(f"Forbidden public extern crate: {crate}")
+
+    for path, kinds in item_kinds(listing).items():
+        if path in allowed and kinds != {allowed[path]}:
+            raise ValueError(
+                f"Item kind mismatch for {path}: {sorted(kinds)}; expected {allowed[path]}"
+            )
+    unknown = own_paths(listing) - allowed.keys()
     if unknown:
         raise ValueError(
             f"Items need ADR justification in api/allowlist.json: {sorted(unknown)}"
@@ -110,7 +143,7 @@ def main():
         "--update", action="store_true", help="write the reviewed snapshot"
     )
     args = parser.parse_args()
-    allowed = set()
+    allowed = {}
     for section in json.loads((ROOT / "api/allowlist.json").read_text()):
         if not section["justification"]:
             raise ValueError("Every allowlist group needs an ADR justification")
