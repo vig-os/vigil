@@ -103,6 +103,40 @@ jobs:
       - name: Run nix flake check
         run: nix flake check -L
 
+  json-order:
+    if: ${{ !inputs.label-only }}
+    name: JSON ordering (${{ matrix.map }})
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - map: default
+            cargo-args: --no-default-features
+          - map: preserve-order
+            cargo-args: --no-default-features --features test-preserve-order
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+      - name: Verify golden bytes and deterministic ordering
+        env:
+          RUSTFLAGS: --cfg vigil_unstable
+          CARGO_ARGS: ${{ matrix.cargo-args }}
+        run: |
+          nix develop -c cargo test --locked $CARGO_ARGS --test golden
+          nix develop -c cargo test --locked $CARGO_ARGS --lib ordered
+
   conformance:
     if: ${{ !inputs.label-only }}
     name: Collector conformance
@@ -158,7 +192,7 @@ jobs:
     # Run after every heavy lane, even on failure/skip, so the final verdict
     # reads labels at the end of full CI rather than before a long build.
     # Stop superseded runs promptly; always() would hold the concurrency slot.
-    needs: [extension, conformance, supply-chain, msrv, latest-stable, performance]
+    needs: [extension, json-order, conformance, supply-chain, msrv, latest-stable, performance]
     if: ${{ !cancelled() }}
     name: Semver compatibility
     runs-on: ${{ fromJSON(inputs.runner-json) }}

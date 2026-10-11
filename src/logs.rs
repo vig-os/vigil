@@ -152,11 +152,13 @@ impl<S: LineSink> OtlpJsonLogExporter<S> {
                 lost = 0;
                 return Ok(());
             };
-            let line = encode_line(&ExportLogsServiceRequest {
+            let request = ExportLogsServiceRequest {
                 resource_logs: vec![resource_logs],
-            })
-            .map_err(|e| OTelSdkError::InternalFailure(format!("encoding log batch: {e}")))?;
-            let lines = counted_lines(&line, self.max_line_bytes, lost)
+            };
+            let json = encode_json(&request)
+                .map_err(|e| OTelSdkError::InternalFailure(format!("encoding log batch: {e}")))?;
+            let line = encode_projected(&json).map_err(OTelSdkError::InternalFailure)?;
+            let lines = counted_lines(&line, &json, self.max_line_bytes, lost)
                 .map_err(OTelSdkError::InternalFailure)?;
             for line in lines {
                 self.sink.write_line(line.text.as_bytes()).map_err(|e| {
@@ -200,9 +202,14 @@ impl<S: LineSink + 'static> LogExporter for OtlpJsonLogExporter<S> {
 ///
 /// `ExportLogsServiceRequest` and `LogsData` share their wire shape (a repeated
 /// `resourceLogs` field 1), so the JSON is identical.
+#[cfg(any(test, feature = "audit"))]
 pub(crate) fn encode_line(request: &ExportLogsServiceRequest) -> Result<String, String> {
     let json = encode_json(request)?;
-    let line = crate::ordered_json::encode(&json, "", crate::ordered_json::LOGS)?;
+    encode_projected(&json)
+}
+
+fn encode_projected(json: &Json) -> Result<String, String> {
+    let line = crate::ordered_json::encode(json, "", crate::ordered_json::LOGS)?;
     // Refuse any non-finite double the patching missed.
     if line.contains(r#""doubleValue":null"#) {
         return Err("a non-finite doubleValue was not sanitized".to_owned());
@@ -212,13 +219,9 @@ pub(crate) fn encode_line(request: &ExportLogsServiceRequest) -> Result<String, 
 
 /// Projects the typed request using the encoder's body and non-finite rules.
 pub(crate) fn encode_json(request: &ExportLogsServiceRequest) -> Result<Json, String> {
-    // The upstream serializer owns OTLP field encodings. Parse its bytes for
-    // patching, retaining exact finite doubles and the original nesting support.
-    let encoded = serde_json::to_vec(request).map_err(|e| e.to_string())?;
-    let mut decoder = serde_json::Deserializer::from_slice(&encoded);
-    decoder.disable_recursion_limit();
-    let mut json =
-        <Json as serde::Deserialize>::deserialize(&mut decoder).map_err(|e| e.to_string())?;
+    // Maps hold the upstream OTLP projection and non-finite patches only.
+    // Explicit ordered serialization owns all final field ordering.
+    let mut json = serde_json::to_value(request).map_err(|e| e.to_string())?;
     for (resource, json_resource) in request
         .resource_logs
         .iter()
@@ -242,7 +245,8 @@ fn bounded_lines_counted(
     limit: usize,
     dropped: &mut usize,
 ) -> Result<Vec<String>, String> {
-    let lines = counted_lines(line, limit, 0)?;
+    let json = serde_json::from_str(line).map_err(|e| e.to_string())?;
+    let lines = counted_lines(line, &json, limit, 0)?;
     *dropped = dropped.saturating_add(lines.iter().map(|line| line.stubs).sum::<usize>());
     Ok(lines.into_iter().map(|line| line.text).collect())
 }
@@ -253,7 +257,12 @@ struct CountedLine {
     stubs: usize,
 }
 
-fn counted_lines(line: &str, limit: usize, records: usize) -> Result<Vec<CountedLine>, String> {
+fn counted_lines(
+    line: &str,
+    request: &Json,
+    limit: usize,
+    records: usize,
+) -> Result<Vec<CountedLine>, String> {
     if line.len() <= limit {
         return Ok(vec![CountedLine {
             text: line.to_owned(),
@@ -261,7 +270,6 @@ fn counted_lines(line: &str, limit: usize, records: usize) -> Result<Vec<Counted
             stubs: 0,
         }]);
     }
-    let request: Json = serde_json::from_str(line).map_err(|e| e.to_string())?;
     let mut lines = Vec::new();
     for resource in request["resourceLogs"].as_array().into_iter().flatten() {
         let (resource_start, resource_end) = array_frame(resource, "scopeLogs")?;
@@ -1170,19 +1178,18 @@ mod ordered_tests {
         }
     }
 
-    #[test]
-    fn encoding_does_not_add_a_nesting_limit() {
+    fn nested_request(depth: usize) -> ExportLogsServiceRequest {
         let mut body = AnyValue {
-            value: Some(Value::StringValue("leaf".into())),
+            value: Some(Value::StringValue("leaf".repeat(512))),
         };
-        for _ in 0..140 {
+        for _ in 0..depth {
             body = AnyValue {
                 value: Some(Value::ArrayValue(
                     opentelemetry_proto::tonic::common::v1::ArrayValue { values: vec![body] },
                 )),
             };
         }
-        let request = ExportLogsServiceRequest {
+        ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 scope_logs: vec![ScopeLogs {
                     log_records: vec![LogRecord {
@@ -1193,8 +1200,44 @@ mod ordered_tests {
                 }],
                 ..Default::default()
             }],
-        };
-        assert!(encode_line(&request).unwrap().contains("leaf"));
+        }
+    }
+
+    #[test]
+    fn encoding_does_not_add_a_nesting_limit() {
+        assert!(encode_line(&nested_request(140)).unwrap().contains("leaf"));
+    }
+
+    fn assert_split_preserves_record(mut request: ExportLogsServiceRequest) {
+        let expected = encode_line(&request).unwrap();
+        let record = request.resource_logs[0].scope_logs[0].log_records[0].clone();
+        request.resource_logs[0].scope_logs[0]
+            .log_records
+            .push(record);
+        let json = encode_json(&request).unwrap();
+        let line = encode_projected(&json).unwrap();
+        let limit = expected.len() + 1;
+        assert!(line.len() > limit);
+        let lines = counted_lines(&line, &json, limit, 2).unwrap();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            assert_eq!(line.text, expected);
+            assert_eq!(line.records, 1);
+            assert_eq!(line.stubs, 0);
+        }
+    }
+
+    #[test]
+    fn splitting_preserves_deep_nesting_and_finite_doubles() {
+        // Straddle the old JSON parser's 128-container limit, then go far beyond.
+        for depth in [39, 40, 41, 140] {
+            assert_split_preserves_record(nested_request(depth));
+        }
+        let mut request = nested_request(0);
+        request.resource_logs[0].scope_logs[0].log_records[0].body = Some(AnyValue {
+            value: Some(Value::DoubleValue(f64::from_bits(0x3e23_af87_5e8f_644c))),
+        });
+        assert_split_preserves_record(request);
     }
 
     #[test]
