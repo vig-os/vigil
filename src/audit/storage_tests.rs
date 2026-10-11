@@ -1,5 +1,8 @@
 use super::*;
-use crate::audit::{CheckpointFields, Entry, RecordContext};
+use crate::{
+    audit::{CheckpointFields, Entry, RecordContext},
+    rotate::{RotatingFile, RotationConfig},
+};
 use std::{
     fs,
     io::Write,
@@ -31,36 +34,35 @@ fn context(seq: u64, previous: [u8; 32]) -> RecordContext {
     RecordContext::new(TRAIL, seq, 100 + seq, "test", previous)
 }
 fn cp(seq: u64, previous: [u8; 32], mmr: &Mmr) -> Record {
-    Record::checkpoint(
-        context(seq, previous),
-        CheckpointFields::new(
-            mmr.size(),
-            mmr.root(),
-            mmr.peaks().to_vec(),
-            [1; 32],
-            [0; 64],
-        )
-        .unwrap(),
-    )
-    .unwrap()
+    let peaks = mmr.peaks().to_vec();
+    let fields = CheckpointFields::new(mmr.size(), mmr.root(), peaks, [1; 32], [0; 64]).unwrap();
+    Record::checkpoint(context(seq, previous), fields).unwrap()
 }
 fn line(record: &Record) -> Vec<u8> {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
     let extra = AnyValue {
         value: Some(any_value::Value::StringValue("context".into())),
     };
-    let mut line = crate::logs::encode_line(&super::super::request(record, extra).unwrap())
+    let mut line = crate::logs::encode_line(&crate::audit::format::request(record, extra).unwrap())
         .unwrap()
         .into_bytes();
     line.push(b'\n');
     line
 }
+fn seeded(first: &Record) -> Mmr {
+    let mut mmr = Mmr::new();
+    mmr.push(first.hash()).unwrap();
+    mmr
+}
 fn append(path: &Path, record: &Record) {
+    append_bytes(path, &line(record));
+}
+fn append_bytes(path: &Path, bytes: &[u8]) {
     fs::OpenOptions::new()
         .append(true)
         .open(path)
         .unwrap()
-        .write_all(&line(record))
+        .write_all(bytes)
         .unwrap();
 }
 fn fixture(path: &Path) -> Record {
@@ -86,15 +88,29 @@ fn entry(previous: &Record) -> Record {
 fn bad<T>(result: Result<T, AuditError>, kind: AuditErrorKind) {
     assert_eq!(result.err().unwrap().kind(), kind);
 }
+fn reject<T>(result: Result<T, AuditError>) {
+    bad(result, AuditErrorKind::CorruptTrail);
+}
+fn corrupt_open(path: &Path) {
+    reject(TrailReader::open(path, TRAIL, None));
+}
+fn write_records(path: &Path, records: &[&Record]) {
+    write(
+        path,
+        records.iter().flat_map(|r| line(r)).collect::<Vec<_>>(),
+    );
+}
+fn write(path: &Path, bytes: impl AsRef<[u8]>) {
+    fs::write(path.join("audit.jsonl"), bytes).unwrap();
+}
+fn segment(path: &Path, id: usize) -> PathBuf {
+    path.join(format!("audit-20260101T000000.000000000Z_{id:06}.jsonl"))
+}
 fn rotated(path: &Path, last: &Record, mmr: &mut Mmr, id: usize) -> Record {
     let close = cp(last.context.seq + 1, last.hash(), mmr);
     append(&path.join("audit.jsonl"), &close);
     mmr.push(close.hash()).unwrap();
-    fs::rename(
-        path.join("audit.jsonl"),
-        path.join(format!("audit-20260101T000000.000000000Z_{id:06}.jsonl")),
-    )
-    .unwrap();
+    fs::rename(path.join("audit.jsonl"), segment(path, id)).unwrap();
     let opening = cp(close.context.seq + 1, close.hash(), mmr);
     fs::write(path.join("audit.jsonl"), line(&opening)).unwrap();
     mmr.push(opening.hash()).unwrap();
@@ -108,62 +124,36 @@ fn validates_chain_mmr_identity_structure_and_expected_head() {
     append(&d.0.join("audit.jsonl"), &second);
     assert_eq!(head(&open(&d.0)), Head::of(&second));
     assert!(TrailReader::open(&d.0, TRAIL, Some(Head::of(&first))).is_ok());
+    let absent = Head {
+        seq: 1,
+        hash: [0; 32],
+    };
     bad(
-        TrailReader::open(
-            &d.0,
-            TRAIL,
-            Some(Head {
-                seq: 1,
-                hash: [0; 32],
-            }),
-        ),
+        TrailReader::open(&d.0, TRAIL, Some(absent)),
         AuditErrorKind::HeadMismatch,
     );
-    bad(
-        TrailReader::open(&d.0, [0; 16], None),
-        AuditErrorKind::CorruptTrail,
-    );
+    reject(TrailReader::open(&d.0, [0; 16], None));
     let wrong = Record::new(context(1, [0; 32]), Entry::new("actor", "change", "object")).unwrap();
-    fs::write(
-        d.0.join("audit.jsonl"),
-        [line(&first), line(&wrong)].concat(),
-    )
-    .unwrap();
-    bad(
-        TrailReader::open(&d.0, TRAIL, None),
-        AuditErrorKind::CorruptTrail,
-    );
+    write_records(&d.0, &[&first, &wrong]);
+    corrupt_open(&d.0);
     let wrong = Record::checkpoint(
         context(2, second.hash()),
         CheckpointFields::new(2, [0; 32], vec![[0; 32]], [0; 32], [0; 64]).unwrap(),
     )
     .unwrap();
-    fs::write(
-        d.0.join("audit.jsonl"),
-        [line(&first), line(&second), line(&wrong)].concat(),
-    )
-    .unwrap();
-    bad(
-        TrailReader::open(&d.0, TRAIL, None),
-        AuditErrorKind::CorruptTrail,
-    );
+    write_records(&d.0, &[&first, &second, &wrong]);
+    corrupt_open(&d.0);
     for bytes in [
         Vec::new(),
         line(&second),
         b"{\"torn\":".to_vec(),
         b"\n".to_vec(),
     ] {
-        fs::write(d.0.join("audit.jsonl"), bytes).unwrap();
-        bad(
-            TrailReader::open(&d.0, TRAIL, None),
-            AuditErrorKind::CorruptTrail,
-        );
+        write(&d.0, bytes);
+        corrupt_open(&d.0);
     }
     fs::remove_file(d.0.join("audit.jsonl")).unwrap();
-    bad(
-        TrailReader::open(&d.0, TRAIL, None),
-        AuditErrorKind::CorruptTrail,
-    );
+    corrupt_open(&d.0);
 }
 #[test]
 fn incremental_scan_reads_only_new_bytes_and_refuses_shrink_or_broken_append() {
@@ -183,27 +173,16 @@ fn incremental_scan_reads_only_new_bytes_and_refuses_shrink_or_broken_append() {
     assert_eq!(head(&reader), Head::of(&second));
     let wrong = Record::new(context(2, first.hash()), Entry::new("x", "y", "z")).unwrap();
     append(&d.0.join("audit.jsonl"), &wrong);
-    bad(
-        reader.with_current(|_| Ok(()), |_, _, _| Ok(())),
-        AuditErrorKind::CorruptTrail,
-    );
-    fs::write(d.0.join("audit.jsonl"), line(&first)).unwrap();
-    bad(
-        reader.with_current(|_| Ok(()), |_, _, _| Ok(())),
-        AuditErrorKind::CorruptTrail,
-    );
+    reject(reader.with_current(|_| Ok(()), |_, _, _| Ok(())));
+    write(&d.0, line(&first));
+    reject(reader.with_current(|_| Ok(()), |_, _, _| Ok(())));
 }
 #[test]
 fn repaired_fragments_are_checked_and_complete_json_without_lf_is_not_a_gap() {
     let d = Temp::new();
     let first = fixture(&d.0);
     let gap = b"{\"first\":\"\xf0\x9f\n{\"second\":";
-    fs::OpenOptions::new()
-        .append(true)
-        .open(d.0.join("audit.jsonl"))
-        .unwrap()
-        .write_all(gap)
-        .unwrap();
+    append_bytes(&d.0.join("audit.jsonl"), gap);
     let reader = open(&d.0);
     let digest = reader
         .with_current(
@@ -224,47 +203,25 @@ fn repaired_fragments_are_checked_and_complete_json_without_lf_is_not_a_gap() {
         Entry::new("x", "y", "z"),
     )
     .unwrap();
-    fs::OpenOptions::new()
-        .append(true)
-        .open(d.0.join("audit.jsonl"))
-        .unwrap()
-        .write_all(b"\n")
-        .unwrap();
+    append_bytes(&d.0.join("audit.jsonl"), b"\n");
     append(&d.0.join("audit.jsonl"), &second);
     assert_eq!(head(&reader), Head::of(&second));
     let unattested = entry(&first);
-    fs::write(
-        d.0.join("audit.jsonl"),
-        [
-            line(&first),
-            gap.to_vec(),
-            b"\n".to_vec(),
-            line(&unattested),
-        ]
-        .concat(),
-    )
-    .unwrap();
-    bad(
-        TrailReader::open(&d.0, TRAIL, None),
-        AuditErrorKind::CorruptTrail,
-    );
     let wrong = Record::new(
         context(1, first.hash()).repaired([0; 32]),
         Entry::new("x", "y", "z"),
     )
     .unwrap();
-    fs::write(
-        d.0.join("audit.jsonl"),
-        [line(&first), gap.to_vec(), b"\n".to_vec(), line(&wrong)].concat(),
-    )
-    .unwrap();
-    bad(
-        TrailReader::open(&d.0, TRAIL, None),
-        AuditErrorKind::CorruptTrail,
-    );
+    for record in [&unattested, &wrong] {
+        write(
+            &d.0,
+            [line(&first), gap.to_vec(), b"\n".to_vec(), line(record)].concat(),
+        );
+        corrupt_open(&d.0);
+    }
     let mut bytes = line(&first);
     bytes.pop();
-    fs::write(d.0.join("audit.jsonl"), bytes).unwrap();
+    write(&d.0, bytes);
     let reader = open(&d.0);
     reader
         .with_current(
@@ -276,12 +233,7 @@ fn repaired_fragments_are_checked_and_complete_json_without_lf_is_not_a_gap() {
             },
         )
         .unwrap();
-    fs::OpenOptions::new()
-        .append(true)
-        .open(d.0.join("audit.jsonl"))
-        .unwrap()
-        .write_all(b"\n")
-        .unwrap();
+    append_bytes(&d.0.join("audit.jsonl"), b"\n");
     append(&d.0.join("audit.jsonl"), &unattested);
     assert_eq!(head(&reader), Head::of(&unattested));
     for invalid in [
@@ -293,39 +245,27 @@ fn repaired_fragments_are_checked_and_complete_json_without_lf_is_not_a_gap() {
         b"{}",
         &[b'x'; 1],
     ] {
-        fs::write(
-            d.0.join("audit.jsonl"),
-            [line(&first), invalid.to_vec()].concat(),
-        )
-        .unwrap();
-        bad(
-            TrailReader::open(&d.0, TRAIL, None),
-            AuditErrorKind::CorruptTrail,
-        );
+        write(&d.0, [line(&first), invalid.to_vec()].concat());
+        corrupt_open(&d.0);
     }
-    fs::write(
-        d.0.join("audit.jsonl"),
-        [line(&first), vec![b'{'; 1_000_001]].concat(),
-    )
-    .unwrap();
-    bad(
-        TrailReader::open(&d.0, TRAIL, None),
-        AuditErrorKind::CorruptTrail,
+    write(
+        &d.0,
+        [line(&first), vec![b'{'; MAX_PAYLOAD_BYTES + 1]].concat(),
     );
+    corrupt_open(&d.0);
 }
 #[test]
 fn rotations_follow_old_descriptor_and_every_intervening_segment() {
     let d = Temp::new();
     let first = fixture(&d.0);
     let reader = open(&d.0);
-    let mut mmr = Mmr::new();
-    mmr.push(first.hash()).unwrap();
+    let mut mmr = seeded(&first);
     let mut last = first.clone();
     for id in 0..3 {
         last = rotated(&d.0, &last, &mut mmr, id);
     }
     // A sealing crash can leave every byte of its closing JSON except LF.
-    let sealed_path = d.0.join("audit-20260101T000000.000000000Z_000000.jsonl");
+    let sealed_path = segment(&d.0, 0);
     let length = fs::metadata(&sealed_path).unwrap().len();
     fs::OpenOptions::new()
         .write(true)
@@ -335,33 +275,28 @@ fn rotations_follow_old_descriptor_and_every_intervening_segment() {
         .unwrap();
     assert_eq!(head(&reader), Head::of(&last));
     assert!(TrailReader::open(&d.0, TRAIL, Some(Head::of(&first))).is_ok());
-    fs::remove_file(d.0.join("audit-20260101T000000.000000000Z_000000.jsonl")).unwrap();
+    fs::remove_file(segment(&d.0, 0)).unwrap();
     bad(
         TrailReader::open(&d.0, TRAIL, Some(Head::of(&first))),
         AuditErrorKind::HeadMismatch,
     );
     // An archived prefix is allowed: the oldest remaining opening is self-contained.
     assert_eq!(head(&open(&d.0)), Head::of(&last));
-    let lagging = open(&d.0);
+    let archived = open(&d.0);
     last = rotated(&d.0, &last, &mut mmr, 3);
-    let old_length = fs::metadata(d.0.join("audit-20260101T000000.000000000Z_000003.jsonl"))
-        .unwrap()
-        .len();
+    let lagging = open(&d.0);
+    fs::remove_file(segment(&d.0, 3)).unwrap();
+    assert_eq!(head(&archived), Head::of(&last));
     last = rotated(&d.0, &last, &mut mmr, 4);
-    fs::remove_file(d.0.join("audit-20260101T000000.000000000Z_000004.jsonl")).unwrap();
-    bad(
-        lagging.with_current(|_| Ok(()), |_, _, _| Ok(())),
-        AuditErrorKind::CorruptTrail,
-    );
-    assert!(old_length > 0);
-    assert!(last.context.seq > 0);
+    rotated(&d.0, &last, &mut mmr, 5);
+    fs::remove_file(segment(&d.0, 5)).unwrap();
+    reject(lagging.with_current(|_| Ok(()), |_, _, _| Ok(())));
 }
 #[test]
 fn gap_requires_matching_resume_declaration() {
     let d = Temp::new();
     let first = fixture(&d.0);
-    let mut mmr = Mmr::new();
-    mmr.push(first.hash()).unwrap();
+    let mmr = seeded(&first);
     let opening = cp(7, first.hash(), &mmr);
     let resume = Record::new(
         context(8, opening.hash()),
@@ -373,25 +308,11 @@ fn gap_requires_matching_resume_declaration() {
             )),
     )
     .unwrap();
-    fs::write(
-        d.0.join("audit.jsonl"),
-        [line(&first), line(&opening)].concat(),
-    )
-    .unwrap();
-    bad(
-        TrailReader::open(&d.0, TRAIL, None),
-        AuditErrorKind::CorruptTrail,
-    );
+    write_records(&d.0, &[&first, &opening]);
+    corrupt_open(&d.0);
     append(&d.0.join("audit.jsonl"), &entry(&opening));
-    bad(
-        TrailReader::open(&d.0, TRAIL, None),
-        AuditErrorKind::CorruptTrail,
-    );
-    fs::write(
-        d.0.join("audit.jsonl"),
-        [line(&first), line(&opening), line(&resume)].concat(),
-    )
-    .unwrap();
+    corrupt_open(&d.0);
+    write_records(&d.0, &[&first, &opening, &resume]);
     assert_eq!(head(&open(&d.0)), Head::of(&resume));
     let wrong = Record::new(
         context(8, opening.hash()),
@@ -399,15 +320,21 @@ fn gap_requires_matching_resume_declaration() {
             .details("head=0:blake3:00 lost_through=6 file=-"),
     )
     .unwrap();
-    fs::write(
-        d.0.join("audit.jsonl"),
-        [line(&first), line(&opening), line(&wrong)].concat(),
+    write_records(&d.0, &[&first, &opening, &wrong]);
+    corrupt_open(&d.0);
+}
+fn write_child(file: &File, s: &State) -> Result<(), AuditError> {
+    let record = Record::new(
+        context(s.head.seq + 1, s.head.hash),
+        Entry::new(std::process::id().to_string(), "child", "test"),
     )
     .unwrap();
-    bad(
-        TrailReader::open(&d.0, TRAIL, None),
-        AuditErrorKind::CorruptTrail,
-    );
+    let mut file = file;
+    file.write_all(&line(&record)).unwrap();
+    Ok(())
+}
+fn would_block<T>(result: io::Result<T>) {
+    assert_eq!(result.err().unwrap().kind(), io::ErrorKind::WouldBlock);
 }
 fn wait_for(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -420,7 +347,7 @@ fn child(path: &Path, role: &str) -> std::process::Child {
     Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "audit::format::storage::tests::child_role",
+            "audit::storage::tests::child_role",
             "--nocapture",
         ])
         .env("VIGIL_READER_TEST_DIR", path)
@@ -452,44 +379,36 @@ fn child_role() {
     let path = PathBuf::from(path);
     let role = std::env::var("VIGIL_READER_TEST_ROLE").unwrap();
     let reader = open(&path);
-    if role == "stress" {
+    if role == "reentrant" {
+        let logs = RotatingFile::open(&path, "logs", RotationConfig::default()).unwrap();
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, _| {
+                    would_block(logs.append(b"{}"));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let directory = Directory::open(&path).unwrap();
+        directory
+            .with_lock(|_| {
+                would_block(directory.with_lock(|_| ()));
+            })
+            .unwrap();
+        logs.append(b"{}").unwrap();
+    } else if role == "stress" {
         for _ in 0..60 {
             reader
-                .with_current(
-                    |_| Ok(()),
-                    |_, file, s| {
-                        let record = Record::new(
-                            context(s.head.seq + 1, s.head.hash),
-                            Entry::new(std::process::id().to_string(), "stress", "test"),
-                        )
-                        .unwrap();
-                        let mut file = file;
-                        file.write_all(&line(&record)).unwrap();
-                        Ok(())
-                    },
-                )
+                .with_current(|_| Ok(()), |_, file, s| write_child(file, s))
                 .unwrap();
         }
     } else {
         fs::write(path.join("ready"), b"").unwrap();
         wait_for(&path.join("go"));
         fs::write(path.join("waiting"), b"").unwrap();
-        let result = reader.with_current(
-            |_| Ok(()),
-            |_, file, s| {
-                let record = Record::new(
-                    context(s.head.seq + 1, s.head.hash),
-                    Entry::new("child", "replace", "test"),
-                )
-                .unwrap();
-                let mut file = file;
-                file.write_all(&line(&record)).unwrap();
-                Ok(())
-            },
-        );
-        if role == "symlink" {
-            bad(result, AuditErrorKind::Io);
-        } else if role == "directory" || role == "delete" {
+        let result = reader.with_current(|_| Ok(()), |_, file, s| write_child(file, s));
+        if ["symlink", "directory", "delete"].contains(&role.as_str()) {
             bad(result, AuditErrorKind::CorruptTrail);
         } else {
             result.unwrap();
@@ -504,15 +423,7 @@ fn six_processes_serialize_one_trail() {
     for child in &mut children {
         finish(child);
     }
-    let start = Instant::now();
-    let reader = open(&d.0);
-    let scanned = start.elapsed();
-    let start = Instant::now();
-    assert_eq!(head(&reader).seq, 360);
-    eprintln!(
-        "B2a host scan of 361 records: {scanned:?}; unchanged refresh: {:?}",
-        start.elapsed()
-    );
+    assert_eq!(head(&open(&d.0)).seq, 360);
 }
 #[test]
 fn waiting_process_rechecks_replaced_file_and_directory_and_deleted_live() {
@@ -530,7 +441,7 @@ fn waiting_process_rechecks_replaced_file_and_directory_and_deleted_live() {
             let mut mmr = Mmr::new();
             mmr.push(first.hash()).unwrap();
             rotated(&d.0, &first, &mut mmr, 0);
-            stale = d.0.join("audit-20260101T000000.000000000Z_000000.jsonl");
+            stale = segment(&d.0, 0);
             if role == "symlink" {
                 fs::remove_file(d.0.join("audit.jsonl")).unwrap();
                 std::os::unix::fs::symlink(&stale, d.0.join("audit.jsonl")).unwrap();
@@ -561,9 +472,7 @@ fn waiting_process_rechecks_replaced_file_and_directory_and_deleted_live() {
 fn audit_and_logs_share_handle_without_nesting_locks() {
     let d = Temp::new();
     fixture(&d.0);
-    let logs =
-        crate::rotate::RotatingFile::open(&d.0, "logs", crate::rotate::RotationConfig::default())
-            .unwrap();
+    let logs = RotatingFile::open(&d.0, "logs", RotationConfig::default()).unwrap();
     let reader = open(&d.0);
     let duplicate = open(&d.0);
     for _ in 0..10 {
@@ -574,4 +483,70 @@ fn audit_and_logs_share_handle_without_nesting_locks() {
     assert!(locked.shares_lock(&reader.directory));
     assert!(reader.directory.shares_lock(&duplicate.directory));
     locked.with_lock(|_| ()).unwrap();
+}
+
+#[test]
+fn rotation_reads_only_new_data() {
+    let d = Temp::new();
+    let mut last = fixture(&d.0);
+    let mut mmr = seeded(&last);
+    for id in 0..20 {
+        for _ in 0..200 {
+            last = entry(&last);
+            append(&d.0.join("audit.jsonl"), &last);
+            mmr.push(last.hash()).unwrap();
+        }
+        last = rotated(&d.0, &last, &mut mmr, id);
+    }
+    let reader = open(&d.0);
+    let before = fs::metadata(d.0.join("audit.jsonl")).unwrap().len();
+    last = rotated(&d.0, &last, &mut mmr, 20);
+    let added = fs::metadata(segment(&d.0, 20)).unwrap().len() - before
+        + fs::metadata(d.0.join("audit.jsonl")).unwrap().len();
+    SCANNED.with(|n| n.set(0));
+    assert_eq!(head(&reader), Head::of(&last));
+    let scanned = SCANNED.with(|n| n.get());
+    let total: u64 = fs::read_dir(&d.0)
+        .unwrap()
+        .map(|p| p.unwrap().metadata().unwrap().len())
+        .sum();
+    eprintln!("rotation bytes scanned={scanned}, new={added}, trail={total}");
+    assert_eq!(scanned as u64, added);
+}
+#[test]
+fn newer_fork_is_rejected_by_cached_and_fresh_readers() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let reader = open(&d.0);
+    let mut mmr = seeded(&first);
+    rotated(&d.0, &first, &mut mmr, 0);
+    fs::write(segment(&d.0, 1), line(&first)).unwrap();
+    reject(reader.with_current(|_| Ok(()), |_, _, _| Ok(())));
+    corrupt_open(&d.0);
+}
+#[test]
+fn nonregular_segments_are_structural_corruption() {
+    for kind in ["symlink", "directory", "fifo"] {
+        let d = Temp::new();
+        fixture(&d.0);
+        let path = segment(&d.0, 0);
+        match kind {
+            "symlink" => std::os::unix::fs::symlink(d.0.join("audit.jsonl"), &path).unwrap(),
+            "directory" => fs::create_dir(&path).unwrap(),
+            _ => assert!(
+                Command::new("mkfifo")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            ),
+        }
+        corrupt_open(&d.0);
+    }
+}
+#[test]
+fn callback_lock_reentry_returns_would_block() {
+    let d = Temp::new();
+    fixture(&d.0);
+    finish(&mut child(&d.0, "reentrant"));
 }

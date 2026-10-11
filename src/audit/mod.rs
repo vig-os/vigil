@@ -9,6 +9,8 @@
 mod format;
 mod mmr;
 mod signing;
+#[cfg_attr(not(test), allow(dead_code))] // Internal reader; writes follow in #11.
+pub(crate) mod storage;
 pub use format::{Checkpoint, CheckpointFields, Entry, Record, RecordContext, Value};
 pub use mmr::Mmr;
 pub use signing::{KeySeed, Signer, SignerError, checkpoint_message, verify_signature};

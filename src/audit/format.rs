@@ -2,7 +2,7 @@ use super::{AuditError, AuditErrorKind};
 use validation::valid_text;
 
 #[path = "validation.rs"]
-mod validation;
+pub(super) mod validation;
 #[cfg_attr(not(test), allow(dead_code))] // B2/B3 consume this production boundary.
 #[path = "writer.rs"]
 mod writer;
@@ -31,12 +31,12 @@ impl Value {
 #[derive(Clone, Debug)]
 pub struct Entry {
     actor: String,
-    action: String,
+    pub(super) action: String,
     object: String,
     reason: Option<String>,
     before: Option<Value>,
     after: Option<Value>,
-    details: Option<String>,
+    pub(super) details: Option<String>,
 }
 impl Entry {
     /// Creates an action with its actor and regulated object identifier.
@@ -124,9 +124,9 @@ impl Entry {
 /// Checkpoint commitment to all leaves preceding its own sequence number.
 #[derive(Clone, Debug)]
 pub struct CheckpointFields {
-    size: u64,
-    root: [u8; 32],
-    peaks: Vec<[u8; 32]>,
+    pub(super) size: u64,
+    pub(super) root: [u8; 32],
+    pub(super) peaks: Vec<[u8; 32]>,
     key: [u8; 32],
     signature: [u8; 64],
 }
@@ -174,7 +174,7 @@ impl CheckpointFields {
 }
 
 #[derive(Clone, Debug)]
-enum Kind {
+pub(super) enum Kind {
     Entry(Entry),
     Checkpoint(CheckpointFields),
 }
@@ -182,13 +182,13 @@ enum Kind {
 /// Context supplied by a writer under its lock; times are nanoseconds since epoch.
 #[derive(Clone, Debug)]
 pub struct RecordContext {
-    trail: [u8; 16],
-    seq: u64,
+    pub(super) trail: [u8; 16],
+    pub(super) seq: u64,
     time: u64,
     service: String,
     host: Option<String>,
-    repaired: Option<[u8; 32]>,
-    previous: [u8; 32],
+    pub(super) repaired: Option<[u8; 32]>,
+    pub(super) previous: [u8; 32],
 }
 impl RecordContext {
     /// Sets trail identity, order, timestamp, service and previous chain hash.
@@ -228,8 +228,8 @@ impl RecordContext {
 /// building block: the future trail writer supplies time inside its lock.
 #[derive(Clone, Debug)]
 pub struct Record {
-    context: RecordContext,
-    kind: Kind,
+    pub(super) context: RecordContext,
+    pub(super) kind: Kind,
 }
 impl Record {
     /// Builds a record. `previous` must be the genesis hash at sequence zero,
@@ -368,7 +368,3 @@ pub use codec::Checkpoint;
 #[cfg(test)]
 #[path = "roundtrip_tests.rs"]
 mod roundtrip_tests;
-
-#[cfg_attr(not(test), allow(dead_code))] // Internal reader; B2b/#11 adds writes, B3 adds the public sink.
-#[path = "storage.rs"]
-pub(crate) mod storage;

@@ -1,14 +1,19 @@
 //! Read-side state for #11. B2b settles staging files and checks the marker
 //! before invoking this boundary; it also owns repair writes and durability.
 //! This module never creates a data file, writes bytes or checks signatures.
-use super::{AuditError, AuditErrorKind, Kind, Record};
+//! Cached records are not revalidated after same-length in-place rewrites
+//! (ADR-0005 decision 8); offline verification (#13) detects such changes.
+use super::{
+    AuditError, AuditErrorKind, Record,
+    format::{Kind, validation::MAX_PAYLOAD_BYTES},
+};
 use crate::{audit::Mmr, rotate::Directory};
 use rustix::fs::{self as rfs, Mode, OFlags};
 use std::{
     fs::File,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     os::unix::fs::MetadataExt,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Mutex,
 };
 
@@ -57,6 +62,8 @@ impl State {
     }
 }
 struct Cache {
+    // Last sealed name observed when this live descriptor was acquired.
+    sealed_before: Option<PathBuf>,
     file: File,
     state: State,
 }
@@ -104,7 +111,8 @@ impl TrailReader {
     /// B2b's append boundary: recheck the live inode and validate every newly
     /// observed record before handing the current descriptor to the writer.
     /// B2b must settle staging *inside this same directory lock*, before refresh;
-    /// the callback provides that seam without nesting another flock.
+    /// the callback provides that seam without nesting another flock. Reentering
+    /// this directory lock fails with an I/O `WouldBlock` error.
     pub(crate) fn with_current<T>(
         &self,
         settle: impl FnOnce(&File) -> Result<(), AuditError>,
@@ -133,23 +141,33 @@ fn existing(dir: &File, name: &Path) -> Result<File, AuditError> {
     rfs::openat(
         dir,
         name,
-        OFlags::RDWR | OFlags::APPEND | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        OFlags::RDWR | OFlags::APPEND | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )
     .map(File::from)
     .map_err(|e| {
-        if e == rustix::io::Errno::NOENT {
-            corrupt("missing trail file")
+        if matches!(
+            e,
+            rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::ISDIR
+        ) {
+            corrupt("missing or nonregular trail file")
         } else {
             io_error(e.into())
         }
+    })
+    .and_then(|file| {
+        if !file.metadata().map_err(io_error)?.is_file() {
+            return Err(corrupt("nonregular trail file"));
+        }
+        Ok(file)
     })
 }
 fn initial(dir: &File, trail: [u8; 16], expected: Option<Head>) -> Result<Cache, AuditError> {
     let mut chain = None;
     let mut found = false;
-    for name in crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)? {
-        let file = existing(dir, &name)?;
+    let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
+    for name in &names {
+        let file = existing(dir, name)?;
         chain = Some(scan(&file, trail, chain, true, expected, &mut found)?);
         sealed(chain.as_ref().ok_or_else(|| corrupt("empty segment"))?)?;
     }
@@ -161,7 +179,11 @@ fn initial(dir: &File, trail: [u8; 16], expected: Option<Head>) -> Result<Cache,
             "expected head absent or different",
         ));
     }
-    Ok(Cache { file, state })
+    Ok(Cache {
+        file,
+        state,
+        sealed_before: names.last().cloned(),
+    })
 }
 fn sealed(state: &State) -> Result<(), AuditError> {
     // A complete JSON checkpoint without LF is still a record (ADR-0005 d5).
@@ -210,26 +232,39 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
         &mut found,
     )?;
     sealed(&state)?;
-    // A slow writer may miss several rotations. Follow every intervening
-    // segment; never jump directly from its old descriptor to the live head.
-    for name in crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)? {
-        let file = existing(dir, &name)?;
-        let metadata = file.metadata().map_err(io_error)?;
-        if (metadata.dev(), metadata.ino()) == (old.dev(), old.ino()) {
+    // Locate the old descriptor by metadata, never by rereading historical
+    // contents. If archived, the previous sealed name remains a lower bound.
+    let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
+    let mut boundary = cache.sealed_before.clone();
+    for name in &names {
+        let metadata = rfs::statat(dir, name, rfs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| io_error(e.into()))?;
+        if (metadata.st_dev as u64, metadata.st_ino as u64) == (old.dev(), old.ino()) {
+            boundary = Some(name.clone());
+            break;
+        }
+    }
+    for name in &names {
+        if boundary.as_ref().is_some_and(|b| {
+            crate::rotate::segment_key(name, "audit") <= crate::rotate::segment_key(b, "audit")
+        }) {
             continue;
         }
-        let candidate = scan(&file, trail, None, true, None, &mut found)?;
-        if candidate.head.seq <= state.head.seq {
-            continue;
-        }
+        let file = existing(dir, name)?;
         state = scan(&file, trail, Some(state), true, None, &mut found)?;
         sealed(&state)?;
     }
     let file = existing(dir, Path::new("audit.jsonl"))?;
     let state = scan(&file, trail, Some(state), true, None, &mut found)?;
-    *cache = Cache { file, state };
+    *cache = Cache {
+        file,
+        state,
+        sealed_before: names.last().cloned(),
+    };
     Ok(())
 }
+
+const MAX_READ_BYTES: u64 = MAX_PAYLOAD_BYTES as u64 + 2; // LF plus one excess byte.
 
 /// Bounded reads: each payload is capped even when it is only a fragment.
 fn scan(
@@ -274,7 +309,7 @@ fn scan(
         let mut line = Vec::new();
         let count = reader
             .by_ref()
-            .take(1_000_002)
+            .take(MAX_READ_BYTES)
             .read_until(b'\n', &mut line)
             .map_err(io_error)?;
         if count == 0 {
@@ -285,7 +320,7 @@ fn scan(
         offset += count as u64;
         let newline = line.ends_with(b"\n");
         let payload = line.strip_suffix(b"\n").unwrap_or(&line);
-        if payload.len() > 1_000_000 {
+        if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(corrupt("audit line exceeds byte cap"));
         }
         let records = match Record::parse_line(payload) {
@@ -403,24 +438,20 @@ fn apply(record: &Record, state: &mut Option<State>) -> Result<(), AuditError> {
             let (named, lost) = named
                 .split_once(" lost_through=")
                 .ok_or_else(|| corrupt("invalid resume loss bound"))?;
-            let (seq, hash) = named
+            let (seq_text, hash) = named
                 .strip_prefix("head=")
                 .and_then(|v| v.split_once(':'))
                 .ok_or_else(|| corrupt("invalid resume head"))?;
-            let seq = seq
+            let seq = seq_text
                 .parse::<u64>()
                 .map_err(|_| corrupt("invalid resume head sequence"))?;
-            if lost
-                != s.head
-                    .seq
-                    .checked_sub(1)
-                    .ok_or_else(|| corrupt("resume after creation checkpoint"))?
-                    .to_string()
-                || seq.to_string()
-                    != named
-                        .strip_prefix("head=")
-                        .and_then(|v| v.split_once(':'))
-                        .map_or("", |p| p.0)
+            let bound = s
+                .head
+                .seq
+                .checked_sub(1)
+                .ok_or_else(|| corrupt("resume after creation checkpoint"))?;
+            if lost != bound.to_string()
+                || seq.to_string() != seq_text
                 || seq >= s.head.seq
                 || hash != crate::audit::digest_string(&s.checkpoint_previous)
                 || s.checkpoint_predecessor.is_some_and(|p| p.seq != seq)
