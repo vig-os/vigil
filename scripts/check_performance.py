@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare Criterion mean elapsed times to a reviewed, committed baseline."""
+"""Compare Criterion means to the merge-base measured on the same runner."""
 
 import argparse
 import json
@@ -20,11 +20,11 @@ BENCHMARKS = {
 THRESHOLD = 2.0
 
 
-def read_estimates(root):
+def read_estimates(root, baseline="new"):
     """Require every workload; missing measurements must never look green."""
     values = {}
     for name in BENCHMARKS:
-        path = root / name / "new" / "estimates.json"
+        path = root / name / baseline / "estimates.json"
         value = json.loads(path.read_text())["mean"]["point_estimate"]
         if (
             not isinstance(value, (int, float))
@@ -41,8 +41,8 @@ def report(current, baseline):
     lines = [
         "## Performance (advisory)",
         "",
-        f"Flag threshold: elapsed time >= {THRESHOLD:g}x committed baseline.",
-        "Shared runners vary; confirm on baseline hardware before acting.",
+        f"Flag threshold: elapsed time >= {THRESHOLD:g}x same-runner merge-base.",
+        "Base and head use the same harness, runner and filesystem; repeat flags before acting.",
         "",
         "| Workload | Mean ms | Records/s or ops/s | Baseline ratio | Status |",
         "| --- | ---: | ---: | ---: | --- |",
@@ -68,10 +68,15 @@ def report(current, baseline):
 
 
 def main():
-    """Report advisory results or explicitly replace a reviewed baseline."""
+    """Report a comparison or export a full-run local reference."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results", type=Path, required=True)
-    parser.add_argument("--baseline", type=Path, default=Path("benches/baseline.json"))
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        required=True,
+        help="Criterion root containing base estimates, or local full-run JSON",
+    )
     parser.add_argument("--update", action="store_true")
     parser.add_argument(
         "--environment", help="Hardware/OS/toolchain/storage for baseline update"
@@ -80,6 +85,24 @@ def main():
     try:
         current = read_estimates(args.results)
         if args.update:
+            mode = json.loads((args.results / "performance-mode.json").read_text())
+            if (
+                mode.get("quick") is not False
+                or os.environ.get("VIGIL_BENCH_QUICK") is not None
+            ):
+                raise ValueError(
+                    "Reference update refuses quick-mode or unverified results"
+                )
+            for name in BENCHMARKS:
+                sample = json.loads(
+                    (args.results / name / "new" / "sample.json").read_text()
+                )
+                if len(sample["iters"]) < 100 or len(sample["iters"]) != len(
+                    sample["times"]
+                ):
+                    raise ValueError(
+                        f"Reference update refuses quick-mode/incomplete samples: {name}"
+                    )
             if not args.environment:
                 parser.error("--update requires --environment")
             args.baseline.write_text(
@@ -93,10 +116,16 @@ def main():
                 + "\n"
             )
             return
-        baseline = json.loads(args.baseline.read_text())
-        output, regression = report(current, baseline["mean_ns"])
+        baseline = (
+            read_estimates(args.baseline, "base")
+            if args.baseline.is_dir()
+            else json.loads(args.baseline.read_text())["mean_ns"]
+        )
+        output, regression = report(current, baseline)
     except (OSError, ValueError, KeyError, TypeError) as error:
-        output = f"## Performance (advisory)\n\nMeasurement unavailable: {error}\n"
+        output = (
+            f"## Performance measurement failed\n\nMeasurement unavailable: {error}\n"
+        )
         print(output)
         if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
             with open(summary, "a") as file:
@@ -108,7 +137,7 @@ def main():
             file.write(output)
     if regression:
         print(
-            "::warning::Performance >= 2x baseline; repeat on reference hardware and investigate."
+            "::warning::Performance >= 2x baseline; repeat the same-runner comparison and investigate."
         )
     # Regressions are advisory. Broken measurement is distinct and exits 1.
 

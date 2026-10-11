@@ -17,14 +17,18 @@ impl Scratch {
     fn new() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("vigil-bench-{}-{id}", std::process::id()));
+        let root = std::env::var_os("VIGIL_BENCH_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = root.join(format!("vigil-bench-{}-{id}", std::process::id()));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
 }
 impl Drop for Scratch {
     fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
+        // Cleanup must not panic during unwinding and turn an assertion into an abort.
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -158,6 +162,12 @@ fn main() {
         );
         return;
     }
+    if !args.iter().any(|arg| arg == "--bench") || args.iter().any(|arg| arg == "--test") {
+        // Prove failed cleanup is harmless: Drop sees an already removed directory.
+        let scratch = Scratch::new();
+        fs::remove_dir(&scratch.0).unwrap();
+        drop(scratch);
+    }
     let mut c = Criterion::default().without_plots();
     if std::env::var_os("VIGIL_BENCH_QUICK").is_some() {
         c = c
@@ -252,4 +262,24 @@ fn main() {
     }
     rotation.finish();
     c.final_summary();
+    // Keep provenance with estimates: unsetting the environment later must not
+    // make quick-mode measurements eligible for a reference update.
+    if args.iter().any(|arg| arg == "--bench") && !args.iter().any(|arg| arg == "--test") {
+        let root = std::env::var_os("CRITERION_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("CARGO_TARGET_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| "target".into())
+                    .join("criterion")
+            });
+        fs::write(
+            root.join("performance-mode.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "quick": std::env::var_os("VIGIL_BENCH_QUICK").is_some(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
 }

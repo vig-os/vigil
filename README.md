@@ -326,24 +326,30 @@ policy without license exceptions.
 Reference measurements (2026-10-11): shared KVM VM, AMD Ryzen 7 9800X3D,
 12 exposed vCPUs, Linux 6.18.55 / NixOS, x86_64, Rust 1.95.0
 (59807616e, LLVM 22.1.2), release profile with thin LTO and one codegen unit.
-Scratch files are in `/tmp` on tmpfs; these numbers measure cached filesystem
-operations, **not durable storage latency** (`append` does not call `fsync`).
-The committed means are in [benches/baseline.json](benches/baseline.json).
+Scratch files are on the real local ext4 filesystem `/dev/vdd` mounted at
+`$HOME` (virtual block device), selected with `VIGIL_BENCH_DIR`. This is a
+warm-cache filesystem workload: neither append nor flush calls `fsync`, so the
+numbers include kernel writes and metadata operations, not durable-storage
+latency. Reference measurements are documentation, never a cross-machine CI
+baseline.
 
-| Workload | Reference mean | Consumer budget |
+| Workload | Ext4 reference mean | Consumer budget |
 | --- | ---: | ---: |
-| Append, 1 process (4,096 records) | 12.15 ms; 337k records/s | ≥150k records/s |
-| Append, 8 processes (32,768 total) | 175.04 ms; 187k records/s aggregate | ≥75k records/s aggregate |
-| Export, 256-byte bodies | 14.00 ms; 293k records/s | ≥125k records/s |
-| Export with near-cap splitting, 4 KiB bodies | 57.83 ms; 71k records/s | ≥30k records/s |
-| `Config::init`, fresh process/directory | 0.152 ms | ≤0.5 ms |
-| Rotation, 100 existing segments | 0.036 ms | ≤0.1 ms |
-| Rotation, 1,000 existing segments | 0.235 ms | ≤0.7 ms |
-| Rotation, 10,000 existing segments | 2.617 ms | ≤7 ms |
+| Append, 1 process (4,096 records) | 12.32 ms; 333k records/s | ≥50k records/s |
+| Append, 8 processes (32,768 total) | 148.69 ms; 220k records/s aggregate | ≥25k records/s aggregate |
+| Export, 256-byte bodies | 11.62 ms; 352k records/s | ≥100k records/s |
+| Export with near-cap splitting, 4 KiB bodies | 118.75 ms; 34.5k records/s | ≥10k records/s |
+| `Config::init`, fresh process/directory | 0.141 ms | ≤1 ms |
+| Rotation, 100 existing segments | 0.150 ms | ≤1 ms |
+| Rotation, 1,000 existing segments | 2.059 ms | ≤10 ms |
+| Rotation, 10,000 existing segments | 35.708 ms | ≤100 ms |
 
 Budgets are consumer capacity-planning targets on comparable hardware and a
-local filesystem with cached writes, using the workloads above. They reserve
-at least 2× headroom for ordinary variance and application work; they are not
+Linux ext4 filesystem with cached writes, using the workloads above. They are
+explicitly scoped to local dev/CI disks with available CPU and memory, not NFS,
+synchronous durability or cold-cache workloads. They reserve at least 2×
+headroom from the disk reference; larger margins on filesystem operations
+allow for typical hosted-runner and virtual-disk variability; they are not
 per-record deadlines or p99 guarantees. Provision below these rates, measure
 on your actual disk, and monitor queue losses. A shared directory serializes
 all signals, so eight writers share the aggregate budget, not eight times it.
@@ -372,46 +378,81 @@ Measurement details:
   each append to rotate. Retention is disabled to isolate the scan needed to
   select the next segment name. Remove the new segment outside timing to keep
   the existing count fixed. Default retention adds a separate metadata scan.
-  Rotation is about 72× slower at 10,000 segments than at 100.
+  Rotation is about 238× slower at 10,000 segments than at 100.
   The measured growth makes tiny segments unsuitable for sustained traffic:
   choose a larger size and keep segment counts bounded. At 10,000 segments the
   rotation cost alone already dominates the ordinary append cost.
 
-Reproduce inside the dev shell:
+Reproduce the disk reference inside the dev shell:
 
 ```sh
-export CARGO_TARGET_DIR="$HOME/.cache/vigil-target/feature-49-perf-budgets"
+export CARGO_TARGET_DIR="$PWD/target"
 export CARGO_BUILD_JOBS=3
+export VIGIL_BENCH_DIR="$(mktemp -d "$HOME/.cache/vigil-performance.XXXXXX")"
+df -T "$VIGIL_BENCH_DIR"
+unset VIGIL_BENCH_QUICK CRITERION_HOME
 nix develop -c cargo bench --locked --bench performance
-nix develop -c python3 scripts/check_performance.py \
-  --results "$CARGO_TARGET_DIR/criterion"
+nix develop -c cargo test --locked --bench performance
 ```
 
-The full reference run uses 100 samples, a 3-second warmup and a 5-second
-measurement target per workload. Child startup and fixture cleanup increase
-wall time beyond the timed work. Set `VIGIL_BENCH_QUICK=1` for CI's 10 samples,
-1-second warmup and 1-second measurement target (Criterion can extend that
-when a workload is slower). `cargo test --all-targets` validates each workload
-once. Run long local commands under `watcher-s1 --silence 10m -- …`; CI has a
-30-minute job timeout, including child processes.
+The full reference run uses 100 samples, a 3-second warmup, a 5-second
+measurement target and Criterion's default 100,000 resamples per workload.
+Child startup and fixture cleanup increase wall time beyond the timed work.
+Set `VIGIL_BENCH_QUICK=1` for CI's 10 samples, 1-second warmup, 1-second
+measurement target and `nresamples(1000)`; Criterion can extend sampling for
+slower workloads. `cargo test --locked --bench performance` validates every
+workload once without timing assertions. An explicit step in the blocking Rust
+checks lane runs this command, independently of performance timing. Scratch
+cleanup deliberately ignores errors so unwinding cannot cause a second panic.
 
-The **Performance (advisory)** CI job compares each Criterion mean elapsed time
-with the committed baseline. A ratio **>=2.0×** (equivalently throughput at most
-half the baseline) produces a `REGRESSION` row in the job summary and a warning
-annotation. Missing or invalid measurements are reported as unavailable with a
-failed measurement step. The whole job is `continue-on-error`, so neither
-runner noise nor measurement infrastructure turns **CI Summary** red.
+CI's **Performance comparison** job checks out the PR head with full history,
+computes its merge-base with the target branch, and creates a disposable
+merge-base worktree. It overlays the exact head benchmark harness and its
+Criterion dev dependency because historical commits may predate the suite;
+it preserves the base runtime manifest and existing lockfile pins, adding the
+missing dev dependency entries only in that disposable checkout. It measures
+base with Criterion `--save-baseline base`, then head with `--baseline base`,
+sequentially in the **same job on the same runner and filesystem**, with a
+shared scratch root and fresh estimate directory. Separate Cargo artifact
+directories prevent one checkout from reusing the other's benchmark binary.
+Head builds use `--locked`.
+Hardware, filesystem, compiler and both commit IDs appear in the job log.
+There is no committed cross-machine CI baseline. Local comparisons use:
 
-On a flag, the reviewer repeats the full benchmark on reference hardware,
-comparing the base and proposed commits under the same conditions. A confirmed
-regression must be fixed before merge, or receive an explicit maintainer-approved
-budget change with an issue describing the consumer impact. Do not reset the
-baseline merely to clear a flag. To update intentionally, run the full suite,
-then the command below, review every changed mean, update this table and its
-hardware/date notes, and commit the baseline and documentation together:
+```sh
+export VIGIL_BENCH_QUICK=1
+nix develop -c python3 scripts/compare_performance.py --base-ref origin/dev
+```
+
+The report flags mean elapsed-time ratios **>=2.0×** versus that same-runner
+merge-base (equivalently throughput at most half). A slowdown exits **0**,
+adds a `REGRESSION` row to the summary and emits a warning annotation. In the
+PR Checks UI, the performance job stays **green with a warning**, and CI
+Summary stays green when all other checks pass. A build/run failure, missing or
+invalid estimates, or broken correctness assertion exits nonzero: the
+performance job is **red and blocking**, and CI Summary fails. There is no
+`continue-on-error` on this job or its steps. CI has a 30-minute job timeout.
+These exit-status and workflow contracts have automated tests.
+
+A warning requires repeating the same-runner comparison before attributing it
+to code. A confirmed regression must be fixed before merge, or receive an
+explicit maintainer-approved budget change with an issue describing consumer
+impact. The merge-base baseline is regenerated on every run, so there is no
+baseline reset to clear warnings.
+
+To refresh the documented disk reference, run the full suite on the stated
+filesystem, review all means and update this table, its hardware/date notes and
+budget rationale together. An optional local JSON snapshot can be exported:
 
 ```sh
 nix develop -c python3 scripts/check_performance.py \
-  --results "$CARGO_TARGET_DIR/criterion" --update \
-  --environment 'date; CPU/vCPUs; OS/kernel; rustc/LLVM; storage; full mode'
+  --results "$CARGO_TARGET_DIR/criterion" \
+  --baseline "$CARGO_TARGET_DIR/reference.json" --update \
+  --environment 'date; CPU/vCPUs; OS/kernel; rustc/LLVM; filesystem; fsync policy'
 ```
+
+`--update` refuses quick-mode results, even after `VIGIL_BENCH_QUICK` is unset:
+the harness records the mode beside the estimates. Missing/unverified mode
+metadata or fewer than 100 samples for any workload is also rejected, so a
+filtered full run cannot relabel leftover quick estimates. This optional
+snapshot is not used by CI.

@@ -71,6 +71,9 @@ jobs:
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
           dev-profile-path: ${{ inputs.dev-profile-path }}
 
+      - name: Validate benchmark correctness without timing assertions
+        run: nix develop -c cargo test --locked --bench performance
+
       # Plain Cargo shares a process between library tests; nextest does not.
       - name: Cargo tests with default test threads
         run: nix develop -c cargo test --locked --all-targets --all-features
@@ -188,20 +191,22 @@ jobs:
         run: nix develop .#latest-stable -c python3 scripts/check_rust_version.py latest-stable
 
   performance:
-    name: Performance (advisory)
+    name: Performance comparison
     runs-on: ${{ fromJSON(inputs.runner-json) }}
     timeout-minutes: 30
-    # Includes measurement/toolchain failures: this lane never gates CI Summary.
-    continue-on-error: true
+    # Build/run/estimate failures block; only measured slowdowns are advisory.
     env:
       CARGO_TARGET_DIR: target/performance
       CARGO_BUILD_JOBS: '3'
+      BASE_REF: ${{ github.event.pull_request.base.sha || 'origin/dev' }}
       VIGIL_BENCH_QUICK: '1'
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Set up devkit toolchain
         uses: ./.github/actions/setup-devkit-toolchain
         with:
@@ -210,10 +215,6 @@ jobs:
           cachix-cache: ${{ vars.CACHIX_CACHE }}
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
           dev-profile-path: ${{ inputs.dev-profile-path }}
-      - name: Measure public API workloads
-        run: nix develop -c cargo bench --locked --bench performance
-      - name: Report against committed baseline
-        if: ${{ !cancelled() }}
+      - name: Measure merge-base and head on the same runner
         run: |
-          nix develop -c python3 scripts/check_performance.py \
-            --results "$CARGO_TARGET_DIR/criterion"
+          nix develop -c python3 scripts/compare_performance.py --base-ref "$BASE_REF"

@@ -83,5 +83,99 @@ class PerformanceTests(unittest.TestCase):
             self.assertIn("2.00x | REGRESSION", summary.read_text())
 
 
+class RevisionTests(unittest.TestCase):
+    """Revision requirements: same-runner estimates and full-run provenance."""
+
+    def test_named_criterion_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in BENCHMARKS:
+                path = root / name / "base" / "estimates.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({"mean": {"point_estimate": 123}}))
+            self.assertEqual(
+                read_estimates(root, "base"), dict.fromkeys(BENCHMARKS, 123)
+            )
+
+    def test_update_refuses_quick_results_after_environment_is_unset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in BENCHMARKS:
+                path = root / name / "new" / "estimates.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({"mean": {"point_estimate": 123}}))
+            (root / "performance-mode.json").write_text('{"quick": true}')
+            output = root / "reference.json"
+            env = dict(os.environ)
+            env.pop("VIGIL_BENCH_QUICK", None)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("check_performance.py")),
+                    "--results",
+                    str(root),
+                    "--baseline",
+                    str(output),
+                    "--update",
+                    "--environment",
+                    "test disk",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("quick-mode", result.stdout + result.stderr)
+            self.assertFalse(output.exists())
+
+    def test_update_requires_full_samples_for_every_workload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in BENCHMARKS:
+                target = root / name / "new"
+                target.mkdir(parents=True)
+                (target / "estimates.json").write_text(
+                    json.dumps({"mean": {"point_estimate": 123}})
+                )
+                (target / "sample.json").write_text(
+                    json.dumps({"iters": [1] * 100, "times": [123] * 100})
+                )
+            (root / "performance-mode.json").write_text('{"quick": false}')
+            output = root / "reference.json"
+            env = dict(os.environ)
+            env.pop("VIGIL_BENCH_QUICK", None)
+            command = [
+                sys.executable,
+                str(Path(__file__).with_name("check_performance.py")),
+                "--results",
+                str(root),
+                "--baseline",
+                str(output),
+                "--update",
+                "--environment",
+                "test disk",
+            ]
+            result = subprocess.run(
+                command, env=env, capture_output=True, text=True, check=False
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(output.read_text())["mean_ns"],
+                dict.fromkeys(BENCHMARKS, 123),
+            )
+            output.unlink()
+            # A filtered full run must not relabel old quick estimates as full.
+            (target / "sample.json").write_text(
+                json.dumps({"iters": [1] * 10, "times": [123] * 10})
+            )
+            result = subprocess.run(
+                command, env=env, capture_output=True, text=True, check=False
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("quick-mode", result.stdout)
+            self.assertFalse(output.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

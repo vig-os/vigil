@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Public API performance benchmarks, documented consumer budgets and advisory CI regression reports ([#49](https://github.com/vig-os/vigil/issues/49)).
+- Public API performance benchmarks, disk-based consumer budgets and same-runner CI regression reports ([#49](https://github.com/vig-os/vigil/issues/49)).
 
 - Docs: README "Stability" section and ADR-0001 "Versioning stance at 1.0", covering the semver and on-disk format promises, what counts as a major, how upstream spec changes are absorbed, MSRV, platforms and the separately frozen audit format ([#50](https://github.com/vig-os/vigil/issues/50)).
 
