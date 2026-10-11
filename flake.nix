@@ -72,6 +72,25 @@
           ];
         };
 
+        audit = vigos.lib.mkRustProject {
+          inherit pkgs;
+          src = ./.;
+          doctest = true;
+          cargoExtraArgs = "--features audit";
+          toolchainHash = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
+          extraSrcFiles = [
+            "README.md"
+            ".config/nextest.toml"
+            "tests/fixtures"
+          ];
+        };
+
+        rustChecks =
+          rust.checks
+          // nixpkgs.lib.mapAttrs' (
+            name: value: nixpkgs.lib.nameValuePair "audit-${name}" value
+          ) audit.checks;
+
         # Devkit knobs read from .vig-os (#1224, #1432, #1431, #1282, #1633): the
         # flake-generated pre-commit hooks — the branch guard and the
         # commit-message validator — follow the workspace manifest, mirroring
@@ -180,7 +199,7 @@
               cargo-clippy = {
                 enable = true;
                 name = "cargo clippy -D warnings";
-                entry = "cargo clippy --all-targets --locked -- -D warnings";
+                entry = "cargo clippy --all-targets --all-features --locked -- -D warnings";
                 files = "(\\.rs$|^Cargo\\.(toml|lock)$)";
                 language = "system";
                 pass_filenames = false;
@@ -237,7 +256,7 @@
           }
         );
 
-        checks = rust.checks // {
+        checks = rustChecks // {
           changelog =
             pkgs.runCommand "changelog-check"
               {

@@ -1,6 +1,9 @@
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "audit")]
+pub mod audit;
+
 mod init;
 pub use init::{Config, Console, Guard, InitError, InitErrorKind, init};
 
