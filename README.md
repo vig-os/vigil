@@ -208,13 +208,3 @@ protect against an attacker who can read them and rewrite the trail. Pin trail
 identities and keep trust policy and application receipts outside the writable
 trail directory; stop all writers before rotating keys. Use digests rather than
 personal data, retaining the referenced values in the application's own store.
-
-## Temporary MSRV rejection proof
-
-This doctest deliberately uses `std::assert_matches!`, stabilized in Rust 1.96:
-<https://blog.rust-lang.org/2026/05/28/Rust-1.96.0/>.
-It will be reverted after capturing the failing MSRV CI run for #45.
-
-```rust
-std::assert_matches!(Some(45), Some(45));
-```
