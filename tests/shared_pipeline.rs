@@ -15,24 +15,22 @@ fn record_and_read(test_case: &'static str) {
     tracing::info!(test_case, "shared pipeline record");
     guard.flush().unwrap();
     let lines = vigil::rotate::read_since(guard.dir().unwrap(), "logs", None).unwrap();
-    let own_records =
-        lines
-            .iter()
-            .flat_map(|line| {
-                let data: serde_json::Value = serde_json::from_str(line).unwrap();
-                data["resourceLogs"][0]["scopeLogs"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .flat_map(|scope| scope["logRecords"].as_array().unwrap().clone())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|record| {
-                record["attributes"].as_array().unwrap().iter().any(|attr| {
-                    attr["key"] == "test_case" && attr["value"]["stringValue"] == test_case
+    let mut own_records = 0;
+    for line in lines {
+        let data: serde_json::Value = serde_json::from_str(&line).unwrap();
+        for scope in data["resourceLogs"][0]["scopeLogs"].as_array().unwrap() {
+            own_records += scope["logRecords"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|record| {
+                    record["attributes"].as_array().unwrap().iter().any(|attr| {
+                        attr["key"] == "test_case" && attr["value"]["stringValue"] == test_case
+                    })
                 })
-            })
-            .count();
+                .count();
+        }
+    }
     assert_eq!(own_records, 1);
 }
 

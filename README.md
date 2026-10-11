@@ -84,30 +84,29 @@ A previously set global or scoped default subscriber returns `ForeignSubscriber`
 even after the scope ends; compose a layer
 into that subscriber's Registry instead. Failed attempts release the slot.
 
-`Guard::flush()` exports queued logs without stopping the pipeline, with a
-five-second timeout. `shutdown()` uses the same timeout;
-`shutdown_with_timeout(Duration)` lets a caller choose it. These return
+`Guard::flush()` exports queued logs with a five-second timeout; `shutdown()`
+uses the same timeout and `shutdown_with_timeout(Duration)` accepts another.
+They return
 `FlushError` with `Timeout`, `Failed` or `DataLost` (in that precedence order).
-`lost(Signal::Logs)` counts failed exports and diagnostic replacements since
-the previous flush. Shutdown also adds queue overflow since startup.
-Flush can only flag overflow; the actual loss is at least one record greater
-than its returned count when overflow was flagged. These counts are lower
-bounds: compiling WARN out removes the SDK overflow event, and concurrent
-records during shutdown may arrive after its counter or worker has stopped.
+`lost(Signal::Logs)` counts failed exports, diagnostic replacements and queue
+overflow since the previous flush or startup, without counting them again at
+shutdown. Overflow counting works on every flush, independently of SDK diagnostics
+and consumer filters. Counts are exact with quiescent producers and a successful
+drain; concurrent arrivals can reduce the overflow lower bound, and timed-out or
+failed drains do not count records still queued or in flight. Concurrent records
+during shutdown may arrive after its watermark/counter or worker has stopped.
+More than 64 concurrent flush requests can fill the SDK control channel and return
+`Failed`. If creating the shutdown thread fails, shutdown runs inline.
 A failed durable log line counts its records even if another copy was delivered;
 records on earlier successful lines are excluded. Records emitted after shutdown
 begins are rejected with one warning and are not counted. Stderr fallback returns
 success. Explicit shutdown makes Drop a no-op and returns countable losses without
-printing them again; Drop reports remaining losses on stderr.
+printing them again; Drop reports only losses not yet printed on stderr, naming the actual outcome.
 
 ## Testing consumers
 
-Use `cargo nextest run` for one process per test. Each test creates one
-pipeline, records its events, calls `guard.shutdown()`, then reads its files
-with `rotate::read_since`. Dropping the guard stops the pipeline; another
-test in the same process cannot initialize it again. An earlier `set_default` or
-`with_default` in that binary also makes `init` return `ForeignSubscriber`, even
-after its scope ends; use a fresh process or compose with `Config::layer`.
+With `cargo nextest run`, each process initializes, records, shuts down and
+reads its files. The process slot and scoped-default restrictions above apply:
 
 ```rust,no_run
 let dir = std::env::temp_dir().join(format!("vigil-test-{}", std::process::id()));

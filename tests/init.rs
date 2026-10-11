@@ -254,7 +254,7 @@ fn runtime_errors_are_counted_and_limited() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(stderr.lines().count(), 2, "{stderr}");
     assert!(stderr.contains("dropped records: 1"), "{stderr}");
-    assert!(stderr.contains("dropped records: 3"), "{stderr}");
+    assert!(stderr.contains("dropped records: 2"), "{stderr}");
     fs::remove_dir_all(dir).unwrap();
 }
 

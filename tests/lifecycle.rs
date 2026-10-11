@@ -1,4 +1,9 @@
-use std::{fs, process::Command};
+use std::{
+    fs,
+    process::Command,
+    time::{Duration, Instant},
+};
+use tracing_subscriber::prelude::*;
 use vigil::{Config, FlushErrorKind, Signal};
 
 #[test]
@@ -19,7 +24,38 @@ fn child() {
         guard.shutdown().unwrap();
         return;
     }
-    let guard = Config::new("lifecycle").dir(&dir).init().unwrap();
+    let (layer, guard) = Config::new("lifecycle")
+        .dir(&dir)
+        .queue_size(4)
+        .layer()
+        .unwrap();
+    tracing_subscriber::registry()
+        .with(layer)
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+    if mode.starts_with("overflow") {
+        let lock = fs::File::open(&dir).unwrap();
+        let mut lost = 0;
+        for _ in 0..2 {
+            lock.lock().unwrap();
+            for _ in 0..50 {
+                tracing::info!("overflow burst");
+            }
+            lock.unlock().unwrap();
+            let error = guard.flush().unwrap_err();
+            assert_eq!(error.kind(), FlushErrorKind::DataLost);
+            assert!(error.lost(Signal::Logs) > 0);
+            lost += error.lost(Signal::Logs);
+        }
+        let lines = fs::read_to_string(dir.join("logs.jsonl")).unwrap();
+        assert_eq!(lost + lines.matches("overflow burst").count() as u64, 100);
+        if mode == "overflow_twice" {
+            drop(guard);
+        } else {
+            guard.shutdown().unwrap();
+        }
+        return;
+    }
     if matches!(
         mode.as_str(),
         "timeout" | "flush_timeout" | "concurrent_flush"
@@ -27,13 +63,13 @@ fn child() {
         let lock = fs::File::open(&dir).unwrap();
         lock.lock().unwrap();
         tracing::info!("blocked export");
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         if mode == "timeout" {
             let error = guard
-                .shutdown_with_timeout(std::time::Duration::from_millis(25))
+                .shutdown_with_timeout(Duration::from_millis(25))
                 .unwrap_err();
             assert_eq!(error.kind(), FlushErrorKind::Timeout);
-            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            assert!(started.elapsed() < Duration::from_secs(2));
             assert_eq!(
                 error.lost(Signal::Logs),
                 0,
@@ -49,9 +85,9 @@ fn child() {
                     assert_eq!(error.lost(Signal::Logs), 0);
                 }
             });
-            assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+            assert!(started.elapsed() >= Duration::from_secs(5));
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(8),
+                started.elapsed() < Duration::from_secs(8),
                 "flushes must not serialize their timeout budgets"
             );
             lock.unlock().unwrap();
@@ -60,20 +96,20 @@ fn child() {
         } else {
             let error = guard.flush().unwrap_err();
             assert_eq!(error.kind(), FlushErrorKind::Timeout);
-            assert!(started.elapsed() >= std::time::Duration::from_secs(5));
-            assert!(started.elapsed() < std::time::Duration::from_secs(8));
+            assert!(started.elapsed() >= Duration::from_secs(5));
+            assert!(started.elapsed() < Duration::from_secs(8));
             lock.unlock().unwrap();
             guard.flush().unwrap();
             guard.shutdown().unwrap();
         }
         // A timed-out SDK worker may finish once the directory lock is released.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while !fs::read_to_string(dir.join("logs.jsonl"))
             .unwrap()
             .contains("blocked export")
         {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
         }
         return;
     }
@@ -126,37 +162,42 @@ fn lifecycle_reports_period_losses_and_stderr_fallback_succeeds() {
         "flush_timeout",
         "concurrent_flush",
     ] {
-        let dir =
-            std::env::temp_dir().join(format!("vigil-lifecycle-{}-{mode}", std::process::id()));
-        let out = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "child", "--nocapture"])
-            .env("VIGIL_LIFECYCLE_MODE", mode)
-            .env("VIGIL_LIFECYCLE_DIR", &dir)
-            .env("RUST_LOG", "info")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let out = run(mode, "info");
         if mode == "loss" {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            assert_eq!(
-                stderr.matches("runtime log export failed").count(),
-                1,
-                "{stderr}"
-            );
-            assert!(
-                !stderr.contains("log shutdown failed"),
-                "explicit shutdown must not repeat losses: {stderr}"
-            );
-            assert!(
-                !stderr.contains("runtime log export losses"),
-                "explicit shutdown must return the pending summary: {stderr}"
-            );
+            assert_eq!(stderr.matches("runtime log export failed").count(), 1);
+            assert!(!stderr.contains("vigil: log shutdown:"), "{stderr}");
+            assert!(!stderr.contains("runtime log export losses"), "{stderr}");
         }
-        fs::remove_dir_all(dir).unwrap();
     }
+}
+
+fn run(mode: &str, filter: &str) -> std::process::Output {
+    let dir = std::env::temp_dir().join(format!("vigil-{mode}-{}", std::process::id()));
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "child", "--nocapture"])
+        .env("VIGIL_LIFECYCLE_MODE", mode)
+        .env("VIGIL_LIFECYCLE_DIR", &dir)
+        .env("RUST_LOG", filter)
+        .output()
+        .unwrap();
+    fs::remove_dir_all(dir).unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+#[test]
+fn overflow_twice() {
+    let out = run("overflow_twice", "info");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("log shutdown: DataLost; dropped records:")
+    );
+}
+#[test]
+fn overflow_with_consumer_filter() {
+    run("overflow_filtered", "info,opentelemetry=error");
 }

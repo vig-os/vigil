@@ -9,7 +9,7 @@ use std::{
     cell::Cell,
     fmt,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -61,11 +61,17 @@ impl FlushError {
 
     /// A lower bound on lost data, in the signal's own unit.
     ///
-    /// Flush counts losses since the previous flush; shutdown counts since
-    /// that flush or startup, plus queue overflow since startup. Flush cannot
-    /// count overflow: when it flags overflow, true log loss is at least one
-    /// record more than this count. Shared pipelines that never shut down only
-    /// flag overflow. Export failures and diagnostic stubs are included.
+    /// Flush and shutdown count losses since the previous flush or startup:
+    /// failed exports, diagnostic stubs and queue overflow. Overflow counting
+    /// is independent of SDK diagnostics, static max levels and consumer filters.
+    /// Counts are exact when producers are quiescent and draining succeeds.
+    /// Concurrent arrivals reaching the exporter after the flush watermark can
+    /// reduce the overflow lower bound; a later drain or shutdown can recover
+    /// it. Timed-out/failed drains leave queued and in-flight records uncounted,
+    /// since they may still be exported. Shutdown also reconciles the SDK's
+    /// since-start overflow total without counting previously reported losses.
+    /// Records arriving concurrently after shutdown's watermark/counter read
+    /// or worker disconnection can be lost without being counted.
     ///
     /// A failed durable log line counts its records even if another copy
     /// reached a remote receiver. Metrics and traces currently return zero;
@@ -73,11 +79,6 @@ impl FlushError {
     /// that never reached the SDK, excluding data-point export failures and
     /// measurements aggregated before a later name conflict (ADR-0003 d23).
     /// Records rejected after shutdown begins are not counted.
-    ///
-    /// Known gaps: compiling WARN out with tracing's static max-level features
-    /// removes the SDK's overflow event; records emitted on other threads
-    /// during shutdown may arrive after its counter was read or after the
-    /// worker disconnected. Such records are lost but cannot be counted.
     pub fn lost(&self, signal: Signal) -> u64 {
         match signal {
             Signal::Logs => self.logs,
@@ -108,72 +109,92 @@ impl std::error::Error for FlushError {
 struct Period {
     logs: u64,
     failed: bool,
-    overflow: bool,
     timeout: bool,
 }
 
 #[derive(Debug, Default)]
+struct State {
+    period: Period,
+    accepted: u64,
+    reached: u64,
+    overflow_reported: u64,
+    sdk_overflow: u64,
+    pending_stderr: u64,
+    pending_failed: bool,
+}
+#[derive(Debug, Default)]
 pub(crate) struct Losses {
-    // Publish a failed export's count and kind together; a flush must not
-    // split them across periods when the worker starts its next export.
-    period: Mutex<Period>,
+    state: Mutex<State>,
     pub(crate) shutting_down: AtomicBool,
 }
 impl Losses {
-    pub(crate) fn record(&self, logs: u64, failed: bool) {
-        let mut period = self
-            .period
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        period.logs = period.logs.saturating_add(logs);
-        period.failed |= failed;
-    }
-
-    pub(crate) fn add(&self, logs: u64) {
-        self.record(logs, false);
-    }
-
-    fn overflowed(&self) {
-        self.period
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .overflow = true;
     }
-
+    pub(crate) fn record(&self, logs: u64, failed: bool) {
+        let mut state = self.state();
+        state.period.logs = state.period.logs.saturating_add(logs);
+        state.period.failed |= failed;
+        state.pending_failed |= failed;
+        state.pending_stderr = state.pending_stderr.saturating_add(logs);
+    }
+    pub(crate) fn reached(&self, logs: u64) {
+        let mut state = self.state();
+        state.reached = state.reached.saturating_add(logs);
+    }
+    pub(crate) fn reported(&self, logs: u64) {
+        let mut state = self.state();
+        state.pending_stderr = state.pending_stderr.saturating_sub(logs);
+        state.pending_failed = false;
+    }
+    pub(crate) fn pending_stderr(&self) -> (u64, bool) {
+        let state = self.state();
+        (state.pending_stderr, state.pending_failed)
+    }
+    fn overflow_total(&self, total: u64) {
+        let mut state = self.state();
+        state.sdk_overflow = total;
+        Self::overflow(&mut state, total);
+    }
+    fn overflow(state: &mut State, total: u64) {
+        let lost = total.saturating_sub(state.overflow_reported);
+        state.overflow_reported = state.overflow_reported.max(total);
+        state.period.logs = state.period.logs.saturating_add(lost);
+        state.pending_stderr = state.pending_stderr.saturating_add(lost);
+    }
+    fn drained(&self, accepted: u64, result: &OTelSdkResult) {
+        if result.is_ok() {
+            let mut state = self.state();
+            // Everything accepted before the request has drained. Later
+            // arrivals may have reached the exporter too: subtracting them
+            // deliberately undercounts rather than counting queued records.
+            let total = accepted.saturating_sub(state.reached);
+            Self::overflow(&mut state, total);
+        }
+    }
     pub(crate) fn finish(&self, result: OTelSdkResult) -> Result<(), FlushError> {
-        let Period {
-            logs,
-            failed,
-            overflow,
-            timeout,
-        } = std::mem::take(
-            &mut *self
-                .period
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        let kind = if timeout || matches!(result, Err(OTelSdkError::Timeout(_))) {
+        let period = std::mem::take(&mut self.state().period);
+        let kind = if period.timeout || matches!(result, Err(OTelSdkError::Timeout(_))) {
             FlushErrorKind::Timeout
-        } else if failed || result.is_err() {
+        } else if period.failed || result.is_err() {
             FlushErrorKind::Failed
-        } else if logs != 0 || overflow {
+        } else if period.logs != 0 {
             FlushErrorKind::DataLost
         } else {
             return Ok(());
         };
         Err(FlushError {
             kind,
-            logs,
+            logs: period.logs,
             source: result.err(),
         })
     }
 
     fn observe(&self, result: OTelSdkResult) -> OTelSdkResult {
         if matches!(result, Err(OTelSdkError::Timeout(_))) {
-            self.period
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .timeout = true;
+            self.state().period.timeout = true;
         }
         result
     }
@@ -204,18 +225,28 @@ pub(crate) struct ReportingProcessor {
 }
 impl LogProcessor for ReportingProcessor {
     fn emit(&self, data: &mut SdkLogRecord, scope: &InstrumentationScope) {
+        // Count only completed emits: an unfinished emit must never be
+        // mistaken for overflow at a concurrent flush's watermark.
         self.inner.emit(data, scope);
+        let mut state = self.losses.state();
+        state.accepted = state.accepted.saturating_add(1);
     }
     fn force_flush(&self) -> OTelSdkResult {
+        let accepted = self.losses.state().accepted;
         let result = self.inner.force_flush();
+        self.losses.drained(accepted, &result);
         if let Err(OTelSdkError::Timeout(duration)) = &result {
             FLUSH_TIMEOUT.with(|timeout| timeout.set(Some(*duration)));
         }
         result
     }
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
-        self.losses
-            .observe(self.inner.shutdown_with_timeout(timeout))
+        let accepted = self.losses.state().accepted;
+        let result = self
+            .losses
+            .observe(self.inner.shutdown_with_timeout(timeout));
+        self.losses.drained(accepted, &result);
+        result
     }
     fn set_resource(&mut self, resource: &Resource) {
         self.inner.set_resource(resource);
@@ -236,15 +267,6 @@ impl<S: Subscriber> Layer<S> for AfterShutdown {
                 std::io::stderr(),
                 "vigil: event after shutdown; further events will be dropped silently"
             );
-        }
-    }
-}
-
-pub(crate) struct Overflow(pub(crate) Arc<Losses>);
-impl<S: Subscriber> Layer<S> for Overflow {
-    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
-        if event.metadata().name() == "BatchLogProcessor.LogDroppingStarted" {
-            self.0.overflowed();
         }
     }
 }
@@ -278,7 +300,7 @@ impl Subscriber for ShutdownCapture {
         if Self::captures(event.metadata()) {
             let mut count = Count(0);
             event.record(&mut count);
-            self.losses.add(count.0);
+            self.losses.overflow_total(count.0);
         } else {
             self.forward.event(event);
         }
@@ -314,23 +336,21 @@ mod tests {
     use super::*;
     use opentelemetry::logs::{Logger as _, LoggerProvider as _};
     use opentelemetry_sdk::logs::{BatchConfigBuilder, LogBatch, LogExporter, SdkLoggerProvider};
-    use std::sync::{Condvar, atomic::AtomicU64, mpsc};
+    use std::sync::{atomic::AtomicU64, mpsc};
     use tracing_subscriber::layer::SubscriberExt;
 
     #[derive(Debug)]
     struct Block {
         started: mpsc::SyncSender<()>,
-        release: Arc<(Mutex<bool>, Condvar)>,
+        release: Mutex<mpsc::Receiver<()>>,
+        losses: Arc<Losses>,
     }
     impl LogExporter for Block {
-        async fn export(&self, _: LogBatch<'_>) -> OTelSdkResult {
-            let (lock, wake) = &*self.release;
-            let mut ready = lock.lock().unwrap();
-            if !*ready {
-                self.started.send(()).unwrap();
-                ready = wake.wait_while(ready, |ready| !*ready).unwrap();
+        async fn export(&self, batch: LogBatch<'_>) -> OTelSdkResult {
+            self.losses.reached(batch.iter().count() as u64);
+            if self.started.send(()).is_ok() {
+                self.release.lock().unwrap().recv().unwrap();
             }
-            drop(ready);
             Ok(())
         }
     }
@@ -345,24 +365,24 @@ mod tests {
     }
 
     #[test]
-    fn sdk_overflow_is_flagged_on_flush_and_counted_on_shutdown_thread() {
+    fn sdk_overflow_capture_does_not_repeat_flushed_losses() {
         let losses = Arc::new(Losses::default());
         let forwarded = Arc::new(AtomicU64::new(0));
         let subscriber = tracing_subscriber::registry()
-            .with(Overflow(losses.clone()))
             .with(Forwarded(forwarded.clone()))
             .with(tracing_subscriber::filter::filter_fn(|meta| {
                 meta.name() != "BatchLogProcessor.LogsDropped"
             }));
         let _current = tracing::subscriber::set_default(subscriber);
         let (started, wait) = mpsc::sync_channel(1);
-        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (release, released) = mpsc::sync_channel(0);
         let provider = SdkLoggerProvider::builder()
             .with_log_processor(ReportingProcessor {
                 losses: losses.clone(),
                 inner: BatchLogProcessor::builder(Block {
                     started,
-                    release: release.clone(),
+                    release: Mutex::new(released),
+                    losses: losses.clone(),
                 })
                 .with_batch_config(
                     BatchConfigBuilder::default()
@@ -379,70 +399,46 @@ mod tests {
         for _ in 0..10 {
             logger.emit(logger.create_log_record());
         }
-        *release.0.lock().unwrap() = true;
-        release.1.notify_all();
+        drop(wait);
+        release.send(()).unwrap();
         let error = losses.finish(provider.force_flush()).unwrap_err();
         assert_eq!(error.kind(), FlushErrorKind::DataLost);
-        assert_eq!(error.lost(Signal::Logs), 0, "flush cannot count overflow");
-        assert!(
-            losses.finish(provider.force_flush()).is_ok(),
-            "the one-time overflow flag belongs only to the previous period"
-        );
-        let forward = tracing::dispatcher::get_default(Clone::clone);
-        let captured = losses.clone();
+        assert_eq!(error.lost(Signal::Logs), 9);
+        assert!(losses.finish(provider.force_flush()).is_ok());
+        let capture = ShutdownCapture {
+            forward: tracing::dispatcher::get_default(Clone::clone),
+            losses: losses.clone(),
+        };
         std::thread::scope(|scope| {
             scope
-                .spawn(move || {
-                    tracing::subscriber::with_default(
-                        ShutdownCapture {
-                            forward,
-                            losses: captured,
-                        },
-                        || provider.shutdown_with_timeout(Duration::from_secs(5)),
-                    )
-                })
+                .spawn(move || tracing::subscriber::with_default(capture, || provider.shutdown()))
                 .join()
                 .unwrap()
                 .unwrap();
         });
-        let error = losses.finish(Ok(())).unwrap_err();
-        assert_eq!(error.kind(), FlushErrorKind::DataLost);
-        assert_eq!(
-            error.lost(Signal::Logs),
-            9,
-            "pins the SDK's LogsDropped event, dropped_logs_count field and calling thread"
-        );
-        assert_eq!(
-            forwarded.load(Ordering::Relaxed),
-            1,
-            "non-overflow shutdown diagnostics must reach the original dispatcher"
-        );
         assert!(losses.finish(Ok(())).is_ok());
+        // Pins the SDK event name, field and shutdown thread capture.
+        assert_eq!(losses.state().sdk_overflow, 9);
+        assert_eq!(forwarded.load(Ordering::Relaxed), 1);
     }
 
     #[test]
-    fn typed_timeouts_precede_failures_and_counted_losses() {
+    fn outcome_precedence_counts_and_period_resets() {
         let losses = Losses::default();
-        losses.add(2);
-        losses.record(0, true);
+        losses.record(2, true);
         let result = losses.observe(Err(OTelSdkError::Timeout(Duration::ZERO)));
         let error = losses.finish(result).unwrap_err();
         assert_eq!(error.kind(), FlushErrorKind::Timeout);
         assert_eq!(error.lost(Signal::Logs), 2);
         assert!(std::error::Error::source(&error).is_some());
-    }
-    #[test]
-    fn failed_precedes_data_loss_and_periods_reset() {
-        let losses = Losses::default();
-        losses.add(3);
-        losses.record(0, true);
-        losses.overflowed();
+        assert!(losses.finish(Ok(())).is_ok());
+        losses.record(3, true);
         let error = losses.finish(Ok(())).unwrap_err();
         assert_eq!(error.kind(), FlushErrorKind::Failed);
         assert_eq!(error.lost(Signal::Logs), 3);
         assert!(losses.finish(Ok(())).is_ok());
-        losses.add(u64::MAX);
-        losses.add(1);
+        losses.record(u64::MAX, false);
+        losses.record(1, false);
         let error = losses.finish(Ok(())).unwrap_err();
         assert_eq!(error.kind(), FlushErrorKind::DataLost);
         assert_eq!(error.lost(Signal::Logs), u64::MAX);
