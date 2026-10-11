@@ -1,3 +1,4 @@
+//! Flush loss reporting, stderr fallback and queue overflow across periods.
 use std::{
     fs,
     process::Command,

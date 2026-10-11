@@ -77,7 +77,7 @@
           inherit pkgs;
           src = ./.;
           doctest = true;
-          cargoExtraArgs = "--features audit";
+          cargoExtraArgs = "--all-features";
           toolchainHash = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
           extraSrcFiles = [
             "README.md"
@@ -298,6 +298,11 @@
         };
 
         checks = rustChecks // {
+          # Docs.rs exposes this surface too. Enforce the Cargo documentation
+          # lints for all features with vigil_unstable, as CI already does.
+          unstable-clippy = audit.checks.clippy.overrideAttrs (old: {
+            RUSTFLAGS = (old.RUSTFLAGS or "") + " --cfg vigil_unstable";
+          });
           changelog =
             pkgs.runCommand "changelog-check"
               {

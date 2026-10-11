@@ -1,3 +1,4 @@
+//! Public rotation configuration bounds and explicit retention behavior.
 use std::{fs, time::Duration};
 use vigil::rotate::{RotatingFile, RotationConfig, segments};
 

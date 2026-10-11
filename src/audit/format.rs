@@ -135,6 +135,11 @@ impl CheckpointFields {
     /// Creates fields; peak count must equal the population count of `size`.
     /// The caller supplies the MMR root and left-to-right peaks. Signature
     /// verification and consistency with trail history belong to #13.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditErrorKind::InvalidConfig`] if the number of peaks differs
+    /// from the population count of `size`.
     pub fn new(
         size: u64,
         root: [u8; 32],
@@ -220,11 +225,24 @@ pub struct Record {
 impl Record {
     /// Builds a record. `previous` must be the genesis hash at sequence zero,
     /// or the preceding record hash; the writer is responsible for that link.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditErrorKind::InvalidEntry`] if any supplied text (including
+    /// service, host, or before/after text) is empty or contains NUL, or
+    /// [`AuditErrorKind::TooLarge`] if a canonical field exceeds `u32::MAX` bytes.
     pub fn new(context: RecordContext, entry: Entry) -> Result<Self, AuditError> {
         entry.validate()?;
         Self::build(context, Kind::Entry(entry))
     }
     /// Builds a checkpoint. Its MMR size must equal its sequence number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditErrorKind::InvalidConfig`] if MMR size differs from the
+    /// sequence number, [`AuditErrorKind::InvalidEntry`] if service or host is
+    /// empty or contains NUL, or [`AuditErrorKind::TooLarge`] if a canonical
+    /// field exceeds `u32::MAX` bytes.
     pub fn checkpoint(
         context: RecordContext,
         fields: CheckpointFields,

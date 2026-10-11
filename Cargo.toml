@@ -51,7 +51,14 @@ harness = false
 name = "flock"
 test = true
 
+# Public documentation is a build contract for stable and vigil_unstable APIs.
+# Cargo applies these levels to every feature set, including flake/CI clippy.
+[lints.clippy]
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
+
 [lints.rust]
+missing_docs = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(vigil_unstable)'] }
 
 [package.metadata.docs.rs]

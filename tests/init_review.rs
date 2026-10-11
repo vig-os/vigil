@@ -1,3 +1,4 @@
+//! Initialization failure paths, queue bounds and shutdown deadlines.
 use std::{
     fs,
     process::{Command, Stdio},

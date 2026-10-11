@@ -43,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Deny missing public documentation and missing error/panic sections across stable and unstable APIs with all features in flake and CI checks ([#44](https://github.com/vig-os/vigil/issues/44)).
+
 - **Breaking:** exporters, sinks and exact OpenTelemetry re-exports require `--cfg vigil_unstable`; `NON_FINITE` is crate-private. Docs.rs labels the unstable surface, which is compiled and tested separately; empty `RUST_LOG` uses the default filter and unnamed guards drop immediately ([#42](https://github.com/vig-os/vigil/issues/42)).
 
 - Shutdown stops recording before draining; explicit shutdown reports losses to the caller without repeating them on stderr, and Drop reports them once. Failed durable log lines count only records not already written, plus diagnostic replacements (ADR-0003 decisions 3, 4 and 23; [#42](https://github.com/vig-os/vigil/issues/42)).
