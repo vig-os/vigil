@@ -179,7 +179,9 @@ impl Drop for Guard {
 /// # Errors
 /// Returns `AlreadyRunning`, `ForeignSubscriber`, `InvalidServiceName`
 /// or `InvalidFilter`. Use nextest for one process per test, or share one
-/// pipeline per test binary.
+/// pipeline per test binary. An earlier scoped default (`set_default` or
+/// `with_default`) causes `ForeignSubscriber` even after its scope ends;
+/// use `Config::layer` to compose, or initialize in a fresh test process.
 pub fn init(service: impl Into<String>) -> Result<Guard, InitError> {
     Config::new(service).init()
 }
