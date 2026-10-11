@@ -606,7 +606,12 @@ impl Config {
         let file = dir.as_ref()
             .ok_or_else(|| std::io::Error::other(format!("neither XDG_STATE_HOME nor HOME provides an absolute path; rejected XDG_STATE_HOME={:?}, HOME={:?}", env::var_os("XDG_STATE_HOME"), env::var_os("HOME"))))
             .and_then(|dir| RotatingFile::open(dir, "logs", rotation))
-            .and_then(|file| instance_id().map(|id| (file, id)));
+            .map_err(|error| format!("cannot open log storage at {path_description}: {error}"))
+            .and_then(|file| {
+                instance_id()
+                    .map(|id| (file, id))
+                    .map_err(|error| format!("cannot generate service instance id: {error}"))
+            });
         let (destination, guard): (PipelineLayer<S>, Guard) = match file {
             Ok((file, id)) => {
                 let mut attrs = vec![
@@ -657,10 +662,7 @@ impl Config {
                 )
             }
             Err(error) => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "vigil: cannot open log storage at {path_description}: {error}; falling back to stderr"
-                );
+                let _ = writeln!(std::io::stderr(), "vigil: {error}; falling back to stderr");
                 (
                     tracing_subscriber::fmt::layer()
                         .with_writer(std::io::stderr)
@@ -729,6 +731,10 @@ fn log_batch_config(queue_size: usize) -> opentelemetry_sdk::logs::BatchConfig {
 // RFC 9562 UUID v4: 122 random bits, version 4 and the RFC variant.
 fn instance_id() -> std::io::Result<String> {
     let mut bytes = [0; 16];
+    #[cfg(test)]
+    if entropy_failure_tests::FAIL_ENTROPY.get() {
+        return Err(std::io::Error::other("injected entropy failure"));
+    }
     getrandom::fill(&mut bytes).map_err(|error| std::io::Error::other(error.to_string()))?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
@@ -1011,5 +1017,59 @@ mod batch_config_tests {
             let output = cmd.output().unwrap();
             assert!(output.status.success(), "{output:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod entropy_failure_tests {
+    use super::*;
+
+    thread_local! {
+        pub(super) static FAIL_ENTROPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn entropy_failure_degrades_with_the_real_cause() {
+        const CHILD: &str = "VIGIL_ENTROPY_FAILURE_DIR";
+        if let Some(dir) = env::var_os(CHILD) {
+            FAIL_ENTROPY.set(true);
+            let guard = Config::new("entropy-failure")
+                .dir(std::path::PathBuf::from(dir))
+                .filter_env("VIGIL_ENTROPY_TEST_FILTER")
+                .default_filter("info")
+                .init()
+                .unwrap();
+            assert!(guard.provider.is_none());
+            assert!(guard.dir().is_none());
+            tracing::info!("entropy fallback is alive");
+            guard.flush().unwrap();
+            guard.shutdown().unwrap();
+            return;
+        }
+        let temp =
+            TempDir(env::temp_dir().join(format!("vigil-entropy-failure-{}", std::process::id())));
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "init::entropy_failure_tests::entropy_failure_degrades_with_the_real_cause",
+                "--nocapture",
+            ])
+            .env(CHILD, &temp.0)
+            .env_remove("VIGIL_ENTROPY_TEST_FILTER")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(stderr.matches("cannot generate service instance id: injected entropy failure; falling back to stderr").count(), 1, "{stderr}");
+        assert!(!stderr.contains("cannot open log storage"), "{stderr}");
+        assert!(stderr.contains("entropy fallback is alive"), "{stderr}");
+        assert!(std::fs::read(temp.0.join("logs.jsonl")).unwrap().is_empty());
     }
 }

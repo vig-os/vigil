@@ -3,6 +3,27 @@ use serde_json::Value;
 use std::{fs, process::Command};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+struct TempDir(std::path::PathBuf);
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // Match the property tests' cleanup guard: never panic during unwinding.
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn temporary_directory_is_removed_when_an_assertion_fails() {
+    let path = std::env::temp_dir().join(format!("vigil-resource-cleanup-{}", std::process::id()));
+    let temp = TempDir(path.clone());
+    fs::create_dir_all(&path).unwrap();
+    let failure = std::panic::catch_unwind(move || {
+        let _temp = temp;
+        assert_eq!(1, 2, "exercise assertion failure cleanup");
+    });
+    assert!(failure.is_err());
+    assert!(!path.exists());
+}
+
 #[test]
 fn child() {
     let Ok(mode) = std::env::var("VIGIL_IDENTITY_MODE") else {
@@ -67,10 +88,14 @@ fn run(mode: &str, dir: &std::path::Path) -> String {
 
 #[test]
 fn init_and_layer_generate_distinct_rfc9562_v4_resources() {
-    let root = std::env::temp_dir().join(format!("vigil-resource-identity-{}", std::process::id()));
-    fs::create_dir_all(&root).unwrap();
-    let init = run("init", &root.join("init"));
-    let layer = run("layer", &root.join("layer"));
+    let root = TempDir(
+        std::env::temp_dir().join(format!("vigil-resource-identity-{}", std::process::id())),
+    );
+    fs::create_dir_all(&root.0).unwrap();
+    let init = run("init", &root.0.join("init"));
+    let second_init = run("init", &root.0.join("second-init"));
+    let layer = run("layer", &root.0.join("layer"));
+    assert_ne!(init, second_init);
     assert_ne!(init, layer);
-    fs::remove_dir_all(root).unwrap();
+    assert_ne!(second_init, layer);
 }
