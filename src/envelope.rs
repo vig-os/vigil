@@ -252,7 +252,6 @@ pub(crate) fn patch_any_value(value: &AnyValue, json: &mut Json) {
 
 // Canonical texts are computed once, after sanitizing. They form a total
 // ordering even for distinct number types and non-finite attribute values.
-#[cfg(feature = "metrics")]
 pub(crate) fn normalize(value: &mut Json, context: &str, rules: Rules) -> Result<(), String> {
     match value {
         Json::Object(fields) => {
@@ -265,8 +264,8 @@ pub(crate) fn normalize(value: &mut Json, context: &str, rules: Rules) -> Result
                 normalize(value, context, rules)?;
             }
             let key = match context {
-                "resourceMetrics" => Some("resource"),
-                "scopeMetrics" => Some("scope"),
+                "resourceLogs" | "resourceMetrics" => Some("resource"),
+                "scopeLogs" | "scopeMetrics" => Some("scope"),
                 "metrics" => Some("name"),
                 "dataPoints" => Some("attributes"),
                 _ => None,
@@ -275,8 +274,18 @@ pub(crate) fn normalize(value: &mut Json, context: &str, rules: Rules) -> Result
                 let mut ordered = values
                     .drain(..)
                     .map(|v| {
+                        let identity = if key == "scope" {
+                            serde_json::json!([
+                                v[key]["name"],
+                                v[key]["version"],
+                                v["schemaUrl"],
+                                v[key]["attributes"]
+                            ])
+                        } else {
+                            v[key].clone()
+                        };
                         Ok((
-                            ordered_json::encode(&v[key], key, rules)?,
+                            ordered_json::encode(&identity, key, rules)?,
                             ordered_json::encode(&v, context, rules)?,
                             v,
                         ))

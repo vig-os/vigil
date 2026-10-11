@@ -91,7 +91,7 @@ impl<S: LineSink + 'static> PushMetricExporter for OtlpJsonMetricExporter<S> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record("metric", "data points", lost, &result, false);
-        Ok(())
+        result
     }
     fn force_flush(&self) -> OTelSdkResult {
         self.sink
@@ -155,7 +155,8 @@ pub(crate) fn fit_metric(
     let (prefix, suffix) =
         envelope::array_frame(&item[field], "dataPoints", crate::ordered_json::METRICS)?;
     let prefix = format!("{{\"{field}\":{prefix}");
-    let suffix = format!("{suffix},{}", &metadata[1..]);
+    let separator = if metadata == "{}" { "" } else { "," };
+    let suffix = format!("{suffix}{separator}{}", &metadata[1..]);
     let mut text = prefix.clone();
     let mut count = 0;
     let mut lines = Vec::new();
@@ -367,7 +368,11 @@ mod tests {
                     .build(),
             )
             .build();
-        let meter = provider.meter("fixture");
+        let meter = provider.meter_with_scope(
+            opentelemetry::InstrumentationScope::builder("fixture")
+                .with_attributes([KeyValue::new("scope.nonfinite", f64::NEG_INFINITY)])
+                .build(),
+        );
         let gauge = meter.f64_gauge("gauge").build();
         let counter = meter.u64_counter("counter").build();
         let histogram = meter
@@ -602,6 +607,84 @@ mod tests {
     }
 
     #[test]
+    fn split_without_metric_metadata_is_valid_at_exact_point_limit() {
+        let point = serde_json::json!({"timeUnixNano": "2", "asInt": "1"});
+        let single = serde_json::json!({"gauge": {"dataPoints": [point.clone()]}});
+        let pair = serde_json::json!({"gauge": {"dataPoints": [point.clone(), point]}});
+        let wrap = |metric| {
+            serde_json::json!({"resourceMetrics": [{
+                "scopeMetrics": [{"metrics": [metric]}]
+            }]})
+        };
+        let single = wrap(single);
+        let limit = envelope::bounded_lines(&single, 1000, Envelope::Metrics).unwrap()[0]
+            .text
+            .len();
+        let lines = envelope::bounded_lines(&wrap(pair), limit, Envelope::Metrics).unwrap();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            let parsed: Json = serde_json::from_str(line.text()).unwrap();
+            assert_eq!(line.text().len(), limit);
+            assert_eq!(
+                point_count(&parsed["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]),
+                1
+            );
+        }
+        assert!(
+            envelope::bounded_lines(&single, limit - 1, Envelope::Metrics)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn empty_metric_and_envelope_fit_exactly_but_not_one_byte_less() {
+        // Zero-point metrics still carry metadata; fitting must retain it.
+        let metric = serde_json::json!({"name": "empty", "gauge": {"dataPoints": []}});
+        let limit = crate::ordered_json::encode(&metric, "metrics", crate::ordered_json::METRICS)
+            .unwrap()
+            .len()
+            + 17;
+        let lines = fit_metric(&metric, 17, limit).unwrap();
+        assert_eq!(lines.len(), 1);
+        serde_json::from_str::<Json>(lines[0].text()).unwrap();
+        assert!(fit_metric(&metric, 17, limit - 1).unwrap().is_empty());
+        // An empty request remains an OTLP payload when it fits.
+        let request = serde_json::json!({"resourceMetrics": []});
+        let limit = crate::ordered_json::encode(&request, "", crate::ordered_json::METRICS)
+            .unwrap()
+            .len();
+        let lines = envelope::bounded_lines(&request, limit, Envelope::Metrics).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Json>(lines[0].text()).unwrap(),
+            request
+        );
+        assert!(
+            envelope::bounded_lines(&request, limit - 1, Envelope::Metrics)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sdk_scope_attributes_are_sanitized() {
+        let json = project(fixture(false)).unwrap();
+        assert_eq!(
+            json["resourceMetrics"][0]["scopeMetrics"][0]["scope"]["attributes"][0]["value"]["doubleValue"],
+            "-Infinity"
+        );
+        for line in envelope::bounded_lines(&json, 2400, Envelope::Metrics).unwrap() {
+            let parsed: Json = serde_json::from_str(line.text()).unwrap();
+            assert_eq!(
+                parsed["resourceMetrics"][0]["scopeMetrics"][0]["scope"]["attributes"][0]["value"]
+                    ["doubleValue"],
+                "-Infinity"
+            );
+        }
+    }
+
+    #[test]
     fn failed_line_marks_failed_without_counting_written_points() {
         #[derive(Debug)]
         struct FailSecond(Mutex<Vec<String>>);
@@ -643,7 +726,7 @@ mod tests {
                     .map(point_count)
                     .sum::<usize>();
                 assert_eq!(lost, total - written);
-                ready(self.0.export(rm)).unwrap();
+                assert!(ready(self.0.export(rm)).is_err());
                 let error = self.0.losses.finish(Ok(())).unwrap_err();
                 assert_eq!(error.kind(), FlushErrorKind::Failed);
                 assert_eq!(error.lost(Signal::Metrics), 0);

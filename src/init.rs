@@ -1092,6 +1092,17 @@ mod failure_reporting_tests {
     use super::*;
     use opentelemetry_sdk::error::OTelSdkError;
     #[test]
+    fn log_shutdown_gate_suppresses_an_otherwise_due_report() {
+        let mut failures = Failures::default();
+        let result = Err(OTelSdkError::InternalFailure("shutdown failure".into()));
+        assert_eq!(failures.record("log", "records", 2, &result, true), 0);
+        assert_eq!(failures.dropped, 2);
+        assert_eq!(failures.reported, 0);
+        assert!(failures.last_report.is_none());
+        assert_eq!(failures.record("log", "records", 0, &result, false), 2);
+    }
+
+    #[test]
     fn first_failure_and_rate_limited_summaries_name_signal_and_unit() {
         const CHILD: &str = "VIGIL_FAILURE_REPORT_TEST";
         if std::env::var_os(CHILD).is_some() {

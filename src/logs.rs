@@ -271,6 +271,7 @@ fn project_json(request: &ExportLogsServiceRequest) -> Result<Json, String> {
     {
         patch_resource_logs(resource, json_resource);
     }
+    crate::envelope::normalize(&mut json, "", crate::ordered_json::LOGS)?;
     Ok(json)
 }
 
@@ -1137,6 +1138,40 @@ mod loss_tests {
 #[cfg(test)]
 mod ordered_tests {
     use super::*;
+
+    #[test]
+    fn shared_ordering_sorts_log_scopes_without_reordering_records() {
+        let scope = |name: &str| ScopeLogs {
+            scope: Some(InstrumentationScope {
+                name: name.into(),
+                ..Default::default()
+            }),
+            log_records: vec![
+                LogRecord {
+                    time_unix_nano: 2,
+                    ..Default::default()
+                },
+                LogRecord {
+                    time_unix_nano: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![scope("z"), scope("a")],
+                ..Default::default()
+            }],
+        };
+        let a = project_json(&request).unwrap();
+        request.resource_logs[0].scope_logs.reverse();
+        assert_eq!(a, project_json(&request).unwrap());
+        assert_eq!(a["resourceLogs"][0]["scopeLogs"][0]["scope"]["name"], "a");
+        let records = &a["resourceLogs"][0]["scopeLogs"][0]["logRecords"];
+        assert_eq!(records[0]["timeUnixNano"], "2");
+        assert_eq!(records[1]["timeUnixNano"], "1");
+    }
 
     #[test]
     fn encoding_preserves_finite_double_spelling() {

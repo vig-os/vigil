@@ -4,6 +4,7 @@
 - **Date:** 2026-10-09
 - **Amended by [ADR-0006](0006-shipping.md)** (Accepted 2026-10-11): decision 9 is superseded for the optional `push` feature; decision 5 and the versioning stance gain a fixed time-first JSON key order.
 - **Amended:** 2026-10-11, [#50](https://github.com/vig-os/vigil/issues/50): the new section "Versioning stance at 1.0" states what 1.0 promises readers and what counts as a vigil major. It collects existing decisions and newly states one principle (a major is a renamed, removed or re-meant attribute; a purely additive semconv pin move is a minor). It builds on the stance below, which stays the record of how the Development spec is absorbed.
+- **Amended:** 2026-10-12, [#7](https://github.com/vig-os/vigil/issues/7): the 1.0 bounding promise distinguishes shortened log records and spans from dropped metric data points.
 - **Issues:** [#1](https://github.com/vig-os/vigil/issues/1), [#3](https://github.com/vig-os/vigil/issues/3), [#6](https://github.com/vig-os/vigil/issues/6)
 
 ## Context
