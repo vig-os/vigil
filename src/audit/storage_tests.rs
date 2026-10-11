@@ -674,3 +674,103 @@ fn intervening_segment_without_closure_or_resume_is_rejected() {
     reject(reader.with_current(|_| Ok(()), |_, _, _| Ok(())));
     corrupt_open(&d.0);
 }
+
+fn declaration(
+    opening: &Record,
+    seq: u64,
+    hash: [u8; 32],
+    lost: u64,
+    repaired: Option<[u8; 32]>,
+) -> Record {
+    let mut ctx = context(opening.context.seq + 1, opening.hash());
+    if let Some(digest) = repaired {
+        ctx = ctx.repaired(digest);
+    }
+    Record::new(
+        ctx,
+        Entry::new("operator", "vigil.audit.resume", "trail")
+            .reason("incident")
+            .details(format!(
+                "head={seq}:{} lost_through={lost} file=-",
+                crate::audit::digest_string(&hash)
+            )),
+    )
+    .unwrap()
+}
+#[test]
+fn resume_rejects_wrong_loss_bound() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let opening = cp(7, first.hash(), &seeded(&first));
+    let wrong = declaration(&opening, 0, first.hash(), 5, None);
+    write_records(&d.0, &[&first, &opening, &wrong]);
+    corrupt_open(&d.0);
+}
+#[test]
+fn resume_rejects_predecessor_sequence_mismatch_with_right_hash() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let opening = cp(7, first.hash(), &seeded(&first));
+    let wrong = declaration(&opening, 1, first.hash(), 6, None);
+    write_records(&d.0, &[&first, &opening, &wrong]);
+    corrupt_open(&d.0);
+}
+#[test]
+fn archived_resume_rejects_head_sequence_at_opening_with_right_hash() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    // An archived prefix has no checkpoint_predecessor; the upper bound is
+    // independently necessary even when the previous hash and loss bound match.
+    let opening = cp(7, first.hash(), &seeded(&first));
+    let wrong = declaration(&opening, 7, first.hash(), 6, None);
+    write_records(&d.0, &[&opening, &wrong]);
+    corrupt_open(&d.0);
+}
+fn reject_both(reader: &TrailReader, path: &Path) {
+    let running = reader
+        .with_current(|_| Ok(()), |_, _, _| Ok(()))
+        .err()
+        .map(|e| e.kind());
+    let fresh = TrailReader::open(path, TRAIL, None).err().map(|e| e.kind());
+    assert_eq!(
+        (running, fresh),
+        (
+            Some(AuditErrorKind::CorruptTrail),
+            Some(AuditErrorKind::CorruptTrail)
+        )
+    );
+}
+#[test]
+fn closed_segment_with_fragment_requires_resume_in_fresh_and_running_readers() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let reader = open(&d.0);
+    let mut mmr = seeded(&first);
+    let opening = rotated(&d.0, &first, &mut mmr, 0);
+    append_bytes(&segment(&d.0, 0), b"{\"torn\":");
+    append(&d.0.join("audit.jsonl"), &entry(&opening));
+    reject_both(&reader, &d.0);
+}
+#[test]
+fn resume_rejects_attested_fragment_between_opening_and_declaration() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let last = entry(&first);
+    append(&d.0.join("audit.jsonl"), &last);
+    let reader = open(&d.0);
+    fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+    let opening = cp(2, last.hash(), &seeded_pair(&first, &last));
+    let gap = b"{\"torn\":\n";
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"vigil.audit.v1.repaired\0");
+    digest.update(gap);
+    let resume = declaration(
+        &opening,
+        1,
+        last.hash(),
+        1,
+        Some(*digest.finalize().as_bytes()),
+    );
+    write(&d.0, [line(&opening), gap.to_vec(), line(&resume)].concat());
+    reject_both(&reader, &d.0);
+}
