@@ -9,8 +9,25 @@ import sys
 
 def checks_ran(output):
     """Require a recognized summary containing at least one executed check."""
-    summaries = re.findall(r"\b(\d+) checks:\s*(\d+) pass(?:,\s*(\d+) fail)?", output)
+    summaries = re.findall(r"\b(\d+) checks?:\s*(\d+) pass(?:,\s*(\d+) fail)?", output)
     return bool(summaries) and all(int(total) > 0 for total, _, _ in summaries)
+
+
+def stable_environment():
+    """Override every inherited Cargo compiler/documentation flag source."""
+    env = os.environ.copy()
+    for key in list(env):
+        if key in ("RUSTFLAGS", "RUSTDOCFLAGS") or (
+            key.startswith("CARGO_") and key.endswith(("RUSTFLAGS", "RUSTDOCFLAGS"))
+        ):
+            env.pop(key)
+    # In pinned cargo-semver-checks 0.47.0 these take precedence over target
+    # and user-level Cargo configuration. The tool appends its own JSON
+    # options to RUSTDOCFLAGS for the child Cargo invocation. Encoded flags
+    # must remain absent, or Cargo would ignore those required JSON options.
+    env["CARGO_BUILD_RUSTFLAGS"] = ""
+    env["CARGO_BUILD_RUSTDOCFLAGS"] = ""
+    return env
 
 
 def main():
@@ -20,16 +37,15 @@ def main():
     ).strip()
     if not re.fullmatch(r"[0-9a-f]{40}", baseline):
         raise SystemExit("Expected a full merge-base SHA")
-    env = os.environ.copy()
-    # Cargo prefers encoded flags; clear both forms and rustdoc flags so a
-    # caller's unstable opt-in cannot change the surface being checked.
-    for key in (
-        "RUSTFLAGS",
-        "CARGO_ENCODED_RUSTFLAGS",
-        "RUSTDOCFLAGS",
-        "CARGO_ENCODED_RUSTDOCFLAGS",
-    ):
-        env.pop(key, None)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    if baseline == head:
+        print(
+            "Semver gate failed: merge base equals HEAD; refusing self-comparison. "
+            "Run on a feature PR into dev, not dev dispatch or dev-to-main.",
+            file=sys.stderr,
+        )
+        return 1
+    env = stable_environment()
     env["CARGO_TERM_COLOR"] = "never"
     print(f"Stable API baseline: {baseline}", flush=True)
     result = subprocess.run(

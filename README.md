@@ -176,6 +176,9 @@ even while both versions are 0.0.0. It fails if no checks run. All Cargo feature
 are checked with `vigil_unstable` off; unstable items have no semver protection.
 Run locally with `git fetch origin` followed by
 `nix develop -c python3 scripts/check_semver.py`.
+The gate refuses to compare when the merge base equals HEAD, including a
+workflow dispatch on `dev` or a release PR from `dev` to `main`; run it on a
+feature PR into `dev`. Self-comparison cannot prove compatibility.
 The public-API allowlist gate arrives with #42 (part 3/3).
 See [ADR-0004](docs/adr/0004-public-api-and-stability.md) for the stability policy
 and the architect-reviewed `semver:major` exception before publication.

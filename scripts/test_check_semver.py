@@ -21,3 +21,7 @@ class CheckCountTests(unittest.TestCase):
 
     def test_one_empty_summary_fails(self):
         self.assertFalse(checks_ran("222 checks: 222 pass\n0 checks: 0 pass"))
+
+    def test_singular_summary(self):
+        self.assertTrue(checks_ran("1 check: 1 pass, 0 skip"))
+        self.assertFalse(checks_ran("0 check: 0 pass, 252 skip"))

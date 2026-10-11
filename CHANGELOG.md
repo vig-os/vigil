@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - ADR-0004 configuration and composition APIs: `Config::layer`, `Console`, `Config::filter_env`, `Config::default_filter`, `Guard::dir`, and typed `InitErrorKind` errors; duration-based `Config::retention` and validated `RotationConfig` builders ([#42](https://github.com/vig-os/vigil/issues/42), [#36](https://github.com/vig-os/vigil/issues/36)).
-- Semver CI compares the stable API against the merge base with `dev` and rejects zero-check passes ([#43](https://github.com/vig-os/vigil/issues/43)).
+- Semver CI compares the stable API against the merge base with `dev`, excludes unstable items despite inherited Cargo flags and rejects self-comparisons and zero-check passes ([#43](https://github.com/vig-os/vigil/issues/43)).
 
 - Supply-chain CI gates vulnerabilities, unmaintained crates, licenses, OpenTelemetry compatibility lines and dependency sources with flake-pinned cargo-deny, enforce advisory DB freshness and run weekly on `dev` ([#47](https://github.com/vig-os/vigil/issues/47)).
 
