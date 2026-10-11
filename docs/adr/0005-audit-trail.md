@@ -248,10 +248,12 @@ rules also cover Collector multi-record lines and unhashed scope/resource data.
 decoder stays strict (canonical-only). The invariant “every line the writer can
 emit verifies” is enforced by construction: ONE shared validation module defines
 the accepted domain, and BOTH the production mapping and `parse_line` call it.
-There are no duplicated domain rules. Keys must be nonempty, NUL-free and unique
+There are no duplicated domain rules. Finite double tokens are checked before
+JSON parsing loses their spelling, against the shared encoder’s shortest
+round-trip form. Correlation identifiers require lowercase hex. Keys must be nonempty, NUL-free and unique
 within each attribute/kvlist list; KeyValue values must be present, and AnyValue
 must contain exactly one value. Context string values may be empty or contain
-escaped controls; authenticated text and keys must be nonempty and NUL-free.
+escaped controls, including NUL; authenticated text and keys must be nonempty and NUL-free.
 Full Unicode, including DEL, U+2028 and U+2029, is accepted without normalization.
 `MAX_CONTEXT_DEPTH = 16` counts container edges from an attribute's root AnyValue
 at depth zero, for both arrays and kvlists. This stays well below serde's 128
@@ -270,9 +272,10 @@ non-finite-double rules. No truncation or context sanitization occurs. The share
 encoder omits an absent body rather than emitting `body: null`.
 
 Property tests generate entries/checkpoints, absent details, empty strings,
-random keys including empty/duplicate keys, missing values, all AnyValue kinds,
+random keys including empty/duplicate/NUL keys, missing values, all AnyValue kinds,
 signed int64 extremes, depth at/beyond the limit, full Unicode and payloads
-at/beyond the size cap. Every input either receives a typed writer refusal or
+at/beyond the size cap. Context strings include NUL; authenticated text excludes it
+by its domain rule, and NUL-containing keys exercise typed refusal. Every input either receives a typed writer refusal or
 round-trips to identical canonical record bytes and hash. A fixed-seed corpus
 of 256 accepted lines from that same generator runs through the real pinned
 Collector in CI; refused samples are exercised during corpus generation.
@@ -281,6 +284,8 @@ This verifies individual records, not chain history (#13).
 | Input accepted by pdata | Vigil reader (canonical-only) | Writer boundary |
 | --- | --- | --- |
 | intValue `"+5"` or `"007"` | Reject noncanonical decimal | Emits canonical decimal |
+| Finite doubleValue `1`, `1E2`, or `1.50` | Reject noncanonical spelling | Emits serde_json shortest round-trip form (`1.0`, `100.0`, `1.5`) |
+| Uppercase traceId/spanId hex | Reject InvalidField | Emits lowercase hex |
 | Quoted finite doubleValue, e.g. `"1.5"` | Reject | Emits finite numbers, only non-finite strings |
 | Numeric timeUnixNano/observedTimeUnixNano | Reject | Emits decimal strings |
 | Tab between tokens | Reject raw control | Emits compact JSON with escaped content |

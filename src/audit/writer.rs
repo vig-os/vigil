@@ -37,6 +37,14 @@ pub(crate) fn request(
     record: &Record,
     extra: AnyValue,
 ) -> Result<ExportLogsServiceRequest, AuditError> {
+    request_with_clone(record, extra, Clone::clone)
+}
+// Keep the first context clone observable in tests: preflight must precede it.
+fn request_with_clone(
+    record: &Record,
+    extra: AnyValue,
+    clone_context: impl FnOnce(&AnyValue) -> AnyValue,
+) -> Result<ExportLogsServiceRequest, AuditError> {
     let refuse = |error: AuditError| {
         if error.kind() == AuditErrorKind::TooLarge {
             error
@@ -106,7 +114,7 @@ pub(crate) fn request(
     };
     let mut resource_attributes = vec![
         kv("service.name", text(&c.service)),
-        kv("context", extra.clone()),
+        kv("context", clone_context(&extra)),
     ];
     if let Some(host) = &c.host {
         resource_attributes.push(kv("host.name", text(host)));
@@ -144,4 +152,26 @@ pub(crate) fn request(
         .map_err(|_| AuditError::new(AuditErrorKind::InvalidConfig, "OTLP encoding failed"))?;
     validation::payload(line.as_bytes()).map_err(refuse)?;
     Ok(request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn typed_refusal_precedes_clone_and_projection() {
+        let record = Record::new(
+            RecordContext::new([0; 16], 0, 0, "service", [0; 32]),
+            Entry::new("actor", "action", "object"),
+        )
+        .unwrap();
+        let mut deep = text("leaf");
+        for _ in 0..64 {
+            deep = av(any_value::Value::ArrayValue(ArrayValue {
+                values: vec![deep],
+            }));
+        }
+        let error = request_with_clone(&record, deep, |_| panic!("cloned before typed refusal"))
+            .unwrap_err();
+        assert_eq!(error.kind(), AuditErrorKind::InvalidConfig);
+    }
 }

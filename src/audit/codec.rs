@@ -80,6 +80,9 @@ impl<'de> Visitor<'de> for UniqueVisitor {
                     return Err(de::Error::custom("escape in raw-read field"));
                 }
                 Json::String(serde_json::from_str(raw.get()).map_err(de::Error::custom)?)
+            } else if key == "doubleValue" {
+                let raw = map.next_value::<&serde_json::value::RawValue>()?;
+                canonical_double(raw.get()).map_err(de::Error::custom)?
             } else {
                 map.next_value::<Unique>()?.0
             };
@@ -165,14 +168,7 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
         return Err(finding(FindingKind::UnknownField));
     }
     // Correlation metadata is permitted, but is never authenticated record content.
-    for (key, width) in [("traceId", 32), ("spanId", 16)] {
-        if let Some(v) = log.get(key) {
-            let s = v.as_str().ok_or_else(corrupt)?;
-            if !s.is_empty() && (s.len() != width || !s.bytes().all(|b| b.is_ascii_hexdigit())) {
-                return Err(corrupt());
-            }
-        }
-    }
+    correlation_ids(log)?;
     if let Some(v) = log.get("flags")
         && v.as_u64().is_none_or(|n| n > u32::MAX.into())
     {

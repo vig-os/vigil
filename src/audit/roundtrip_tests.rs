@@ -28,9 +28,20 @@ fn unicode() -> BoxedStrategy<String> {
         2 => prop::sample::select(vec!['\u{2028}', '\u{2029}', '\u{7f}', '\u{1}', '\n', '\r', '\t', '\u{d7ff}', '\u{e000}', '\u{10000}', '\u{10ffff}'])], 1..40)
         .prop_map(|chars| chars.into_iter().collect()).boxed()
 }
+// Context values permit NUL; keys share this generator and may be refused by
+// the validator's nonempty, NUL-free key rule. Authenticated text uses unicode().
+fn context_unicode() -> BoxedStrategy<String> {
+    prop_oneof![
+        prop::collection::vec(any::<char>(), 1..40).prop_map(|chars| chars.into_iter().collect()),
+        Just("\0".into()),
+        Just("before\0after".into()),
+        Just(String::new())
+    ]
+    .boxed()
+}
 fn any_value() -> BoxedStrategy<AnyValue> {
     prop_oneof![
-        prop_oneof![unicode(), Just(String::new())].prop_map(|s| text(&s)),
+        context_unicode().prop_map(|s| text(&s)),
         Just(AnyValue { value: None }),
         any::<bool>().prop_map(|v| av(any_value::Value::BoolValue(v))),
         prop_oneof![any::<i64>(), Just(i64::MIN), Just(i64::MAX)]
@@ -50,7 +61,7 @@ fn any_value() -> BoxedStrategy<AnyValue> {
                 .prop_map(|values| av(any_value::Value::ArrayValue(ArrayValue { values }))),
             prop::collection::vec(
                 (
-                    prop_oneof![unicode(), Just(String::new()), Just("duplicate".into())],
+                    prop_oneof![context_unicode(), Just("duplicate".into())],
                     prop::option::of(inner)
                 ),
                 0..4
@@ -187,6 +198,10 @@ fn roundtrip(record: &Record, extra: AnyValue) -> Option<String> {
 }
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
+    #[test]
+    fn finite_context_doubles_are_accepted(number in any::<f64>().prop_filter("finite", |n| n.is_finite())) {
+        prop_assert!(roundtrip(&record(), av(any_value::Value::DoubleValue(number))).is_some());
+    }
     #[test]
     fn writer_lines_always_verify((record, extra) in generated()) { let _ = roundtrip(&record, extra); }
 }
@@ -343,4 +358,54 @@ fn writer_refuses_oversize_without_truncation() {
         request(&record, text("valid")).unwrap_err().kind(),
         AuditErrorKind::TooLarge
     );
+}
+
+#[test]
+fn context_numbers_and_ids_are_canonical() {
+    for resource in [false, true] {
+        for (field, spelling, accepted) in [
+            ("intValue", "\"007\"", false),
+            ("intValue", "\"+5\"", false),
+            ("intValue", "\"7\"", true),
+            ("doubleValue", "1", false),
+            ("doubleValue", "1E2", false),
+            ("doubleValue", "1.50", false),
+            ("doubleValue", "1.0", true),
+            ("doubleValue", "100.0", true),
+            ("doubleValue", "1.5", true),
+        ] {
+            let mut json =
+                crate::logs::encode_json(&request(&record(), text("valid")).unwrap()).unwrap();
+            let attrs = if resource {
+                &mut json["resourceLogs"][0]["resource"]["attributes"]
+            } else {
+                &mut json["resourceLogs"][0]["scopeLogs"][0]["scope"]["attributes"]
+            };
+            attrs
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"key":"number", "value":{"stringValue":"NUMBER_TOKEN"}}));
+            let line = serde_json::to_string(&json).unwrap().replace(
+                "\"stringValue\":\"NUMBER_TOKEN\"",
+                &format!("\"{field}\":{spelling}"),
+            );
+            assert_eq!(
+                Record::parse_line(line.as_bytes()).is_ok(),
+                accepted,
+                "{field}: {spelling}, resource={resource}"
+            );
+        }
+    }
+    for (field, width) in [("traceId", 32), ("spanId", 16)] {
+        for (digit, accepted) in [("a", true), ("A", false)] {
+            let mut json =
+                crate::logs::encode_json(&request(&record(), text("valid")).unwrap()).unwrap();
+            json["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0][field] =
+                digit.repeat(width).into();
+            assert_eq!(
+                Record::parse_line(&serde_json::to_vec(&json).unwrap()).is_ok(),
+                accepted
+            );
+        }
+    }
 }

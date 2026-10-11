@@ -41,8 +41,8 @@ and update the digest from the printed BLAKE3. The ignored test is an explicit
 fixture-writing utility; both verification tests run normally in CI.
 
 The production mapping and reader share context validation. The generator now
-includes empty/duplicate/random keys, absent KeyValue/AnyValue values, empty
-strings, absent details, U+2028/U+2029, arrays/kvlist depths at and beyond 16,
+includes empty/duplicate/NUL/random keys, absent KeyValue/AnyValue values, empty
+strings and NUL-containing context strings, absent details, U+2028/U+2029, arrays/kvlist depths at and beyond 16,
 and size refusals. Corpus generation exercises typed refusals and collects 256
 accepted lines; it does not discard a successfully emitted unverifiable line.
 Depth counts container edges from root AnyValue depth zero. Invalid context

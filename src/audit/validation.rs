@@ -178,10 +178,36 @@ fn any_value_at(v: &Json, depth: usize) -> Result<(), AuditError> {
                 if val
                     .as_str()
                     .is_some_and(|s| s.parse::<i64>().is_ok_and(|n| n.to_string() == s)) => {}
-            "doubleValue"
-                if val.is_number()
-                    || ["NaN", "Infinity", "-Infinity"].contains(&val.as_str().unwrap_or("")) => {}
+            "doubleValue" if canonical_double(&val.to_string()).is_ok() => {}
             _ => return Err(corrupt()),
+        }
+    }
+    Ok(())
+}
+/// Accepts exactly the shared encoder's finite-double spelling or nonfinite strings.
+pub(super) fn canonical_double(raw: &str) -> Result<Json, AuditError> {
+    if ["\"NaN\"", "\"Infinity\"", "\"-Infinity\""].contains(&raw) {
+        return serde_json::from_str(raw).map_err(|_| corrupt());
+    }
+    let number: f64 = raw.parse().map_err(|_| corrupt())?;
+    if !number.is_finite() || serde_json::to_string(&number).map_err(|_| corrupt())? != raw {
+        return Err(corrupt());
+    }
+    Ok(Json::from(number))
+}
+/// Validates optional, unhashed correlation identifiers in the writer's lowercase form.
+pub(super) fn correlation_ids(log: &Json) -> Result<(), AuditError> {
+    for (key, width) in [("traceId", 32), ("spanId", 16)] {
+        if let Some(value) = log.get(key) {
+            let text = value.as_str().ok_or_else(corrupt)?;
+            if !text.is_empty()
+                && (text.len() != width
+                    || !text
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+            {
+                return Err(corrupt());
+            }
         }
     }
     Ok(())
@@ -219,6 +245,7 @@ pub(super) fn contexts(json: &Json) -> Result<(), AuditError> {
                 context_message(context, false)?;
             }
             for log in array(required(scope, "logRecords")?)? {
+                correlation_ids(log)?;
                 attributes(required(log, "attributes")?)?;
             }
         }
