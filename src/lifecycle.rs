@@ -366,6 +366,11 @@ mod tests {
 
     #[test]
     fn sdk_overflow_capture_does_not_repeat_flushed_losses() {
+        if !crate::subscriber_test_child(
+            "lifecycle::tests::sdk_overflow_capture_does_not_repeat_flushed_losses",
+        ) {
+            return;
+        }
         let losses = Arc::new(Losses::default());
         let forwarded = Arc::new(AtomicU64::new(0));
         let subscriber = tracing_subscriber::registry()

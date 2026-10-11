@@ -71,6 +71,12 @@ jobs:
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
           dev-profile-path: ${{ inputs.dev-profile-path }}
 
+      # Plain Cargo shares a process between library tests; nextest does not.
+      - name: Cargo tests with default test threads
+        run: nix develop -c cargo test --locked --all-targets --all-features
+      - name: Cargo tests with one test thread
+        run: nix develop -c cargo test --locked --all-targets --all-features -- --test-threads=1
+
       - name: Run nix flake check
         run: nix flake check -L
 

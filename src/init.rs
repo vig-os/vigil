@@ -865,6 +865,11 @@ mod install_race_tests {
 
     #[test]
     fn foreign_subscriber_winning_install_releases_reservation() {
+        if !crate::subscriber_test_child(
+            "init::install_race_tests::foreign_subscriber_winning_install_releases_reservation",
+        ) {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("vigil-install-race-{}", std::process::id()));
         let mut provider = None;
         let error = Config::new("race")
@@ -914,6 +919,11 @@ mod guard_tests {
 
     #[test]
     fn stop_consumes_provider_before_drop_and_stops_recording_first() {
+        if !crate::subscriber_test_child(
+            "init::guard_tests::stop_consumes_provider_before_drop_and_stops_recording_first",
+        ) {
+            return;
+        }
         let provider = SdkLoggerProvider::builder().build();
         let retained = provider.clone();
         let mut guard = Guard {
