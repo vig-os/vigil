@@ -14,7 +14,6 @@ categories = ["development-tools::debugging"]
 # The crates.io name `vigil` is taken (an unrelated deadlock watchdog), so the
 # package is `vigil-telemetry` while code still writes `vigil::init(...)`.
 name = "vigil"
-path = "semver-proof.rs"
 
 [dependencies]
 opentelemetry = "0.33"
