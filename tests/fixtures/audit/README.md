@@ -8,6 +8,10 @@ Checkpoint vectors use the same context, empty MMR, and seed `07` repeated
 32 times. A separate scratch program encoded each tag explicitly in ADR order,
 then hashed and signed with BLAKE3 and Ed25519. RFC 8032 test 1 is also asserted.
 
+The amendment-2 `repaired_fields` vector inserts `F(0x07, [0x42; 32])`
+into the original record byte stream after the host tag. `repaired_hash` hashes
+that stream with the record domain prefix. Original vectors remain unchanged.
+
 MMR vectors were generated with the unmodified `leaf_hash`, `node_hash`,
 `push_peak`, `bag` and `merkle_root` functions extracted from tessera-core
 at `f08255d`, `tessera/crates/tessera-core/src/hash.rs`. Leaf input i is
@@ -43,7 +47,10 @@ fixture-writing utility; both verification tests run normally in CI.
 The production mapping and reader share context validation. The generator now
 includes empty/duplicate/NUL/random keys, absent KeyValue/AnyValue values, empty
 strings and NUL-containing context strings, absent details, U+2028/U+2029, arrays/kvlist depths at and beyond 16,
-and size refusals. Corpus generation exercises typed refusals and collects 256
+optional authenticated repair digests, normal and resume checkpoint counts (weighted 3:1), and size refusals.
+A coverage test requires the fixed corpus to contain both count forms, with normal
+checkpoints more frequent. Empty MMRs are generated only at sequence zero;
+reserved `audit.*` context keys are refused at the writer and reader boundaries. Corpus generation exercises typed refusals and collects 256
 accepted lines; it does not discard a successfully emitted unverifiable line.
 Depth counts container edges from root AnyValue depth zero. Invalid context
 returns InvalidConfig; oversized payloads return TooLarge before writing.

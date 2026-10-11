@@ -64,6 +64,9 @@ fn request_with_clone(
         kv("audit.prev_hash", digest(&c.previous)),
         kv("audit.hash", digest(&record.hash())),
     ];
+    if let Some(repaired) = c.repaired {
+        attributes.push(kv("audit.repaired", digest(&repaired)));
+    }
     let event_name = match &record.kind {
         Kind::Entry(entry) => {
             for (key, value) in [

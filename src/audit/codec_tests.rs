@@ -576,3 +576,55 @@ fn codec_anchor_whitespace_is_preserved() {
     assert_eq!(cp.line(), spaced);
     assert_eq!(cp.hash(), Checkpoint::parse(line).unwrap().hash());
 }
+
+#[test]
+fn repaired_digest_roundtrips_and_rejects_tampering() {
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+    let extra = || AnyValue {
+        value: Some(any_value::Value::StringValue("context".into())),
+    };
+    for checkpoint in [false, true] {
+        let context = RecordContext::new([0x11; 16], 7, 123, "svc", [0; 32]).repaired([0x42; 32]);
+        let record = if checkpoint {
+            Record::checkpoint(
+                context,
+                CheckpointFields::new(3, [0; 32], vec![[0; 32]; 2], [0; 32], [0; 64]).unwrap(),
+            )
+            .unwrap()
+        } else {
+            Record::new(context, Entry::new("actor", "action", "object")).unwrap()
+        };
+        let mut json =
+            crate::logs::encode_json(&super::format::request(&record, extra()).unwrap()).unwrap();
+        let decoded = Record::parse_line(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(decoded[0].canonical(), record.canonical());
+        assert_eq!(
+            attr(&mut json, "audit.repaired")["stringValue"],
+            digest_string(&[0x42; 32])
+        );
+        for invalid in [
+            json!("blake3:bad"),
+            json!("blake3:".to_owned() + &"AB".repeat(32)),
+            json!(42),
+        ] {
+            let mut altered = json.clone();
+            attr(&mut altered, "audit.repaired")["stringValue"] = invalid;
+            rejected(&altered);
+        }
+        let mut altered = json.clone();
+        attr(&mut altered, "audit.repaired")["stringValue"] = json!(digest_string(&[0x43; 32]));
+        assert_eq!(
+            Record::parse_line(&serde_json::to_vec(&altered).unwrap())
+                .unwrap_err()
+                .finding_kind(),
+            Some(FindingKind::HashMismatch)
+        );
+        attrs(&mut json).retain(|item| item["key"] != "audit.repaired");
+        assert_eq!(
+            Record::parse_line(&serde_json::to_vec(&json).unwrap())
+                .unwrap_err()
+                .finding_kind(),
+            Some(FindingKind::HashMismatch)
+        );
+    }
+}

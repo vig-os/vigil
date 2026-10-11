@@ -250,3 +250,49 @@ fn validation_optional_fields_and_limits() {
         assert!(error.to_string().contains("test"));
     }
 }
+
+#[test]
+fn resume_checkpoint_counts_records_not_skipped_sequences() {
+    for (seq, size, accepted) in [
+        (0, 0, true),
+        (7, 3, true),
+        (7, 0, false),
+        (1, 1, true),
+        (7, 7, true),
+        (3, 7, false),
+        (0, 1, false),
+        (i64::MAX as u64 + 1, 0, false),
+        (u64::MAX, u64::MAX, false),
+    ] {
+        let result = Record::checkpoint(
+            RecordContext::new([0; 16], seq, 0, "svc", [0; 32]),
+            CheckpointFields::new(
+                size,
+                [0; 32],
+                vec![[0; 32]; size.count_ones() as usize],
+                [0; 32],
+                [0; 64],
+            )
+            .unwrap(),
+        );
+        assert_eq!(result.is_ok(), accepted, "seq={seq}, size={size}");
+        if let Err(error) = result {
+            assert_eq!(error.kind(), AuditErrorKind::InvalidConfig);
+        }
+    }
+}
+
+#[test]
+fn repaired_tag_is_authenticated_and_old_vectors_stay_identical() {
+    let original = Record::new(context(), entry()).unwrap();
+    assert_eq!(original.canonical(), vector("record_fields"));
+    assert_eq!(original.hash().as_slice(), vector("record_hash"));
+    let repaired = Record::new(context().repaired([0x42; 32]), entry()).unwrap();
+    assert_eq!(repaired.canonical(), vector("repaired_fields"));
+    assert_eq!(repaired.hash().as_slice(), vector("repaired_hash"));
+    assert_ne!(repaired.hash(), original.hash());
+    let fields = CheckpointFields::new(0, Mmr::new().root(), vec![], [0; 32], [0; 64]).unwrap();
+    let plain = Record::checkpoint(context(), fields.clone()).unwrap();
+    let attested = Record::checkpoint(context().repaired([0x42; 32]), fields).unwrap();
+    assert_ne!(plain.signing_message(), attested.signing_message());
+}

@@ -180,6 +180,7 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
             "audit.v",
             "audit.trail",
             "audit.seq",
+            "audit.repaired",
             "audit.prev_hash",
             "audit.hash",
             "audit.actor",
@@ -216,6 +217,9 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
     let mut context = RecordContext::new(trail, seq, time, service, previous);
     if let Some(host) = resource.get("host.name") {
         context = context.host(string(host)?);
+    }
+    if let Some(repaired) = attrs.remove("audit.repaired") {
+        context = context.repaired(digest(repaired)?);
     }
     let record = match required(log, "eventName")?.as_str() {
         Some("audit.record") => {
@@ -273,13 +277,14 @@ impl Record {
     /// fields, invalid v1 values, empty/whitespace input, and mismatching record
     /// hashes with CorruptTrail and a verifier finding via AuditError::finding_kind. Collector lines containing multiple resources,
     /// scopes and records are accepted. Resource/scope context other than service
-    /// and host names, and correlation metadata, is unhashed.
+    /// and host names, and correlation metadata, is unhashed. Reserved `audit.*`
+    /// keys in resource/scope attributes or nested context kvlists are rejected.
     ///
     /// This checks individual structure and hashes, not chain links, MMR history,
     /// signatures or trust (#13). It does not classify incomplete input as a torn
     /// write: recovery needs file position and adjacent links (B2); strict warning
-    /// policy remains deferred to #68. Receipt reconciliation across resume is
-    /// separate and deferred to #70. Context AnyValue nesting is limited to 16 container edges; JSON also has a 128-level parser guard.
+    /// policy and receipt reconciliation across resume follow the accepted
+    /// amendment 2 (#68/#70) and belong to trail verification (#13). Context AnyValue nesting is limited to 16 container edges; JSON also has a 128-level parser guard.
     /// Only canonical camelCase message keys and decimal-string int64 fields
     /// are accepted. Raw bytes below 0x20 are InvalidField; escaped controls and DEL are content.
     /// JSON payloads over 1,000,000 bytes, excluding one optional final LF, fail

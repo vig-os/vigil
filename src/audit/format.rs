@@ -187,6 +187,7 @@ pub struct RecordContext {
     time: u64,
     service: String,
     host: Option<String>,
+    repaired: Option<[u8; 32]>,
     previous: [u8; 32],
 }
 impl RecordContext {
@@ -204,8 +205,17 @@ impl RecordContext {
             time,
             service: service.into(),
             host: None,
+            repaired: None,
             previous,
         }
+    }
+    /// Attests a torn-tail gap repaired by the writer, including repair newlines.
+    /// Supply BLAKE3 of `b"vigil.audit.v1.repaired\0"` followed by the gap bytes.
+    /// Only the first record or checkpoint after a repair carries this digest;
+    /// applications must not derive it from an entry. Recovery checks belong to #11.
+    pub fn repaired(mut self, digest: [u8; 32]) -> Self {
+        self.repaired = Some(digest);
+        self
     }
     /// Adds the authenticated host name when present in the writer's resource.
     pub fn host(mut self, host: impl Into<String>) -> Self {
@@ -236,12 +246,17 @@ impl Record {
         entry.validate()?;
         Self::build(context, Kind::Entry(entry))
     }
-    /// Builds a checkpoint. Its MMR size must equal its sequence number.
+    /// Builds a checkpoint. MMR size counts records preceding this checkpoint,
+    /// while sequence numbers can skip lost records at a declared resume gap.
+    /// Size must not exceed sequence; equality holds before any resume gap.
+    /// Zero size is allowed only at seq 0: every later checkpoint includes
+    /// the creation checkpoint as a leaf (ADR-0005 decisions 7 and 8).
+    /// Checking the exact count and the gap declaration requires trail history (#13).
     ///
     /// # Errors
     ///
-    /// Returns [`AuditErrorKind::InvalidConfig`] if MMR size differs from the
-    /// sequence number or either exceeds `i64::MAX`,
+    /// Returns [`AuditErrorKind::InvalidConfig`] if MMR size exceeds the
+    /// sequence number, is zero at a nonzero sequence, or either exceeds `i64::MAX`,
     /// [`AuditErrorKind::InvalidEntry`] if service or host is
     /// empty or contains NUL, or [`AuditErrorKind::TooLarge`] if a canonical
     /// field exceeds `u32::MAX` bytes.
@@ -249,12 +264,7 @@ impl Record {
         context: RecordContext,
         fields: CheckpointFields,
     ) -> Result<Self, AuditError> {
-        if fields.size != context.seq {
-            return Err(AuditError::new(
-                AuditErrorKind::InvalidConfig,
-                "checkpoint size must equal sequence",
-            ));
-        }
+        validation::checkpoint_count(context.seq, fields.size)?;
         Self::build(context, Kind::Checkpoint(fields))
     }
     fn build(context: RecordContext, kind: Kind) -> Result<Self, AuditError> {
@@ -297,6 +307,9 @@ impl Record {
         ];
         if let Some(host) = &self.context.host {
             fields.push((6, host.as_bytes().to_vec()));
+        }
+        if let Some(repaired) = self.context.repaired {
+            fields.push((7, repaired.to_vec()));
         }
         match &self.kind {
             // Entry validation is completed by new; fields cannot change.
