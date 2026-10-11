@@ -605,11 +605,13 @@ impl Config {
         );
         let file = dir.as_ref()
             .ok_or_else(|| std::io::Error::other(format!("neither XDG_STATE_HOME nor HOME provides an absolute path; rejected XDG_STATE_HOME={:?}, HOME={:?}", env::var_os("XDG_STATE_HOME"), env::var_os("HOME"))))
-            .and_then(|dir| RotatingFile::open(dir, "logs", rotation));
+            .and_then(|dir| RotatingFile::open(dir, "logs", rotation))
+            .and_then(|file| instance_id().map(|id| (file, id)));
         let (destination, guard): (PipelineLayer<S>, Guard) = match file {
-            Ok(file) => {
+            Ok((file, id)) => {
                 let mut attrs = vec![
                     KeyValue::new("service.name", self.service),
+                    KeyValue::new("service.instance.id", id),
                     KeyValue::new("process.pid", i64::from(std::process::id())),
                 ];
                 if let Some(host) = hostname() {
@@ -634,13 +636,7 @@ impl Config {
                             losses: losses.clone(),
                             inner: OtlpJsonLogExporter::new(Arc::new(file)),
                         })
-                        .with_batch_config(
-                            BatchConfigBuilder::default()
-                                .with_max_queue_size(queue_size)
-                                .with_max_export_batch_size(512)
-                                .with_scheduled_delay(Duration::from_secs(1))
-                                .build(),
-                        )
+                        .with_batch_config(log_batch_config(queue_size))
                         .build(),
                     })
                     .build();
@@ -719,6 +715,35 @@ fn number(key: &str, minimum: u64) -> Option<u64> {
         None
     }
 }
+// Override every setting available to the synchronous processor. Export
+// timeout exists only on the SDK's async processor, which vigil does not use;
+// the synchronous processor has no concurrency setting (ADR-0003 decision 6).
+fn log_batch_config(queue_size: usize) -> opentelemetry_sdk::logs::BatchConfig {
+    BatchConfigBuilder::default()
+        .with_max_queue_size(queue_size)
+        .with_max_export_batch_size(512)
+        .with_scheduled_delay(Duration::from_secs(1))
+        .build()
+}
+
+// RFC 9562 UUID v4: 122 random bits, version 4 and the RFC variant.
+fn instance_id() -> std::io::Result<String> {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes).map_err(|error| std::io::Error::other(error.to_string()))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let mut id = String::with_capacity(36);
+    for (index, byte) in bytes.into_iter().enumerate() {
+        if [4, 6, 8, 10].contains(&index) {
+            id.push('-');
+        }
+        for nibble in [byte >> 4, byte & 0xf] {
+            id.push(b"0123456789abcdef"[nibble as usize] as char);
+        }
+    }
+    Ok(id)
+}
+
 fn hostname() -> Option<String> {
     let host = rustix::system::uname()
         .nodename()
@@ -951,5 +976,40 @@ mod guard_tests {
             Err(OTelSdkError::AlreadyShutdown)
         ));
         drop(guard);
+    }
+}
+
+#[cfg(test)]
+mod batch_config_tests {
+    use super::*;
+
+    #[test]
+    fn otel_batch_environment_does_not_change_effective_settings() {
+        const CHILD: &str = "VIGIL_BATCH_CONFIG_CHILD";
+        if env::var_os(CHILD).is_some() {
+            assert_eq!(
+                format!("{:?}", log_batch_config(65_536)),
+                "BatchConfig { max_queue_size: 65536, scheduled_delay: 1s, max_export_batch_size: 512 }"
+            );
+            assert_eq!(
+                format!("{:?}", log_batch_config(16)),
+                "BatchConfig { max_queue_size: 16, scheduled_delay: 1s, max_export_batch_size: 16 }"
+            );
+            return;
+        }
+        for value in ["7", "999999"] {
+            let mut cmd = std::process::Command::new(env::current_exe().unwrap());
+            cmd.args(["--exact", "init::batch_config_tests::otel_batch_environment_does_not_change_effective_settings", "--nocapture"]).env(CHILD, "1");
+            for key in [
+                "OTEL_BLRP_MAX_QUEUE_SIZE",
+                "OTEL_BLRP_MAX_EXPORT_BATCH_SIZE",
+                "OTEL_BLRP_SCHEDULE_DELAY",
+                "OTEL_BLRP_EXPORT_TIMEOUT",
+            ] {
+                cmd.env(key, value);
+            }
+            let output = cmd.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
     }
 }

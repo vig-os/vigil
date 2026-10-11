@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Internal audit trail scanning with shared directory locks, incremental state, stale-inode protection and resume-aware segment boundaries ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
+- Random UUID v4 `service.instance.id` on the shared resource built by `init` and `layer`, keeping concurrent producers distinct; explicit synchronous log batch settings are tested against `OTEL_BLRP_*` overrides ([#7](https://github.com/vig-os/vigil/issues/7)).
 
 - Audit amendment 2 format support: authenticated repair digests and checkpoint MMR counts independent of resume sequence gaps, with reserved context names and creation-only empty MMR validation ([#79](https://github.com/vig-os/vigil/issues/79)).
 
