@@ -152,5 +152,9 @@
       "vigil::audit::FindingKind::Unparsable": "variant",
       "vigil::audit::Record::parse_line": "fn"
     }
+  },
+  {
+    "justification": "ADR-0005 amendment 2 decisions 3–5; #79 authenticated repair digest on format context",
+    "items": {"vigil::audit::RecordContext::repaired": "fn"}
   }
 ]

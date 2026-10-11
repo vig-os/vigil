@@ -180,6 +180,7 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
             "audit.v",
             "audit.trail",
             "audit.seq",
+            "audit.repaired",
             "audit.prev_hash",
             "audit.hash",
             "audit.actor",
@@ -216,6 +217,9 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
     let mut context = RecordContext::new(trail, seq, time, service, previous);
     if let Some(host) = resource.get("host.name") {
         context = context.host(string(host)?);
+    }
+    if let Some(repaired) = attrs.remove("audit.repaired") {
+        context = context.repaired(digest(repaired)?);
     }
     let record = match required(log, "eventName")?.as_str() {
         Some("audit.record") => {

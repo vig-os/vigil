@@ -79,6 +79,7 @@ pub struct vigil::audit::RecordContext
 impl vigil::audit::RecordContext
 pub fn vigil::audit::RecordContext::host(self, host: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn vigil::audit::RecordContext::new(trail: [u8; 16], seq: u64, time: u64, service: impl core::convert::Into<alloc::string::String>, previous: [u8; 32]) -> Self
+pub fn vigil::audit::RecordContext::repaired(self, digest: [u8; 32]) -> Self
 pub struct vigil::audit::SignerError(_)
 impl vigil::audit::SignerError
 pub fn vigil::audit::SignerError::new(detail: impl core::convert::Into<alloc::string::String>) -> Self

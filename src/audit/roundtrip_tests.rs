@@ -32,7 +32,7 @@ fn unicode() -> BoxedStrategy<String> {
 // the validator's nonempty, NUL-free key rule. Authenticated text uses unicode().
 fn context_unicode() -> BoxedStrategy<String> {
     prop_oneof![
-        prop::collection::vec(any::<char>(), 1..40).prop_map(|chars| chars.into_iter().collect()),
+        unicode(),
         Just("\0".into()),
         Just("before\0after".into()),
         Just(String::new())
@@ -116,6 +116,7 @@ fn generated() -> impl Strategy<Value = (Record, AnyValue)> {
             prop::option::of(unicode()),
             prop::option::of(unicode()),
             prop::option::of(unicode()),
+            prop::option::of(any::<[u8; 32]>()),
         ),
         value(),
         value(),
@@ -130,7 +131,7 @@ fn generated() -> impl Strategy<Value = (Record, AnyValue)> {
         .prop_map(
             |(
                 strings,
-                (host, reason, details),
+                (host, reason, details, repaired),
                 before,
                 after,
                 trail,
@@ -143,12 +144,13 @@ fn generated() -> impl Strategy<Value = (Record, AnyValue)> {
             )| {
                 let mut context = RecordContext::new(trail, seq, time, &strings[0], previous);
                 context.host = host;
+                context.repaired = repaired;
                 let kind = if checkpoint {
                     Kind::Checkpoint(
                         CheckpointFields::new(
-                            seq,
+                            seq / 2,
                             previous,
-                            vec![previous; seq.count_ones() as usize],
+                            vec![previous; (seq / 2).count_ones() as usize],
                             key,
                             signature,
                         )
@@ -200,7 +202,11 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
     #[test]
     fn finite_context_doubles_are_accepted(number in any::<f64>().prop_filter("finite", |n| n.is_finite())) {
-        prop_assert!(roundtrip(&record(), av(any_value::Value::DoubleValue(number))).is_some());
+        for depth in [0, 1, 3] {
+            for kvlist in [false, true] {
+                prop_assert!(roundtrip(&record(), nested(av(any_value::Value::DoubleValue(number)), depth, kvlist)).is_some());
+            }
+        }
     }
     #[test]
     fn writer_lines_always_verify((record, extra) in generated()) { let _ = roundtrip(&record, extra); }
