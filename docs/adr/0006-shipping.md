@@ -55,18 +55,18 @@ The architect's review of this ADR found that Probe F's config loses data when t
 
 ### Probe Q: queue capacity, clean stops while the queue is full, duplicates, disk
 
-The second review found that S5's config still loses data when an outage backlog outgrows the queue. Same harness as Probe S, with S5's settings unless a row says otherwise. Each case was run 1–3 times on unique ports.
+The second review found that S5's config still loses data when an outage backlog outgrows the queue. Same harness as Probe S, with S5's settings unless a row says otherwise. Each case was run 1–7 times on unique ports. Every probe line held one record; vigil's lines hold more (below).
 
 | Case | Queue | Scenario | Delivered | Lost | Duplicates |
 |---|---|---|---|---|---|
 | Q1 | default `sizer: requests`, 1000 | 1500 records while the backend is down (queue full at stop); SIGTERM; backend up; restart | 1351/1500 | **149** | 0 |
 | Q2 | `sizer: bytes`, 256 MiB | as Q1 (queue holds the backlog: 132 390 bytes) | 1500/1500 | 0 | 0 |
 | Q3a | `sizer: bytes`, 50 000 (forced full) | as Q1; 3 runs | 1285, 1202, 1285 | **215, 298, 215** | 0 |
-| Q3b | as Q3a, plus `max_concurrent_files: 2` | as Q1; 4 runs (Q3b ×3, QF) | 1401 each | **99 each** | 0 |
+| Q3b | as Q3a, plus `max_concurrent_files: 2` | as Q1; 4 runs (Q3b ×3, QO) | 1401 each | **99 each** | 0 |
 | Q4 | as Q3a | as Q1 but SIGKILL; 2 runs | 1500/1500 | 0 | **566 each** |
-| F | reference config (decision 2) | as Q1; 5 runs | 1500/1500 each | 0 | 0 |
-| FK | reference config | as Q1 but SIGKILL; 2 runs | 1500/1500 each | 0 | 0 |
-| M | reference config, live backend | 3000 records streaming with rotation; SIGKILL at 1.5 s; restart; 7 runs | 3000/3000 each | 0 | 0, 0, 35, 8, 0, 1, 0 |
+| QF | reference config (decision 2) | as Q1; 5 runs | 1500/1500 each | 0 | 0 |
+| QFK | reference config | as Q1 but SIGKILL; 2 runs | 1500/1500 each | 0 | 0 |
+| QM | reference config, live backend | 3000 records streaming with rotation; SIGKILL at 1.5 s; restart; 7 runs | 3000/3000 each | 0 | 0, 0, 35, 8, 0, 1, 0 |
 
 - **Why a clean stop loses data when the queue is full** (Q1, Q3).
   - With `block_on_overflow`, the receiver's hand-off of a batch blocks while the queue is full.
@@ -74,18 +74,18 @@ The second review found that S5's config still loses data when an outage backlog
   - A batch is at most 100 lines (`reader.DefaultMaxBatchSize`, not configurable), and every file read concurrently holds one, so Q3a lost two to three batches.
   - `max_concurrent_files: 2` makes the receiver read one file at a time, which bounds the loss at one batch (Q3b: 99 in 4/4 runs).
   - `otlpjsonfile` has no receiver-side retry option at v0.151.0 or on main, so no setting can keep the offset.
-- **Why the queue must hold the outage** (Q2, F). While the queue is not full, nothing blocks, so a clean stop loses nothing.
+- **Why the queue must hold the outage** (Q2, QF). While the queue is not full, nothing blocks, so a clean stop loses nothing.
 - **Sizing data.** `sizer: bytes` counts the exporter's encoded request size, not the JSON line:
   - ~100 KB log lines: 1000 lines held 100 099 890 queue bytes;
   - ~300-byte lines: 50 000 bytes held 566 records.
 - **Operator signal.** The shipper's own metrics (`service.telemetry.metrics`) show `otelcol_exporter_queue_size` reaching `otelcol_exporter_queue_capacity` before the full state that a stop would turn into loss. On such a stop the shipper logs "Rejecting data" with `context canceled`.
 - **Duplicates after SIGKILL.**
-  - The receiver saves its offsets after each completed poll. While the queue is not full, a SIGKILL re-sends what one poll read: M saw 0–35 of 3000, and the review saw 1, 7 and 91.
+  - The receiver saves its offsets after each completed poll. While the queue is not full, a SIGKILL re-sends what one poll read: QM saw 0–35 of 3000 (probes ran with `poll_interval: 100ms`; the default of 200 ms reads more per poll), and the review saw 1, 7 and 91.
   - While the queue is full, the blocked poll never completes, so a SIGKILL re-sends everything queued since the last saved offset: Q4 re-sent the whole queue (566), and the review saw 1000 with the default 1000-item queue.
   - So the bound is the queue's contents plus one batch.
 - **Backends absorb exact duplicates.** The same OTLP log record pushed twice to Loki 3.7.8 came back as **1** entry. The same cumulative sample pushed twice to Prometheus 3.12.0 counted **1** sample.
-- **Disk** (100 KB lines; queue held 100 MB). The `file_storage` file grew to 118 MB and, **without compaction, stayed 118 MB after the queue drained and after a restart**. With `compaction: { on_start: true, on_rebound: true }` (probe thresholds 10/2 MiB, `check_interval: 1s`) it shrank to 0.33 MB after draining and 0.1 MB after a restart (K1 vs K2), with all 1000 records delivered.
-- **A misleading log line.** "Exporting failed. Dropping data." is logged at SIGTERM for items that the disk queue keeps and delivers after the restart (S2, F).
+- **Disk** (100 KB lines; queue held 100 MB). The `file_storage` file grew to 118 MB and, **without compaction, stayed 118 MB after the queue drained and after a restart**. With `compaction: { on_start: true, on_rebound: true }` (thresholds 10/2 MiB as in the reference config; `check_interval: 1s` in the probe, default 5 s) it shrank to 0.33 MB after draining and 0.1 MB after a restart (K1 vs K2), with all 1000 records delivered.
+- **A misleading log line.** "Exporting failed. Dropping data." is logged at SIGTERM for items that the disk queue keeps and delivers after the restart (S2, QF).
 
 ### Probe K: fingerprints and JSON key order
 
@@ -185,8 +185,8 @@ extensions:
       directory: ${env:SHIPPER_STORAGE_DIR}
       on_start: true
       on_rebound: true
-      rebound_needed_threshold_mib: 100
-      rebound_trigger_threshold_mib: 10
+      rebound_needed_threshold_mib: 10         # the thresholds Probe Q proved (10/2 MiB)
+      rebound_trigger_threshold_mib: 2
 receivers:
   otlpjsonfile/logs:                        # likewise /metrics and /traces
     include:                                # one pair per vigil service; SHIPPER_STATE_ROOT: absolute path, e.g. /home/u/.local/state
@@ -213,10 +213,10 @@ service:
 The full form (three receivers, three exporters, three pipelines) passes `otelcol-contrib validate` (0.151.0). `SHIPPER_STATE_ROOT` and `SHIPPER_STORAGE_DIR` are the shipper's own variables, not ones vigil reads. The Collector does not expand `~`, so both are absolute paths. The rules:
 
 - **The receiver's `storage` is required.** Without it a restart re-sends everything (F1: 100 duplicates). With it, restarts and rotations while the Collector is down lose and duplicate nothing (F3, F5).
-- **Each exporter needs a disk `sending_queue` with `block_on_overflow: true`, a byte capacity, and `max_elapsed_time: 0`.** The memory queue loses everything queued or retrying at shutdown (S1: 20/20 lost). Without `block_on_overflow` a backlog overflows the queue and is rejected for good (S4: up to 356/3000 lost). Any finite retry cap drops data during an outage longer than it (S6: 12/20 lost with 5 s; the default is 5 min). With all of them: S2, S3, S5, S7, F, FK and M lost nothing. While the backend stays down, the queue fills; then the receiver stops reading and the rest of the backlog waits in vigil's own files, bounded only by retention.
-- **Size each queue for the longest outage that a clean shipper stop must survive.** `queue_size` (bytes) ≥ the signal's data rate × that outage. With 256 MiB and ~300-byte records (~90 queue bytes each, Probe Q) that is about 3 million records. Beyond that the queue is full, and **a clean stop while it is full loses up to 100 records per signal** (Q3b, one reader batch, with `max_concurrent_files: 2`; without that setting several batches, Q3a). Watch `otelcol_exporter_queue_size` against `otelcol_exporter_queue_capacity` in the shipper's own telemetry, and do not stop or restart the shipper while they are equal. The cause is upstream (Notes for the owner).
-- **Disk.** Each queue can hold up to its `queue_size` on disk; the three reference queues need up to 768 MiB on the `file_storage` filesystem, and the storage file runs ~18% above the queued bytes (Probe Q: 118 MB for 100 MB). `compaction` with `on_rebound` returns the space after the backlog drains (118 MB → 0.33 MB). Without it the file stays at its peak for good, including across restarts. Compaction needs free space for a temporary copy in its `directory`.
-- **Operator note:** at SIGTERM the shipper logs "Exporting failed. Dropping data." for items the disk queue keeps and delivers after the restart (S2, F). With this config that line is not data loss; the loss signal is "Rejecting data" with `context canceled` while the queue is full.
+- **Each exporter needs a disk `sending_queue` with `block_on_overflow: true`, a byte capacity, and `max_elapsed_time: 0`.** The memory queue loses everything queued or retrying at shutdown (S1: 20/20 lost). Without `block_on_overflow` a backlog overflows the queue and is rejected for good (S4: up to 356/3000 lost). Any finite retry cap drops data during an outage longer than it (S6: 12/20 lost with 5 s; the default is 5 min). With all of them: S2, S3, S5, S7, QF, QFK and QM lost nothing. While the backend stays down, the queue fills; then the receiver stops reading and the rest of the backlog waits in vigil's own files, bounded only by retention.
+- **Size each queue for the longest outage that a clean shipper stop must survive.** `queue_size` (bytes) ≥ the signal's data rate × that outage. For scale: Probe Q's one-record lines of ~300 bytes took ~90 queue bytes each, so 256 MiB held about 3 million such lines. vigil's lines usually carry many records, so measure your own rate in queue bytes (`otelcol_exporter_queue_size`) rather than counting records. Beyond that capacity the queue is full, and **a clean stop while it is full loses up to 100 lines per signal**: one reader batch (Q3b, with `max_concurrent_files: 2`; without that setting several batches, Q3a). A vigil line is one export batch, at most 1 MiB (ADR-0001 decision 10); for logs that is up to 512 records (`src/init.rs:314`). So the bound is up to 100 MiB of telemetry, or up to 51 200 log records, per signal. Watch `otelcol_exporter_queue_size` against `otelcol_exporter_queue_capacity` in the shipper's own telemetry, and do not stop or restart the shipper while they are equal. The cause is upstream (Notes for the owner).
+- **Disk.** Each queue can hold up to its `queue_size` on disk; the storage file runs ~18% above the queued bytes (Probe Q: 118 MB for 100 MB). So the three reference queues need about 900 MiB on the `file_storage` filesystem, plus free space for compaction's temporary copy (up to the file's size). `compaction` with `on_rebound` returns the space after the backlog drains (118 MB → 0.33 MB). Without it the file stays at its peak for good, including across restarts. Compaction needs free space for a temporary copy in its `directory`.
+- **Operator note:** at SIGTERM the shipper logs "Exporting failed. Dropping data." for items the disk queue keeps and delivers after the restart (S2, QF). With this config that line is not data loss; the loss signal is "Rejecting data" with `context canceled` while the queue is full.
 - **`start_at: beginning`.** With `end`, records written before the first start or during downtime are lost (F2: 100/150).
 - **`include` lists each vigil service's live file and its segments.** `<service>/<signal>.jsonl` and `<service>/<signal>-*.jsonl`, the names ADR-0002 decision 5 fixes. Matching only the live file loses whatever was unread when it rotated (F4: 82/150). Services are listed by name rather than with `*/`, because `$XDG_STATE_HOME/*/logs.jsonl` also matches files other programs write, and the receiver would ingest or reject them. Adding a service is a config change, made by whatever deploys the services (g-fleet for the fleet, #15).
 - **`include_file_name: false`.** Otherwise every record carries a `log.file.name` that changes on rotation (F3 vs default). Only the shipper's own diagnostics need it.
@@ -233,8 +233,8 @@ The full form (three receivers, three exporters, three pipelines) passes `otelco
 | A vigil service missing from `include` | that service is silently never shipped | The deployment adds each service when it installs it (#15); #60's README lists the step. |
 | Backend down longer than retention | loss | Alert on shipper backlog. Retention (90 days by default) is the buffer. |
 | Backend rejects old or out-of-order records (decision 1) | loss, logged by the shipper as a permanent error | Backend acceptance windows. |
-| Clean stop (SIGTERM) while a queue is full (outage backlog > `queue_size`) | **loss of up to 100 records per signal** (Q3b) ✓ | Size `queue_size` for the longest outage. Alert on `otelcol_exporter_queue_size` reaching `otelcol_exporter_queue_capacity`; don't stop the shipper in that state. The upstream fix is in Notes for the owner. |
-| SIGKILL, crash or power loss | **duplicates of everything read since the last saved offset**: one poll's worth with room in the queue (0–35/3000 in M, 91 in the review); up to the whole queue plus one batch when it is full (566 in Q4, 1000 in the review) ✓ | Stop with SIGTERM (systemd's default). Loki and Prometheus absorb exact duplicates (Probe Q). Record identity is below the table. |
+| Clean stop (SIGTERM) while a queue is full (outage backlog > `queue_size`) | **loss of up to 100 lines per signal** (one reader batch; each line ≤ 1 MiB, ≤ 512 log records) (Q3b) ✓ | Size `queue_size` for the longest outage. Alert on `otelcol_exporter_queue_size` reaching `otelcol_exporter_queue_capacity`; don't stop the shipper in that state. The upstream fix is in Notes for the owner. |
+| SIGKILL, crash or power loss | **duplicates of everything read since the last saved offset**: one poll's worth of lines with room in the queue (0–35 of 3000 one-record lines in QM, 91 in the review); up to the whole queue plus one 100-line batch when it is full (566 lines in Q4, 1000 in the review); each line can hold many records ✓ | Stop with SIGTERM (systemd's default). Loki and Prometheus absorb exact duplicates (Probe Q). Record identity is below the table. |
 | Power loss with `file_storage` `fsync: false` (the default) | recent queue items and offsets may be lost or replayed | `fsync: true` at a write-cost; not probed. |
 | `file_storage` directory lost or not persistent | full re-read: duplicates of everything retained; queued items lost but re-read | Put it on persistent storage owned by the shipper's user. |
 | Files that start with identical bytes (before decision 3 / #64 land) | silent loss (Probe K) ✓ | Decisions 3 and #64. |
@@ -339,7 +339,7 @@ let guard = vigil::Config::new("flock")
 ## Consequences
 
 - **Two supported paths, one format.**
-  - **Hosts with the Collector** get shipping from the files with no loss across backend outages that fit the queue (`queue_size`, sized per decision 2) and across clean restarts. Beyond that capacity, a clean stop while the queue is full loses up to 100 records per signal. A crash re-sends records, up to the queue's contents, and backends absorb exact duplicates. Old records are subject to the backend's acceptance window (decision 1). The config, its sizing and its signals are documented and tested (#60).
+  - **Hosts with the Collector** get shipping from the files with no loss across backend outages that fit the queue (`queue_size`, sized per decision 2) and across clean restarts. Beyond that capacity, a clean stop while the queue is full loses up to 100 lines (one reader batch, each line up to 512 log records or 1 MiB) per signal. A crash re-sends records, up to the queue's contents, and backends absorb exact duplicates. Old records are subject to the backend's acceptance window (decision 1). The config, its sizing and its signals are documented and tested (#60).
   - **Hosts with Alloy** (the fleet) use `push` until Alloy can read OTLP files; push is live but loses data while the agent is down, and the files keep it.
   - The fleet rollout (#15) chooses per host and may land after 1.0.
 - **A shipper bug now costs data silently.** F2/F4 and Probe K lost records with no error anywhere, and S1/S4/S6/Q1 lost them with only shipper log lines; #60's conformance test is what keeps the reference config honest. Hand-written configs that drop a rule above will lose or duplicate data, so the README states the rules, not just the YAML.
