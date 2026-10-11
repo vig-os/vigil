@@ -382,6 +382,7 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
 
   It returns pure Ed25519 signatures and uses only std types (ADR-0004 decision 1). An application can implement it over any device or remote signer. Because it is unsealed, a method added in 1.x must have a default implementation; a new required method is a major. The signer is called inside the locked section, so a slow signer slows down the writers of that trail. A checkpoint is due at most every `checkpoint_every` records.
 - **`KeyFileSigner`** is vigil's one implementation in 1.0. It loads a file holding the 32-byte seed as 64 hex characters, with surrounding whitespace allowed. That is the format `tessera keygen` writes (`signing_key_from_hex`), so tools are interoperable. **Use separate keys for vigil and tessera.** The domain-separated messages already prevent a signature from crossing over. Separate keys also keep a compromise of one tool's key from forcing the other's revocation, and let each be revoked on its own schedule.
+  - **Use the secret seed file, never the public key or `.pub` file.** Both a seed and a public key are 32 bytes encoded as 64 hex characters. The parser cannot distinguish them: supplying a public key as a seed silently derives a different signing key. Check the derived public key against the trusted `key_id` before use. The v1 raw-hex format permits no header or prefix to disambiguate; only surrounding whitespace is allowed. A format change needs a separate decision.
   - Like OpenSSH, it refuses a file with group or other permission bits, or one owned by another user.
   - `vigil-audit keygen <file>` writes the seed (`0600`, never overwriting) and `<file>.pub` with the public key. The seed comes from `getrandom`.
   - The seed is held in `ed25519_dalek::SigningKey`, which zeroizes it on drop.
@@ -608,9 +609,9 @@ Only vigil's own types and std appear. Hashes and keys are byte arrays, not `bla
 - **The MMR** is vigil's own code (push, root and peaks; the probe's version is under 50 lines), with the golden vectors of decision 12. Proof generation is not needed by `verify`, which recomputes everything, and comes with the anchor-holder API in [#57](https://github.com/vig-os/vigil/issues/57).
 - **Cost and licences.** 17 more crates in the normal tree (64 → 81, probe; `pure` adds none). **Licences.** [#47](https://github.com/vig-os/vigil/issues/47)'s `deny.toml` (merged in #55) allows Apache-2.0, MIT and Unicode-3.0.
   - `blake3` and `constant_time_eq` pass through their Apache-2.0 alternative.
-  - `curve25519-dalek`, `ed25519-dalek` and `subtle` are BSD-3-Clause only, so the PR that adds them (#12) adds BSD-3-Clause to the allowlist and justifies it there: permissive, notice-retaining, and compatible with Apache-2.0 distribution.
+  - `curve25519-dalek`, `ed25519-dalek` and `subtle` are BSD-3-Clause only, so the PR that adds them (#12) adds crate-scoped BSD-3-Clause license exceptions for exactly those three crates and justifies them there: permissive, notice-retaining, and compatible with Apache-2.0 distribution.
 
-  **For #12:** `curve25519-dalek`, `ed25519-dalek` and `subtle` are BSD-3-Clause only. #12 must add BSD-3-Clause to `deny.toml` with a justification in that PR.
+  **For #12:** `curve25519-dalek`, `ed25519-dalek` and `subtle` are BSD-3-Clause only. #12 must add crate-scoped BSD-3-Clause exceptions for exactly those three crates to `deny.toml`, with a justification in that PR.
 
   crates.io only; no git dependency.
 
@@ -684,7 +685,7 @@ The four threat models: **(a)** an attacker who can write the trail files but ho
 - **Disk only grows.** Archiving is the operator's job; vigil only guarantees that any sealed segment can be moved.
 - **The format is a long-term promise.** v1's encoding, domain strings and MMR can never change in 1.x. Every fix must be expressible as a v2, which costs an ADR and a second verifier path kept alive alongside v1.
 - **Code that must stay small.** The audit sink adds a second writer to the crate's riskiest file (`src/rotate.rs`, a crate-internal locked-section API). It is shared code, so the multi-process tests of ADR-0002 must cover both callers.
-- **Dependencies.** 17 more crates with `audit` on, and BSD-3-Clause in the licence allowlist.
+- **Dependencies.** 17 more crates with `audit` on, and crate-scoped BSD-3-Clause licence exceptions for the three reviewed crypto crates.
 - **Tessera.** Its interoperability costs vigil nothing now, and it keeps the adoption path open without making vigil's promise depend on tessera's release schedule.
 - **What the #66 amendment costs** (decision 16):
   - **Applications store one more thing.** Each process stores the `Checkpoint` that `close()` returns next to its receipts, and a rotation needs every writer to have closed (or one restart and close). An application that drops the handle instead of closing it makes rotation take that extra step.

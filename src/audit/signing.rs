@@ -39,6 +39,12 @@ impl KeySeed {
     /// Parses 64 hex characters with surrounding whitespace allowed, matching
     /// tessera's key files. Uppercase hex is accepted for seeds only; wire
     /// hashes and public keys are always written in lowercase.
+    ///
+    /// **Supply the secret seed, never the public key or `.pub` file.** Both
+    /// are 32 bytes written as 64 hex characters, so this parser cannot tell
+    /// them apart. A public key is accepted as a seed and silently derives a
+    /// different signing key. Check the derived public key against the trusted
+    /// key id before use. The v1 key-file format allows no header or prefix.
     pub fn parse(text: &str) -> Result<Self, SignerError> {
         let text = text.trim().as_bytes();
         if text.len() != 64 {

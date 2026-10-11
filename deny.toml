@@ -19,12 +19,24 @@ allow = [
     "Apache-2.0",
     # Permissive; compatible with Apache-2.0 distribution with retained notices.
     "MIT",
-    # Audit Ed25519 (dalek and subtle): permissive, notice-retaining,
-    # compatible with Apache-2.0 distribution (ADR-0005 decision 14).
-    "BSD-3-Clause",
     # unicode-ident's data license; permissive with retained Unicode notices.
     "Unicode-3.0",
 ]
+
+# Audit crypto only (ADR-0005 decision 14): permissive, notice-retaining,
+# compatible with Apache-2.0 distribution. Other BSD-3-Clause crates still
+# require review; this is deliberately not a global license allowance.
+[[licenses.exceptions]]
+name = "curve25519-dalek"
+allow = ["BSD-3-Clause"]
+
+[[licenses.exceptions]]
+name = "ed25519-dalek"
+allow = ["BSD-3-Clause"]
+
+[[licenses.exceptions]]
+name = "subtle"
+allow = ["BSD-3-Clause"]
 
 [bans]
 # scripts/check_supply_chain.py additionally denies duplicate semver majors
