@@ -47,7 +47,10 @@ fixture-writing utility; both verification tests run normally in CI.
 The production mapping and reader share context validation. The generator now
 includes empty/duplicate/NUL/random keys, absent KeyValue/AnyValue values, empty
 strings and NUL-containing context strings, absent details, U+2028/U+2029, arrays/kvlist depths at and beyond 16,
-optional authenticated repair digests, resume checkpoint counts, and size refusals. Corpus generation exercises typed refusals and collects 256
+optional authenticated repair digests, normal and resume checkpoint counts (weighted 3:1), and size refusals.
+A coverage test requires the fixed corpus to contain both count forms, with normal
+checkpoints more frequent. Empty MMRs are generated only at sequence zero;
+reserved `audit.*` context keys are refused at the writer and reader boundaries. Corpus generation exercises typed refusals and collects 256
 accepted lines; it does not discard a successfully emitted unverifiable line.
 Depth counts container edges from root AnyValue depth zero. Invalid context
 returns InvalidConfig; oversized payloads return TooLarge before writing.

@@ -117,6 +117,7 @@ fn generated() -> impl Strategy<Value = (Record, AnyValue)> {
             prop::option::of(unicode()),
             prop::option::of(unicode()),
             prop::option::of(any::<[u8; 32]>()),
+            prop_oneof![3 => Just(false), 1 => Just(true)],
         ),
         value(),
         value(),
@@ -131,7 +132,7 @@ fn generated() -> impl Strategy<Value = (Record, AnyValue)> {
         .prop_map(
             |(
                 strings,
-                (host, reason, details, repaired),
+                (host, reason, details, repaired, resume),
                 before,
                 after,
                 trail,
@@ -145,12 +146,17 @@ fn generated() -> impl Strategy<Value = (Record, AnyValue)> {
                 let mut context = RecordContext::new(trail, seq, time, &strings[0], previous);
                 context.host = host;
                 context.repaired = repaired;
+                let size = if resume && seq > 1 {
+                    (seq / 2).max(1)
+                } else {
+                    seq
+                };
                 let kind = if checkpoint {
                     Kind::Checkpoint(
                         CheckpointFields::new(
-                            seq / 2,
+                            size,
                             previous,
-                            vec![previous; (seq / 2).count_ones() as usize],
+                            vec![previous; size.count_ones() as usize],
                             key,
                             signature,
                         )
@@ -414,4 +420,84 @@ fn context_numbers_and_ids_are_canonical() {
             );
         }
     }
+}
+
+#[test]
+fn r2_reserved_context_keys_are_rejected_at_both_boundaries() {
+    for key in ["audit.repaired", "audit.seq", "audit.future"] {
+        let extra = av(any_value::Value::KvlistValue(KeyValueList {
+            values: vec![kv(key, text("misleading"))],
+        }));
+        assert_eq!(
+            request(&record(), extra).unwrap_err().kind(),
+            AuditErrorKind::InvalidConfig
+        );
+        for resource in [false, true] {
+            for nested in [false, true] {
+                let mut json =
+                    crate::logs::encode_json(&request(&record(), text("valid")).unwrap()).unwrap();
+                let attrs = if resource {
+                    &mut json["resourceLogs"][0]["resource"]["attributes"]
+                } else {
+                    &mut json["resourceLogs"][0]["scopeLogs"][0]["scope"]["attributes"]
+                };
+                let reserved = serde_json::json!({"key":key,"value":{"stringValue":"misleading"}});
+                attrs.as_array_mut().unwrap().push(if nested {
+                    serde_json::json!({"key":"nested-context","value":{"kvlistValue":{"values":[reserved]}}})
+                } else { reserved });
+                assert_eq!(
+                    Record::parse_line(&serde_json::to_vec(&json).unwrap())
+                        .unwrap_err()
+                        .finding_kind(),
+                    Some(crate::audit::FindingKind::InvalidField)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn r2_zero_size_is_only_the_creation_checkpoint() {
+    for seq in [1, 7, i64::MAX as u64] {
+        let context = RecordContext::new([0; 16], seq, 0, "service", [0; 32]);
+        let fields =
+            CheckpointFields::new(0, crate::audit::Mmr::new().root(), vec![], [0; 32], [0; 64])
+                .unwrap();
+        // Assemble an invalid wire input without the checked constructor.
+        let invalid = Record {
+            context: context.clone(),
+            kind: Kind::Checkpoint(fields.clone()),
+        };
+        let line = crate::logs::encode_line(&request(&invalid, text("context")).unwrap()).unwrap();
+        assert_eq!(
+            Record::checkpoint(context, fields).unwrap_err().kind(),
+            AuditErrorKind::InvalidConfig
+        );
+        assert_eq!(
+            Record::parse_line(line.as_bytes())
+                .unwrap_err()
+                .finding_kind(),
+            Some(crate::audit::FindingKind::InvalidField)
+        );
+    }
+}
+
+#[test]
+fn r2_corpus_contains_normal_and_resume_checkpoints() {
+    let (mut normal, mut resume) = (0, 0);
+    for line in corpus() {
+        for record in Record::parse_line(line.as_bytes()).unwrap() {
+            if let Kind::Checkpoint(fields) = record.kind {
+                if fields.size == record.context.seq {
+                    normal += 1;
+                } else {
+                    resume += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        normal > resume && resume > 0,
+        "normal={normal}, resume={resume}"
+    );
 }

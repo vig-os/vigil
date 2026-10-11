@@ -256,6 +256,8 @@ fn resume_checkpoint_counts_records_not_skipped_sequences() {
     for (seq, size, accepted) in [
         (0, 0, true),
         (7, 3, true),
+        (7, 0, false),
+        (1, 1, true),
         (7, 7, true),
         (3, 7, false),
         (0, 1, false),

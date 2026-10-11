@@ -249,12 +249,14 @@ impl Record {
     /// Builds a checkpoint. MMR size counts records preceding this checkpoint,
     /// while sequence numbers can skip lost records at a declared resume gap.
     /// Size must not exceed sequence; equality holds before any resume gap.
+    /// Zero size is allowed only at seq 0: every later checkpoint includes
+    /// the creation checkpoint as a leaf (ADR-0005 decisions 7 and 8).
     /// Checking the exact count and the gap declaration requires trail history (#13).
     ///
     /// # Errors
     ///
     /// Returns [`AuditErrorKind::InvalidConfig`] if MMR size exceeds the
-    /// sequence number or either exceeds `i64::MAX`,
+    /// sequence number, is zero at a nonzero sequence, or either exceeds `i64::MAX`,
     /// [`AuditErrorKind::InvalidEntry`] if service or host is
     /// empty or contains NUL, or [`AuditErrorKind::TooLarge`] if a canonical
     /// field exceeds `u32::MAX` bytes.
@@ -262,12 +264,7 @@ impl Record {
         context: RecordContext,
         fields: CheckpointFields,
     ) -> Result<Self, AuditError> {
-        if fields.size > context.seq {
-            return Err(AuditError::new(
-                AuditErrorKind::InvalidConfig,
-                "checkpoint size exceeds sequence",
-            ));
-        }
+        validation::checkpoint_count(context.seq, fields.size)?;
         Self::build(context, Kind::Checkpoint(fields))
     }
     fn build(context: RecordContext, kind: Kind) -> Result<Self, AuditError> {

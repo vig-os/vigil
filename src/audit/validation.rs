@@ -67,18 +67,21 @@ pub(super) fn integer(v: &Json) -> Result<u64, AuditError> {
 pub(super) type Attributes<'a> = BTreeMap<&'a str, &'a Json>;
 /// Validates keys and values and indexes one attribute list.
 pub(super) fn attributes(v: &Json) -> Result<Attributes<'_>, AuditError> {
-    attributes_at(v, 0)
+    attributes_at(v, 0, false)
 }
-fn attributes_at(v: &Json, depth: usize) -> Result<Attributes<'_>, AuditError> {
+fn attributes_at(v: &Json, depth: usize, context: bool) -> Result<Attributes<'_>, AuditError> {
     let mut result = BTreeMap::new();
     for a in array(v)? {
         message(a, &["key", "value"])?;
         let fields = object(a)?;
         let key = text(required(a, "key")?)?;
+        if context {
+            context_key(key)?;
+        }
         let value = fields
             .get("value")
             .ok_or_else(|| finding(FindingKind::MissingField))?;
-        any_value_at(value, depth)?;
+        any_value_at(value, depth, context)?;
         if result.insert(key, value).is_some() {
             return Err(corrupt());
         }
@@ -113,7 +116,7 @@ pub(super) fn context_message(v: &Json, resource: bool) -> Result<(), AuditError
         return Err(corrupt());
     }
     if let Some(attrs) = v.get("attributes") {
-        attributes(attrs)?;
+        attributes_at(attrs, 0, true)?;
     }
     if let Some(refs) = v.get("entityRefs") {
         for entity in array(refs)? {
@@ -133,7 +136,7 @@ pub(super) fn context_message(v: &Json, resource: bool) -> Result<(), AuditError
     }
     Ok(())
 }
-fn any_value_at(v: &Json, depth: usize) -> Result<(), AuditError> {
+fn any_value_at(v: &Json, depth: usize, context: bool) -> Result<(), AuditError> {
     nesting(depth)?;
     message(
         v,
@@ -157,10 +160,10 @@ fn any_value_at(v: &Json, depth: usize) -> Result<(), AuditError> {
                 if let Some(values) = val.get("values") {
                     if key == "arrayValue" {
                         for value in array(values)? {
-                            any_value_at(value, depth + 1)?;
+                            any_value_at(value, depth + 1, context)?;
                         }
                     } else {
-                        attributes_at(values, depth + 1)?;
+                        attributes_at(values, depth + 1, context)?;
                     }
                 }
             }
@@ -260,7 +263,7 @@ fn nesting(depth: usize) -> Result<(), AuditError> {
     }
     Ok(())
 }
-/// Preflights typed context with the same budget before cloning or JSON projection.
+/// Preflights typed context depth and reserved keys before cloning or JSON projection.
 /// This bounded traversal cannot recurse into arbitrarily deep caller input.
 pub(super) fn typed_context_depth(
     value: &opentelemetry_proto::tonic::common::v1::AnyValue,
@@ -279,6 +282,7 @@ pub(super) fn typed_context_depth(
             }
             Some(Value::KvlistValue(list)) => {
                 for pair in &list.values {
+                    context_key(&pair.key)?;
                     if let Some(value) = &pair.value {
                         visit(value, depth + 1)?;
                     }
@@ -289,4 +293,24 @@ pub(super) fn typed_context_depth(
         Ok(())
     }
     visit(value, 0)
+}
+
+/// Reserves audit names for authenticated log-record attributes, including nested context.
+fn context_key(key: &str) -> Result<(), AuditError> {
+    if key.starts_with("audit.") {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+
+/// Checks history-independent MMR count invariants (ADR-0005 decisions 7 and 8).
+/// Creation is seq 0 with no leaves; every later checkpoint includes creation.
+pub(super) fn checkpoint_count(seq: u64, size: u64) -> Result<(), AuditError> {
+    if seq > i64::MAX as u64 || size > seq || (seq > 0 && size == 0) {
+        return Err(AuditError::new(
+            AuditErrorKind::InvalidConfig,
+            "checkpoint count must be zero only at creation, positive otherwise, and at most sequence within OTLP int64",
+        ));
+    }
+    Ok(())
 }

@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Audit amendment 2 format support: authenticated repair digests and checkpoint MMR counts independent of resume sequence gaps ([#79](https://github.com/vig-os/vigil/issues/79)).
+- Audit amendment 2 format support: authenticated repair digests and checkpoint MMR counts independent of resume sequence gaps, with reserved context names and creation-only empty MMR validation ([#79](https://github.com/vig-os/vigil/issues/79)).
 
 - Public API performance benchmarks, disk-based consumer budgets and same-runner CI regression reports ([#49](https://github.com/vig-os/vigil/issues/49)).
 - Stable public API snapshot and ADR allowlist gates, including declaration kinds, hidden exports and expanded macros; reviewed pre-publish `semver:major` findings remain visible in CI summaries ([#42](https://github.com/vig-os/vigil/issues/42)).
