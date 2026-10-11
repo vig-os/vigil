@@ -347,10 +347,13 @@ baseline.
 Budgets are consumer capacity-planning targets on comparable hardware and a
 Linux ext4 filesystem with cached writes, using the workloads above. They are
 explicitly scoped to local dev/CI disks with available CPU and memory, not NFS,
-synchronous durability or cold-cache workloads. They reserve at least 2×
-headroom from the disk reference; larger margins on filesystem operations
-allow for typical hosted-runner and virtual-disk variability; they are not
-per-record deadlines or p99 guarantees. Provision below these rates, measure
+synchronous durability or cold-cache workloads. The VM append references above
+provide 6.66× headroom at one process (333k / 50k records/s) and 8.80× at eight
+processes (220k / 25k aggregate records/s). CI run 38133079340 on an AMD EPYC
+7763 runner with 4 vCPUs and ext4 measured 76.7k records/s at one process and
+40.6k aggregate at eight: only 1.53× and 1.62× headroom, respectively. These
+are measurements on two particular systems, not a guaranteed margin on other
+hosts. Budgets are not per-record deadlines or p99 guarantees. Provision below these rates, measure
 on your actual disk, and monitor queue losses. A shared directory serializes
 all signals, so eight writers share the aggregate budget, not eight times it.
 Slow disks, CPU contention, large attributes, retention scans and uncached
@@ -402,20 +405,26 @@ Set `VIGIL_BENCH_QUICK=1` for CI's 10 samples, 1-second warmup, 1-second
 measurement target and `nresamples(1000)`; Criterion can extend sampling for
 slower workloads. `cargo test --locked --bench performance` validates every
 workload once without timing assertions. An explicit step in the blocking Rust
-checks lane runs this command, independently of performance timing. Scratch
+checks lane runs this command exactly once. Its broader Cargo test steps select
+libraries, binaries, integration tests and examples, excluding benchmarks.
+This correctness run is independent of performance timing. Scratch
 cleanup deliberately ignores errors so unwinding cannot cause a second panic.
 
 CI's **Performance comparison** job checks out the PR head with full history,
 computes its merge-base with the target branch, and creates a disposable
-merge-base worktree. It overlays the exact head benchmark harness and its
-Criterion dev dependency because historical commits may predate the suite;
-it preserves the base runtime manifest and existing lockfile pins, adding the
-missing dev dependency entries only in that disposable checkout. It measures
-base with Criterion `--save-baseline base`, then head with `--baseline base`,
-sequentially in the **same job on the same runner and filesystem**, with a
-shared scratch root and fresh estimate directory. Separate Cargo artifact
-directories prevent one checkout from reusing the other's benchmark binary.
-Head builds use `--locked`.
+merge-base worktree. If that base already declares and locks Criterion, it
+overlays the exact head benchmark harness while preserving the base dependency
+manifest and lockfile. A missing benchmark target declaration is added without
+changing dependencies. Both base and head build with `--locked` against their
+own lockfiles: no dependency resolution or lockfile updates are allowed. It
+measures base with Criterion `--save-baseline base`, then head with
+`--baseline base`, sequentially in the **same job on the same runner and
+filesystem**, with a shared scratch root and fresh estimate directory. Separate
+Cargo artifact directories prevent reuse of the other checkout's binary.
+If the merge-base predates the locked Criterion dependency, the job explicitly
+skips the timing comparison with a notice annotation and job summary; it does
+not fabricate a baseline or resolve extra dependencies. Benchmark correctness
+still runs in the blocking Rust lane. Other build/run/lockfile failures block.
 Hardware, filesystem, compiler and both commit IDs appear in the job log.
 There is no committed cross-machine CI baseline. Local comparisons use:
 

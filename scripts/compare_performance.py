@@ -11,25 +11,27 @@ import tomllib
 
 
 def prepare_base(base, head):
-    """Overlay only the benchmark and its dev dependency on historical source.
+    """Overlay the harness only when the base already pins its dependency.
 
-    The merge-base may predate this suite. Preserve its runtime manifest and
-    lockfile; Cargo resolves only the added benchmark dev dependency as needed.
+    Historical commits without Criterion cannot provide a locked baseline.
+    Return False without modifying them; never resolve additional dependencies.
+    Other manifest/lock mismatches remain blocking Cargo --locked failures.
     """
-    destination = base / "benches" / "performance.rs"
-    destination.parent.mkdir(exist_ok=True)
-    shutil.copyfile(head / "benches" / "performance.rs", destination)
     manifest = base / "Cargo.toml"
     original = manifest.read_text()
     config = tomllib.loads(original)
-    if "criterion" not in config.get("dev-dependencies", {}):
-        original += (
-            '\n[dev-dependencies.criterion]\nversion = "=0.8.2"\n'
-            'default-features = false\nfeatures = ["cargo_bench_support"]\n'
-        )
+    lock = tomllib.loads((base / "Cargo.lock").read_text())
+    if "criterion" not in config.get("dev-dependencies", {}) or not any(
+        package.get("name") == "criterion" for package in lock.get("package", [])
+    ):
+        return False
+    destination = base / "benches" / "performance.rs"
+    destination.parent.mkdir(exist_ok=True)
+    shutil.copyfile(head / "benches" / "performance.rs", destination)
     if not any(bench.get("name") == "performance" for bench in config.get("bench", [])):
         original += '\n[[bench]]\nname = "performance"\nharness = false\n'
-    manifest.write_text(original)
+        manifest.write_text(original)
+    return True
 
 
 def measure(base, head, env):
@@ -39,13 +41,11 @@ def measure(base, head, env):
     target = Path(env["CARGO_TARGET_DIR"])
     base_env = {**env, "CARGO_TARGET_DIR": str(target / "performance-base")}
     head_env = {**env, "CARGO_TARGET_DIR": str(target / "performance-head")}
-    # Historical lockfiles lack the newly overlaid dev dependency. Cargo keeps
-    # existing compatible pins and adds the missing entries in this disposable
-    # checkout. Head must always respect its reviewed, committed lockfile.
     subprocess.run(
         [
             "cargo",
             "bench",
+            "--locked",
             "--bench",
             "performance",
             "--",
@@ -115,7 +115,20 @@ def main():
             ["git", "worktree", "add", "--detach", str(base), merge_base], check=True
         )
         try:
-            prepare_base(base, head)
+            if not prepare_base(base, head):
+                notice = (
+                    "Performance comparison skipped: merge-base "
+                    + merge_base
+                    + " predates the locked Criterion benchmark dependency. "
+                    "No timing comparison was made; benchmark correctness remains blocking."
+                )
+                print("::notice::" + notice, flush=True)
+                if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
+                    with open(summary, "a") as file:
+                        file.write(
+                            "## Performance comparison skipped\n\n" + notice + "\n"
+                        )
+                return
             scratch = root / "scratch"
             scratch.mkdir()
             env = {

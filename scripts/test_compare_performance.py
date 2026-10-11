@@ -26,17 +26,33 @@ class ComparisonTests(unittest.TestCase):
                 '[package]\nname="example"\nversion="0.1.0"\n'
                 '[dependencies]\nserde="1"\n'
             )
-            (base / "Cargo.lock").write_text("keep existing pins")
-            prepare_base(base, head)
+            (base / "Cargo.lock").write_text("version = 4\n")
+            self.assertFalse(prepare_base(base, head))
+            self.assertFalse((base / "benches").exists())
+            self.assertEqual((base / "Cargo.lock").read_text(), "version = 4\n")
+            self.assertEqual(
+                (base / "Cargo.toml").read_text(),
+                '[package]\nname="example"\nversion="0.1.0"\n'
+                '[dependencies]\nserde="1"\n',
+            )
+            (base / "Cargo.toml").write_text(
+                (base / "Cargo.toml").read_text()
+                + '[dev-dependencies]\ncriterion="=0.8.2"\n'
+            )
+            self.assertFalse(prepare_base(base, head))
+            self.assertFalse((base / "benches").exists())
+            (base / "Cargo.lock").write_text(
+                'version = 4\n[[package]]\nname="criterion"\nversion="0.8.2"\n'
+            )
+            locked = (base / "Cargo.lock").read_text()
+            self.assertTrue(prepare_base(base, head))
             config = tomllib.loads((base / "Cargo.toml").read_text())
             self.assertEqual(config["dependencies"], {"serde": "1"})
-            self.assertEqual(
-                config["dev-dependencies"]["criterion"]["version"], "=0.8.2"
-            )
+            self.assertEqual(config["dev-dependencies"]["criterion"], "=0.8.2")
             self.assertEqual(
                 config["bench"], [{"name": "performance", "harness": False}]
             )
-            self.assertEqual((base / "Cargo.lock").read_text(), "keep existing pins")
+            self.assertEqual((base / "Cargo.lock").read_text(), locked)
             self.assertEqual(
                 (base / "benches/performance.rs").read_text(), "new public API harness"
             )
@@ -57,6 +73,7 @@ class ComparisonTests(unittest.TestCase):
         base, head, report = run.call_args_list
         self.assertEqual(base.args[0][-2:], ["--save-baseline", "base"])
         self.assertEqual(head.args[0][-2:], ["--baseline", "base"])
+        self.assertIn("--locked", base.args[0])
         self.assertIn("--locked", head.args[0])
         self.assertEqual(base.kwargs["cwd"], Path("/base"))
         self.assertEqual(head.kwargs["cwd"], Path("/head"))
@@ -90,7 +107,16 @@ class ComparisonTests(unittest.TestCase):
         self.assertNotIn("continue-on-error:", performance)
         self.assertIn("compare_performance.py", performance)
         self.assertIn("fetch-depth: 0", performance)
-        self.assertIn("cargo test --locked --bench performance", workflow)
+        self.assertEqual(workflow.count("cargo test --locked --bench performance"), 1)
+        self.assertNotIn("cargo test --locked --all-targets", workflow)
+        self.assertEqual(
+            workflow.count("cargo test --locked --lib --bins --tests --examples"), 2
+        )
+
+    def test_documented_append_headroom_distinguishes_vm_and_ci(self):
+        readme = Path("README.md").read_text()
+        for number in ("76.7k", "40.6k", "1.53×", "1.62×", "6.66×", "8.80×"):
+            self.assertIn(number, readme)
 
     def test_ci_summary_blocks_extension_failures_and_cancellations(self):
         workflow = Path(".github/workflows/ci.yml").read_text()

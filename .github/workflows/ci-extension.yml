@@ -76,9 +76,9 @@ jobs:
 
       # Plain Cargo shares a process between library tests; nextest does not.
       - name: Cargo tests with default test threads
-        run: nix develop -c cargo test --locked --all-targets --all-features
+        run: nix develop -c cargo test --locked --lib --bins --tests --examples --all-features
       - name: Cargo tests with one test thread
-        run: nix develop -c cargo test --locked --all-targets --all-features -- --test-threads=1
+        run: nix develop -c cargo test --locked --lib --bins --tests --examples --all-features -- --test-threads=1
 
       - name: Run nix flake check
         run: nix flake check -L
