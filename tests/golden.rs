@@ -54,3 +54,23 @@ fn golden_bytes_are_identical_across_repeated_runs() {
         assert_eq!(golden_output(), first);
     }
 }
+
+#[test]
+fn time_first_order_preserves_golden_content() {
+    let old = include_str!("fixtures/logs-before-64.jsonl");
+    let actual = golden_output();
+    let old: Vec<serde_json::Value> = old
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let new: Vec<serde_json::Value> = actual
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(old, new);
+    for line in actual.lines() {
+        let observed = &serde_json::from_str::<serde_json::Value>(line).unwrap()["resourceLogs"][0]
+            ["scopeLogs"][0]["logRecords"][0]["observedTimeUnixNano"];
+        assert!(line[..128.min(line.len())].contains(observed.as_str().unwrap()));
+    }
+}

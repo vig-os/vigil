@@ -47,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Deny missing public documentation and missing error/panic sections across stable and unstable APIs with all features in flake and CI checks ([#44](https://github.com/vig-os/vigil/issues/44)).
+- Apply ADR-0006 decision 3 time-first JSON key order to logs ([#64](https://github.com/vig-os/vigil/issues/64)).
 
 - **Breaking:** exporters, sinks and exact OpenTelemetry re-exports require `--cfg vigil_unstable`; `NON_FINITE` is crate-private. Docs.rs labels the unstable surface, which is compiled and tested separately; empty `RUST_LOG` uses the default filter and unnamed guards drop immediately ([#42](https://github.com/vig-os/vigil/issues/42)).
 
@@ -62,6 +63,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** remove `Config::retention_days`; use `Config::retention(Option<Duration>)` ([#42](https://github.com/vig-os/vigil/issues/42)).
 
 ### Fixed
+
+- Make OTLP/JSON output independent of consumer `serde_json/preserve_order` feature unification ([#64](https://github.com/vig-os/vigil/issues/64)).
 
 - Bind label-only semver approval to the PR number and head, grant explicit read permissions, and detect concurrent relabels and write-role approvals; document label rename behavior and the removal merge window ([#42](https://github.com/vig-os/vigil/issues/42)).
 
