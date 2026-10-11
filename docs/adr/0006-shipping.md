@@ -51,7 +51,41 @@ The architect's review of this ADR found that Probe F's config loses data when t
 - **S1:** the receiver commits its offsets once a line is handed to the pipeline, and the default sending queue lives in memory, so whatever was queued or retrying at shutdown is gone. S2/S3 fix this with a disk queue and unbounded retry.
 - **S4:** after a restart the receiver reads its backlog faster than the exporter sends; the full queue rejects data ("sending queue is full", `rejected_items`), the receiver does not retry rejected data, and its offsets move on. `block_on_overflow: true` turns that into backpressure (S5).
 - **S6:** the retry cap drops data on a long outage even while the shipper keeps running. In one run with a 5 s cap followed by a restart, the dropped batches were delivered after all (with 1 duplicate); this is not relied on.
-- **Duplicates:** a SIGKILL between handing a line to the queue and saving the read offset, or between a successful send and removing the queue item, re-sends a few records (S4: 2 and 10 of 3000). S3/S5 happened to show none. The Collector has no setting that closes this window.
+- **Duplicates:** a SIGKILL re-sends what was read since the receiver last saved its offsets. Probe Q measures how much that can be.
+
+### Probe Q: queue capacity, clean stops while the queue is full, duplicates, disk
+
+The second review found that S5's config still loses data when an outage backlog outgrows the queue. Same harness as Probe S, with S5's settings unless a row says otherwise. Each case was run 1–3 times on unique ports.
+
+| Case | Queue | Scenario | Delivered | Lost | Duplicates |
+|---|---|---|---|---|---|
+| Q1 | default `sizer: requests`, 1000 | 1500 records while the backend is down (queue full at stop); SIGTERM; backend up; restart | 1351/1500 | **149** | 0 |
+| Q2 | `sizer: bytes`, 256 MiB | as Q1 (queue holds the backlog: 132 390 bytes) | 1500/1500 | 0 | 0 |
+| Q3a | `sizer: bytes`, 50 000 (forced full) | as Q1; 3 runs | 1285, 1202, 1285 | **215, 298, 215** | 0 |
+| Q3b | as Q3a, plus `max_concurrent_files: 2` | as Q1; 4 runs (Q3b ×3, QF) | 1401 each | **99 each** | 0 |
+| Q4 | as Q3a | as Q1 but SIGKILL; 2 runs | 1500/1500 | 0 | **566 each** |
+| F | reference config (decision 2) | as Q1; 5 runs | 1500/1500 each | 0 | 0 |
+| FK | reference config | as Q1 but SIGKILL; 2 runs | 1500/1500 each | 0 | 0 |
+| M | reference config, live backend | 3000 records streaming with rotation; SIGKILL at 1.5 s; restart; 7 runs | 3000/3000 each | 0 | 0, 0, 35, 8, 0, 1, 0 |
+
+- **Why a clean stop loses data when the queue is full** (Q1, Q3).
+  - With `block_on_overflow`, the receiver's hand-off of a batch blocks while the queue is full.
+  - On SIGTERM the Collector cancels it ("Rejecting data", `context canceled`), and the reader advances its offset anyway: `pkg/stanza/fileconsumer/internal/reader/reader.go:268-273` and `:289-293` at v0.151.0, unchanged on main.
+  - A batch is at most 100 lines (`reader.DefaultMaxBatchSize`, not configurable), and every file read concurrently holds one, so Q3a lost two to three batches.
+  - `max_concurrent_files: 2` makes the receiver read one file at a time, which bounds the loss at one batch (Q3b: 99 in 4/4 runs).
+  - `otlpjsonfile` has no receiver-side retry option at v0.151.0 or on main, so no setting can keep the offset.
+- **Why the queue must hold the outage** (Q2, F). While the queue is not full, nothing blocks, so a clean stop loses nothing.
+- **Sizing data.** `sizer: bytes` counts the exporter's encoded request size, not the JSON line:
+  - ~100 KB log lines: 1000 lines held 100 099 890 queue bytes;
+  - ~300-byte lines: 50 000 bytes held 566 records.
+- **Operator signal.** The shipper's own metrics (`service.telemetry.metrics`) show `otelcol_exporter_queue_size` reaching `otelcol_exporter_queue_capacity` before the full state that a stop would turn into loss. On such a stop the shipper logs "Rejecting data" with `context canceled`.
+- **Duplicates after SIGKILL.**
+  - The receiver saves its offsets after each completed poll. While the queue is not full, a SIGKILL re-sends what one poll read: M saw 0–35 of 3000, and the review saw 1, 7 and 91.
+  - While the queue is full, the blocked poll never completes, so a SIGKILL re-sends everything queued since the last saved offset: Q4 re-sent the whole queue (566), and the review saw 1000 with the default 1000-item queue.
+  - So the bound is the queue's contents plus one batch.
+- **Backends absorb exact duplicates.** The same OTLP log record pushed twice to Loki 3.7.8 came back as **1** entry. The same cumulative sample pushed twice to Prometheus 3.12.0 counted **1** sample.
+- **Disk** (100 KB lines; queue held 100 MB). The `file_storage` file grew to 118 MB and, **without compaction, stayed 118 MB after the queue drained and after a restart**. With `compaction: { on_start: true, on_rebound: true }` (probe thresholds 10/2 MiB, `check_interval: 1s`) it shrank to 0.33 MB after draining and 0.1 MB after a restart (K1 vs K2), with all 1000 records delivered.
+- **A misleading log line.** "Exporting failed. Dropping data." is logged at SIGTERM for items that the disk queue keeps and delivers after the restart (S2, F).
 
 ### Probe K: fingerprints and JSON key order
 
@@ -138,7 +172,7 @@ A host uses one path, never both: both would deliver every record twice. Push is
 
 So within ADR-0002's 90-day retention, a catch-up longer than those windows needs backend configuration, or the old records stay only in the files. This is documented with the reference config (#60). It was not probed here beyond reading Loki's defaults.
 
-### 2. The reference file shipper: Collector-contrib `otlpjsonfile`, configured to lose and duplicate nothing on clean restarts
+### 2. The reference file shipper: Collector-contrib `otlpjsonfile`, with bounded and documented loss
 
 The reference config (shipped and tested in [#60](https://github.com/vig-os/vigil/issues/60)) is this, and each setting is load-bearing:
 
@@ -147,6 +181,12 @@ extensions:
   file_storage/vigil:
     directory: ${env:SHIPPER_STORAGE_DIR}   # persistent; holds read offsets and the sending queues
     create_directory: true
+    compaction:                             # without it the file never shrinks after an outage (Probe Q)
+      directory: ${env:SHIPPER_STORAGE_DIR}
+      on_start: true
+      on_rebound: true
+      rebound_needed_threshold_mib: 100
+      rebound_trigger_threshold_mib: 10
 receivers:
   otlpjsonfile/logs:                        # likewise /metrics and /traces
     include:                                # one pair per vigil service; SHIPPER_STATE_ROOT: absolute path, e.g. /home/u/.local/state
@@ -155,10 +195,12 @@ receivers:
     start_at: beginning
     include_file_name: false
     storage: file_storage/vigil
+    max_concurrent_files: 2                 # one file at a time: bounds the full-queue stop loss to one batch
 exporters:
   otlp_http/loki:                           # likewise /prometheus and /traces
     endpoint: http://loki.example:3100/otlp # → /otlp/v1/logs; Prometheus: …:9090/api/v1/otlp; traces: …:4318
-    sending_queue: { enabled: true, storage: file_storage/vigil, block_on_overflow: true }
+    sending_queue: { enabled: true, storage: file_storage/vigil, block_on_overflow: true,
+                     sizer: bytes, queue_size: 268435456 }   # 256 MiB per exporter; size it (below)
     retry_on_failure: { enabled: true, max_elapsed_time: 0 }
 service:
   extensions: [file_storage/vigil]
@@ -171,7 +213,10 @@ service:
 The full form (three receivers, three exporters, three pipelines) passes `otelcol-contrib validate` (0.151.0). `SHIPPER_STATE_ROOT` and `SHIPPER_STORAGE_DIR` are the shipper's own variables, not ones vigil reads. The Collector does not expand `~`, so both are absolute paths. The rules:
 
 - **The receiver's `storage` is required.** Without it a restart re-sends everything (F1: 100 duplicates). With it, restarts and rotations while the Collector is down lose and duplicate nothing (F3, F5).
-- **Each exporter needs a disk `sending_queue` with `block_on_overflow: true` and `max_elapsed_time: 0`.** The memory queue loses everything queued or retrying at shutdown (S1: 20/20 lost). Without `block_on_overflow` a backlog overflows the queue and is rejected for good (S4: up to 356/3000 lost). Any finite retry cap drops data during an outage longer than it (S6: 12/20 lost with 5 s; the default is 5 min). With all three: S2, S3, S5, S7 lost and duplicated nothing. While the backend stays down, the queue fills, the receiver stops reading, and the backlog waits in vigil's own files, bounded only by retention.
+- **Each exporter needs a disk `sending_queue` with `block_on_overflow: true`, a byte capacity, and `max_elapsed_time: 0`.** The memory queue loses everything queued or retrying at shutdown (S1: 20/20 lost). Without `block_on_overflow` a backlog overflows the queue and is rejected for good (S4: up to 356/3000 lost). Any finite retry cap drops data during an outage longer than it (S6: 12/20 lost with 5 s; the default is 5 min). With all of them: S2, S3, S5, S7, F, FK and M lost nothing. While the backend stays down, the queue fills; then the receiver stops reading and the rest of the backlog waits in vigil's own files, bounded only by retention.
+- **Size each queue for the longest outage that a clean shipper stop must survive.** `queue_size` (bytes) ≥ the signal's data rate × that outage. With 256 MiB and ~300-byte records (~90 queue bytes each, Probe Q) that is about 3 million records. Beyond that the queue is full, and **a clean stop while it is full loses up to 100 records per signal** (Q3b, one reader batch, with `max_concurrent_files: 2`; without that setting several batches, Q3a). Watch `otelcol_exporter_queue_size` against `otelcol_exporter_queue_capacity` in the shipper's own telemetry, and do not stop or restart the shipper while they are equal. The cause is upstream (Notes for the owner).
+- **Disk.** Each queue can hold up to its `queue_size` on disk; the three reference queues need up to 768 MiB on the `file_storage` filesystem, and the storage file runs ~18% above the queued bytes (Probe Q: 118 MB for 100 MB). `compaction` with `on_rebound` returns the space after the backlog drains (118 MB → 0.33 MB). Without it the file stays at its peak for good, including across restarts. Compaction needs free space for a temporary copy in its `directory`.
+- **Operator note:** at SIGTERM the shipper logs "Exporting failed. Dropping data." for items the disk queue keeps and delivers after the restart (S2, F). With this config that line is not data loss; the loss signal is "Rejecting data" with `context canceled` while the queue is full.
 - **`start_at: beginning`.** With `end`, records written before the first start or during downtime are lost (F2: 100/150).
 - **`include` lists each vigil service's live file and its segments.** `<service>/<signal>.jsonl` and `<service>/<signal>-*.jsonl`, the names ADR-0002 decision 5 fixes. Matching only the live file loses whatever was unread when it rotated (F4: 82/150). Services are listed by name rather than with `*/`, because `$XDG_STATE_HOME/*/logs.jsonl` also matches files other programs write, and the receiver would ingest or reject them. Adding a service is a config change, made by whatever deploys the services (g-fleet for the fleet, #15).
 - **`include_file_name: false`.** Otherwise every record carries a `log.file.name` that changes on rotation (F3 vs default). Only the shipper's own diagnostics need it.
@@ -188,11 +233,20 @@ The full form (three receivers, three exporters, three pipelines) passes `otelco
 | A vigil service missing from `include` | that service is silently never shipped | The deployment adds each service when it installs it (#15); #60's README lists the step. |
 | Backend down longer than retention | loss | Alert on shipper backlog. Retention (90 days by default) is the buffer. |
 | Backend rejects old or out-of-order records (decision 1) | loss, logged by the shipper as a permanent error | Backend acceptance windows. |
-| SIGKILL, crash or power loss between enqueue and offset save, or between send and queue removal | a few duplicates (S4: up to 10/3000) ✓ | Stop with SIGTERM (systemd's default). Backends that drop exact duplicates absorb them; not probed. |
+| Clean stop (SIGTERM) while a queue is full (outage backlog > `queue_size`) | **loss of up to 100 records per signal** (Q3b) ✓ | Size `queue_size` for the longest outage. Alert on `otelcol_exporter_queue_size` reaching `otelcol_exporter_queue_capacity`; don't stop the shipper in that state. The upstream fix is in Notes for the owner. |
+| SIGKILL, crash or power loss | **duplicates of everything read since the last saved offset**: one poll's worth with room in the queue (0–35/3000 in M, 91 in the review); up to the whole queue plus one batch when it is full (566 in Q4, 1000 in the review) ✓ | Stop with SIGTERM (systemd's default). Loki and Prometheus absorb exact duplicates (Probe Q). Record identity is below the table. |
+| Power loss with `file_storage` `fsync: false` (the default) | recent queue items and offsets may be lost or replayed | `fsync: true` at a write-cost; not probed. |
 | `file_storage` directory lost or not persistent | full re-read: duplicates of everything retained; queued items lost but re-read | Put it on persistent storage owned by the shipper's user. |
 | Files that start with identical bytes (before decision 3 / #64 land) | silent loss (Probe K) ✓ | Decisions 3 and #64. |
 | Push and the file shipper both active | everything twice | Decision 1, `VIGIL_PUSH=off`. |
-| A hand-written config that drops a rule above | loss or duplicates (F1, F2, F4, S1, S4, S6) ✓ | Use the reference config. |
+| A hand-written config that drops a rule above | loss or duplicates (F1, F2, F4, S1, S4, S6, Q1, Q3a) ✓ | Use the reference config. |
+
+**Record identity for deduplication.** vigil records carry **no record id**, and this ADR adds none.
+- **Logs:** a re-sent record is byte-identical, so its natural key is the stream (resource attributes) plus `timeUnixNano`, `observedTimeUnixNano`, body and attributes. With `service.instance.id` (ADR-0003) and nanosecond timestamps, two distinct records collide only when one process emits identical records in the same nanosecond. Loki stores identical (stream, timestamp, line) entries once.
+- **Metrics:** a data point is keyed by series plus `timeUnixNano`. Prometheus ignores a sample identical to one it has.
+- **Spans:** `traceId` + `spanId` is a unique key, but backend handling of a re-sent span was not probed.
+
+A consumer that needs exact-once downstream dedupes on these keys; the shipper cannot provide it.
 - **Loki labels.** Deployments with many short-lived processes stop `service.instance.id` from becoming a Loki index label as follows; the default list's `k8s.*` and `cloud.*` entries can be added back as needed, and everything not listed becomes structured metadata (Probe L):
 
 ```yaml
@@ -285,10 +339,10 @@ let guard = vigil::Config::new("flock")
 ## Consequences
 
 - **Two supported paths, one format.**
-  - **Hosts with the Collector** get shipping from the files with no loss and no duplicates across backend outages and clean restarts. A crash can re-send a few records, and old records are subject to the backend's acceptance window (decision 1). The config is documented and tested.
+  - **Hosts with the Collector** get shipping from the files with no loss across backend outages that fit the queue (`queue_size`, sized per decision 2) and across clean restarts. Beyond that capacity, a clean stop while the queue is full loses up to 100 records per signal. A crash re-sends records, up to the queue's contents, and backends absorb exact duplicates. Old records are subject to the backend's acceptance window (decision 1). The config, its sizing and its signals are documented and tested (#60).
   - **Hosts with Alloy** (the fleet) use `push` until Alloy can read OTLP files; push is live but loses data while the agent is down, and the files keep it.
   - The fleet rollout (#15) chooses per host and may land after 1.0.
-- **A shipper bug now costs data silently.** F2/F4 and Probe K lost records with no error anywhere, and S1/S4/S6 lost them with only shipper log lines; #60's conformance test is what keeps the reference config honest. Hand-written configs that drop a rule above will lose or duplicate data, so the README states the rules, not just the YAML.
+- **A shipper bug now costs data silently.** F2/F4 and Probe K lost records with no error anywhere, and S1/S4/S6/Q1 lost them with only shipper log lines; #60's conformance test is what keeps the reference config honest. Hand-written configs that drop a rule above will lose or duplicate data, so the README states the rules, not just the YAML.
 - **Key order is a contract.** Decision 3 binds the serializer: changing which keys come first is a format change under ADR-0001's versioning stance. Implementing it needs a writer whose order vigil's code fixes, independent of `serde_json` features (#64), with the table applied in #7 and #8, paid once for all signals.
 - **The `push` feature costs** 6 crates and one thread per process, and only in builds that enable it. The default build stays network-free. Moving to a `ureq` 4 later is internal (no `ureq` type is public), so it is a vigil minor.
 - **What push cannot do:** reach a remote collector, authenticate its peer, use TLS, or backfill. The peer limit (decision 5) is a documented 1.0 limit. The fix ([#65](https://github.com/vig-os/vigil/issues/65): a Unix socket, or a `push-tls` feature pulling `rustls`, +12 crates in Probe D) is additive, through a new ADR, so a vigil minor.
@@ -320,12 +374,20 @@ let guard = vigil::Config::new("flock")
 - **Reading the standard `OTEL_EXPORTER_OTLP_*` variables.** They are often set host-wide or per session for other programs, including to remote collectors. Under decision 5 a remote value would disable vigil's push, and a loopback value meant for a different program would quietly redirect it. They also carry per-signal endpoints that vigil does not need. Rejected for `VIGIL_PUSH_*`, which only vigil reads.
 - **Allowing `localhost` and resolving it once at init.** That needs a pinned resolver in the HTTP client and turns a configuration value into an environment check. An IP literal says the same thing without either. Rejected.
 
+## Notes for the owner: upstream bug report (draft, not filed)
+
+The full-queue stop loss is the Collector's, and no 0.151.0 setting removes it. An existing upstream issue covers the mechanism: [contrib#47908](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/47908) (open, `Stale`), "fileconsumer: `readContents` silently drops tokens when `emitFunc` returns an error". A maintainer answered there that advancing the offset is intended, because retries belong to the exporter or to stanza's receiver-side `consumerretry`. Its fix PR, [contrib#47934](https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/47934), was closed. Our case is the one that answer does not cover: the error is the Collector's own shutdown cancelling a hand-off that the exporter's `block_on_overflow` is holding. Neither retry layer can help then, and `otlpjsonfile` has no `consumerretry` anyway. Suggested comment on #47908, if the owner wants one:
+
+> **`context.Canceled` at shutdown loses one batch per reader, with every loss-preventing option enabled.** otelcol-contrib 0.151.0: `otlpjsonfile` (`file_storage`, `start_at: beginning`) → `otlp_http` with a persistent `sending_queue` (`block_on_overflow: true`), `retry_on_failure.max_elapsed_time: 0`. Make the backend unavailable until the queue is full, then send SIGTERM. The blocked `emitFunc` returns `context canceled` ("Rejecting data"), `reader.go:268-273`/`:289-293` advance `r.Offset`, and the checkpoint written at shutdown persists it. After a restart, exactly one 100-line batch per concurrently read file is missing (99/1500 with `max_concurrent_files: 2`, 3/3 runs; 215–298 with the default). Proposal: when `emitFunc` fails because the receiver's context was cancelled, keep the offset at the batch start (at-least-once; the next start re-reads the batch), or give `otlpjsonfile` the same `consumerretry` option `filelog` has. A persistent queue can then only produce duplicates, not loss.
+
+Filing and wording are the owner's decision; nothing has been posted.
+
 ## References
 
 - [vig-os/vigil#39](https://github.com/vig-os/vigil/issues/39), [#60](https://github.com/vig-os/vigil/issues/60), [#41](https://github.com/vig-os/vigil/issues/41), [#64](https://github.com/vig-os/vigil/issues/64), [#65](https://github.com/vig-os/vigil/issues/65), [#15](https://github.com/vig-os/vigil/issues/15), [#7](https://github.com/vig-os/vigil/issues/7), [#8](https://github.com/vig-os/vigil/issues/8)
 - [ADR-0001](0001-on-disk-format.md) (format; decisions 5, 6, 8, 9, 10), [ADR-0002](0002-rotation-and-retention.md) (segment names, permissions, retention), ADR-0003 ([#38](https://github.com/vig-os/vigil/issues/38): `service.instance.id`, exporter seam), [ADR-0004](0004-public-api-and-stability.md) ([#37](https://github.com/vig-os/vigil/issues/37): stable surface, errors, feature table)
 - [OTLP/HTTP](https://opentelemetry.io/docs/specs/otlp/#otlphttp) (paths, JSON encoding, retryable statuses, `Retry-After`, partial success); [OTLP exporter configuration](https://opentelemetry.io/docs/specs/otel/protocol/exporter/) (environment variables)
-- Collector-contrib: [`otlpjsonfilereceiver`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/otlpjsonfilereceiver) (alpha), [`otlpjsonconnector`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/connector/otlpjsonconnector) (alpha), [#50314](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/50314) (count-after-consume race, fixed v0.162.0), [#45339](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/45339) (rename to `otlp_json_file`, v0.154.0)
+- Collector-contrib: [`otlpjsonfilereceiver`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/otlpjsonfilereceiver) (alpha), [`otlpjsonconnector`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/connector/otlpjsonconnector) (alpha), [#50314](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/50314) (count-after-consume race, fixed v0.162.0), [#47908](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/47908) (offset advances when the hand-off fails), [#45339](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/45339) (rename to `otlp_json_file`, v0.154.0)
 - Grafana Alloy: [component inclusion criteria](https://github.com/grafana/alloy/blob/a753fee7a10311a332edd18a05567c3fcf9c0bba/docs/developer/add-otel-component.md), [OTel Engine builder config v1.20.1](https://github.com/grafana/alloy/blob/v1.20.1/collector/builder-config.yaml), [#6752](https://github.com/grafana/alloy/issues/6752), [#4262](https://github.com/grafana/alloy/issues/4262)
 - [Loki OTLP ingestion](https://grafana.com/docs/loki/latest/send-data/otel/) (default index labels, `otlp_config`)
 - [gerchowl/g-fleet#355](https://github.com/gerchowl/g-fleet/issues/355) (fleet logging scheme, shipping addendum)
