@@ -19,6 +19,9 @@ allow = [
     "Apache-2.0",
     # Permissive; compatible with Apache-2.0 distribution with retained notices.
     "MIT",
+    # Audit Ed25519 (dalek and subtle): permissive, notice-retaining,
+    # compatible with Apache-2.0 distribution (ADR-0005 decision 14).
+    "BSD-3-Clause",
     # unicode-ident's data license; permissive with retained Unicode notices.
     "Unicode-3.0",
 ]

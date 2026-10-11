@@ -182,3 +182,17 @@ feature PR into `dev`. Self-comparison cannot prove compatibility.
 The public-API allowlist gate arrives with #42 (part 3/3).
 See [ADR-0004](docs/adr/0004-public-api-and-stability.md) for the stability policy
 and the architect-reviewed `semver:major` exception before publication.
+
+## Audit format (opt-in)
+
+Enable `audit` for the I/O-free ADR-0005 format primitives: entries, canonical
+record encoding, hashes, MMR commitments and checkpoint signatures. The durable
+`AuditTrail::record` API follows in #11; verification and the CLI follow in #13.
+These primitives alone do not persist records or establish trust. Their low-level
+API is provisional before 1.0.
+
+A deployment must use storage that honours flushes. Keys held locally cannot
+protect against an attacker who can read them and rewrite the trail. Pin trail
+identities and keep trust policy and application receipts outside the writable
+trail directory; stop all writers before rotating keys. Use digests rather than
+personal data, retaining the referenced values in the application's own store.
