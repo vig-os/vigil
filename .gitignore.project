@@ -8,3 +8,7 @@
 # Examples (uncomment / add your own):
 #   /scratch/
 #   /secrets.local.yaml
+
+# Ignore generated failure seeds: minimized invariant examples are kept as reviewed tests.
+**/*.proptest-regressions
+/proptest-regressions/

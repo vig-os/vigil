@@ -38,6 +38,7 @@ lto = "thin"
 codegen-units = 1
 
 [dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
 log = "0.4"
 
 [[example]]
