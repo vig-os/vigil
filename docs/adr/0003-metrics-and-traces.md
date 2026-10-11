@@ -1,6 +1,6 @@
 # ADR-0003: Metrics and traces
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-10-11)
 - **Date:** 2026-10-11 (round 2: reconciled with the accepted ADR-0004, metric identity conflicts decided; round 3: Prometheus name collisions, instrument validation, cross-ADR loss rule)
 - **Issues:** [#38](https://github.com/vig-os/vigil/issues/38) (this decision), [#7](https://github.com/vig-os/vigil/issues/7) (metrics), [#8](https://github.com/vig-os/vigil/issues/8) (traces), [#26](https://github.com/vig-os/vigil/issues/26) (log/span correlation), [#9](https://github.com/vig-os/vigil/issues/9) (`schemaUrl`), [#64](https://github.com/vig-os/vigil/issues/64) (key order); consistent with the accepted [ADR-0004](0004-public-api-and-stability.md) ([#37](https://github.com/vig-os/vigil/issues/37))
 

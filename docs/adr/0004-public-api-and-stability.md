@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-11
-- **Amended by [ADR-0003](0003-metrics-and-traces.md)** (proposed in [PR #53](https://github.com/vig-os/vigil/pull/53); in force when ADR-0003 is accepted): decision 3's unit for `lost(Signal::Metrics)` (ADR-0003 decision 23) and decision 8's identity-conflict mechanism (ADR-0003 decision 21), both handed to ADR-0003 by this ADR's reconciliation list.
+- **Amended by [ADR-0003](0003-metrics-and-traces.md)** (accepted 2026-10-11, [PR #53](https://github.com/vig-os/vigil/pull/53)): decision 3's unit for `lost(Signal::Metrics)` (ADR-0003 decision 23) and decision 8's identity-conflict mechanism (ADR-0003 decision 21), both handed to ADR-0003 by this ADR's reconciliation list.
 - **Issues:** [#37](https://github.com/vig-os/vigil/issues/37) (this decision); implemented by [#42](https://github.com/vig-os/vigil/issues/42) (surface), [#7](https://github.com/vig-os/vigil/issues/7) (`vigil::metrics`), [#8](https://github.com/vig-os/vigil/issues/8) (`vigil::propagation`), [#43](https://github.com/vig-os/vigil/issues/43) (semver gate), [#44](https://github.com/vig-os/vigil/issues/44) (missing docs), [#45](https://github.com/vig-os/vigil/issues/45) (MSRV lane)
 
 ## Context
