@@ -39,8 +39,13 @@ lto = "thin"
 codegen-units = 1
 
 [dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 log = "0.4"
+
+[[bench]]
+name = "performance"
+harness = false
 
 [[example]]
 name = "flock"

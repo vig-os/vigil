@@ -71,11 +71,14 @@ jobs:
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
           dev-profile-path: ${{ inputs.dev-profile-path }}
 
+      - name: Validate benchmark correctness without timing assertions
+        run: nix develop -c cargo test --locked --bench performance
+
       # Plain Cargo shares a process between library tests; nextest does not.
       - name: Cargo tests with default test threads
-        run: nix develop -c cargo test --locked --all-targets --all-features
+        run: nix develop -c cargo test --locked --lib --bins --tests --examples --all-features
       - name: Cargo tests with one test thread
-        run: nix develop -c cargo test --locked --all-targets --all-features -- --test-threads=1
+        run: nix develop -c cargo test --locked --lib --bins --tests --examples --all-features -- --test-threads=1
 
       - name: Run nix flake check
         run: nix flake check -L
@@ -186,3 +189,32 @@ jobs:
           dev-profile-path: ${{ inputs.dev-profile-path }}
       - name: Build and test all features
         run: nix develop .#latest-stable -c python3 scripts/check_rust_version.py latest-stable
+
+  performance:
+    name: Performance comparison
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 30
+    # Build/run/estimate failures block; only measured slowdowns are advisory.
+    env:
+      CARGO_TARGET_DIR: target/performance
+      CARGO_BUILD_JOBS: '3'
+      BASE_REF: ${{ github.event.pull_request.base.sha || 'origin/dev' }}
+      VIGIL_BENCH_QUICK: '1'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+      - name: Measure merge-base and head on the same runner
+        run: |
+          nix develop -c python3 scripts/compare_performance.py --base-ref "$BASE_REF"

@@ -312,3 +312,156 @@ protect against an attacker who can read them and rewrite the trail. Pin trail
 identities and keep trust policy and application receipts outside the writable
 trail directory; stop all writers before rotating keys. Use digests rather than
 personal data, retaining the referenced values in the application's own store.
+
+## Performance
+
+The public API benchmark suite measures directory-locked appends, the complete
+`Config::init` → `tracing` → batch processor → OTLP/JSON → rotating file pipeline,
+one-time initialization, and rotation with 100 / 1,000 / 10,000 existing segments.
+It uses Criterion 0.8.2 as a dev dependency for statistical estimates and JSON
+results. Default features are disabled to avoid plotting and parallel analysis
+dependencies; its Apache-2.0/MIT dependency graph passes the existing `deny.toml`
+policy without license exceptions.
+
+Reference measurements (2026-10-11): shared KVM VM, AMD Ryzen 7 9800X3D,
+12 exposed vCPUs, Linux 6.18.55 / NixOS, x86_64, Rust 1.95.0
+(59807616e, LLVM 22.1.2), release profile with thin LTO and one codegen unit.
+Scratch files are on the real local ext4 filesystem `/dev/vdd` mounted at
+`$HOME` (virtual block device), selected with `VIGIL_BENCH_DIR`. This is a
+warm-cache filesystem workload: neither append nor flush calls `fsync`, so the
+numbers include kernel writes and metadata operations, not durable-storage
+latency. Reference measurements are documentation, never a cross-machine CI
+baseline.
+
+| Workload | Ext4 reference mean | Consumer budget |
+| --- | ---: | ---: |
+| Append, 1 process (4,096 records) | 12.32 ms; 333k records/s | ≥50k records/s |
+| Append, 8 processes (32,768 total) | 148.69 ms; 220k records/s aggregate | ≥25k records/s aggregate |
+| Export, 256-byte bodies | 11.62 ms; 352k records/s | ≥100k records/s |
+| Export with near-cap splitting, 4 KiB bodies | 118.75 ms; 34.5k records/s | ≥10k records/s |
+| `Config::init`, fresh process/directory | 0.141 ms | ≤1 ms |
+| Rotation, 100 existing segments | 0.150 ms | ≤1 ms |
+| Rotation, 1,000 existing segments | 2.059 ms | ≤10 ms |
+| Rotation, 10,000 existing segments | 35.708 ms | ≤100 ms |
+
+Budgets are consumer capacity-planning targets on comparable hardware and a
+Linux ext4 filesystem with cached writes, using the workloads above. They are
+explicitly scoped to local dev/CI disks with available CPU and memory, not NFS,
+synchronous durability or cold-cache workloads. The VM append references above
+provide 6.66× headroom at one process (333k / 50k records/s) and 8.80× at eight
+processes (220k / 25k aggregate records/s). CI run 38133079340 on an AMD EPYC
+7763 runner with 4 vCPUs and ext4 measured 76.7k records/s at one process and
+40.6k aggregate at eight: only 1.53× and 1.62× headroom, respectively. These
+are measurements on two particular systems, not a guaranteed margin on other
+hosts. Budgets are not per-record deadlines or p99 guarantees. Provision below these rates, measure
+on your actual disk, and monitor queue losses. A shared directory serializes
+all signals, so eight writers share the aggregate budget, not eight times it.
+Slow disks, CPU contention, large attributes, retention scans and uncached
+metadata can exceed these budgets. Initialization is a one-time cost per
+process; initialize after fork.
+
+Measurement details:
+
+- Append: each fresh child opens its own `RotatingFile`, reports ready, then
+  waits for the parent to release it. One or eight children each append 4,096
+  256-byte payloads with rotation disabled. Timing includes lock waits, writes,
+  release of the children and their exit, excluding process spawn/open and
+  file cleanup. The parent checks the total persisted byte count.
+- Export: 4,096 tracing events with 256-byte bodies, queue size 8,192, console
+  off and explicit info filter. Timing includes event production, serialization,
+  splitting, writes and `Guard::flush`; setup, shutdown and output verification
+  are excluded. The splitting workload uses 4,096-byte bodies so 512-record SDK
+  batches exceed the 1,000,000-byte line cap. It verifies that lines approach
+  the cap (>900,000 bytes), every line is bounded and valid JSON, and all records
+  survive. These are records/s, including the asynchronous worker's completion.
+- Init: a fresh child times only `Config::init` with a new state directory;
+  spawn, shutdown and cleanup are excluded. A successful pipeline permanently
+  occupies its process slot, so reinitializing within a benchmark is invalid.
+- Rotation: preseed valid segment names outside timing; `max_bytes(1)` forces
+  each append to rotate. Retention is disabled to isolate the scan needed to
+  select the next segment name. Remove the new segment outside timing to keep
+  the existing count fixed. Default retention adds a separate metadata scan.
+  Rotation is about 238× slower at 10,000 segments than at 100.
+  The measured growth makes tiny segments unsuitable for sustained traffic:
+  choose a larger size and keep segment counts bounded. At 10,000 segments the
+  rotation cost alone already dominates the ordinary append cost.
+
+Reproduce the disk reference inside the dev shell:
+
+```sh
+export CARGO_TARGET_DIR="$PWD/target"
+export CARGO_BUILD_JOBS=3
+export VIGIL_BENCH_DIR="$(mktemp -d "$HOME/.cache/vigil-performance.XXXXXX")"
+df -T "$VIGIL_BENCH_DIR"
+unset VIGIL_BENCH_QUICK CRITERION_HOME
+nix develop -c cargo bench --locked --bench performance
+nix develop -c cargo test --locked --bench performance
+```
+
+The full reference run uses 100 samples, a 3-second warmup, a 5-second
+measurement target and Criterion's default 100,000 resamples per workload.
+Child startup and fixture cleanup increase wall time beyond the timed work.
+Set `VIGIL_BENCH_QUICK=1` for CI's 10 samples, 1-second warmup, 1-second
+measurement target and `nresamples(1000)`; Criterion can extend sampling for
+slower workloads. `cargo test --locked --bench performance` validates every
+workload once without timing assertions. An explicit step in the blocking Rust
+checks lane runs this command exactly once. Its broader Cargo test steps select
+libraries, binaries, integration tests and examples, excluding benchmarks.
+This correctness run is independent of performance timing. Scratch
+cleanup deliberately ignores errors so unwinding cannot cause a second panic.
+
+CI's **Performance comparison** job checks out the PR head with full history,
+computes its merge-base with the target branch, and creates a disposable
+merge-base worktree. If that base already declares and locks Criterion, it
+overlays the exact head benchmark harness while preserving the base dependency
+manifest and lockfile. A missing benchmark target declaration is added without
+changing dependencies. Both base and head build with `--locked` against their
+own lockfiles: no dependency resolution or lockfile updates are allowed. It
+measures base with Criterion `--save-baseline base`, then head with
+`--baseline base`, sequentially in the **same job on the same runner and
+filesystem**, with a shared scratch root and fresh estimate directory. Separate
+Cargo artifact directories prevent reuse of the other checkout's binary.
+If the merge-base predates the locked Criterion dependency, the job explicitly
+skips the timing comparison with a notice annotation and job summary; it does
+not fabricate a baseline or resolve extra dependencies. Benchmark correctness
+still runs in the blocking Rust lane. Other build/run/lockfile failures block.
+Hardware, filesystem, compiler and both commit IDs appear in the job log.
+There is no committed cross-machine CI baseline. Local comparisons use:
+
+```sh
+export VIGIL_BENCH_QUICK=1
+nix develop -c python3 scripts/compare_performance.py --base-ref origin/dev
+```
+
+The report flags mean elapsed-time ratios **>=2.0×** versus that same-runner
+merge-base (equivalently throughput at most half). A slowdown exits **0**,
+adds a `REGRESSION` row to the summary and emits a warning annotation. In the
+PR Checks UI, the performance job stays **green with a warning**, and CI
+Summary stays green when all other checks pass. A build/run failure, missing or
+invalid estimates, or broken correctness assertion exits nonzero: the
+performance job is **red and blocking**, and CI Summary fails. There is no
+`continue-on-error` on this job or its steps. CI has a 30-minute job timeout.
+These exit-status and workflow contracts have automated tests.
+
+A warning requires repeating the same-runner comparison before attributing it
+to code. A confirmed regression must be fixed before merge, or receive an
+explicit maintainer-approved budget change with an issue describing consumer
+impact. The merge-base baseline is regenerated on every run, so there is no
+baseline reset to clear warnings.
+
+To refresh the documented disk reference, run the full suite on the stated
+filesystem, review all means and update this table, its hardware/date notes and
+budget rationale together. An optional local JSON snapshot can be exported:
+
+```sh
+nix develop -c python3 scripts/check_performance.py \
+  --results "$CARGO_TARGET_DIR/criterion" \
+  --baseline "$CARGO_TARGET_DIR/reference.json" --update \
+  --environment 'date; CPU/vCPUs; OS/kernel; rustc/LLVM; filesystem; fsync policy'
+```
+
+`--update` refuses quick-mode results, even after `VIGIL_BENCH_QUICK` is unset:
+the harness records the mode beside the estimates. Missing/unverified mode
+metadata or fewer than 100 samples for any workload is also rejected, so a
+filtered full run cannot relabel leftover quick estimates. This optional
+snapshot is not used by CI.
