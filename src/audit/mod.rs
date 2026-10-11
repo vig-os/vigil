@@ -1,4 +1,4 @@
-//! Pure audit v1 format primitives (ADR-0005), enabled by `audit`.
+//! Audit v1 format primitives and strict OTLP decoding (ADR-0005), enabled by `audit`.
 //!
 //! This layer performs no I/O and makes no durability or authentication claim
 //! about supplied identities. The durable trail API follows in #11; offline
@@ -9,7 +9,7 @@
 mod format;
 mod mmr;
 mod signing;
-pub use format::{CheckpointFields, Entry, Record, RecordContext, Value};
+pub use format::{Checkpoint, CheckpointFields, Entry, Record, RecordContext, Value};
 pub use mmr::Mmr;
 pub use signing::{KeySeed, Signer, SignerError, checkpoint_message, verify_signature};
 
@@ -79,3 +79,6 @@ pub(crate) fn digest_string(bytes: &[u8; 32]) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod codec_tests;

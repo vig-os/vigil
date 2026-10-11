@@ -1133,6 +1133,7 @@ dependencies = [
  "opentelemetry_sdk",
  "proptest",
  "rustix",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-core",

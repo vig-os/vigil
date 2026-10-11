@@ -1,5 +1,5 @@
 use super::*;
-fn vector(name: &str) -> Vec<u8> {
+pub(super) fn vector(name: &str) -> Vec<u8> {
     let line = include_str!("../../tests/fixtures/audit/primitives.txt")
         .lines()
         .find_map(|l| l.strip_prefix(&format!("{name} ")))

@@ -15,3 +15,11 @@ at `f08255d`, `tessera/crates/tessera-core/src/hash.rs`. Leaf input i is
 are BLAKE3 of concatenated raw roots for all sizes in the inclusive range.
 Tests compare every root through these aggregate goldens and resume at every
 size. There is no tessera dependency or regeneration during tests.
+
+## OTLP decoder fixtures
+
+`codec.jsonl` spells the primitive record and empty-MMR checkpoint above as
+OTLP/JSON, with fixed time, trail and seed. The two lines are independent format
+vectors, both at sequence zero, not a linked trail. Tests decode them and compare
+canonical bytes against `primitives.txt`; the decoder does not regenerate either
+fixture. Full sink trails follow in B3.

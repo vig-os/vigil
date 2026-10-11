@@ -335,7 +335,14 @@ unfinished, rerun full CI to supply the required evidence. Reruns read live stat
 ## Audit format (opt-in)
 
 Enable `audit` for the I/O-free ADR-0005 format primitives: entries, canonical
-record encoding, hashes, MMR commitments and checkpoint signatures. The durable
+record encoding, hashes, MMR commitments, checkpoint signatures and strict
+OTLP decoding. `Record::parse_line` accepts Collector multi-record lines and
+checks v1 field rules, duplicate keys after unescaping and record hashes.
+`Checkpoint::parse` retains one checkpoint line for an external anchor; parsing
+does not check signatures, trust, chain links or MMR history. Empty/whitespace
+lines are errors, not torn writes. Incomplete input also fails decoding; crash
+recovery requires file context and follows in B2, while strict warning policy
+(#68) and receipts across resume (#70) remain separate. The durable
 `AuditTrail::record` API follows in #11; verification and the CLI follow in #13.
 These primitives alone do not persist records or establish trust. Their low-level
 API is provisional before 1.0.

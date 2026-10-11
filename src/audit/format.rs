@@ -339,3 +339,7 @@ fn encode(fields: Vec<(u8, Vec<u8>)>, omit_signature: bool) -> Vec<u8> {
     }
     bytes
 }
+
+#[path = "codec.rs"]
+mod codec;
+pub use codec::Checkpoint;
