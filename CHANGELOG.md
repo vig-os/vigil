@@ -76,6 +76,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Complete README Prometheus unit mapping and conformance diagnostics for bind retries and transient query failures ([#7](https://github.com/vig-os/vigil/issues/7)).
+
 - ADR-0005 amendment 10 leftovers: `--start-from` takes the previous batch's batch-start anchor entry from the anchor store everywhere, the `Unparsable` wording and a doubled parenthesis are fixed, and the `accept-run` span definition is exact (a record owns its newline, a malformed record is never span bytes) with a golden vector for #13. Docs only ([#123](https://github.com/vig-os/vigil/issues/123)).
 - Reject audit service names over 255 bytes before disk access; verify success-only mirroring and complete public writer trait promises, plain-build auto-trait assertions and unstable rustdoc ([#11](https://github.com/vig-os/vigil/issues/11)).
 - Audit signer-outage reporting tolerates unwritable stderr without panicking or failing an acknowledged record ([#100](https://github.com/vig-os/vigil/issues/100)).

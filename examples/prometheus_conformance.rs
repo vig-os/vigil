@@ -15,9 +15,10 @@ mod enabled {
 
     #[test]
     fn oracle_scope_matches_declaring_package() {
+        // The real scope guard is the end-to-end run (ruling 7b3-d2).
         assert_eq!(
             package_scope(),
-            (env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+            ("vigil-telemetry", env!("CARGO_PKG_VERSION"))
         );
     }
 

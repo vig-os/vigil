@@ -100,13 +100,39 @@ Prometheus maps OTLP metrics using its default translation (ADR-0003 d12):
 
 | OTLP input | Prometheus output |
 | --- | --- |
-| `.` and runs of non-alphanumeric characters, including `_` | One `_` |
-| Unit `ms`, `By`, `s`, or `By/s` | `_milliseconds`, `_bytes`, `_seconds`, or `_bytes_per_second` (unless already present) |
+| Runs of characters other than ASCII letters, digits and `:`, including `.` and `_` | One `_` between name tokens; `:` is preserved |
+| Unit | Fixed unit words and per-unit suffixes as detailed below; no repeated suffix token |
 | Monotonic counter | `_total`; inner `total` words are dropped (`app.total.x` → `app_x_total`) |
-| Gauge with unit `1` | `_ratio`; up-down counters and other gauges have no `_total` |
+| Gauge with unit `1` | `_ratio` (`app.x` → `app_x_ratio`) |
+| Up-down counter with unit `1` | No suffix (`app.x` → `app_x`) |
+| Monotonic counter with unit `1` | `_total` only (`app.x` → `app_x_total`) |
 | Histogram | `_bucket`, `_sum`, `_count` after the unit suffix |
 | Resource `service.name` | `job` label |
 | Resource `service.instance.id` | `instance` label |
+
+The fixed numerator unit table is:
+`d` → `days`, `h` → `hours`, `min` → `minutes`, `s` → `seconds`,
+`ms` → `milliseconds`, `us` → `microseconds`, `ns` → `nanoseconds`,
+`By` → `bytes`, `KiBy` → `kibibytes`, `MiBy` → `mebibytes`,
+`GiBy` → `gibibytes`, `TiBy` → `tibibytes`, `KBy` → `kilobytes`,
+`MBy` → `megabytes`, `GBy` → `gigabytes`, `TBy` → `terabytes`,
+`m` → `meters`, `V` → `volts`, `A` → `amperes`, `J` → `joules`,
+`W` → `watts`, `g` → `grams`, `Cel` → `celsius`, `Hz` → `hertz`,
+and `%` → `percent`. Unit `1` contributes no unit word; the instrument-kind
+rules in the table above apply (histograms still get their three suffixes).
+
+Units split at the first `/`: the denominator contributes `_per_<unit>`, with
+`s`, `m`, `h`, `d`, `w`, `mo`, `y` mapped to `second`, `minute`, `hour`,
+`day`, `week`, `month`, `year`. Thus `By/s` becomes `_bytes_per_second`.
+Empty unit parts and annotation parts containing `{` or `}` are dropped.
+Unknown unit parts are kept verbatim after trimming whitespace and sanitizing:
+characters other than ASCII letters, digits and `:` become `_`, repeated `_`
+collapse, and a leading `_` is removed. Already-present suffix tokens are
+not added again. Up-down counters and gauges have no `_total` suffix.
+
+The authoritative [shared translation fixture](tests/fixtures/prometheus_names.json)
+checks these rules against Prometheus 3.12.0 / otlptranslator v1.0.0 for all
+148 accepted declarations; its additional facade-rejected row is translator-only.
 
 Prometheus must be configured with `otlp.promote_scope_metadata: true`
 (ADR-0003 d12). Start it with `--web.enable-otlp-receiver` and include:

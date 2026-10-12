@@ -60,12 +60,30 @@ def stop(child):
             child.wait()
 
 
-def query(port, expression):
+def query(port, expression, deadline):
+    """Retry transport failures within the shared final-value deadline."""
     url = f"http://127.0.0.1:{port}/api/v1/query?" + urllib.parse.urlencode(
         {"query": expression}
     )
-    with urllib.request.urlopen(url, timeout=2) as response:
-        data = json.load(response)
+    last_error = "deadline reached before request"
+    while True:
+        remaining = deadline - time.monotonic()
+        require(
+            remaining > 0,
+            f"query {expression!r}: deadline reached; last error: {last_error}",
+        )
+        try:
+            with urllib.request.urlopen(url, timeout=min(2, remaining)) as response:
+                data = json.load(response)
+            break
+        except (urllib.error.URLError, OSError) as error:
+            last_error = str(error)
+            remaining = deadline - time.monotonic()
+            require(
+                remaining > 0,
+                f"query {expression!r}: deadline reached; last error: {last_error}",
+            )
+            time.sleep(min(0.25, remaining))
     require(data["status"] == "success", f"query failed: {data}")
     return data["data"]["result"]
 
@@ -252,7 +270,7 @@ def start_servers(directory, children):
             )
         children.append(collector)
         # Telemetry is disabled; the Collector binds no ports and needs no retry.
-        return port, prom, collector
+        return port, prom, collector, log_path
     raise AssertionError("Prometheus bind retries exhausted")
 
 
@@ -287,14 +305,12 @@ def main():
         )
         children = []
         try:
-            port, prom, collector = start_servers(directory, children)
+            port, prom, collector, prometheus_log = start_servers(directory, children)
             deadline = time.monotonic() + 60
             pending = expected_runs.copy()
             observed = {}
             while pending and time.monotonic() < deadline:
-                require(
-                    prom.poll() is None, (directory / "prometheus-0.log").read_text()
-                )
+                require(prom.poll() is None, prometheus_log.read_text())
                 require(
                     collector.poll() is None, (directory / "collector.log").read_text()
                 )
@@ -302,13 +318,17 @@ def main():
                 for run in pending:
                     case, instance, job, expected = run
                     values = query(
-                        port, f'{{instance="{instance}",__name__!="target_info"}}'
+                        port,
+                        f'{{instance="{instance}",__name__!="target_info"}}',
+                        deadline,
                     )
                     actual = {
                         canonical(row["metric"]): float(row["value"][1])
                         for row in values
                     }
-                    target = query(port, f'target_info{{instance="{instance}"}}')
+                    target = query(
+                        port, f'target_info{{instance="{instance}"}}', deadline
+                    )
                     if (
                         all(actual.get(key) == value for key, value in expected.items())
                         and target
