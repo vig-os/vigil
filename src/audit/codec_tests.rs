@@ -35,7 +35,9 @@ fn codec_golden_and_checkpoint_anchor() {
     assert_eq!(cp.mmr_root(), Mmr::new().root());
     assert_eq!(
         cp.key_id(),
-        KeySeed::parse(&"07".repeat(32)).unwrap().public_key()
+        KeyFileSigner::from_hex(&"07".repeat(32))
+            .unwrap()
+            .public_key()
     );
     assert_eq!(cp.line(), line);
     assert!(Checkpoint::parse(GOLDEN.lines().next().unwrap()).is_err());

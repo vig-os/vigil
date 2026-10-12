@@ -148,7 +148,7 @@ pub(super) fn line(record: &Record) -> Result<Vec<u8>, AuditError> {
     bytes.push(b'\n');
     Ok(bytes)
 }
-fn sync_io(file: &File, site: &'static str) -> std::io::Result<()> {
+pub(crate) fn sync_io(file: &File, site: &'static str) -> std::io::Result<()> {
     #[cfg(test)]
     hooks::event(site)?;
     if site.ends_with("dir") || site == "marker" {

@@ -44,7 +44,7 @@ fn canonical_hash_and_chain_golden() {
 }
 #[test]
 fn checkpoint_domain_signature_and_golden() {
-    let seed = KeySeed::parse(&"07".repeat(32)).unwrap();
+    let seed = KeyFileSigner::from_hex(&"07".repeat(32)).unwrap();
     let cp = |signature| {
         CheckpointFields::new(0, Mmr::new().root(), vec![], seed.public_key(), signature).unwrap()
     };
@@ -114,9 +114,10 @@ fn mmr_tessera_vectors_and_resume() {
 }
 #[test]
 fn rfc8032_seed_and_strict_signature() {
-    let seed =
-        KeySeed::parse("  9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60\n")
-            .unwrap();
+    let seed = KeyFileSigner::from_hex(
+        "  9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60\n",
+    )
+    .unwrap();
     assert_eq!(
         hex(&seed.public_key()),
         "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
@@ -130,10 +131,14 @@ fn rfc8032_seed_and_strict_signature() {
         )
     );
     verify_signature(&seed.public_key(), b"", &sig).unwrap();
-    assert_eq!(format!("{seed:?}"), "KeySeed([REDACTED])");
+    assert_eq!(format!("{seed:?}"), "KeyFileSigner([REDACTED])");
     assert_eq!(
-        KeySeed::parse(&"AB".repeat(32)).unwrap().public_key(),
-        KeySeed::parse(&"ab".repeat(32)).unwrap().public_key()
+        KeyFileSigner::from_hex(&"AB".repeat(32))
+            .unwrap()
+            .public_key(),
+        KeyFileSigner::from_hex(&"ab".repeat(32))
+            .unwrap()
+            .public_key()
     );
     for bad in [
         "".into(),
@@ -143,7 +148,7 @@ fn rfc8032_seed_and_strict_signature() {
         format!("{} 00", "00".repeat(31)),
         "é".repeat(32),
     ] {
-        assert!(KeySeed::parse(&bad).is_err());
+        assert!(KeyFileSigner::from_hex(&bad).is_err());
     }
 }
 #[test]
