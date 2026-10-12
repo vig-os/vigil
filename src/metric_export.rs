@@ -46,6 +46,7 @@ impl<S: LineSink> OtlpJsonMetricExporter<S> {
         self
     }
     /// Set the payload limit, clamped to 1..=1,048,575 bytes, excluding newline.
+    #[cfg(any(test, vigil_unstable))]
     pub fn with_max_line_bytes(mut self, limit: usize) -> Self {
         self.limit = limit.clamp(1, 1_048_575);
         self

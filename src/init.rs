@@ -957,10 +957,10 @@ fn metrics_enabled() -> bool {
 }
 
 #[cfg(feature = "metrics")]
-fn metrics_reader<S: crate::sink::LineSink + 'static>(
-    exporter: crate::metric_export::OtlpJsonMetricExporter<S>,
+fn metrics_reader<E: opentelemetry_sdk::metrics::exporter::PushMetricExporter>(
+    exporter: E,
     interval: Duration,
-) -> PeriodicReaderBuilder<crate::metric_export::OtlpJsonMetricExporter<S>> {
+) -> PeriodicReaderBuilder<E> {
     PeriodicReader::builder(exporter).with_interval(interval.max(Duration::from_secs(1)))
 }
 
@@ -971,8 +971,11 @@ fn build_metrics(
     interval: Duration,
     losses: Arc<Losses>,
 ) -> SdkMeterProvider {
-    let exporter =
-        crate::metric_export::OtlpJsonMetricExporter::new(file).with_losses(losses.clone());
+    let storage = Arc::new(MetricStorage(Mutex::new(Some(file))));
+    let exporter = PipelineMetricExporter {
+        inner: crate::metric_export::OtlpJsonMetricExporter::new(storage)
+            .with_losses(losses.clone()),
+    };
     SdkMeterProvider::builder()
         .with_resource(resource)
         .with_reader(ReportingMetricReader {
@@ -982,12 +985,69 @@ fn build_metrics(
         .build()
 }
 
+// PeriodicReader acknowledges shutdown before dropping its exporter Arc.
+// Close storage in the exporter's shutdown, before the SDK acknowledgement.
+// A timed-out worker can still write, then releases storage when it stops,
+// even while an external provider clone retains the SDK exporter.
+#[cfg(feature = "metrics")]
+#[derive(Debug)]
+struct MetricStorage(Mutex<Option<Arc<RotatingFile>>>);
+#[cfg(feature = "metrics")]
+impl crate::sink::LineSink for MetricStorage {
+    fn write_line(&self, line: &[u8]) -> std::io::Result<()> {
+        let file = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        file.as_ref()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "metric storage closed")
+            })?
+            .write_line(line)
+    }
+}
+#[cfg(feature = "metrics")]
+impl MetricStorage {
+    fn close(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
+#[cfg(feature = "metrics")]
+#[derive(Debug)]
+struct PipelineMetricExporter {
+    inner: crate::metric_export::OtlpJsonMetricExporter<Arc<MetricStorage>>,
+}
+#[cfg(feature = "metrics")]
+impl opentelemetry_sdk::metrics::exporter::PushMetricExporter for PipelineMetricExporter {
+    async fn export(
+        &self,
+        metrics: &opentelemetry_sdk::metrics::data::ResourceMetrics,
+    ) -> OTelSdkResult {
+        self.inner.export(metrics).await
+    }
+    fn force_flush(&self) -> OTelSdkResult {
+        self.inner.force_flush()
+    }
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        let result = self.inner.shutdown_with_timeout(timeout);
+        self.inner.sink().close();
+        result
+    }
+    fn temporality(&self) -> opentelemetry_sdk::metrics::Temporality {
+        self.inner.temporality()
+    }
+}
+
 // Preserve typed reader timeouts before SdkMeterProvider stringifies them.
 // This requires the SDK's custom-reader feature, without its testing feature.
 #[cfg(feature = "metrics")]
 #[derive(Debug)]
 struct ReportingMetricReader {
-    inner: PeriodicReader<crate::metric_export::OtlpJsonMetricExporter<Arc<RotatingFile>>>,
+    inner: PeriodicReader<PipelineMetricExporter>,
     losses: Arc<Losses>,
 }
 #[cfg(feature = "metrics")]
@@ -1273,20 +1333,19 @@ mod install_race_tests {
         assert_eq!(error.kind(), InitErrorKind::ForeignSubscriber);
         assert!(std::error::Error::source(&error).is_some());
         #[cfg(feature = "metrics")]
-        {
-            let metrics = metrics.unwrap();
-            assert!(matches!(
-                metrics.shutdown(),
-                Err(OTelSdkError::AlreadyShutdown)
-            ));
-            // The SDK retains the reader/exporter in external provider clones.
-            drop(metrics);
-        }
+        let metrics = metrics.unwrap();
+        #[cfg(feature = "metrics")]
+        assert!(matches!(
+            metrics.shutdown(),
+            Err(OTelSdkError::AlreadyShutdown)
+        ));
         #[cfg(target_os = "linux")]
         assert!(
             storage_handles(&dir).is_empty(),
-            "lost install must close storage handles"
+            "lost install must close storage handles, even with a retained metrics provider"
         );
+        #[cfg(feature = "metrics")]
+        drop(metrics);
         assert!(
             matches!(
                 provider.unwrap().shutdown_with_timeout(Duration::ZERO),
