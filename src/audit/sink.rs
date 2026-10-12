@@ -9,7 +9,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
 use rustix::fs::{self as rfs, AtFlags, Mode, OFlags};
 use std::{
     fs::File,
-    io::Read,
+    io::{Read, Write},
     path::Path,
     sync::{
         Arc,
@@ -17,9 +17,6 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-
-#[cfg(test)]
-use std::io::Write;
 
 pub(crate) struct Config {
     pub(crate) service: String,
@@ -657,10 +654,14 @@ impl Drop for Sink {
             && !self.poisoned.load(Ordering::Relaxed)
             && let Err(error) = self.checkpoint()
         {
-            let message = format!("vigil audit: best-effort checkpoint failed: {error}");
+            let message = format!(
+                "vigil audit: best-effort checkpoint failed: {}",
+                error.to_string().escape_debug()
+            );
             #[cfg(test)]
             hooks::stderr(&message);
-            eprintln!("{message}");
+            // A failed stderr write must not turn best-effort Drop into a panic.
+            let _ = writeln!(std::io::stderr().lock(), "{message}");
         }
     }
 }

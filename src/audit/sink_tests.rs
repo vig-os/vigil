@@ -1535,6 +1535,7 @@ struct CountingSigner {
 }
 impl Signer for CountingSigner {
     fn public_key(&self) -> [u8; 32] {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         self.inner.public_key()
     }
     fn sign(&self, message: &[u8]) -> Result<[u8; 64], SignerError> {
@@ -1842,4 +1843,68 @@ fn poison_831_create_staging_name_fsync() {
         Sink::create(&t.0, signer(), Config::default()),
         AuditErrorKind::TrailExists,
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn drop_stderr_child_role() {
+    let Some(path) = std::env::var_os("VIGIL_DROP_STDERR_DIR") else {
+        return;
+    };
+    let s = Sink::open(Path::new(&path), signer(), Config::default(), None).unwrap();
+    fail(&["checkpoint-data"]);
+    drop(s);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn poison_846_drop_stderr_failure() {
+    let t = Temp::new();
+    let mut s = create(&t);
+    silent(&mut s);
+    let before = snapshot(&t);
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "audit::sink::tests::drop_stderr_child_role",
+            "--nocapture",
+        ])
+        .env("VIGIL_DROP_STDERR_DIR", &t.0)
+        .stderr(
+            fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    assert_eq!(snapshot(&t), before);
+}
+#[test]
+fn poison_846_drop_signer_error_is_one_line() {
+    #[derive(Debug)]
+    struct Multiline;
+    impl Signer for Multiline {
+        fn public_key(&self) -> [u8; 32] {
+            signer().public_key()
+        }
+        fn sign(&self, _: &[u8]) -> Result<[u8; 64], SignerError> {
+            Err(SignerError::new("offline\nsecond line\rthird line"))
+        }
+    }
+    let t = Temp::new();
+    let mut s = create(&t);
+    s.signer = Arc::new(Multiline);
+    let before = snapshot(&t);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(s))).is_ok());
+    let lines = hooks::STDERR.with(|lines| lines.borrow().clone());
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].lines().count(), 1);
+    assert!(lines[0].contains("offline\\nsecond line\\rthird line"));
+    assert_eq!(snapshot(&t), before);
 }
