@@ -99,17 +99,17 @@ impl fmt::Display for FlushError {
         if self.logs != 0 {
             write!(f, ": at least {} log records lost", self.logs)?;
         }
+        if let Some(source) = &self.source {
+            write!(f, ": {source}")?;
+        }
         if self.logs != 0 {
-            if self.metrics_failed {
+            if self.signal_kind(Signal::Metrics) == Some(FlushErrorKind::Timeout) {
+                write!(f, "; metric export timed out")?;
+            } else if self.metrics_failed {
                 write!(f, "; metric export failed")?;
             } else if self.metrics_data_lost {
                 write!(f, "; metric data points dropped")?;
             }
-        }
-        if let Some(source) = &self.source
-            && self.logs != 0
-        {
-            write!(f, ": {source}")?;
         }
         Ok(())
     }
@@ -144,14 +144,35 @@ struct State {
     #[cfg(feature = "metrics")]
     pending_metrics_failed: bool,
 }
+#[cfg(all(test, feature = "metrics"))]
+#[derive(Debug)]
+pub(crate) struct FlushOrderProbe {
+    pub(crate) started: std::sync::mpsc::Receiver<()>,
+    pub(crate) release: std::sync::mpsc::Sender<()>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Losses {
     state: Mutex<State>,
     pub(crate) shutting_down: AtomicBool,
     #[cfg(all(test, feature = "metrics"))]
     pub(crate) metric_export_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(all(test, feature = "metrics"))]
+    pub(crate) before_logs_flush: Mutex<Option<FlushOrderProbe>>,
 }
 impl Losses {
+    #[cfg(all(test, feature = "metrics"))]
+    pub(crate) fn observe_flush_order(&self) {
+        if let Some(probe) = self.before_logs_flush.lock().unwrap().take() {
+            let observed = probe.started.recv_timeout(Duration::from_secs(2));
+            probe.release.send(()).unwrap();
+            assert!(
+                observed.is_ok(),
+                "metrics collection must start before logs flush"
+            );
+        }
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
@@ -601,6 +622,40 @@ mod tests {
                 Some(FlushErrorKind::Timeout)
             );
             assert_eq!(error.signal_kind(Signal::Logs), None);
+        }
+    }
+
+    #[test]
+    fn display_keeps_source_without_lost_logs() {
+        let error = Losses::default()
+            .finish(Err(OTelSdkError::InternalFailure("source detail".into())))
+            .unwrap_err();
+        assert!(error.to_string().contains("source detail"));
+        assert!(!error.to_string().contains("log records"));
+    }
+
+    #[test]
+    fn display_orders_log_losses_before_metric_timeout_or_failure() {
+        for outcome in [
+            OTelSdkError::Timeout(Duration::from_secs(1)),
+            OTelSdkError::InternalFailure("source detail".into()),
+        ] {
+            let losses = Losses::default();
+            losses.record(2, false);
+            let timeout = matches!(outcome, OTelSdkError::Timeout(_));
+            let source = outcome.to_string();
+            let error = losses.finish_signals(Ok(()), Err(outcome)).unwrap_err();
+            let text = error.to_string();
+            let suffix = if timeout {
+                "; metric export timed out"
+            } else {
+                "; metric export failed"
+            };
+            assert!(text.ends_with(suffix), "{text}");
+            assert!(
+                text.contains(&format!("2 log records lost: {source}")),
+                "{text}"
+            );
         }
     }
 
