@@ -121,7 +121,7 @@
               builtins.isAttrs deps.${name}
               && (deps.${name}.optional or false)
               && !(builtins.elem "dep:${name}" (
-                pkgs.lib.concatLists (builtins.attrValues cargoManifest.features)
+                pkgs.lib.concatMap (feature: cargoManifest.features.${feature}) userFeatures
               ))
             ) (builtins.attrNames deps)
           ) dependencyTables
@@ -173,7 +173,7 @@
         ) featureSets;
         featureClippyChecks =
           assert pkgs.lib.assertMsg (implicitFeatures == [ ])
-            "Optional dependencies have implicit features that would go unchecked: ${pkgs.lib.concatStringsSep "," implicitFeatures}; reference each as dep:<name> in a feature";
+            "Optional dependencies have implicit features that would go unchecked: ${pkgs.lib.concatStringsSep "," implicitFeatures}; reference each as dep:<name> in a user feature";
           assert pkgs.lib.assertMsg (
             builtins.length featureClippyEntries
             == builtins.length (pkgs.lib.unique (map (entry: entry.name) featureClippyEntries))
