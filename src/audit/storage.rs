@@ -254,7 +254,9 @@ fn initial(dir: &File, trail: [u8; 16], expected: Option<Head>) -> Result<Cache,
 // buffered, and the cumulative MMR and cached head are never replaced by a later
 // checkpoint's claimed peaks.
 #[allow(clippy::too_many_arguments)]
-fn history_segment(
+/// Folds a sealed predecessor without resetting state at damaged run boundaries.
+/// The caller must validate a successor with `scan_staged` or `scan_closing`.
+pub(crate) fn history_segment(
     file: &File,
     trail: [u8; 16],
     mut state: Option<State>,
@@ -401,7 +403,10 @@ fn history_segment(
             // same file, start another. Compare this checkpoint before treating
             // the remaining in-run checkpoints solely as leaves.
             let mut trial = state.clone();
-            closing = inherited && !prefix && !damaged && apply(record, &mut trial, false).is_ok();
+            closing = inherited
+                && !prefix
+                && !damaged
+                && apply(record, &mut trial, state.is_none()).is_ok();
         }
         let is_resume = matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume");
         let base = state.is_none();
@@ -435,6 +440,16 @@ fn history_segment(
         s.gap = gap;
     }
     Ok(state)
+}
+/// Validates a staging successor, requiring a genesis link without a predecessor
+/// and an immediate resume when the predecessor history ends inside a run.
+pub(crate) fn scan_staged(
+    file: &File,
+    trail: [u8; 16],
+    state: Option<State>,
+    run: bool,
+) -> Result<State, AuditError> {
+    scan_inner(file, trail, state, true, None, &mut false, true, run)
 }
 fn scan_closing(
     file: &File,
@@ -549,6 +564,7 @@ fn scan_inner(
     genesis: bool,
     run: bool,
 ) -> Result<State, AuditError> {
+    let genesis = genesis || (run && state.is_none());
     let mut file = file.try_clone().map_err(io_error)?;
     let start = if opening {
         0
@@ -704,8 +720,7 @@ fn apply_checked(
                 "record rolled back, changed or broke its hash link",
             ));
         }
-        if !broken_boundary
-            && s.pending_resume
+        if s.pending_resume
             && !matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume")
         {
             return Err(corrupt("sequence gap lacks a resume declaration"));

@@ -1,7 +1,7 @@
 //! Internal durable writer; the public trail surface follows in #11 B3.
 use super::{
     format::{Kind, request},
-    storage::{Head, State, TrailReader, existing, scan},
+    storage::{Head, State, TrailReader, existing, history_segment, scan_staged},
     *,
 };
 use crate::rotate::{self, Directory};
@@ -248,31 +248,36 @@ fn linked_live(dir: &File) -> Result<bool, AuditError> {
     let live = existing(dir, Path::new("audit.jsonl"), false)?;
     rotate::has_segment_link(dir, "audit", &rfs::fstat(&live).map_err(io_error)?).map_err(io_error)
 }
+#[cfg(test)]
 fn predecessor(dir: &File, trail: [u8; 16]) -> Result<Option<State>, AuditError> {
+    predecessor_run(dir, trail).map(|(state, _)| state)
+}
+fn predecessor_run(dir: &File, trail: [u8; 16]) -> Result<(Option<State>, bool), AuditError> {
     let mut state = None;
+    let mut run = false;
     for name in rotate::rotated_names_at(dir, "audit").map_err(io_error)? {
-        state = Some(scan(
+        state = history_segment(
             &existing(dir, &name, false)?,
             trail,
             state,
             true,
             None,
             &mut false,
-            false,
-        )?);
+            &mut run,
+        )?;
     }
     if exists(dir, "audit.jsonl")? && !linked_live(dir)? {
-        state = Some(scan(
+        state = history_segment(
             &existing(dir, Path::new("audit.jsonl"), false)?,
             trail,
             state,
             true,
             None,
             &mut false,
-            false,
-        )?);
+            &mut run,
+        )?;
     }
-    Ok(state)
+    Ok((state, run))
 }
 fn settle(dir: &File, trail: [u8; 16], poisoned: &AtomicBool) -> Result<(), AuditError> {
     for (name, count) in [(".audit-next.jsonl", 1), (".audit-resume.jsonl", 2)] {
@@ -298,7 +303,7 @@ fn settle(dir: &File, trail: [u8; 16], poisoned: &AtomicBool) -> Result<(), Audi
                 })
                 .collect()
         });
-        let prior = predecessor(dir, trail)?;
+        let (prior, run) = predecessor_run(dir, trail)?;
         let valid = records.as_ref().is_some_and(|records| {
             if records.len() != count {
                 return false;
@@ -312,7 +317,7 @@ fn settle(dir: &File, trail: [u8; 16], poisoned: &AtomicBool) -> Result<(), Audi
                 return false;
             }
             // Scan enforces predecessor/genesis links, forward sequence and immediate resume action.
-            scan(&staged, trail, prior.clone(), true, None, &mut false, true).is_ok()
+            scan_staged(&staged, trail, prior.clone(), run).is_ok()
         });
         if valid {
             if exists(dir, "audit.jsonl")? {

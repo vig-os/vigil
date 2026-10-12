@@ -1183,6 +1183,54 @@ mod runs {
         corrupt_open(&d.0);
     }
     #[test]
+    fn staging_settlement_uses_the_same_run_fold() {
+        use crate::audit::sink::{Config, Sink};
+        use std::sync::Arc;
+        for resume_stage in [false, true] {
+            let (d, _, _, last, mut fold) = attack_fixture();
+            fs::write(
+                d.0.join("audit.trail"),
+                format!("{}\n", crate::audit::hex(&TRAIL)),
+            )
+            .unwrap();
+            let (opening, resume) = close_run(&d, &last, &fold);
+            let expected = if resume_stage {
+                fs::rename(d.0.join("audit.jsonl"), d.0.join(".audit-resume.jsonl")).unwrap();
+                resume
+            } else {
+                fold.push(opening.hash()).unwrap();
+                fold.push(resume.hash()).unwrap();
+                let closing = signed(resume.context.seq + 1, resume.hash(), &fold);
+                write_records(&d.0, &[&opening, &resume, &closing]);
+                fold.push(closing.hash()).unwrap();
+                let next = signed(closing.context.seq + 1, closing.hash(), &fold);
+                fs::write(d.0.join(".audit-next.jsonl"), line(&next)).unwrap();
+                next
+            };
+            let sink = Sink::open(
+                &d.0,
+                Arc::new(KeySeed::parse(&"27".repeat(32)).unwrap()),
+                Config::default(),
+                Some(Head::of(&expected)),
+            )
+            .unwrap();
+            assert_eq!(head(&open(&d.0)), Head::of(&expected));
+            assert!(!d.0.join(".audit-next.jsonl").exists());
+            assert!(!d.0.join(".audit-resume.jsonl").exists());
+            sink.close().unwrap();
+        }
+    }
+    #[test]
+    fn record_free_first_run_requires_genesis_link_at_its_own_base() {
+        let d = Temp::new();
+        let creation = base(&d);
+        put(&d, 0, &[], b"{\"torn\":");
+        let opening = signed(7, [42; 32], &seeded(&creation));
+        let resume = declaration(&opening, 0, [42; 32], 6, None);
+        write_records(&d.0, &[&opening, &resume]);
+        corrupt_open(&d.0);
+    }
+    #[test]
     fn archived_forged_pair_is_documented_reader_residual() {
         let d = Temp::new();
         let first = base(&d);
