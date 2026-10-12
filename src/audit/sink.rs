@@ -106,6 +106,9 @@ pub(crate) struct OperatorWritten {
     pub(crate) record: Option<Record>,
     pub(crate) checkpoint: Record,
 }
+/// A writer retains its highest returned receipt/checkpoint sequence, starting
+/// at zero. A resume below that acknowledgement permanently closes this handle
+/// to writes; neither later calls nor Drop may sign or mutate the directory.
 pub(crate) struct Sink {
     reader: TrailReader,
     trail: [u8; 16],
@@ -114,6 +117,8 @@ pub(crate) struct Sink {
     poisoned: AtomicBool,
     reported: AtomicBool,
     unsigned_records: AtomicU64,
+    pub(crate) acknowledged: AtomicU64,
+    pub(crate) failed_closed: AtomicBool,
     closed: bool,
 }
 fn error(kind: AuditErrorKind, text: impl Into<String>) -> AuditError {
@@ -602,6 +607,8 @@ impl Sink {
             poisoned,
             reported: AtomicBool::new(false),
             unsigned_records: AtomicU64::new(0),
+            acknowledged: AtomicU64::new(0),
+            failed_closed: AtomicBool::new(false),
             closed: false,
         })
     }
@@ -668,7 +675,24 @@ impl Sink {
     fn prepare(&self, dir: &File) -> Result<(), AuditError> {
         self.healthy()?;
         poison_check(dir)?;
+        self.resume_check(None)?;
         settle(dir, self.trail, &self.poisoned)
+    }
+    /// Called under the directory lock, before any cache validation or write.
+    fn resume_check(&self, lost: Option<u64>) -> Result<bool, AuditError> {
+        if self.failed_closed.load(Ordering::Relaxed)
+            || lost.is_some_and(|bound| bound < self.acknowledged.load(Ordering::Relaxed))
+        {
+            self.failed_closed.store(true, Ordering::Relaxed);
+            return Err(error(
+                AuditErrorKind::HeadMismatch,
+                "writer handle contradicted by resume",
+            ));
+        }
+        Ok(lost.is_some())
+    }
+    fn acknowledge(&self, seq: u64) {
+        self.acknowledged.fetch_max(seq, Ordering::Relaxed);
     }
     fn signer_failed(&self) {
         if !self.reported.swap(true, Ordering::Relaxed) {
@@ -698,13 +722,14 @@ impl Sink {
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(error(AuditErrorKind::Poisoned, "handle durability failure"));
         }
-        self.reader.with_current(
+        self.reader.with_resumes(
             |dir| {
                 if self.poisoned.load(Ordering::Relaxed) {
                     return Err(error(AuditErrorKind::Poisoned, "handle durability failure"));
                 }
                 self.prepare(dir)
             },
+            |lost| self.resume_check(lost),
             |dir, live, state| {
                 let time = clock()?;
                 let mut record = if let Some(action) = internal {
@@ -787,6 +812,7 @@ impl Sink {
                 if signer_down {
                     self.unsigned_records.fetch_add(1, Ordering::Relaxed);
                 }
+                self.acknowledge(receipt.seq);
                 Ok(Recorded {
                     head: receipt,
                     unsigned_records: self.unsigned_records.load(Ordering::Relaxed),
@@ -929,8 +955,9 @@ impl Sink {
     }
     pub(crate) fn checkpoint(&self) -> Result<Record, AuditError> {
         self.healthy()?;
-        self.reader.with_current(
+        self.reader.with_resumes(
             |dir| self.prepare(dir),
+            |lost| self.resume_check(lost),
             |dir, file, state| {
                 let cp = self.checkpoint_record(state, clock()?)?;
                 let mut bytes = line(&cp)?;
@@ -940,6 +967,7 @@ impl Sink {
                 let next = state.after(&cp, state.length + bytes.len() as u64)?;
                 append(dir, file, &bytes, "checkpoint-data", &self.poisoned)?;
                 *state = next;
+                self.acknowledge(cp.context.seq);
                 Ok(cp)
             },
         )
@@ -953,6 +981,7 @@ impl Sink {
 impl Drop for Sink {
     fn drop(&mut self) {
         if !self.closed
+            && !self.failed_closed.load(Ordering::Relaxed)
             && !self.poisoned.load(Ordering::Relaxed)
             && let Err(error) = self.checkpoint()
         {

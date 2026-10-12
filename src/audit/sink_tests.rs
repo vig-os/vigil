@@ -2645,3 +2645,255 @@ fn settle_batches_both_staging_discards_after_hard_link() {
         assert!(!t.0.join(".audit-resume.jsonl").exists());
     }
 }
+
+// R7''': keep resumed handles alive during setup. R8 makes their Drop append
+// one checkpoint, so a future public resume handoff starts acknowledged at 0
+// and its Drop writes lost_through + 3, one above the resume record itself.
+fn install_resume(t: &Temp, writer: &Sink, lost: u64) -> Record {
+    let dir = File::open(&t.0).unwrap();
+    let state = predecessor(&dir, writer.trail).unwrap().unwrap();
+    let staged = resume_bytes(
+        writer,
+        &state,
+        lost + 1,
+        state.head.hash,
+        "vigil.audit.resume",
+        &next_resume_file(t),
+    );
+    fs::write(t.0.join(".audit-resume.jsonl"), staged).unwrap();
+    settle(&dir, writer.trail, &AtomicBool::new(false)).unwrap();
+    records(t).last().unwrap().clone()
+}
+fn truncated_resume(t: &Temp, lost: u64) -> (Sink, Arc<operators::SignOnly>, Record) {
+    let key = operators::SignOnly::new("11", false);
+    let writer = Sink::create(&t.0, key.clone(), Config::default()).unwrap();
+    assert_eq!(writer.record(&entry()).unwrap().head.seq, 1);
+    let retained = bytes(t);
+    assert_eq!(writer.record(&entry()).unwrap().head.seq, 2);
+    assert_eq!(writer.record(&entry()).unwrap().head.seq, 3);
+    fs::write(t.0.join("audit.jsonl"), retained).unwrap();
+    let resume = install_resume(t, &writer, lost);
+    (writer, key, resume)
+}
+fn disk_snapshot(t: &Temp) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files: Vec<_> = fs::read_dir(&t.0)
+        .unwrap()
+        .map(|item| {
+            let path = item.unwrap().path();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    files.sort();
+    files
+}
+#[test]
+fn resume_boundary_equality_after_truncated_live() {
+    let t = Temp::new();
+    let (writer, _, resume) = truncated_resume(&t, 3);
+    let receipt = writer.record(&entry()).unwrap();
+    assert_eq!(receipt.head.seq, 6);
+    assert_eq!(
+        records(&t)
+            .iter()
+            .find(|record| record.context.seq == receipt.head.seq)
+            .unwrap()
+            .context
+            .previous,
+        resume.hash()
+    );
+}
+#[test]
+fn resume_ahead_rebuild_folds_once() {
+    let t = Temp::new();
+    let (writer, _, resume) = truncated_resume(&t, 8);
+    super::super::storage::FULL_FOLDS.with(|count| count.set(0));
+    let receipt = writer.record(&entry()).unwrap();
+    assert_eq!(receipt.head.seq, 11);
+    assert_eq!(
+        records(&t)
+            .iter()
+            .find(|record| record.context.seq == receipt.head.seq)
+            .unwrap()
+            .context
+            .previous,
+        resume.hash()
+    );
+    super::super::storage::FULL_FOLDS.with(|count| assert_eq!(count.get(), 1));
+}
+fn assert_contradicted(sealed: bool, path: u8) {
+    let t = Temp::new();
+    let (mut writer, key, _) = truncated_resume(&t, 2);
+    if sealed {
+        let mut other = open(&t);
+        other.config.max_bytes = 1;
+        other.record(&entry()).unwrap();
+        other.closed = true;
+        assert!(!records(&t).iter().any(|r| matches!(&r.kind,
+            Kind::Entry(e) if e.action == "vigil.audit.resume")));
+    }
+    let snapshot = disk_snapshot(&t);
+    let signs = key.calls.load(Ordering::Relaxed);
+    let publics = key.public.load(Ordering::Relaxed);
+    bad(writer.record(&entry()), AuditErrorKind::HeadMismatch);
+    assert_eq!(disk_snapshot(&t), snapshot);
+    assert_eq!(key.calls.load(Ordering::Relaxed), signs);
+    assert_eq!(key.public.load(Ordering::Relaxed), publics);
+    // Replace the contradicted disk layout by a clean creation file. The sticky
+    // gate must stand on its own after the original resume disappears.
+    // Keep the same trail identity: the first sealed segment holds creation.
+    let dir = File::open(&t.0).unwrap();
+    let names = rotate::rotated_names_at(&dir, "audit").unwrap();
+    let creation = fs::read(t.0.join(&names[0])).unwrap();
+    let first = creation.split_inclusive(|b| *b == b'\n').next().unwrap();
+    fs::write(t.0.join("audit.jsonl"), first).unwrap();
+    for name in names {
+        fs::remove_file(t.0.join(name)).unwrap();
+    }
+    // Isolate the sticky state from stale-descriptor errors: the flag alone
+    // must refuse every path even with a freshly validated, writable cache.
+    writer.reader = TrailReader::open(&t.0, writer.trail, None).unwrap();
+    hooks::STDERR.with(|lines| lines.borrow_mut().clear());
+    let snapshot = disk_snapshot(&t);
+    match path {
+        0 => {
+            bad(writer.record(&entry()), AuditErrorKind::HeadMismatch);
+            drop(writer);
+        }
+        1 => {
+            bad(writer.checkpoint(), AuditErrorKind::HeadMismatch);
+            drop(writer);
+        }
+        2 => {
+            bad(writer.close(), AuditErrorKind::HeadMismatch);
+        }
+        _ => drop(writer),
+    }
+    assert_eq!(disk_snapshot(&t), snapshot);
+    assert_eq!(key.calls.load(Ordering::Relaxed), signs);
+    assert_eq!(key.public.load(Ordering::Relaxed), publics);
+    hooks::STDERR.with(|lines| assert!(lines.borrow().is_empty()));
+}
+#[test]
+fn resume_below_acknowledged_live_and_sticky_record() {
+    assert_contradicted(false, 0);
+}
+#[test]
+fn resume_below_acknowledged_sealed_and_sticky_checkpoint() {
+    assert_contradicted(true, 1);
+}
+#[test]
+fn resume_sticky_close() {
+    assert_contradicted(false, 2);
+}
+#[test]
+fn resume_sticky_drop() {
+    assert_contradicted(false, 3);
+}
+#[test]
+fn resume_discovery_uses_minimum_across_two_sealed_and_live() {
+    let t = Temp::new();
+    let (writer, key, _) = truncated_resume(&t, 2);
+    // Successive promotions seal both earlier resume files. Every complete
+    // present record remains valid, while H's acknowledgement 3 exceeds L1=2.
+    install_resume(&t, &writer, 7);
+    install_resume(&t, &writer, 12);
+    let snapshot = disk_snapshot(&t);
+    let signs = key.calls.load(Ordering::Relaxed);
+    bad(writer.record(&entry()), AuditErrorKind::HeadMismatch);
+    assert_eq!(disk_snapshot(&t), snapshot);
+    assert_eq!(key.calls.load(Ordering::Relaxed), signs);
+}
+#[test]
+fn resume_truncated_live_without_declaration_still_corrupt() {
+    let t = Temp::new();
+    let mut writer = create(&t);
+    writer.record(&entry()).unwrap();
+    let retained = bytes(&t);
+    writer.record(&entry()).unwrap();
+    fs::write(t.0.join("audit.jsonl"), retained).unwrap();
+    bad(writer.record(&entry()), AuditErrorKind::CorruptTrail);
+    writer.closed = true;
+}
+#[test]
+fn resume_reader_refresh_and_equal_head_regression() {
+    let t = Temp::new();
+    let writer = create(&t);
+    let reader = TrailReader::open(&t.0, writer.trail, None).unwrap();
+    let receipt = writer.record(&entry()).unwrap();
+    for _ in 0..2 {
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, state| {
+                    assert_eq!(state.head, receipt.head);
+                    assert_eq!(state.mmr.size(), 2);
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn resume_acknowledges_signer_down_receipts_and_returned_checkpoints() {
+    let t = Temp::new();
+    let mut writer = create(&t);
+    assert_eq!(writer.acknowledged.load(Ordering::Relaxed), 0);
+    writer.signer = operators::SignOnly::new("11", true);
+    writer.config.checkpoint_every = 1;
+    let receipt = writer.record(&entry()).unwrap();
+    assert_eq!(receipt.head.seq, 1);
+    assert_eq!(receipt.unsigned_records, 1);
+    assert_eq!(writer.acknowledged.load(Ordering::Relaxed), 1);
+    writer.signer = signer();
+    let checkpoint = writer.checkpoint().unwrap();
+    assert_eq!(checkpoint.context.seq, 2);
+    assert_eq!(writer.acknowledged.load(Ordering::Relaxed), 2);
+    let checkpoint = writer.close().unwrap();
+    assert_eq!(checkpoint.context.seq, 3);
+}
+#[test]
+fn resume_fresh_handoff_drop_checkpoint_sequence() {
+    let t = Temp::new();
+    let (mut old, _, _) = truncated_resume(&t, 3);
+    old.closed = true;
+    let fresh = open(&t);
+    assert_eq!(fresh.acknowledged.load(Ordering::Relaxed), 0);
+    drop(fresh);
+    assert_eq!(records(&t).last().unwrap().context.seq, 6);
+}
+
+#[test]
+fn resume_discovery_requires_full_validation_before_writing() {
+    let t = Temp::new();
+    let (mut writer, key, _) = truncated_resume(&t, 8);
+    let dir = File::open(&t.0).unwrap();
+    let names = rotate::rotated_names_at(&dir, "audit").unwrap();
+    let file = existing(&dir, &names[0], false).unwrap();
+    let mut state = history_segment(&file, writer.trail, None, true, None, &mut None, &mut false)
+        .unwrap()
+        .unwrap();
+    // The header declares an acceptable bound, but its MMR omits the retained
+    // application record. Discovery must never turn that into write authority.
+    let mut wrong = Mmr::new();
+    wrong.push(Record::genesis(&writer.trail)).unwrap();
+    state.mmr = wrong;
+    let forged = resume_bytes(
+        &writer,
+        &state,
+        9,
+        state.head.hash,
+        "vigil.audit.resume",
+        "-",
+    );
+    fs::write(t.0.join("audit.jsonl"), forged).unwrap();
+    let snapshot = disk_snapshot(&t);
+    let signs = key.calls.load(Ordering::Relaxed);
+    let publics = key.public.load(Ordering::Relaxed);
+    bad(writer.record(&entry()), AuditErrorKind::CorruptTrail);
+    assert_eq!(disk_snapshot(&t), snapshot);
+    assert_eq!(key.calls.load(Ordering::Relaxed), signs);
+    assert_eq!(key.public.load(Ordering::Relaxed), publics);
+    writer.closed = true;
+}

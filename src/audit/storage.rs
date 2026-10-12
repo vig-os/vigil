@@ -78,7 +78,7 @@ impl State {
         !self.newline
     }
 }
-struct Cache {
+pub(crate) struct Cache {
     // Last sealed name observed when this live descriptor was acquired.
     sealed_before: Option<PathBuf>,
     file: File,
@@ -86,6 +86,7 @@ struct Cache {
 }
 
 /// Retains the old live descriptor across rotations, preventing inode reuse.
+/// Reader handles across a resume may error; reopen to validate the new trail.
 /// Lock order: directory gate/flock, then cache; never acquire a telemetry
 /// directory lock inside this section (ADR-0002 d3/d7/d13, ADR-0005 d2/d8).
 pub(crate) struct TrailReader {
@@ -184,6 +185,30 @@ impl TrailReader {
         settle: impl FnOnce(&File) -> Result<(), AuditError>,
         f: impl FnOnce(&File, &mut File, &mut State) -> Result<T, AuditError>,
     ) -> Result<T, AuditError> {
+        self.with_current_checked(
+            settle,
+            None::<fn(Option<u64>) -> Result<bool, AuditError>>,
+            f,
+        )
+    }
+
+    /// Writer boundary: discover declared loss before validating cached state.
+    /// The sink decides whether discovery requires a full open-path rebuild.
+    pub(crate) fn with_resumes<T>(
+        &self,
+        settle: impl FnOnce(&File) -> Result<(), AuditError>,
+        decide: impl FnOnce(Option<u64>) -> Result<bool, AuditError>,
+        f: impl FnOnce(&File, &mut File, &mut State) -> Result<T, AuditError>,
+    ) -> Result<T, AuditError> {
+        self.with_current_checked(settle, Some(decide), f)
+    }
+
+    fn with_current_checked<T>(
+        &self,
+        settle: impl FnOnce(&File) -> Result<(), AuditError>,
+        decide: Option<impl FnOnce(Option<u64>) -> Result<bool, AuditError>>,
+        f: impl FnOnce(&File, &mut File, &mut State) -> Result<T, AuditError>,
+    ) -> Result<T, AuditError> {
         self.directory
             .with_lock(|dir| {
                 settle(dir)?;
@@ -191,7 +216,13 @@ impl TrailReader {
                     .cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                refresh(dir, self.trail, &mut cache)?;
+                if let Some(decide) = decide
+                    && decide(resumes_after(dir, self.trail, &cache)?)?
+                {
+                    *cache = initial(dir, self.trail, None)?;
+                } else {
+                    refresh(dir, self.trail, &mut cache)?;
+                }
                 let old = cache.file.metadata().map_err(io_error)?;
                 let Cache { file, state, .. } = &mut *cache;
                 let result = f(dir, file, state);
@@ -255,6 +286,8 @@ fn initial_record(
     trail: [u8; 16],
     expected: Option<Head>,
 ) -> Result<(Cache, Option<Record>), AuditError> {
+    #[cfg(test)]
+    FULL_FOLDS.with(|count| count.set(count.get() + 1));
     let mut chain = None;
     let mut found = None;
     let mut run = false;
@@ -540,6 +573,96 @@ fn sealed(state: &State) -> bool {
     // A complete JSON checkpoint without LF is still a record (ADR-0005 d5).
     state.checkpoint && state.gap.is_none() && !state.pending_resume
 }
+/// Discovers the minimum declared loss bound using only two bounded header
+/// records per file after the cached inode (or its retained sealed-name bound).
+/// These records are not validated yet: a low bound can only fail closed, and
+/// an accepted bound proceeds only through open's full validation (B3d2-d7).
+/// Readers do not use this discovery path and retain refresh's strict checks.
+pub(crate) fn resumes_after(
+    dir: &File,
+    trail: [u8; 16],
+    cache: &Cache,
+) -> Result<Option<u64>, AuditError> {
+    let old = cache.file.metadata().map_err(io_error)?;
+    let live = existing(dir, Path::new("audit.jsonl"), false)?;
+    let current = live.metadata().map_err(io_error)?;
+    // B3d2-d7: promotion gives live a new inode; the same inode has no
+    // resume after our boundary and still goes through ordinary refresh.
+    if (old.dev(), old.ino()) == (current.dev(), current.ino()) {
+        return Ok(None);
+    }
+    let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
+    let mut boundary = cache.sealed_before.as_ref();
+    for name in &names {
+        let metadata = rfs::statat(dir, name, rfs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| io_error(e.into()))?;
+        if (metadata.st_dev as u64, metadata.st_ino as u64) == (old.dev(), old.ino()) {
+            boundary = Some(name);
+            break;
+        }
+    }
+    let mut minimum = None;
+    for name in &names {
+        if boundary.is_some_and(|b| {
+            crate::rotate::segment_key(name, "audit") <= crate::rotate::segment_key(b, "audit")
+        }) {
+            continue;
+        }
+        let file = existing(dir, name, false)?;
+        if let Some(bound) = resume_header(&file, trail)? {
+            minimum = Some(minimum.map_or(bound, |prior: u64| prior.min(bound)));
+        }
+    }
+    if let Some(bound) = resume_header(&live, trail)? {
+        minimum = Some(minimum.map_or(bound, |prior| prior.min(bound)));
+    }
+    Ok(minimum)
+}
+
+fn resume_header(file: &File, trail: [u8; 16]) -> Result<Option<u64>, AuditError> {
+    let mut reader = BufReader::new(file);
+    for index in 0..2 {
+        let mut line = Vec::new();
+        reader
+            .by_ref()
+            .take(MAX_READ_BYTES)
+            .read_until(b'\n', &mut line)
+            .map_err(io_error)?;
+        let payload = line.strip_suffix(b"\n").unwrap_or(&line);
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            return Ok(None);
+        }
+        let Ok(records) = Record::parse_line(payload) else {
+            return Ok(None);
+        };
+        let [record] = records.as_slice() else {
+            return Ok(None);
+        };
+        if record.context.trail != trail {
+            return Ok(None);
+        }
+        if index == 0 {
+            if !matches!(record.kind, Kind::Checkpoint(_)) {
+                return Ok(None);
+            }
+        } else if matches!(&record.kind, Kind::Entry(entry) if entry.action == "vigil.audit.resume")
+        {
+            // Validation binds lost_through to the immediately preceding
+            // checkpoint's seq minus one. Parse the declared value here;
+            // the full rebuild checks that equality and every other field.
+            if let Kind::Entry(entry) = &record.kind {
+                return Ok(entry
+                    .details
+                    .as_deref()
+                    .and_then(|details| details.split_once(" lost_through="))
+                    .and_then(|(_, tail)| tail.split_once(" file="))
+                    .and_then(|(bound, _)| bound.parse().ok()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditError> {
     let old = cache.file.metadata().map_err(io_error)?;
     let live = rfs::statat(dir, "audit.jsonl", rfs::AtFlags::SYMLINK_NOFOLLOW).map_err(|e| {
@@ -822,7 +945,7 @@ fn apply_checked(
     }
     match &record.kind {
         Kind::Checkpoint(cp) => {
-            if (compare_mmr || (root_link && head.seq > 0))
+            if compare_mmr
                 && (cp.size != mmr.size() || cp.root != mmr.root() || cp.peaks != mmr.peaks())
             {
                 return Err(corrupt("checkpoint MMR differs from preceding records"));
@@ -922,3 +1045,6 @@ mod tests;
 
 #[cfg(test)]
 thread_local! { static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
+thread_local! { pub(crate) static FULL_FOLDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
