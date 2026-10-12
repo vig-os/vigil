@@ -15,7 +15,7 @@ use opentelemetry_sdk::{
 };
 use serde_json::Value as Json;
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
 
@@ -40,6 +40,10 @@ impl<S: LineSink> OtlpJsonMetricExporter<S> {
             losses: Arc::new(Losses::default()),
             failures: Mutex::default(),
         }
+    }
+    pub(crate) fn with_losses(mut self, losses: Arc<Losses>) -> Self {
+        self.losses = losses;
+        self
     }
     /// Set the payload limit, clamped to 1..=1,048,575 bytes, excluding newline.
     pub fn with_max_line_bytes(mut self, limit: usize) -> Self {
@@ -83,14 +87,32 @@ impl<S: LineSink> OtlpJsonMetricExporter<S> {
 }
 impl<S: LineSink + 'static> PushMetricExporter for OtlpJsonMetricExporter<S> {
     async fn export(&self, metrics: &ResourceMetrics) -> OTelSdkResult {
+        #[cfg(test)]
+        if let Some(sender) = self
+            .losses
+            .metric_export_started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = sender.send(());
+        }
         let (result, lost) = self.write(metrics);
         if lost != 0 || result.is_err() {
             self.losses.metric_data_points(result.is_err());
         }
-        self.failures
+        let reported = self
+            .failures
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record("metric", "data points", lost, &result, false);
+            .record(
+                "metric",
+                "data points",
+                lost,
+                &result,
+                self.losses.shutting_down.load(Ordering::Acquire),
+            );
+        self.losses.metric_pending(lost as u64, reported);
         result
     }
     fn force_flush(&self) -> OTelSdkResult {
