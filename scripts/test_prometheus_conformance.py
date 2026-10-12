@@ -1,5 +1,6 @@
 """Exercise transient query failures and diagnostics without real sleeps or servers."""
 
+import http.client
 import io
 import json
 import pathlib
@@ -17,6 +18,9 @@ class QueryTests(unittest.TestCase):
             urllib.error.URLError("not ready"),
             ConnectionRefusedError("refused"),
             TimeoutError("timed out"),
+            ConnectionResetError("reset"),
+            http.client.IncompleteRead(b"partial"),
+            json.JSONDecodeError("invalid", "", 0),
         ):
             with self.subTest(error=error):
                 response = Mock()
@@ -38,6 +42,49 @@ class QueryTests(unittest.TestCase):
                 self.assertEqual(request.call_args.kwargs["timeout"], 0.75)
                 sleep.assert_called_once_with(0.25)
 
+    def test_expired_deadline_never_requests(self):
+        with (
+            patch.object(oracle.time, "monotonic", return_value=1),
+            patch.object(oracle.urllib.request, "urlopen") as request,
+            self.assertRaisesRegex(AssertionError, "app_x.*deadline"),
+        ):
+            oracle.query(1234, "app_x", 1)
+        request.assert_not_called()
+
+    def test_sleep_is_capped_by_remaining_deadline(self):
+        with (
+            patch.object(oracle.time, "monotonic", side_effect=[0, 0.9, 1]),
+            patch.object(oracle.time, "sleep") as sleep,
+            patch.object(
+                oracle.urllib.request,
+                "urlopen",
+                side_effect=ConnectionResetError("reset"),
+            ) as request,
+            self.assertRaisesRegex(AssertionError, "app_x.*deadline.*reset"),
+        ):
+            oracle.query(1234, "app_x", 1)
+        self.assertAlmostEqual(sleep.call_args.args[0], 0.1)
+        self.assertEqual(request.call_count, 1)
+
+    def test_client_http_errors_fail_immediately(self):
+        for code in (400, 401, 404, 429):
+            error = urllib.error.HTTPError("url", code, "bad query", {}, io.BytesIO())
+            self.addCleanup(error.close)
+            with (
+                self.subTest(code=code),
+                patch.object(oracle.time, "monotonic", side_effect=[0, 0, 1]),
+                patch.object(oracle.time, "sleep") as sleep,
+                patch.object(
+                    oracle.urllib.request,
+                    "urlopen",
+                    side_effect=error,
+                ) as request,
+                self.assertRaisesRegex(AssertionError, "app_x.*bad query"),
+            ):
+                oracle.query(1234, "app_x", 1)
+            request.assert_called_once()
+            sleep.assert_not_called()
+
     def test_deadline_names_query_and_last_error(self):
         with (
             patch.object(oracle.time, "monotonic", side_effect=[0, 1]),
@@ -56,6 +103,37 @@ class QueryTests(unittest.TestCase):
 
 
 class ServerLogTests(unittest.TestCase):
+    def test_start_servers_selects_second_attempt_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            first, second, collector = Mock(), Mock(), Mock()
+            first.poll.return_value = 1
+            second.poll.return_value = None
+            response = Mock()
+            response.__enter__ = Mock(return_value=Mock(status=200))
+            response.__exit__ = Mock(return_value=False)
+
+            def spawn(command, **kwargs):
+                if command[0] == "prometheus":
+                    kwargs["stdout"].write("address already in use")
+                    return first if "tsdb-0" in command[-1] else second
+                return collector
+
+            with (
+                patch.object(oracle.subprocess, "Popen", side_effect=spawn) as popen,
+                patch.object(oracle.urllib.request, "urlopen", return_value=response),
+                patch.object(oracle, "free_port", side_effect=[1234, 5678]),
+            ):
+                children = []
+                port, prom, col, log = oracle.start_servers(directory, children)
+            self.assertEqual(
+                (port, prom, col, log),
+                (5678, second, collector, directory / "prometheus-1.log"),
+            )
+            self.assertEqual(children, [first, second, collector])
+            self.assertIn("prometheus-1.json", popen.call_args_list[1].args[0][-2])
+            self.assertIn("tsdb-1", popen.call_args_list[1].args[0][-1])
+
     def test_second_attempt_failure_reports_second_attempt_log(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = pathlib.Path(temporary)

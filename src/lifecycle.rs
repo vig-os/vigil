@@ -49,6 +49,7 @@ pub enum FlushErrorKind {
 /// Concrete error sources are not stable; downcasting is unsupported.
 /// `Error::source()` returns the logs source when present, otherwise the
 /// metrics source. Display keeps each source on its own signal's part.
+/// The `Display` text is for people; it is not part of the stability promise. Match on `kind()`.
 #[derive(Debug)]
 pub struct FlushError {
     kind: FlushErrorKind,
@@ -102,45 +103,49 @@ impl FlushError {
 impl fmt::Display for FlushError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self.kind)?;
-        let logs_part = self.logs != 0 || self.sources[0].is_some();
-        if self.logs != 0 {
-            write!(f, ": at least {} log records lost", self.logs)?;
-        }
-        if let Some(source) = &self.sources[0] {
-            write!(f, ": {source}")?;
+        let mut separator = ": ";
+        let logs_part = self.logs != 0 || self.signal_kinds[0].is_some();
+        if logs_part {
+            write!(f, "{separator}")?;
+            separator = "; ";
+            if self.logs != 0 {
+                write!(f, "at least {} log records lost", self.logs)?;
+            } else {
+                f.write_str(match self.signal_kinds[0] {
+                    Some(FlushErrorKind::Timeout) => "log export timed out",
+                    _ => "log export failed",
+                })?;
+            }
+            if let Some(source) = &self.sources[0] {
+                write!(f, ": {source}")?;
+            }
         }
         if self.measurements != 0 {
             write!(
                 f,
-                "{}at least {} metric measurements lost",
-                if logs_part { "; " } else { ": " },
+                "{separator}at least {} metric measurements lost",
                 self.measurements
             )?;
+            separator = "; ";
         }
         if self.metric_names_poisoned {
             write!(
                 f,
-                "{}metric names poisoned by conflicting declarations",
-                if logs_part || self.measurements != 0 {
-                    "; "
-                } else {
-                    ": "
-                }
+                "{separator}metric names poisoned by conflicting declarations"
             )?;
+            separator = "; ";
         }
-        if logs_part || self.measurements != 0 || self.metric_names_poisoned {
-            match self.signal_kind(Signal::Metrics) {
-                Some(FlushErrorKind::Timeout) => write!(f, "; metric export timed out")?,
-                Some(FlushErrorKind::Failed) => write!(f, "; metric export failed")?,
-                Some(FlushErrorKind::DataLost) if self.data_points_lost => {
-                    write!(f, "; metric data points dropped")?
-                }
-                Some(FlushErrorKind::DataLost) => {}
-                None => return Ok(()),
+        let metric_label = match self.signal_kind(Signal::Metrics) {
+            Some(FlushErrorKind::Timeout) => Some("metric export timed out"),
+            Some(FlushErrorKind::Failed) => Some("metric export failed"),
+            _ if self.data_points_lost => Some("metric data points dropped"),
+            _ => None,
+        };
+        if let Some(label) = metric_label {
+            write!(f, "{separator}{label}")?;
+            if let Some(source) = &self.sources[1] {
+                write!(f, ": {source}")?;
             }
-        }
-        if let Some(source) = &self.sources[1] {
-            write!(f, ": {source}")?;
         }
         Ok(())
     }
@@ -522,6 +527,217 @@ impl Subscriber for ShutdownCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metric_only_error(kind: FlushErrorKind) -> FlushError {
+        FlushError {
+            kind,
+            signal_kinds: [None, Some(kind)],
+            logs: 0,
+            measurements: 0,
+            data_points_lost: false,
+            metric_names_poisoned: false,
+            sources: [None, Some(OTelSdkError::InternalFailure("metrics".into()))],
+        }
+    }
+
+    #[test]
+    fn display_metrics_only_failed() {
+        assert_eq!(
+            metric_only_error(FlushErrorKind::Failed).to_string(),
+            "Failed: metric export failed: Operation failed: metrics"
+        );
+    }
+
+    #[test]
+    fn display_metrics_only_timeout() {
+        assert_eq!(
+            metric_only_error(FlushErrorKind::Timeout).to_string(),
+            "Timeout: metric export timed out: Operation failed: metrics"
+        );
+    }
+
+    #[test]
+    fn display_poisoned_names_with_metric_export_outcomes() {
+        for (kind, expected) in [
+            (
+                FlushErrorKind::Failed,
+                "Failed: metric names poisoned by conflicting declarations; metric export failed: Operation failed: metrics",
+            ),
+            (
+                FlushErrorKind::Timeout,
+                "Timeout: metric names poisoned by conflicting declarations; metric export timed out: Operation failed: metrics",
+            ),
+        ] {
+            let mut error = metric_only_error(kind);
+            error.metric_names_poisoned = true;
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn display_signal_parts() {
+        let cases = [
+            (
+                FlushErrorKind::Failed,
+                None,
+                Some(FlushErrorKind::Failed),
+                0,
+                0,
+                false,
+                false,
+                None,
+                Some("metrics"),
+                "Failed: metric export failed: metrics",
+            ),
+            (
+                FlushErrorKind::Failed,
+                None,
+                Some(FlushErrorKind::Failed),
+                0,
+                0,
+                false,
+                false,
+                None,
+                None,
+                "Failed: metric export failed",
+            ),
+            (
+                FlushErrorKind::Timeout,
+                None,
+                Some(FlushErrorKind::Timeout),
+                0,
+                0,
+                false,
+                false,
+                None,
+                Some("metrics"),
+                "Timeout: metric export timed out: metrics",
+            ),
+            (
+                FlushErrorKind::DataLost,
+                None,
+                Some(FlushErrorKind::DataLost),
+                0,
+                0,
+                true,
+                false,
+                None,
+                None,
+                "DataLost: metric data points dropped",
+            ),
+            (
+                FlushErrorKind::Failed,
+                Some(FlushErrorKind::Failed),
+                None,
+                2,
+                0,
+                false,
+                false,
+                Some("logs"),
+                None,
+                "Failed: at least 2 log records lost: logs",
+            ),
+            (
+                FlushErrorKind::DataLost,
+                Some(FlushErrorKind::DataLost),
+                None,
+                2,
+                0,
+                false,
+                false,
+                None,
+                None,
+                "DataLost: at least 2 log records lost",
+            ),
+            (
+                FlushErrorKind::Failed,
+                Some(FlushErrorKind::Failed),
+                Some(FlushErrorKind::Failed),
+                0,
+                0,
+                false,
+                false,
+                Some("logs"),
+                Some("metrics"),
+                "Failed: log export failed: logs; metric export failed: metrics",
+            ),
+            (
+                FlushErrorKind::DataLost,
+                None,
+                Some(FlushErrorKind::DataLost),
+                0,
+                0,
+                false,
+                true,
+                None,
+                None,
+                "DataLost: metric names poisoned by conflicting declarations",
+            ),
+            (
+                FlushErrorKind::DataLost,
+                None,
+                Some(FlushErrorKind::DataLost),
+                0,
+                3,
+                false,
+                false,
+                None,
+                None,
+                "DataLost: at least 3 metric measurements lost",
+            ),
+            (
+                FlushErrorKind::Timeout,
+                Some(FlushErrorKind::Timeout),
+                None,
+                0,
+                0,
+                false,
+                false,
+                None,
+                None,
+                "Timeout: log export timed out",
+            ),
+        ];
+        for (
+            kind,
+            logs_kind,
+            metrics_kind,
+            logs,
+            measurements,
+            data_points_lost,
+            metric_names_poisoned,
+            logs_source,
+            metrics_source,
+            expected,
+        ) in cases
+        {
+            let error = FlushError {
+                kind,
+                signal_kinds: [logs_kind, metrics_kind],
+                logs,
+                measurements,
+                data_points_lost,
+                metric_names_poisoned,
+                sources: [
+                    logs_source.map(|s: &str| OTelSdkError::InternalFailure(s.into())),
+                    metrics_source.map(|s: &str| OTelSdkError::InternalFailure(s.into())),
+                ],
+            };
+            assert_eq!(
+                error.to_string(),
+                expected
+                    .replace(
+                        "metrics",
+                        &OTelSdkError::InternalFailure("metrics".into()).to_string()
+                    )
+                    .replace(
+                        ": logs",
+                        &format!(": {}", OTelSdkError::InternalFailure("logs".into()))
+                    )
+            );
+        }
+    }
+
     use opentelemetry::logs::{Logger as _, LoggerProvider as _};
     use opentelemetry_sdk::logs::{BatchConfigBuilder, LogBatch, LogExporter, SdkLoggerProvider};
     use std::sync::{atomic::AtomicU64, mpsc};
@@ -633,7 +849,14 @@ mod tests {
             assert_eq!(error.lost(Signal::Metrics), 0);
             assert_eq!(error.lost(Signal::Logs), 0);
             assert!(!error.to_string().contains("log records"));
-            assert_eq!(error.to_string(), format!("{:?}", error.kind()));
+            assert_eq!(
+                error.to_string(),
+                if failed {
+                    "Failed: metric export failed"
+                } else {
+                    "DataLost: metric data points dropped"
+                }
+            );
             assert!(losses.finish(Ok(())).is_ok());
         }
         losses.metric_data_points(true);
