@@ -803,3 +803,21 @@ fn archived_resume_rejects_head_sequence_above_opening_with_right_hash() {
     write_records(&d.0, &[&opening, &wrong]);
     corrupt_open(&d.0);
 }
+
+#[test]
+fn genesis_resume_requires_immediate_matching_declaration() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let genesis = Record::genesis(&TRAIL);
+    let opening = cp(5, genesis, &seeded(&first));
+    let resume = declaration(&opening, 0, genesis, 4, None);
+    write_records(&d.0, &[&opening]);
+    corrupt_open(&d.0);
+    write_records(&d.0, &[&opening, &entry(&opening)]);
+    corrupt_open(&d.0);
+    let wrong = declaration(&opening, 0, [42; 32], 4, None);
+    write_records(&d.0, &[&opening, &wrong]);
+    corrupt_open(&d.0);
+    write_records(&d.0, &[&opening, &resume]);
+    assert_eq!(head(&open(&d.0)), Head::of(&resume));
+}

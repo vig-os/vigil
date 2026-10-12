@@ -56,7 +56,7 @@ impl State {
     /// Advances from known writer output, never from a reread of our own bytes.
     pub(crate) fn after(&self, record: &Record, length: u64) -> Result<Self, AuditError> {
         let mut next = Some(self.clone());
-        apply(record, &mut next)?;
+        apply(record, &mut next, false)?;
         let mut next = next.ok_or_else(|| corrupt("missing written state"))?;
         next.offset = length;
         next.length = length;
@@ -221,10 +221,12 @@ fn initial(dir: &File, trail: [u8; 16], expected: Option<Head>) -> Result<Cache,
     let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
     for name in &names {
         let file = existing(dir, name, false)?;
-        chain = Some(scan(&file, trail, chain, true, expected, &mut found)?);
+        chain = Some(scan(
+            &file, trail, chain, true, expected, &mut found, false,
+        )?);
     }
     let file = existing(dir, Path::new("audit.jsonl"), true)?;
-    let state = scan(&file, trail, chain, true, expected, &mut found)?;
+    let state = scan(&file, trail, chain, true, expected, &mut found, false)?;
     if expected.is_some() && !found {
         return Err(AuditError::new(
             AuditErrorKind::HeadMismatch,
@@ -263,6 +265,7 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
                 false,
                 None,
                 &mut found,
+                false,
             )?;
         }
         return Ok(());
@@ -277,6 +280,7 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
         false,
         None,
         &mut found,
+        false,
     )?;
     // Locate the old descriptor by metadata, never by rereading historical
     // contents. If archived, the previous sealed name remains a lower bound.
@@ -297,10 +301,10 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
             continue;
         }
         let file = existing(dir, name, false)?;
-        state = scan(&file, trail, Some(state), true, None, &mut found)?;
+        state = scan(&file, trail, Some(state), true, None, &mut found, false)?;
     }
     let file = existing(dir, Path::new("audit.jsonl"), true)?;
-    let state = scan(&file, trail, Some(state), true, None, &mut found)?;
+    let state = scan(&file, trail, Some(state), true, None, &mut found, false)?;
     *cache = Cache {
         file,
         state,
@@ -312,6 +316,8 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
 const MAX_READ_BYTES: u64 = MAX_PAYLOAD_BYTES as u64 + 2; // LF plus one excess byte.
 
 /// Bounded reads: each payload is capped even when it is only a fragment.
+/// `genesis` requires a root link when no predecessor exists (staging settlement).
+/// Otherwise decision 2 permits a self-contained archived prefix checkpoint.
 pub(crate) fn scan(
     file: &File,
     trail: [u8; 16],
@@ -319,6 +325,7 @@ pub(crate) fn scan(
     opening: bool,
     expected: Option<Head>,
     found: &mut bool,
+    genesis: bool,
 ) -> Result<State, AuditError> {
     let mut file = file.try_clone().map_err(io_error)?;
     let start = if opening {
@@ -415,7 +422,7 @@ pub(crate) fn scan(
         {
             return Err(corrupt("unclosed segment lacks matching immediate resume"));
         }
-        apply(record, &mut state)?;
+        apply(record, &mut state, genesis)?;
         if !first {
             boundary_resume = false;
         }
@@ -438,21 +445,25 @@ pub(crate) fn scan(
     state.gap = gap;
     Ok(state)
 }
-fn apply(record: &Record, state: &mut Option<State>) -> Result<(), AuditError> {
+fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<(), AuditError> {
     let head = Head::of(record);
+    let root_link =
+        state.is_none() && record.context.previous == Record::genesis(&record.context.trail);
+    // A root checkpoint above zero declares loss and needs an immediate resume;
+    // an archived prefix instead carries its predecessor hash and MMR (d2/d8).
+    let mut pending = state.is_none() && head.seq > 0 && root_link;
     let mut mmr = if let Some(s) = state.as_ref() {
         s.mmr.clone()
     } else {
         let Kind::Checkpoint(cp) = &record.kind else {
             return Err(corrupt("missing initial checkpoint"));
         };
-        if head.seq == 0 && record.context.previous != Record::genesis(&record.context.trail) {
-            return Err(corrupt("creation checkpoint does not link genesis"));
+        if (genesis || head.seq == 0) && !root_link {
+            return Err(corrupt("initial checkpoint does not link genesis"));
         }
         Mmr::from_peaks(cp.size, cp.peaks.clone()).map_err(|_| corrupt("invalid opening peaks"))?
     };
     let prior = state.as_ref().map(|s| s.head);
-    let mut pending = false;
     if let Some(s) = state.as_ref() {
         if head == s.head {
             return Ok(());

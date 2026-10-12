@@ -873,3 +873,40 @@ fn record_at_rotation_limit_stays_in_live_file() {
     assert!(rotate::rotated_names_at(&dir, "audit").unwrap().is_empty());
     s.closed = true;
 }
+
+#[test]
+fn resume_without_predecessor_discards_non_genesis_link() {
+    let t = Temp::new();
+    let mut s = create(&t);
+    s.closed = true;
+    let mut state = predecessor(&File::open(&t.0).unwrap(), s.trail)
+        .unwrap()
+        .unwrap();
+    state.head.hash = [42; 32];
+    let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume");
+    fs::remove_file(t.0.join("audit.jsonl")).unwrap();
+    fs::write(t.0.join(".audit-resume.jsonl"), staged).unwrap();
+    bad_open(&t, None, AuditErrorKind::CorruptTrail);
+    assert!(!t.0.join(".audit-resume.jsonl").exists());
+    assert!(!t.0.join("audit.jsonl").exists());
+    assert!(t.0.join("audit.trail").exists());
+}
+
+#[test]
+fn resume_without_predecessor_promotes_genesis_link() {
+    let t = Temp::new();
+    let mut s = create(&t);
+    s.closed = true;
+    let mut state = predecessor(&File::open(&t.0).unwrap(), s.trail)
+        .unwrap()
+        .unwrap();
+    state.head.hash = Record::genesis(&s.trail);
+    let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume");
+    fs::remove_file(t.0.join("audit.jsonl")).unwrap();
+    fs::write(t.0.join(".audit-resume.jsonl"), &staged).unwrap();
+    let mut reopened = open(&t);
+    reopened.closed = true;
+    assert_eq!(bytes(&t), staged);
+    assert_eq!(scan_head(&reopened).seq, 6);
+    assert!(!t.0.join(".audit-resume.jsonl").exists());
+}

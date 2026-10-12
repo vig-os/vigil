@@ -205,6 +205,7 @@ fn predecessor(dir: &File, trail: [u8; 16]) -> Result<Option<State>, AuditError>
             true,
             None,
             &mut false,
+            false,
         )?);
     }
     if exists(dir, "audit.jsonl")? && !linked_live(dir)? {
@@ -215,6 +216,7 @@ fn predecessor(dir: &File, trail: [u8; 16]) -> Result<Option<State>, AuditError>
             true,
             None,
             &mut false,
+            false,
         )?);
     }
     Ok(state)
@@ -257,8 +259,8 @@ fn settle(dir: &File, trail: [u8; 16], poisoned: &AtomicBool) -> Result<(), Audi
             if count == 1 && first.context.seq != seq {
                 return false;
             }
-            // Scan enforces hash links, forward sequence and immediate resume action for discard.
-            scan(&staged, trail, prior.clone(), true, None, &mut false).is_ok()
+            // Scan enforces predecessor/genesis links, forward sequence and immediate resume action.
+            scan(&staged, trail, prior.clone(), true, None, &mut false, true).is_ok()
         });
         if valid {
             if exists(dir, "audit.jsonl")? {
