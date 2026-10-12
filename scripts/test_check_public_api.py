@@ -42,6 +42,25 @@ class PublicApiTests(unittest.TestCase):
             self.allowed,
         )
 
+    def test_const_functions_keep_function_kind_and_adr_checks(self):
+        validate(
+            self.listing + "pub const fn vigil::Config::layer()\n",
+            self.document,
+            self.allowed,
+        )
+        with self.assertRaisesRegex(ValueError, "ADR justification"):
+            validate(
+                self.listing + "pub const fn vigil::unjustified()\n",
+                self.document,
+                self.allowed,
+            )
+        with self.assertRaisesRegex(ValueError, "kind mismatch"):
+            validate(
+                self.listing + "pub const fn vigil::VERSION()\n",
+                self.document,
+                self.allowed,
+            )
+
     def test_new_owned_item_needs_adr_even_with_updated_snapshot(self):
         with self.assertRaisesRegex(ValueError, "ADR justification"):
             validate(

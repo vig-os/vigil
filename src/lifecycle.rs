@@ -54,6 +54,8 @@ pub struct FlushError {
     kind: FlushErrorKind,
     signal_kinds: [Option<FlushErrorKind>; 2],
     logs: u64,
+    measurements: u64,
+    data_points_lost: bool,
     sources: [Option<OTelSdkError>; 2],
 }
 impl FlushError {
@@ -81,15 +83,16 @@ impl FlushError {
     /// or worker disconnection can be lost without being counted.
     ///
     /// A failed durable log line counts its records even if another copy
-    /// reached a remote receiver. Metrics and traces currently return zero;
-    /// their implementations land in #7/#8. Metrics will count measurements
+    /// reached a remote receiver. Traces currently return zero; their
+    /// implementation lands in #8. Metrics count measurements
     /// that never reached the SDK, excluding data-point export failures and
     /// measurements aggregated before a later name conflict (ADR-0003 d23).
     /// Records rejected after shutdown begins are not counted.
     pub fn lost(&self, signal: Signal) -> u64 {
         match signal {
             Signal::Logs => self.logs,
-            Signal::Metrics | Signal::Traces => 0,
+            Signal::Metrics => self.measurements,
+            Signal::Traces => 0,
         }
     }
 }
@@ -103,11 +106,22 @@ impl fmt::Display for FlushError {
         if let Some(source) = &self.sources[0] {
             write!(f, ": {source}")?;
         }
-        if logs_part {
+        if self.measurements != 0 {
+            write!(
+                f,
+                "{}at least {} metric measurements lost",
+                if logs_part { "; " } else { ": " },
+                self.measurements
+            )?;
+        }
+        if logs_part || self.measurements != 0 {
             match self.signal_kind(Signal::Metrics) {
                 Some(FlushErrorKind::Timeout) => write!(f, "; metric export timed out")?,
                 Some(FlushErrorKind::Failed) => write!(f, "; metric export failed")?,
-                Some(FlushErrorKind::DataLost) => write!(f, "; metric data points dropped")?,
+                Some(FlushErrorKind::DataLost) if self.data_points_lost => {
+                    write!(f, "; metric data points dropped")?
+                }
+                Some(FlushErrorKind::DataLost) => {}
                 None => return Ok(()),
             }
         }
@@ -129,6 +143,7 @@ impl std::error::Error for FlushError {
 #[derive(Debug, Default)]
 struct Period {
     logs: u64,
+    measurements: u64,
     metrics_failed: bool,
     metrics_data_lost: bool,
     failed: bool,
@@ -144,6 +159,8 @@ struct State {
     overflow_reported: u64,
     sdk_overflow: u64,
     pending_stderr: u64,
+    #[cfg(feature = "metrics")]
+    pending_measurements: u64,
     pending_failed: bool,
     #[cfg(feature = "metrics")]
     pending_points: u64,
@@ -190,6 +207,21 @@ impl Losses {
         state.period.failed |= failed;
         state.pending_failed |= failed;
         state.pending_stderr = state.pending_stderr.saturating_add(logs);
+    }
+    #[cfg(feature = "metrics")]
+    pub(crate) fn measurements_dropped(&self, n: u64) {
+        let mut state = self.state();
+        state.period.measurements = state.period.measurements.saturating_add(n);
+        state.pending_measurements = state.pending_measurements.saturating_add(n);
+    }
+    #[cfg(feature = "metrics")]
+    pub(crate) fn measurements_reported_at_start(&self, n: u64) {
+        let mut state = self.state();
+        state.period.measurements = state.period.measurements.saturating_add(n);
+    }
+    #[cfg(feature = "metrics")]
+    pub(crate) fn pending_measurements(&self) -> u64 {
+        self.state().pending_measurements
     }
     #[cfg(feature = "metrics")]
     pub(crate) fn metric_data_points(&self, failed: bool) {
@@ -271,6 +303,8 @@ impl Losses {
         result: OTelSdkResult,
         metrics: OTelSdkResult,
     ) -> Result<(), FlushError> {
+        #[cfg(feature = "metrics")]
+        crate::metrics::drain_before_init(self, false);
         let mut period = std::mem::take(&mut self.state().period);
         // Each caller retains its own outcome even if another concurrent
         // flush consumed the period's shared counts and exporter flags.
@@ -283,7 +317,7 @@ impl Losses {
             FlushErrorKind::Timeout
         } else if period.failed || period.metrics_failed || result.is_err() {
             FlushErrorKind::Failed
-        } else if period.logs != 0 || period.metrics_data_lost {
+        } else if period.logs != 0 || period.measurements != 0 || period.metrics_data_lost {
             FlushErrorKind::DataLost
         } else {
             return Ok(());
@@ -310,10 +344,12 @@ impl Losses {
                 signal_kind(
                     period.metrics_timeout,
                     period.metrics_failed,
-                    period.metrics_data_lost,
+                    period.metrics_data_lost || period.measurements != 0,
                 ),
             ],
             logs: period.logs,
+            measurements: period.measurements,
+            data_points_lost: period.metrics_data_lost,
             sources: [result.err(), metrics.err()],
         })
     }

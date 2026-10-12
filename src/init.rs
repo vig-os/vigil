@@ -4,7 +4,7 @@ use std::{
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -90,7 +90,21 @@ impl InitError {
 }
 
 const MAX_QUEUE_SIZE: usize = 1_048_576;
-static PIPELINE: AtomicBool = AtomicBool::new(false);
+static RESERVED: AtomicBool = AtomicBool::new(false);
+static PIPELINE: OnceLock<PublishedPipeline> = OnceLock::new();
+
+pub(crate) struct PublishedPipeline {
+    #[cfg(feature = "metrics")]
+    pub(crate) metrics: Option<SdkMeterProvider>,
+    #[cfg(feature = "metrics")]
+    pub(crate) losses: Arc<Losses>,
+    #[cfg(feature = "metrics")]
+    pub(crate) stopped: Arc<AtomicBool>,
+}
+#[cfg(feature = "metrics")]
+pub(crate) fn published_pipeline() -> Option<&'static PublishedPipeline> {
+    PIPELINE.get()
+}
 type PipelineLayer<S> = Box<dyn Layer<S> + Send + Sync + 'static>;
 
 // A failed attempt releases the reservation; successful pipelines retain it
@@ -98,7 +112,7 @@ type PipelineLayer<S> = Box<dyn Layer<S> + Send + Sync + 'static>;
 struct Reservation(bool);
 impl Reservation {
     fn acquire() -> Result<Self, InitError> {
-        PIPELINE
+        RESERVED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| Self(true))
             .map_err(|_| {
@@ -108,14 +122,27 @@ impl Reservation {
                 )
             })
     }
-    fn commit(mut self) {
+    fn commit(mut self, _guard: &Guard) {
+        let published = PublishedPipeline {
+            #[cfg(feature = "metrics")]
+            metrics: _guard.metrics.clone(),
+            #[cfg(feature = "metrics")]
+            losses: _guard.losses.clone(),
+            #[cfg(feature = "metrics")]
+            stopped: _guard.stopped.clone(),
+        };
+        let _ = PIPELINE.set(published);
+        #[cfg(feature = "metrics")]
+        if let Some(pipeline) = PIPELINE.get() {
+            crate::metrics::drain_before_init(&pipeline.losses, true);
+        }
         self.0 = false;
     }
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
         if self.0 {
-            PIPELINE.store(false, Ordering::Release);
+            RESERVED.store(false, Ordering::Release);
         }
     }
 }
@@ -240,7 +267,6 @@ impl MetricFlushes {
 #[derive(Debug)]
 pub struct Guard {
     provider: Option<SdkLoggerProvider>,
-    // 7b2: d9 pipeline slot
     #[cfg(feature = "metrics")]
     metrics: Option<SdkMeterProvider>,
     #[cfg(feature = "metrics")]
@@ -458,6 +484,11 @@ impl Guard {
         #[cfg(feature = "metrics")]
         {
             let (points, failed) = self.losses.pending_metrics();
+            let measurements = if dropping {
+                self.losses.pending_measurements()
+            } else {
+                0
+            };
             let kind = error
                 .and_then(|error| error.signal_kind(Signal::Metrics))
                 .unwrap_or(if failed {
@@ -466,10 +497,14 @@ impl Guard {
                     FlushErrorKind::DataLost
                 });
             if points != 0
+                || measurements != 0
                 || (dropping && kind != FlushErrorKind::DataLost)
                 || kind == FlushErrorKind::Timeout
             {
                 let _ = write!(std::io::stderr(), "vigil: metric shutdown: {kind:?}");
+                if measurements != 0 {
+                    let _ = write!(std::io::stderr(), "; dropped measurements: {measurements}");
+                }
                 if points != 0 {
                     let _ = write!(std::io::stderr(), "; dropped data points: {points}");
                 }
@@ -696,7 +731,7 @@ impl Config {
     }
 
     fn init_with(self, before_install: impl FnOnce(&Guard)) -> Result<Guard, InitError> {
-        if PIPELINE.load(Ordering::Acquire) {
+        if RESERVED.load(Ordering::Acquire) {
             return Err(InitError::new(
                 InitErrorKind::AlreadyRunning,
                 "vigil pipeline already initialized in this process",
@@ -721,7 +756,7 @@ impl Config {
                 source: Some(Box::new(source)),
             });
         }
-        reservation.commit();
+        reservation.commit(&guard);
         if tracing_log::LogTracer::init().is_err() {
             let _ = writeln!(
                 std::io::stderr(),
@@ -768,7 +803,7 @@ impl Config {
     {
         let reservation = Reservation::acquire()?;
         let result = self.build_layer()?;
-        reservation.commit();
+        reservation.commit(&result.1);
         Ok(result)
     }
 
@@ -2739,5 +2774,53 @@ mod metrics_rotation_tests {
         assert!(logs_writer.shares_lock(&metrics_writer));
         drop((logs_writer, metrics_writer));
         fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod facade_publication_tests {
+    use super::*;
+    use crate::metrics::Counter;
+
+    #[test]
+    fn pending_reservation_and_failed_install_do_not_publish_or_consume_records() {
+        if !crate::subscriber_test_child(
+            "init::facade_publication_tests::pending_reservation_and_failed_install_do_not_publish_or_consume_records",
+        ) {
+            return;
+        }
+        let dir = env::temp_dir().join(format!("vigil-facade-pending-{}", std::process::id()));
+        static C: Counter = Counter::new(crate::scope!(), "pending");
+        C.add(1, &[]);
+        let error = Config::new("pending")
+            .dir(&dir)
+            .init_with(|_| {
+                assert!(published_pipeline().is_none());
+                C.add(1, &[]);
+                assert_eq!(
+                    Config::new("second")
+                        .layer::<Registry>()
+                        .err()
+                        .unwrap()
+                        .kind(),
+                    InitErrorKind::AlreadyRunning
+                );
+                // Force the global installation failure after providers have been built.
+                tracing::subscriber::set_global_default(tracing_subscriber::registry()).unwrap();
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), InitErrorKind::ForeignSubscriber);
+        assert!(published_pipeline().is_none());
+        let (_, guard) = Config::new("retry").dir(&dir).layer::<Registry>().unwrap();
+        C.add(7, &[]);
+        assert_eq!(guard.flush().unwrap_err().lost(Signal::Metrics), 2);
+        guard.shutdown().unwrap();
+        let text = std::fs::read_to_string(dir.join("metrics.jsonl")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            json["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"][0]["asInt"],
+            7
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

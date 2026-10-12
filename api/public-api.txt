@@ -96,6 +96,76 @@ impl vigil::audit::Signer for vigil::audit::KeyFileSigner
 pub fn vigil::audit::KeyFileSigner::public_key(&self) -> [u8; 32]
 pub fn vigil::audit::KeyFileSigner::sign(&self, message: &[u8]) -> core::result::Result<[u8; 64], vigil::audit::SignerError>
 pub fn vigil::audit::keygen(path: impl core::convert::AsRef<std::path::Path>) -> core::result::Result<[u8; 32], vigil::audit::SignerError>
+pub mod vigil::metrics
+#[non_exhaustive] pub enum vigil::metrics::Value
+pub vigil::metrics::Value::Bool(bool)
+pub vigil::metrics::Value::F64(f64)
+pub vigil::metrics::Value::I64(i64)
+pub vigil::metrics::Value::Str(alloc::borrow::Cow<'static, str>)
+impl core::convert::From<&'static str> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: &'static str) -> Self
+impl core::convert::From<alloc::string::String> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: alloc::string::String) -> Self
+impl core::convert::From<bool> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: bool) -> Self
+impl core::convert::From<f32> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: f32) -> Self
+impl core::convert::From<f64> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: f64) -> Self
+impl core::convert::From<i16> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: i16) -> Self
+impl core::convert::From<i32> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: i32) -> Self
+impl core::convert::From<i64> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: i64) -> Self
+impl core::convert::From<i8> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: i8) -> Self
+impl core::convert::From<isize> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: isize) -> Self
+impl core::convert::From<u16> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: u16) -> Self
+impl core::convert::From<u32> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: u32) -> Self
+impl core::convert::From<u64> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: u64) -> Self
+impl core::convert::From<u8> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: u8) -> Self
+impl core::convert::From<usize> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: usize) -> Self
+pub struct vigil::metrics::Counter(_)
+impl vigil::metrics::Counter
+pub fn vigil::metrics::Counter::add(&self, value: u64, attrs: &[(&'static str, vigil::metrics::Value)])
+pub const fn vigil::metrics::Counter::new(scope: vigil::metrics::Scope, name: &'static str) -> Self
+pub const fn vigil::metrics::Counter::with_description(self, description: &'static str) -> Self
+pub const fn vigil::metrics::Counter::with_unit(self, unit: &'static str) -> Self
+pub struct vigil::metrics::CounterF64(_)
+impl vigil::metrics::CounterF64
+pub fn vigil::metrics::CounterF64::add(&self, value: f64, attrs: &[(&'static str, vigil::metrics::Value)])
+pub const fn vigil::metrics::CounterF64::new(scope: vigil::metrics::Scope, name: &'static str) -> Self
+pub const fn vigil::metrics::CounterF64::with_description(self, description: &'static str) -> Self
+pub const fn vigil::metrics::CounterF64::with_unit(self, unit: &'static str) -> Self
+pub struct vigil::metrics::Gauge(_)
+impl vigil::metrics::Gauge
+pub const fn vigil::metrics::Gauge::new(scope: vigil::metrics::Scope, name: &'static str) -> Self
+pub fn vigil::metrics::Gauge::record(&self, value: f64, attrs: &[(&'static str, vigil::metrics::Value)])
+pub const fn vigil::metrics::Gauge::with_description(self, description: &'static str) -> Self
+pub const fn vigil::metrics::Gauge::with_unit(self, unit: &'static str) -> Self
+pub struct vigil::metrics::Histogram(_)
+impl vigil::metrics::Histogram
+pub const fn vigil::metrics::Histogram::new(scope: vigil::metrics::Scope, name: &'static str) -> Self
+pub fn vigil::metrics::Histogram::record(&self, value: f64, attrs: &[(&'static str, vigil::metrics::Value)])
+pub const fn vigil::metrics::Histogram::with_boundaries(self, boundaries: &'static [f64]) -> Self
+pub const fn vigil::metrics::Histogram::with_description(self, description: &'static str) -> Self
+pub const fn vigil::metrics::Histogram::with_unit(self, unit: &'static str) -> Self
+pub struct vigil::metrics::Scope
+impl vigil::metrics::Scope
+pub const fn vigil::metrics::Scope::new(name: &'static str, version: &'static str) -> Self
+pub struct vigil::metrics::UpDownCounter(_)
+impl vigil::metrics::UpDownCounter
+pub fn vigil::metrics::UpDownCounter::add(&self, value: i64, attrs: &[(&'static str, vigil::metrics::Value)])
+pub const fn vigil::metrics::UpDownCounter::new(scope: vigil::metrics::Scope, name: &'static str) -> Self
+pub const fn vigil::metrics::UpDownCounter::with_description(self, description: &'static str) -> Self
+pub const fn vigil::metrics::UpDownCounter::with_unit(self, unit: &'static str) -> Self
 pub mod vigil::rotate
 pub struct vigil::rotate::RotatingFile
 impl vigil::rotate::RotatingFile
@@ -113,6 +183,7 @@ pub fn vigil::rotate::find_newest<T>(dir: &std::path::Path, signal: &str, pick: 
 pub fn vigil::rotate::read_since(dir: &std::path::Path, signal: &str, since: core::option::Option<std::time::SystemTime>) -> std::io::error::Result<alloc::vec::Vec<alloc::string::String>>
 pub fn vigil::rotate::segments(dir: &std::path::Path, signal: &str) -> std::io::error::Result<alloc::vec::Vec<std::path::PathBuf>>
 pub fn vigil::rotate::segments_since(dir: &std::path::Path, signal: &str, since: core::option::Option<std::time::SystemTime>) -> std::io::error::Result<alloc::vec::Vec<std::path::PathBuf>>
+pub macro vigil::scope!
 #[non_exhaustive] pub enum vigil::Console
 pub vigil::Console::Off
 pub vigil::Console::Stderr
