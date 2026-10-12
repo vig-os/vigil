@@ -82,7 +82,8 @@ are dropped and counted, with one report when the pipeline starts. Metrics use
 Conflicting declarations poison every name involved: future records are dropped,
 and exports remove all streams under those names. Conflicts include incompatible
 kinds, units or histogram boundaries, spelling or description differences within
-one scope, and overlapping Prometheus series names (ADR-0003 d21). Compatible
+one scope, and overlapping Prometheus series names within a scope or between
+incompatible pairs across scopes (ADR-0003 d21). Compatible
 sharing across scopes requires Prometheus `otlp.promote_scope_metadata: true`;
 vigil prints a reminder once per shared name.
 

@@ -18,18 +18,20 @@ pub(crate) enum Kind {
     Gauge,
     Histogram,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct Declaration {
     pub(crate) scope: (&'static str, &'static str),
     pub(crate) name: &'static str,
     pub(crate) kind: Kind,
     pub(crate) unit: &'static str,
     pub(crate) description: &'static str,
-    pub(crate) boundaries: Option<&'static [f64]>,
+    pub(crate) boundaries: Option<Vec<f64>>,
 }
 impl Declaration {
     fn compatible(&self, other: &Self) -> bool {
-        self.kind == other.kind && self.unit == other.unit && self.boundaries == other.boundaries
+        self.kind == other.kind
+            && self.unit == other.unit
+            && compare_boundaries(self.boundaries.as_deref(), other.boundaries.as_deref()).is_eq()
     }
     fn conflicts(&self, other: &Self, overlap: bool) -> bool {
         if self == other {
@@ -37,11 +39,7 @@ impl Declaration {
         }
         let same_name = self.name.eq_ignore_ascii_case(other.name);
         if self.scope == other.scope {
-            overlap
-                || (same_name
-                    && (!self.compatible(other)
-                        || self.name != other.name
-                        || self.description != other.description))
+            overlap || (same_name && (!self.compatible(other) || self.name != other.name))
         } else {
             (same_name && !self.compatible(other))
                 || (overlap && (self.kind != other.kind || self.unit != other.unit))
@@ -62,18 +60,46 @@ impl Declaration {
                 other.unit,
                 other.description,
             ))
-            .then_with(|| match (self.boundaries, other.boundaries) {
-                (None, None) => std::cmp::Ordering::Equal,
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                (Some(a), Some(b)) => a
-                    .iter()
-                    .zip(b)
-                    .map(|(a, b)| a.total_cmp(b))
-                    .find(|o| !o.is_eq())
-                    .unwrap_or_else(|| a.len().cmp(&b.len())),
+            .then_with(|| {
+                compare_boundaries(self.boundaries.as_deref(), other.boundaries.as_deref())
             })
     }
+}
+impl PartialEq for Declaration {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for Declaration {}
+impl PartialOrd for Declaration {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Declaration {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.compare(other)
+    }
+}
+fn compare_boundaries(a: Option<&[f64]>, b: Option<&[f64]>) -> std::cmp::Ordering {
+    match (a, b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(a), Some(b)) => a
+            .iter()
+            .zip(b)
+            .map(|(a, b)| a.total_cmp(b))
+            .find(|o| !o.is_eq())
+            .unwrap_or_else(|| a.len().cmp(&b.len())),
+    }
+}
+/// Canonicalize before constructing registry declarations and SDK instruments.
+pub(crate) fn canonical_boundaries(boundaries: &[f64]) -> Vec<f64> {
+    boundaries
+        .iter()
+        .map(|&value| if value == 0.0 { 0.0 } else { value })
+        .collect()
 }
 #[derive(Debug, Default)]
 struct Name {

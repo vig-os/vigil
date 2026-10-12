@@ -175,7 +175,9 @@ impl<T> Declaration<T> {
                         kind,
                         unit: self.unit,
                         description: self.description,
-                        boundaries: self.boundaries,
+                        boundaries: self
+                            .boundaries
+                            .map(crate::metric_identity::canonical_boundaries),
                     };
                     let scope = InstrumentationScope::builder(self.scope.name)
                         .with_version(self.scope.version)
@@ -403,6 +405,7 @@ impl Histogram {
     }
     /// An empty slice exports count, sum, min and max with no buckets; not
     /// calling this builder (`None`) keeps the SDK default boundaries.
+    /// -0.0 is exported as 0.0.
     ///
     /// # Panics
     /// Panics if boundaries are non-finite or not strictly increasing.
@@ -421,7 +424,8 @@ impl Histogram {
                 .with_unit(self.0.unit)
                 .with_description(self.0.description);
             if let Some(boundaries) = self.0.boundaries {
-                builder = builder.with_boundaries(boundaries.to_vec());
+                builder = builder
+                    .with_boundaries(crate::metric_identity::canonical_boundaries(boundaries));
             }
             builder.build()
         }) {
