@@ -125,8 +125,9 @@ and `HOME` are ignored, with rejected values explained if no path is available. 
 at the next prune. Explicit `retention(None)` overrides the environment.
 Explicit `Config` values override environment values.
 `Config::revision` or `VIGIL_VCS_REVISION` supplies the producer commit.
-Storage initialization failures emit one warning and fall back to stderr;
-a second initialization returns an error before creating storage. An existing
+Log storage initialization failures make logs fall back to stderr; metrics
+storage initialization failures disable metrics with their own warning.
+A second initialization returns an error before creating storage. An existing
 `log` logger is preserved: initialization succeeds with one warning that `log`
 records cannot reach vigil; tracing events continue to be written.
 
@@ -134,7 +135,8 @@ Call `init` **after forking**. A child forked after initialization inherits the
 parent's directory lock and subscriber but has no batch worker; it cannot safely
 continue using that logging instance.
 
-Storage-open failures fall back to stderr. Runtime export failures drop the affected
+Log storage-open failures fall back to stderr; metrics storage failures disable
+metrics with their own warning. Runtime export failures drop the affected
 records: the first error is reported on stderr, followed by cumulative dropped-record
 summaries at most once per minute during failing exports and at shutdown if needed.
 After the guard drops, events are discarded with one stderr warning.
@@ -148,7 +150,8 @@ filter and terminal-only ANSI. Its format may change; do not parse it.
 `Config::layer` composes into your own `tracing_subscriber::registry()` with
 per-layer filters, so your other layers keep their own filtering.
 See `examples/flock.rs`. `Guard::dir()` gives the actual directory, or `None`
-for stderr fallback. One successful `init` or `layer` permanently occupies
+when logs fell back to stderr; metrics may still write `metrics.jsonl`.
+One successful `init` or `layer` permanently occupies
 the process slot; later attempts return `AlreadyRunning`, even after shutdown.
 A previously set global or scoped default subscriber returns `ForeignSubscriber`,
 even after the scope ends; compose a layer
@@ -161,8 +164,12 @@ with a warning naming the instance identity generation failure. The synchronous 
 explicitly sets its queue size, batch size and delay; `OTEL_BLRP_*` variables do
 not configure vigil.
 
-`Guard::flush()` exports queued logs with a five-second timeout; `shutdown()`
+`Guard::flush()` exports queued logs and collects and exports metrics with a
+five-second timeout; `shutdown()`
 uses the same timeout and `shutdown_with_timeout(Duration)` accepts another.
+A blocked metrics export can hold shutdown for the SDK reader's fixed five seconds
+even with a shorter timeout, returning metrics `Timeout` (ADR-0003 decision 4;
+[shorter-wait follow-up #112](https://github.com/vig-os/vigil/issues/112)).
 They return
 `FlushError` with `Timeout`, `Failed` or `DataLost` (in that precedence order).
 `lost(Signal::Logs)` counts failed exports, diagnostic replacements and queue
@@ -172,12 +179,14 @@ and consumer filters. Counts are exact with quiescent producers and a successful
 drain; concurrent arrivals can reduce the overflow lower bound, and timed-out or
 failed drains do not count records still queued or in flight. Concurrent records
 during shutdown may arrive after its watermark/counter or worker has stopped.
-More than 64 concurrent flush requests can fill the SDK control channel and return
+More than 64 concurrent flush requests can fill the logs SDK control channel
+and return
 `Failed`. If creating the shutdown thread fails, shutdown runs inline.
 A failed durable log line counts its records even if another copy was delivered;
 records on earlier successful lines are excluded. Records emitted after shutdown
-begins are rejected with one warning and are not counted. Stderr fallback returns
-success. Explicit shutdown makes Drop a no-op and returns countable losses without
+begins are rejected with one warning and are not counted. Logs falling back to
+stderr contribute no error; metrics still report their outcome. Explicit shutdown
+makes Drop a no-op and returns countable losses without
 printing them again; Drop reports only losses not yet printed on stderr, naming the actual outcome.
 
 ## Testing consumers

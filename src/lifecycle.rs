@@ -47,14 +47,14 @@ pub enum FlushErrorKind {
 
 /// A flush/shutdown error with per-signal lower bounds on loss.
 /// Concrete error sources are not stable; downcasting is unsupported.
+/// `Error::source()` returns the logs source when present, otherwise the
+/// metrics source. Display keeps each source on its own signal's part.
 #[derive(Debug)]
 pub struct FlushError {
     kind: FlushErrorKind,
     signal_kinds: [Option<FlushErrorKind>; 2],
     logs: u64,
-    metrics_failed: bool,
-    metrics_data_lost: bool,
-    source: Option<OTelSdkError>,
+    sources: [Option<OTelSdkError>; 2],
 }
 impl FlushError {
     /// The highest-priority outcome: Timeout, then Failed, then DataLost.
@@ -96,27 +96,33 @@ impl FlushError {
 impl fmt::Display for FlushError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self.kind)?;
+        let logs_part = self.logs != 0 || self.sources[0].is_some();
         if self.logs != 0 {
             write!(f, ": at least {} log records lost", self.logs)?;
         }
-        if let Some(source) = &self.source {
+        if let Some(source) = &self.sources[0] {
             write!(f, ": {source}")?;
         }
-        if self.logs != 0 {
-            if self.signal_kind(Signal::Metrics) == Some(FlushErrorKind::Timeout) {
-                write!(f, "; metric export timed out")?;
-            } else if self.metrics_failed {
-                write!(f, "; metric export failed")?;
-            } else if self.metrics_data_lost {
-                write!(f, "; metric data points dropped")?;
+        if logs_part {
+            match self.signal_kind(Signal::Metrics) {
+                Some(FlushErrorKind::Timeout) => write!(f, "; metric export timed out")?,
+                Some(FlushErrorKind::Failed) => write!(f, "; metric export failed")?,
+                Some(FlushErrorKind::DataLost) => write!(f, "; metric data points dropped")?,
+                None => return Ok(()),
             }
+        }
+        if let Some(source) = &self.sources[1] {
+            write!(f, ": {source}")?;
         }
         Ok(())
     }
 }
 impl std::error::Error for FlushError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|source| source as _)
+        self.sources[0]
+            .as_ref()
+            .or(self.sources[1].as_ref())
+            .map(|source| source as _)
     }
 }
 
@@ -256,6 +262,7 @@ impl Losses {
             Self::overflow(&mut state, total);
         }
     }
+    #[cfg(test)]
     pub(crate) fn finish(&self, result: OTelSdkResult) -> Result<(), FlushError> {
         self.finish_signals(result, Ok(()))
     }
@@ -307,9 +314,7 @@ impl Losses {
                 ),
             ],
             logs: period.logs,
-            metrics_failed: period.metrics_failed,
-            metrics_data_lost: period.metrics_data_lost,
-            source: result.err().or_else(|| metrics.err()),
+            sources: [result.err(), metrics.err()],
         })
     }
 
@@ -636,27 +641,37 @@ mod tests {
 
     #[test]
     fn display_orders_log_losses_before_metric_timeout_or_failure() {
-        for outcome in [
-            OTelSdkError::Timeout(Duration::from_secs(1)),
-            OTelSdkError::InternalFailure("source detail".into()),
-        ] {
-            let losses = Losses::default();
-            losses.record(2, false);
-            let timeout = matches!(outcome, OTelSdkError::Timeout(_));
-            let source = outcome.to_string();
-            let error = losses.finish_signals(Ok(()), Err(outcome)).unwrap_err();
-            let text = error.to_string();
-            let suffix = if timeout {
-                "; metric export timed out"
-            } else {
-                "; metric export failed"
-            };
-            assert!(text.ends_with(suffix), "{text}");
-            assert!(
-                text.contains(&format!("2 log records lost: {source}")),
-                "{text}"
-            );
-        }
+        let losses = Losses::default();
+        losses.record(2, false);
+        let metrics = OTelSdkError::Timeout(Duration::from_secs(1));
+        let metrics_text = metrics.to_string();
+        let error = losses.finish_signals(Ok(()), Err(metrics)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Timeout: at least 2 log records lost; metric export timed out: {metrics_text}"
+            )
+        );
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            metrics_text
+        );
+        losses.record(2, false);
+        let logs = OTelSdkError::InternalFailure("logs source".into());
+        let metrics = OTelSdkError::InternalFailure("metrics source".into());
+        let logs_text = logs.to_string();
+        let metrics_text = metrics.to_string();
+        let error = losses.finish_signals(Err(logs), Err(metrics)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Failed: at least 2 log records lost: {logs_text}; metric export failed: {metrics_text}"
+            )
+        );
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            logs_text
+        );
     }
 
     #[test]

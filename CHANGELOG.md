@@ -11,7 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Public audit writer surface (`AuditConfig`, `AuditTrail`, `Receipt`) and optional log mirroring ([#11](https://github.com/vig-os/vigil/issues/11)).
 - `Config::metrics` and `Config::metrics_interval` configure the metrics pipeline and periodic collection ([#7](https://github.com/vig-os/vigil/issues/7)).
-
 - Audit writer crash evidence: sealing and creation matrices, concurrent SIGKILL repairs, clean-stop heads and generated truncation properties ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 
 - Audit fsync poisoning scope: staging rollback, shared barriers after renames, inert poisoned handles and Drop diagnostics, with durable-state replay tests and restart-first poison clearing ([#11](https://github.com/vig-os/vigil/issues/11), [#90](https://github.com/vig-os/vigil/issues/90)).
@@ -60,7 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Provisional audit format primitives require `vigil_unstable` ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - `FlushError::Display` preserves source errors and describes losses per signal; `Guard` final summaries now cover metrics, with independent logs fallback, concurrent shutdown and bounded metrics flush ([#7](https://github.com/vig-os/vigil/issues/7)).
-
 - Audit `Record::new` rejects actions starting with `vigil.audit.` with `InvalidEntry`, reserving that prefix for internal records ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - Log scope order on attribute ties now follows the documented total order ([#7](https://github.com/vig-os/vigil/issues/7)).
 - Deny missing public documentation and missing error/panic sections across stable and unstable APIs with all features in flake and CI checks ([#44](https://github.com/vig-os/vigil/issues/44)).

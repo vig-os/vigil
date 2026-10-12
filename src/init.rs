@@ -337,6 +337,9 @@ impl Guard {
     /// Flush and stop with an explicit timeout. Queued records may be lost
     /// on timeout; the SDK worker may continue until storage unblocks.
     /// If a shutdown thread cannot be created, shutdown runs inline.
+    /// The timeout bounds vigil's waits, but SDK 0.33's periodic reader can
+    /// hold a blocked metrics shutdown for its fixed five seconds even with a
+    /// shorter timeout, returning metrics `Timeout` ([ADR-0003 decision 4](https://github.com/vig-os/vigil/blob/dev/docs/adr/0003-metrics-and-traces.md#decision)).
     ///
     /// # Errors
     /// Returns timeout, SDK/sink failure or data loss. See `FlushError::lost`.
@@ -406,7 +409,7 @@ impl Guard {
                 Err(_) => logs_shutdown(),
             };
             #[cfg(feature = "metrics")]
-            {
+            let metrics = {
                 let metrics = match metrics_thread {
                     Ok(thread) => thread.join().unwrap_or_else(|_| {
                         Err(OTelSdkError::InternalFailure(
@@ -416,13 +419,16 @@ impl Guard {
                     Err(_) => metrics_shutdown(),
                 };
                 self.losses.outcome(Signal::Metrics, &metrics);
-            }
+                metrics
+            };
+            #[cfg(not(feature = "metrics"))]
+            let metrics = Ok(());
             self.losses.outcome(Signal::Logs, &logs);
-            logs
+            (logs, metrics)
         });
         #[cfg(not(feature = "metrics"))]
         let _ = metrics_builder;
-        self.losses.finish(result)
+        self.losses.finish_signals(result.0, result.1)
     }
 
     fn summaries(&self, error: Option<&FlushError>, dropping: bool) {
@@ -1782,6 +1788,12 @@ mod metrics_lifecycle_tests {
             Some(FlushErrorKind::Failed)
         );
         assert_eq!(error.lost(Signal::Metrics), 0);
+        let source = std::error::Error::source(&error).expect("metrics shutdown source");
+        assert!(error.to_string().contains(&source.to_string()));
+        assert!(
+            source.to_string().contains("Failed to shutdown"),
+            "{source}"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1882,24 +1894,21 @@ mod metrics_lifecycle_tests {
         let guard = Config::new("short").dir(&dir).init().unwrap();
         record(&guard);
         let (release, lock_thread) = block_directory(&dir);
-        let (started, observed) = mpsc::channel();
-        *guard.losses.metric_export_started.lock().unwrap() = Some(started);
-        let releaser = std::thread::spawn(move || {
-            observed.recv_timeout(Duration::from_secs(3)).unwrap();
-            std::thread::sleep(Duration::from_millis(200));
-            release.send(()).unwrap();
-        });
+        let timeout = Duration::from_millis(100);
         let start = Instant::now();
-        let error = guard
-            .shutdown_with_timeout(Duration::from_millis(20))
-            .unwrap_err();
-        assert!(start.elapsed() < Duration::from_secs(3));
+        let error = guard.shutdown_with_timeout(timeout).unwrap_err();
+        let elapsed = start.elapsed();
+        release.send(()).unwrap();
+        lock_thread.join().unwrap();
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
         assert_eq!(
             error.signal_kind(Signal::Metrics),
             Some(FlushErrorKind::Timeout)
         );
-        releaser.join().unwrap();
-        lock_thread.join().unwrap();
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            OTelSdkError::Timeout(timeout).to_string()
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2540,6 +2549,90 @@ mod metrics_lifecycle_tests {
         drop(state);
         guard.shutdown().unwrap();
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shutdown_prevents_registered_successor_collection_and_worker() {
+        if child(
+            "shutdown_prevents_registered_successor_collection_and_worker",
+            "stopped",
+            &[],
+        )
+        .is_some()
+        {
+            return;
+        }
+        let dir = directory("stopped-successor");
+        let guard = Config::new("stopped")
+            .dir(&dir)
+            .metrics_interval(Duration::from_secs(3600))
+            .init()
+            .unwrap();
+        record(&guard);
+        let (release, thread) = block_directory(&dir);
+        let (started, observed) = mpsc::channel();
+        *guard.losses.metric_export_started.lock().unwrap() = Some(started);
+        let flushing = guard.metrics_flushing.clone();
+        let first = guard.start_metrics_flush().unwrap();
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let successor = guard.start_metrics_flush().unwrap();
+        assert_eq!(successor, first + 1);
+        assert_eq!(
+            guard
+                .shutdown_with_timeout(Duration::from_millis(100))
+                .unwrap_err()
+                .signal_kind(Signal::Metrics),
+            Some(FlushErrorKind::Timeout)
+        );
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        flushing
+            .wait(first, Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        {
+            let state = flushing.state();
+            assert_eq!(state.started, first, "no successor after shutdown begins");
+            assert_eq!(state.calls, 1, "no new force_flush after shutdown begins");
+            assert_eq!(state.threads, 1, "no new worker after shutdown begins");
+        }
+        assert!(flushing.wait(successor, Instant::now()).is_err());
+    }
+
+    #[test]
+    fn metrics_wait_uses_remaining_budget_after_blocked_logs_flush() {
+        if child(
+            "metrics_wait_uses_remaining_budget_after_blocked_logs_flush",
+            "budget",
+            &[],
+        )
+        .is_some()
+        {
+            return;
+        }
+        let dir = directory("remaining-budget");
+        let guard = Config::new("budget")
+            .dir(&dir)
+            .metrics_interval(Duration::from_secs(3600))
+            .init()
+            .unwrap();
+        record(&guard);
+        let (release, thread) = block_directory(&dir);
+        tracing::info!("block logs flush too");
+        let start = Instant::now();
+        let error = guard.flush().unwrap_err();
+        let elapsed = start.elapsed();
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        assert_eq!(
+            error.signal_kind(Signal::Logs),
+            Some(FlushErrorKind::Timeout)
+        );
+        assert_eq!(
+            error.signal_kind(Signal::Metrics),
+            Some(FlushErrorKind::Timeout)
+        );
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+        guard.shutdown().unwrap();
     }
 
     #[test]
