@@ -668,15 +668,30 @@ mod size_tests {
         }).collect();
         let input =
             serde_json::json!({"resourceLogs":[{"resource":{},"scopeLogs":scopes}]}).to_string();
-        let start = std::time::Instant::now();
-        let lines = bounded_lines(&input, 1_000_000).unwrap();
-        let elapsed = start.elapsed();
+        let json: Json = serde_json::from_str(&input).unwrap();
+        let mut packed = Vec::new();
+        let allocations = allocation_counter::measure(|| {
+            packed =
+                crate::envelope::bounded_lines(&json, 1_000_000, crate::envelope::Envelope::Logs)
+                    .unwrap();
+        });
+        // Count actual allocated bytes, including temporary allocations freed
+        // during packing. A per-scope clone of the growing output or batch,
+        // or re-serialization into a fresh string, exceeds this linear budget.
+        // The allowance covers record encoding and geometric buffer growth;
+        // fixture construction, parsing and output checks are outside it.
+        assert!(
+            allocations.bytes_total <= 32 * input.len() as u64,
+            "packing allocated {} bytes for {} input bytes",
+            allocations.bytes_total,
+            input.len()
+        );
+        let lines: Vec<_> = packed.into_iter().map(|line| line.text).collect();
         assert!(
             lines.len() <= 3,
             "{} lines: scopes were not packed",
             lines.len()
         );
-        assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
         assert!(lines.iter().all(|s| s.len() <= 1_000_000));
         let mut count = 0;
         for line in &lines {
@@ -975,7 +990,7 @@ mod size_tests {
     }
 
     #[test]
-    #[ignore = "run explicitly in release to measure 10k records across 512 scopes"]
+    #[ignore = "explicit release measurement of 10k records across 512 scopes; never gates"]
     fn review_many_scopes_release_benchmark() {
         let input = many_scopes();
         let start = std::time::Instant::now();
@@ -985,7 +1000,6 @@ mod size_tests {
             "10k records / 512 scopes: {elapsed:?}, {} lines",
             lines.len()
         );
-        assert!(elapsed < Duration::from_secs(1));
     }
 
     #[test]
