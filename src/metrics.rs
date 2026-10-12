@@ -1,7 +1,8 @@
 //! Metrics declared once in statics and bound lazily to the process pipeline.
 //! Use [`crate::scope!`] for the declaring crate's instrumentation scope.
 //! Records before initialization are counted silently and reported at startup.
-//! Disabled metrics are silent; records after shutdown warn once and are not counted.
+//! The startup report still prints when metrics are off. Records after shutdown
+//! warn once and are not counted.
 
 use crate::{init::PublishedPipeline, lifecycle::Losses};
 use opentelemetry::{InstrumentationScope, KeyValue, metrics::MeterProvider as _};

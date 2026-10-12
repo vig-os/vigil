@@ -624,7 +624,8 @@ impl Config {
         }
     }
     /// Enable metrics (default true); overrides `VIGIL_METRICS` (`0` or `1`).
-    /// Disabled metrics create no storage, provider or reader thread.
+    /// Disabled metrics create no storage, provider or reader thread;
+    /// the startup report still prints when metrics are off.
     #[cfg(feature = "metrics")]
     #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     #[must_use]
