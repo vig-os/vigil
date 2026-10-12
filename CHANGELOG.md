@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Audit writer crash evidence: sealing and creation matrices, concurrent SIGKILL repairs, clean-stop heads and generated truncation properties ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
+
 - Audit fsync poisoning scope: staging rollback, shared barriers after renames, inert poisoned handles and Drop diagnostics, with durable-state replay tests and restart-first poison clearing ([#11](https://github.com/vig-os/vigil/issues/11), [#90](https://github.com/vig-os/vigil/issues/90)).
 
 - Internal durable audit writer with shared checkpoint cadence, staged segment sealing and recovery with genesis-link validation, repair attestations, signer-outage handling and fsync poisoning ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
@@ -71,6 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** remove `Config::retention_days`; use `Config::retention(Option<Duration>)` ([#42](https://github.com/vig-os/vigil/issues/42)).
 
 ### Fixed
+
+- Audit signer-outage reporting tolerates unwritable stderr without panicking or failing an acknowledged record ([#100](https://github.com/vig-os/vigil/issues/100)).
 
 - Make OTLP/JSON output independent of consumer `serde_json/preserve_order` feature unification ([#64](https://github.com/vig-os/vigil/issues/64)).
 

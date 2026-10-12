@@ -378,4 +378,4 @@ pub use codec::Checkpoint;
 
 #[cfg(test)]
 #[path = "roundtrip_tests.rs"]
-mod roundtrip_tests;
+pub(super) mod roundtrip_tests;

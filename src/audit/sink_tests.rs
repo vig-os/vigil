@@ -1,9 +1,9 @@
 use super::*;
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::atomic::AtomicUsize};
 static NEXT: AtomicUsize = AtomicUsize::new(0);
-struct Temp(PathBuf);
+pub(super) struct Temp(pub(super) PathBuf);
 impl Temp {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         durability::stop();
         hooks::OBSERVE.with(|o| *o.borrow_mut() = None);
         hooks::STDERR.with(|lines| lines.borrow_mut().clear());
@@ -11,6 +11,7 @@ impl Temp {
         hooks::TIME.with(|t| t.set(Some(1_000_000_000)));
         hooks::FAIL.with(|f| f.borrow_mut().clear());
         hooks::SHORT.with(|s| s.set(None));
+        hooks::HALF.with(|s| s.set(false));
         hooks::EVENTS.with(|e| e.borrow_mut().clear());
         let path = std::env::temp_dir().join(format!(
             "vigil-sink-{}-{}",
@@ -26,29 +27,29 @@ impl Drop for Temp {
         fs::remove_dir_all(&self.0).unwrap();
     }
 }
-fn signer() -> Arc<dyn Signer> {
+pub(super) fn signer() -> Arc<dyn Signer> {
     Arc::new(KeySeed::parse(&"11".repeat(32)).unwrap())
 }
-fn create(t: &Temp) -> Sink {
+pub(super) fn create(t: &Temp) -> Sink {
     Sink::create(&t.0, signer(), Config::default()).unwrap()
 }
-fn open(t: &Temp) -> Sink {
+pub(super) fn open(t: &Temp) -> Sink {
     Sink::open(&t.0, signer(), Config::default(), None).unwrap()
 }
-fn entry() -> Entry {
+pub(super) fn entry() -> Entry {
     Entry::new("actor", "change", "object")
 }
-fn bytes(t: &Temp) -> Vec<u8> {
+pub(super) fn bytes(t: &Temp) -> Vec<u8> {
     fs::read(t.0.join("audit.jsonl")).unwrap()
 }
-fn records(t: &Temp) -> Vec<Record> {
+pub(super) fn records(t: &Temp) -> Vec<Record> {
     bytes(t)
         .split(|b| *b == b'\n')
         .filter(|p| !p.is_empty())
         .flat_map(|p| Record::parse_line(p).unwrap())
         .collect()
 }
-fn bad<T>(r: Result<T, AuditError>, kind: AuditErrorKind) {
+pub(super) fn bad<T>(r: Result<T, AuditError>, kind: AuditErrorKind) {
     assert_eq!(r.err().unwrap().kind(), kind);
 }
 fn bad_open(t: &Temp, expected: Option<Head>, kind: AuditErrorKind) {
@@ -57,7 +58,7 @@ fn bad_open(t: &Temp, expected: Option<Head>, kind: AuditErrorKind) {
         kind,
     );
 }
-fn scan_head(s: &Sink) -> Head {
+pub(super) fn scan_head(s: &Sink) -> Head {
     s.reader
         .with_current(|d| s.prepare(d), |_, _, s| Ok(s.head))
         .unwrap()
@@ -220,12 +221,12 @@ fn shared_cadence_after_open_refresh_and_clock_step_back() {
     ));
 }
 #[derive(Debug)]
-struct Failing {
-    fail: AtomicBool,
+pub(super) struct Failing {
+    pub(super) fail: AtomicBool,
     calls: AtomicUsize,
 }
 impl Failing {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             fail: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
@@ -1529,8 +1530,8 @@ fn poison_844_check_before_settlement() {
     }
 }
 #[derive(Debug)]
-struct CountingSigner {
-    calls: AtomicUsize,
+pub(super) struct CountingSigner {
+    pub(super) calls: AtomicUsize,
     inner: Arc<dyn Signer>,
 }
 impl Signer for CountingSigner {
@@ -1543,7 +1544,7 @@ impl Signer for CountingSigner {
         self.inner.sign(message)
     }
 }
-fn counting() -> Arc<CountingSigner> {
+pub(super) fn counting() -> Arc<CountingSigner> {
     Arc::new(CountingSigner {
         calls: AtomicUsize::new(0),
         inner: signer(),

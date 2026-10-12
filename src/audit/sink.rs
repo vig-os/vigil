@@ -166,7 +166,16 @@ fn write_io(file: &File, bytes: &[u8]) -> std::io::Result<()> {
             ));
         }
     }
-    rotate::write_once(&mut &*file, bytes)
+    #[cfg(test)]
+    if hooks::HALF.with(std::cell::Cell::take) {
+        (&*file).write_all(&bytes[..bytes.len() / 2])?;
+        hooks::point("partial-write");
+        panic!("partial-write hook must end the process");
+    }
+    rotate::write_once(&mut &*file, bytes)?;
+    #[cfg(test)]
+    hooks::point("after-write");
+    Ok(())
 }
 fn truncate_io(file: &File, length: u64) -> std::io::Result<()> {
     #[cfg(test)]
@@ -346,11 +355,15 @@ impl Sink {
                 }
                 let mut trail = [0; 16];
                 getrandom::fill(&mut trail).map_err(io_error)?;
+                #[cfg(test)]
+                hooks::point("create-1");
                 let poisoned = AtomicBool::new(false);
                 let marker = new_file(dir, "audit.trail", Mode::RUSR)?;
                 write_io(&marker, format!("{}\n", hex(&trail)).as_bytes()).map_err(io_error)?;
                 sync(&marker, "marker", &poisoned)?;
                 sync(dir, "marker-dir", &poisoned)?;
+                #[cfg(test)]
+                hooks::point("create-2");
                 let context = RecordContext::new(
                     trail,
                     0,
@@ -369,13 +382,18 @@ impl Sink {
                 )
                 .map_err(io_error)?;
                 sync_renamed(dir, "promote-dir", ".audit-next.jsonl", &poisoned)?;
+                #[cfg(test)]
+                hooks::point("create-3");
                 Ok(Head {
                     seq: 0,
                     hash: cp.hash(),
                 })
             })
             .map_err(io_error)??;
-        Self::open(path, signer, config, Some(head))
+        let sink = Self::open(path, signer, config, Some(head))?;
+        #[cfg(test)]
+        hooks::point("create-4");
+        Ok(sink)
     }
     pub(crate) fn open(
         path: &Path,
@@ -471,7 +489,10 @@ impl Sink {
     }
     fn signer_failed(&self) {
         if !self.reported.swap(true, Ordering::Relaxed) {
-            eprintln!("vigil audit: checkpoint signer unavailable; retrying on next append");
+            let message = "vigil audit: checkpoint signer unavailable; retrying on next append";
+            #[cfg(test)]
+            hooks::stderr(message);
+            let _ = writeln!(std::io::stderr().lock(), "{message}");
         }
     }
     pub(crate) fn record(&self, entry: &Entry) -> Result<Head, AuditError> {
@@ -599,8 +620,12 @@ impl Sink {
             ),
             &mmr,
         )?;
+        #[cfg(test)]
+        hooks::point("seal-1");
         let opening_bytes = line(&opening)?;
         Self::stage(dir, &opening_bytes, &self.poisoned)?;
+        #[cfg(test)]
+        hooks::point("seal-2");
         let mut bytes = line(&closing)?;
         if state.needs_newline() {
             bytes.insert(0, b'\n');
@@ -610,8 +635,12 @@ impl Sink {
         append(dir, live, &bytes, "closing-data", &self.poisoned)?;
         *state = closed;
         #[cfg(test)]
+        hooks::point("seal-3");
+        #[cfg(test)]
         hooks::event("seal-rename").map_err(io_error)?;
         rotate::rotate(dir, "audit", Path::new("audit.jsonl")).map_err(io_error)?;
+        #[cfg(test)]
+        hooks::point("seal-4");
         #[cfg(test)]
         hooks::event("promote").map_err(io_error)?;
         rotate::rename_no_replace(
@@ -620,7 +649,11 @@ impl Sink {
             Path::new("audit.jsonl"),
         )
         .map_err(io_error)?;
+        #[cfg(test)]
+        hooks::point("seal-5");
         sync_renamed(dir, "promote-dir", ".audit-next.jsonl", &self.poisoned)?;
+        #[cfg(test)]
+        hooks::point("seal-6");
         *live = existing(dir, Path::new("audit.jsonl"), true)?;
         *state = opened;
         Ok(())
@@ -674,6 +707,7 @@ mod hooks {
     thread_local! {
         pub(super) static CHECK_CLOCK: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
         pub(super) static TIME: Cell<Option<u64>> = const { Cell::new(None) };
+        pub(super) static HALF: Cell<bool> = const { Cell::new(false) };
         pub(super) static SHORT: Cell<Option<usize>> = const { Cell::new(None) };
         pub(super) static FAIL: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
         pub(super) static EVENTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
@@ -690,6 +724,14 @@ mod hooks {
     type Observer = Box<dyn Fn(&str)>;
     thread_local! {
         pub(super) static OBSERVE: RefCell<Option<Observer>> = const { RefCell::new(None) };
+    }
+    // Crash observers park or terminate; they cannot inject an error rollback.
+    pub(super) fn point(site: &'static str) {
+        OBSERVE.with(|observe| {
+            if let Some(observe) = observe.borrow().as_ref() {
+                observe(site);
+            }
+        });
     }
     pub(super) fn event(site: &'static str) -> io::Result<()> {
         OBSERVE.with(|observe| {
@@ -715,3 +757,11 @@ mod durability;
 #[cfg(test)]
 #[path = "sink_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "crash_tests.rs"]
+mod crashes;
+
+#[cfg(test)]
+#[path = "crash_fixtures.rs"]
+pub(crate) mod crash_fixtures;
