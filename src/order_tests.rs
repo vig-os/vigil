@@ -122,3 +122,93 @@ pub(crate) fn ordered_scopes() -> Vec<InstrumentationScope> {
     }
     scopes
 }
+
+#[test]
+fn structural_ties_compare_children_before_numeric_time() {
+    use serde_json::json;
+    for (container, children, a, b) in [
+        (
+            "scopeMetrics",
+            "metrics",
+            json!({"name":"a", "sum":{"dataPoints":[{"timeUnixNano":"900", "startTimeUnixNano":"800", "customTimeUnixNano":"950", "asInt":"10"}]}}),
+            json!({"name":"b", "sum":{"dataPoints":[{"timeUnixNano":"100", "startTimeUnixNano":"50", "customTimeUnixNano":"150", "asInt":"9"}]}}),
+        ),
+        (
+            "scopeMetrics",
+            "metrics",
+            json!({"name":"same", "description":"a", "unit":"z", "sum":{"dataPoints":[{"timeUnixNano":"900"}]}}),
+            json!({"name":"same", "description":"b", "unit":"a", "sum":{"dataPoints":[{"timeUnixNano":"100"}]}}),
+        ),
+        (
+            "scopeMetrics",
+            "metrics",
+            json!({"name":"same", "unit":"a", "sum":{"dataPoints":[{"timeUnixNano":"900"}]}}),
+            json!({"name":"same", "unit":"b", "sum":{"dataPoints":[{"timeUnixNano":"100"}]}}),
+        ),
+        (
+            "scopeMetrics",
+            "metrics",
+            json!({"name":"same", "sum":{"dataPoints":[{"timeUnixNano":"900", "asDouble":9.0}]}}),
+            json!({"name":"same", "sum":{"dataPoints":[{"timeUnixNano":"100", "asDouble":10.0}]}}),
+        ),
+        (
+            "scopeLogs",
+            "logRecords",
+            json!({"timeUnixNano":"900", "observedTimeUnixNano":"901", "body":{"stringValue":"a\n"}}),
+            json!({"timeUnixNano":"100", "observedTimeUnixNano":"101", "body":{"stringValue":"a!"}}),
+        ),
+        (
+            "scopeLogs",
+            "logRecords",
+            json!({"timeUnixNano":"2", "observedTimeUnixNano":"3", "body":{"stringValue":"same"}}),
+            json!({"timeUnixNano":"10", "observedTimeUnixNano":"11", "body":{"stringValue":"same"}}),
+        ),
+        (
+            "scopeMetrics",
+            "metrics",
+            json!({"name":"same", "sum":{"dataPoints":[{"timeUnixNano":"2", "asInt":"1"}]}}),
+            json!({"name":"same", "sum":{"dataPoints":[{"timeUnixNano":"10", "asInt":"1"}]}}),
+        ),
+    ] {
+        let element = |child| json!({"scope":{"name":"same","attributes":[{"key":"nan","value":{"doubleValue":"NaN"}}]}, (children):[child]});
+        let expected = element(a);
+        let scopes = [expected.clone(), element(b)];
+        permutations(&scopes, |scopes| {
+            let mut value = json!({(container):scopes});
+            crate::envelope::normalize(&mut value, "", crate::ordered_json::LOGS).unwrap();
+            assert_eq!(value[container][0], expected);
+        });
+    }
+}
+
+#[test]
+fn structural_ties_compare_typed_values_recursively() {
+    use serde_json::json;
+    let ordered = [
+        json!({"boolValue":false}),
+        json!({"boolValue":true}),
+        json!({"intValue":"9"}),
+        json!({"intValue":"10"}),
+        json!({"doubleValue":"-Infinity"}),
+        json!({"doubleValue":-0.0}),
+        json!({"doubleValue":0.0}),
+        json!({"doubleValue":"Infinity"}),
+        json!({"doubleValue":"NaN"}),
+        json!({"stringValue":"a\n"}),
+        json!({"stringValue":"a!"}),
+        json!({"bytesValue":"AA=="}),
+        json!({"arrayValue":{"values":[{"intValue":"9"}]}}),
+        json!({"arrayValue":{"values":[{"intValue":"10"}]}}),
+        json!({"kvlistValue":{"values":[{"key":"key","value":{"intValue":"9"}}]}}),
+        json!({"kvlistValue":{"values":[{"key":"key","value":{"intValue":"10"}}]}}),
+    ];
+    for values in ordered.windows(2) {
+        let first = json!({"scope":{},"logRecords":[{"timeUnixNano":"900", "body":values[0]}]});
+        let second = json!({"scope":{},"logRecords":[{"timeUnixNano":"100", "body":values[1]}]});
+        permutations(&[first.clone(), second], |scopes| {
+            let mut value = json!({"scopeLogs":scopes});
+            crate::envelope::normalize(&mut value, "", crate::ordered_json::LOGS).unwrap();
+            assert_eq!(value["scopeLogs"][0], first);
+        });
+    }
+}

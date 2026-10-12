@@ -352,9 +352,248 @@ fn compare_element(a: &Json, b: &Json, context: &str) -> std::cmp::Ordering {
         .unwrap_or_else(|| compare_attributes(&a[key]["attributes"], &b[key]["attributes"]))
 }
 
+// A tied element is projected once into decoded non-time structure and a
+// chronological list of (timestamp, field path) pairs. Paths retain presence
+// and association when equal structures have different optional time fields.
+#[derive(Debug)]
+enum StructuralKey {
+    Null,
+    Bool(bool),
+    Int(i128),
+    Double(f64),
+    String(String),
+    Bytes(String),
+    Array(Vec<Self>),
+    Attributes(Vec<Self>),
+    Object(Vec<(String, Self)>),
+}
+impl StructuralKey {
+    fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        use StructuralKey::*;
+        let rank = |key: &Self| match key {
+            Null => 0,
+            Bool(_) => 1,
+            Int(_) => 2,
+            Double(_) => 3,
+            String(_) => 4,
+            Bytes(_) => 5,
+            Array(_) => 6,
+            Attributes(_) => 7,
+            Object(_) => 8,
+        };
+        match (self, other) {
+            (Bool(a), Bool(b)) => a.cmp(b),
+            (Int(a), Int(b)) => a.cmp(b),
+            (Double(a), Double(b)) => a.total_cmp(b),
+            (String(a), String(b)) | (Bytes(a), Bytes(b)) => a.cmp(b),
+            (Array(a), Array(b)) | (Attributes(a), Attributes(b)) => a
+                .iter()
+                .zip(b)
+                .map(|(a, b)| a.compare(b))
+                .find(|order| !order.is_eq())
+                .unwrap_or_else(|| a.len().cmp(&b.len())),
+            (Object(a), Object(b)) => a
+                .iter()
+                .zip(b)
+                .map(|((ka, a), (kb, b))| {
+                    field_order(ka)
+                        .cmp(&field_order(kb))
+                        .then_with(|| a.compare(b))
+                })
+                .find(|order| !order.is_eq())
+                .unwrap_or_else(|| a.len().cmp(&b.len())),
+            _ => rank(self).cmp(&rank(other)),
+        }
+    }
+}
+
+fn field_order(key: &str) -> (usize, &str) {
+    let rank = match key {
+        "name" => 0,
+        "description" => 1,
+        "unit" => 2,
+        "attributes" => 3,
+        "key" => 4,
+        "metrics" | "logRecords" | "scopeMetrics" | "scopeLogs" | "dataPoints" => 5,
+        _ => 6,
+    };
+    (rank, key)
+}
+
+type TimeKey = Vec<(u64, Vec<String>)>;
+fn structural_key(
+    value: &Json,
+    context: &str,
+    path: &mut Vec<String>,
+    times: &mut TimeKey,
+) -> StructuralKey {
+    use StructuralKey as K;
+    match value {
+        Json::Null => K::Null,
+        Json::Bool(v) => K::Bool(*v),
+        Json::Number(v) => match (v.as_i64(), v.as_u64()) {
+            (Some(v), _) => K::Int(v.into()),
+            (_, Some(v)) => K::Int(v.into()),
+            _ => K::Double(v.as_f64().unwrap_or_default()),
+        },
+        Json::String(v) => {
+            if matches!(
+                context,
+                "intValue"
+                    | "asInt"
+                    | "count"
+                    | "bucketCounts"
+                    | "zeroCount"
+                    | "negative"
+                    | "positive"
+            ) && let Ok(v) = v.parse::<i128>()
+            {
+                return K::Int(v);
+            }
+            if matches!(
+                context,
+                "doubleValue"
+                    | "asDouble"
+                    | "sum"
+                    | "min"
+                    | "max"
+                    | "value"
+                    | "quantile"
+                    | "explicitBounds"
+            ) {
+                match v.as_str() {
+                    "NaN" => return K::Double(f64::NAN),
+                    "Infinity" => return K::Double(f64::INFINITY),
+                    "-Infinity" => return K::Double(f64::NEG_INFINITY),
+                    _ => {}
+                }
+            }
+            if context == "bytesValue" {
+                K::Bytes(v.clone())
+            } else {
+                K::String(v.clone())
+            }
+        }
+        Json::Array(values) => K::Array(
+            values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    path.push(i.to_string());
+                    let key = structural_key(v, context, path, times);
+                    path.pop();
+                    key
+                })
+                .collect(),
+        ),
+        Json::Object(fields) => {
+            if fields.is_empty() && matches!(context, "value" | "body") {
+                return K::Null;
+            }
+            // AnyValue's wrapper is a type tag, not a JSON object ordering key.
+            for key in [
+                "boolValue",
+                "intValue",
+                "doubleValue",
+                "stringValue",
+                "bytesValue",
+                "arrayValue",
+                "kvlistValue",
+            ] {
+                if let Some(v) = fields.get(key) {
+                    path.push(key.into());
+                    let result = match key {
+                        "arrayValue" | "kvlistValue" => {
+                            let values = structural_key(&v["values"], "values", path, times);
+                            if key == "kvlistValue" {
+                                match values {
+                                    K::Array(values) => K::Attributes(values),
+                                    _ => K::Attributes(Vec::new()),
+                                }
+                            } else {
+                                match values {
+                                    K::Array(values) => K::Array(values),
+                                    _ => K::Array(Vec::new()),
+                                }
+                            }
+                        }
+                        _ => structural_key(v, key, path, times),
+                    };
+                    path.pop();
+                    return result;
+                }
+            }
+            let mut keys: Vec<_> = fields.keys().map(String::as_str).collect();
+            keys.sort_by_key(|key| field_order(key));
+            let mut result = Vec::new();
+            // Explicit decoded metric metadata precedes its points/values even
+            // when a default field is absent from protobuf JSON.
+            if context == "metrics" {
+                for key in ["name", "description", "unit"] {
+                    result.push((key.into(), K::String(text(&value[key]).into())));
+                }
+            }
+            if context == "dataPoints" {
+                result.push((
+                    "attributes".into(),
+                    structural_key(&value["attributes"], "attributes", path, times),
+                ));
+            }
+            if context == "dataPoints" {
+                let key = if fields.contains_key("asInt") {
+                    "asInt"
+                } else {
+                    "asDouble"
+                };
+                result.push((
+                    "value".into(),
+                    structural_key(&value[key], key, path, times),
+                ));
+            }
+            if matches!(
+                context,
+                "scopeLogs" | "scopeMetrics" | "resourceLogs" | "resourceMetrics"
+            ) {
+                let metadata = if context.starts_with("scope") {
+                    "scope"
+                } else {
+                    "resource"
+                };
+                for key in ["name", "version"] {
+                    result.push((key.into(), K::String(text(&value[metadata][key]).into())));
+                }
+                result.push((
+                    "schemaUrl".into(),
+                    K::String(text(&value["schemaUrl"]).into()),
+                ));
+                result.push((
+                    "attributes".into(),
+                    structural_key(&value[metadata]["attributes"], "attributes", path, times),
+                ));
+            }
+            for key in keys {
+                path.push(key.into());
+                if key == "timeUnixNano" || key.ends_with("TimeUnixNano") {
+                    let time = fields[key]
+                        .as_u64()
+                        .or_else(|| text(&fields[key]).parse().ok())
+                        .unwrap_or_default();
+                    times.push((time, path.clone()));
+                } else if !(context == "metrics" && matches!(key, "name" | "description" | "unit")
+                    || context == "dataPoints" && key == "attributes")
+                {
+                    result.push((key.into(), structural_key(&fields[key], key, path, times)));
+                }
+                path.pop();
+            }
+            K::Object(result)
+        }
+    }
+}
+
 // Traverse envelope containers only: records, attributes and point values have
-// already been normalized by the typed hooks. Encode payloads only to resolve ties.
-pub(crate) fn normalize(value: &mut Json, context: &str, rules: Rules) -> Result<(), String> {
+// already been normalized by the typed hooks. Build structural keys only to resolve ties.
+pub(crate) fn normalize(value: &mut Json, context: &str, _rules: Rules) -> Result<(), String> {
     match value {
         Json::Object(fields) => {
             for (key, value) in fields {
@@ -372,14 +611,14 @@ pub(crate) fn normalize(value: &mut Json, context: &str, rules: Rules) -> Result
                         | "summary"
                         | "dataPoints"
                 ) {
-                    normalize(value, key, rules)?;
+                    normalize(value, key, _rules)?;
                 }
             }
         }
         Json::Array(values) => {
             if context != "dataPoints" {
                 for value in values.iter_mut() {
-                    normalize(value, context, rules)?;
+                    normalize(value, context, _rules)?;
                 }
             }
             if values.len() < 2 {
@@ -404,16 +643,20 @@ pub(crate) fn normalize(value: &mut Json, context: &str, rules: Rules) -> Result
                         end += 1;
                     }
                     if end - start > 1 {
-                        // Encode once, and only inside equal-primary-key groups.
-                        let mut tied = values[start..end]
+                        let mut tied: Vec<_> = values[start..end]
                             .iter_mut()
                             .map(|value| {
-                                let bytes = ordered_json::encode(value, context, rules)?;
-                                Ok((bytes, value.take()))
+                                let mut times = Vec::new();
+                                let key =
+                                    structural_key(value, context, &mut Vec::new(), &mut times);
+                                times.sort();
+                                (key, times, value.take())
                             })
-                            .collect::<Result<Vec<_>, String>>()?;
-                        tied.sort_by(|(a, _), (b, _)| a.cmp(b));
-                        for (slot, (_, value)) in values[start..end].iter_mut().zip(tied) {
+                            .collect();
+                        tied.sort_by(|(a, ta, _), (b, tb, _)| {
+                            a.compare(b).then_with(|| ta.cmp(tb))
+                        });
+                        for (slot, (_, _, value)) in values[start..end].iter_mut().zip(tied) {
                             *slot = value;
                         }
                     }

@@ -549,7 +549,7 @@ fn proto_depth_ok(value: &AnyValue, depth: usize) -> bool {
 /// Group identity uses name, version, schema URL and sorted attributes, with
 /// Debug retaining distinct non-finite doubles. Shared normalization orders the
 /// projected scopes by the total order in ADR-0001 decision 5, with canonical
-/// whole-element bytes breaking equal metadata ties. Records retain their batch
+/// structural child keys breaking equal metadata ties; time decides last. Records retain their batch
 /// order within each scope. The batch has one resource, hence exactly one `ResourceLogs`.
 fn group_batch(
     batch: &LogBatch<'_>,
@@ -1225,7 +1225,11 @@ mod ordered_tests {
                 .map(|(i, scope)| ScopeLogs {
                     scope: Some(scope),
                     log_records: vec![LogRecord {
-                        time_unix_nano: i as u64 + 1,
+                        time_unix_nano: 900 - i as u64 * 100,
+                        observed_time_unix_nano: 901 - i as u64 * 100,
+                        body: Some(AnyValue {
+                            value: Some(Value::StringValue(format!("record-{i}"))),
+                        }),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -1239,6 +1243,15 @@ mod ordered_tests {
                         ..Default::default()
                     }],
                 };
+                let projected = project_json(&request).unwrap();
+                let nan: Vec<_> = projected["resourceLogs"][0]["scopeLogs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s["scope"]["attributes"][0]["value"]["doubleValue"] == "NaN")
+                    .map(|s| s["logRecords"][0]["body"]["stringValue"].as_str().unwrap())
+                    .collect();
+                assert_eq!(nan, ["record-0", "record-1"]);
                 let bytes = encode_line(&request).unwrap();
                 assert_eq!(*expected.get_or_insert_with(|| bytes.clone()), bytes);
             });

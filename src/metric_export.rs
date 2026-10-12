@@ -329,7 +329,9 @@ mod tests {
 
     #[test]
     fn metric_scope_permutations_have_identical_bytes() {
-        use opentelemetry_proto::tonic::metrics::v1::{Metric, ResourceMetrics, ScopeMetrics};
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
+        };
         for family in crate::order_tests::families() {
             let scopes: Vec<_> = family
                 .into_iter()
@@ -338,6 +340,15 @@ mod tests {
                     scope: Some(scope),
                     metrics: vec![Metric {
                         name: format!("counter-{i}"),
+                        data: Some(Data::Sum(Sum {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: 900 - i as u64 * 100,
+                                start_time_unix_nano: 100,
+                                value: Some(number_data_point::Value::AsInt(i as i64)),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        })),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -352,12 +363,75 @@ mod tests {
                     }],
                 };
                 let projected = project(request).unwrap();
+                let nan: Vec<_> = projected["resourceMetrics"][0]["scopeMetrics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s["scope"]["attributes"][0]["value"]["doubleValue"] == "NaN")
+                    .map(|s| s["metrics"][0]["name"].as_str().unwrap())
+                    .collect();
+                assert_eq!(nan, ["counter-0", "counter-1"]);
                 let bytes =
                     crate::ordered_json::encode(&projected, "", crate::ordered_json::METRICS)
                         .unwrap();
                 assert_eq!(*expected.get_or_insert_with(|| bytes.clone()), bytes);
             });
         }
+    }
+
+    #[test]
+    fn sdk_nan_scope_order_is_independent_of_collection_timestamps() {
+        let mut orders = std::collections::BTreeSet::new();
+        // Fresh providers exercise independently seeded SDK HashMaps, while
+        // repeated collections retain their real, per-scope SDK timestamps.
+        for _ in 0..24 {
+            let sink = MemorySink::new();
+            let provider = SdkMeterProvider::builder()
+                .with_reader(
+                    PeriodicReader::builder(OtlpJsonMetricExporter::new(sink.clone()))
+                        .with_interval(Duration::from_secs(3600))
+                        .build(),
+                )
+                .build();
+            let scope = opentelemetry::InstrumentationScope::builder("nan-scope")
+                .with_attributes([KeyValue::new("nan", f64::NAN)])
+                .build();
+            let counters: Vec<_> = (0..4)
+                .map(|i| {
+                    provider
+                        .meter_with_scope(scope.clone())
+                        .u64_counter(format!("counter-{i}"))
+                        .build()
+                })
+                .collect();
+            for counter in &counters {
+                counter.add(1, &[]);
+            }
+            for _ in 0..2 {
+                provider.force_flush().unwrap();
+                let lines = sink.lines();
+                let json: Json = serde_json::from_str(lines.last().unwrap()).unwrap();
+                let order: Vec<_> = json["resourceMetrics"][0]["scopeMetrics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|scope| scope["metrics"].as_array().unwrap())
+                    .map(|metric| metric["name"].as_str().unwrap().to_owned())
+                    .collect();
+                assert_eq!(order.len(), 4);
+                orders.insert(order);
+            }
+            provider.shutdown().unwrap();
+        }
+        assert_eq!(
+            orders.len(),
+            1,
+            "SDK collection timestamps leaked into scope order: {orders:?}"
+        );
+        assert_eq!(
+            orders.first().unwrap(),
+            &["counter-0", "counter-1", "counter-2", "counter-3"]
+        );
     }
 
     fn ready<T>(future: impl std::future::Future<Output = T>) -> T {

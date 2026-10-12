@@ -55,15 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Audit `Record::new` rejects actions starting with `vigil.audit.` with `InvalidEntry`, reserving that prefix for internal records ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - Log scope order on attribute ties now follows the documented total order ([#7](https://github.com/vig-os/vigil/issues/7)).
-
 - Deny missing public documentation and missing error/panic sections across stable and unstable APIs with all features in flake and CI checks ([#44](https://github.com/vig-os/vigil/issues/44)).
 - Apply ADR-0006 decision 3 time-first JSON key order to logs ([#64](https://github.com/vig-os/vigil/issues/64)).
 - Drop log records whose body or attribute AnyValues nest deeper than 16 array/map edges and count them as lost log records; these records were previously exported ([#64](https://github.com/vig-os/vigil/issues/64)).
-
 - **Breaking:** exporters, sinks and exact OpenTelemetry re-exports require `--cfg vigil_unstable`; `NON_FINITE` is crate-private. Docs.rs labels the unstable surface, which is compiled and tested separately; empty `RUST_LOG` uses the default filter and unnamed guards drop immediately ([#42](https://github.com/vig-os/vigil/issues/42)).
-
 - Shutdown stops recording before draining; explicit shutdown reports losses to the caller without repeating them on stderr, and Drop reports them once. Failed durable log lines count only records not already written, plus diagnostic replacements (ADR-0003 decisions 3, 4 and 23; [#42](https://github.com/vig-os/vigil/issues/42)).
-
 - **Breaking:** one successful pipeline permanently occupies the process slot, including after shutdown. Filters apply per layer; empty filter variables count as unset, and explicit `retention(None)` overrides environment retention ([#42](https://github.com/vig-os/vigil/issues/42)).
 - **Breaking:** make `RotationConfig` fields private and remove `Copy` ([#42](https://github.com/vig-os/vigil/issues/42)).
 
