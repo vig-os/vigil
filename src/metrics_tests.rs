@@ -1,12 +1,7 @@
 use super::*;
 use crate::{Config, FlushErrorKind, Signal};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-use std::{
-    fs,
-    panic::catch_unwind,
-    process::{Command, Output},
-    sync::Arc,
-};
+use std::{fs, panic::catch_unwind, process::Output, sync::Arc};
 use tracing_subscriber::{Layer, layer::SubscriberExt};
 
 fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
@@ -19,7 +14,19 @@ fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
 }
 #[test]
 fn name_rule_panics_at_runtime() {
-    for name in ["", "1bad", "bad!", "aé", &"a".repeat(256)] {
+    for name in [
+        "",
+        "1bad",
+        "bad!",
+        "aé",
+        ":",
+        "a:",
+        "_a",
+        "a+b",
+        "\x7f",
+        "a\x7f",
+        &"a".repeat(256),
+    ] {
         let name = Box::leak(name.to_owned().into_boxed_str());
         assert!(
             panic_message(|| {
@@ -91,6 +98,12 @@ fn validation_matches_sdk() {
             "A0_./-z",
             "1bad",
             "a b",
+            ":",
+            "a:",
+            "_a",
+            "a+b",
+            "\x7f",
+            "a\x7f",
             "aé",
             &"a".repeat(255),
             &"a".repeat(256),
@@ -178,22 +191,7 @@ fn attribute_conversions_and_scope() {
     );
 }
 fn child(test: &str) -> Option<Output> {
-    let test = format!("metrics::tests::{test}");
-    if std::env::var("VIGIL_FACADE_CHILD").as_deref() == Ok(&test) {
-        return None;
-    }
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &test, "--nocapture"])
-        .env("VIGIL_FACADE_CHILD", &test)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Some(output)
+    crate::test_child(&format!("metrics::tests::{test}"), "VIGIL_FACADE_CHILD")
 }
 fn dir(test: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("vigil-facade-{test}-{}", std::process::id()))
@@ -373,7 +371,15 @@ fn after_shutdown_never_counts_binds_or_calls_sdk() {
 #[test]
 fn disabled_metrics_are_silent_even_after_shutdown() {
     if let Some(output) = child("disabled_metrics_are_silent_even_after_shutdown") {
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("after vigil shutdown"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("after vigil shutdown"));
+        assert_eq!(
+            stderr
+                .matches("vigil: 1 metric records before vigil::init were dropped")
+                .count(),
+            1
+        );
+        assert!(!stderr.contains("dropped measurements"));
         return;
     }
     let path = dir("off");
@@ -431,6 +437,22 @@ fn publication_race_drains_at_period_finish_and_drop() {
     assert_eq!(guard.flush().unwrap_err().lost(Signal::Metrics), 2);
     guard.flush().unwrap();
     drop(guard);
+    fs::remove_dir_all(path).unwrap();
+}
+#[test]
+fn explicit_shutdown_does_not_print_measurements() {
+    if let Some(output) = child("explicit_shutdown_does_not_print_measurements") {
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("dropped measurements"));
+        return;
+    }
+    let path = dir("explicit-shutdown");
+    let (_, guard) = Config::new("explicit-shutdown")
+        .dir(&path)
+        .layer::<tracing_subscriber::Registry>()
+        .unwrap();
+    // Two producers observed no publication, then incremented after the startup drain.
+    BEFORE_INIT.fetch_add(2, Ordering::Relaxed);
+    assert_eq!(guard.shutdown().unwrap_err().lost(Signal::Metrics), 2);
     fs::remove_dir_all(path).unwrap();
 }
 #[test]
