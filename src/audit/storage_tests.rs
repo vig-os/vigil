@@ -1230,6 +1230,199 @@ mod runs {
         write_records(&d.0, &[&opening, &resume]);
         corrupt_open(&d.0);
     }
+    fn successor_probe(wrong_mmr: bool) {
+        {
+            let d = Temp::new();
+            let first = base(&d);
+            put(&d, 0, &[&first], &[]);
+            let kept = headless(&first, 3);
+            put(&d, 1, &[&kept], &[]);
+            let mut fold = seeded_pair(&first, &kept);
+            let wrong_fold = seeded(&first);
+            let checkpoint = signed(
+                if wrong_mmr { 7 } else { 4 },
+                kept.hash(),
+                if wrong_mmr { &wrong_fold } else { &fold },
+            );
+            let next = if wrong_mmr {
+                declaration(&checkpoint, 3, kept.hash(), 6, None)
+            } else {
+                entry(&checkpoint)
+            };
+            put(&d, 2, &[&checkpoint, &next], &[]);
+            fold.push(checkpoint.hash()).unwrap();
+            fold.push(next.hash()).unwrap();
+            let live = signed(9, next.hash(), &fold);
+            let resume = declaration(&live, next.context.seq, next.hash(), 8, None);
+            write_records(&d.0, &[&live, &resume]);
+            corrupt_open(&d.0);
+        }
+    }
+    #[test]
+    fn first_successor_cannot_defer_missing_resume() {
+        successor_probe(false);
+    }
+    #[test]
+    fn first_successor_cannot_defer_wrong_mmr() {
+        successor_probe(true);
+    }
+    fn checkpoint_ended_run(d: &Temp) -> (Record, Mmr) {
+        let first = base(d);
+        put(d, 0, &[&first], &[]);
+        let kept = headless(&first, 3);
+        let fold = seeded_pair(&first, &kept);
+        let periodic = signed(4, kept.hash(), &fold);
+        put(d, 1, &[&kept, &periodic], &[]);
+        let mut fold = fold;
+        fold.push(periodic.hash()).unwrap();
+        (periodic, fold)
+    }
+    #[test]
+    fn checkpoint_ended_run_requires_resume_on_open() {
+        let d = Temp::new();
+        let (last, fold) = checkpoint_ended_run(&d);
+        let opening = signed(5, last.hash(), &fold);
+        write_records(&d.0, &[&opening, &entry(&opening)]);
+        corrupt_open(&d.0);
+    }
+    #[test]
+    fn checkpoint_ended_run_requires_resume_on_refresh() {
+        let d = Temp::new();
+        let first = base(&d);
+        let reader = open(&d.0);
+        fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+        let kept = headless(&first, 3);
+        let mut fold = seeded_pair(&first, &kept);
+        let periodic = signed(4, kept.hash(), &fold);
+        put(&d, 1, &[&kept, &periodic], &[]);
+        fold.push(periodic.hash()).unwrap();
+        let opening = signed(5, periodic.hash(), &fold);
+        write_records(&d.0, &[&opening, &entry(&opening)]);
+        assert_eq!(
+            reader
+                .with_current(|_| Ok(()), |_, _, _| Ok(()))
+                .unwrap_err()
+                .kind(),
+            AuditErrorKind::CorruptTrail
+        );
+    }
+    #[test]
+    fn checkpoint_ended_run_rejects_single_checkpoint_staging() {
+        use crate::audit::sink::{Config, Sink};
+        use std::sync::Arc;
+        let d = Temp::new();
+        let (last, fold) = checkpoint_ended_run(&d);
+        fs::write(
+            d.0.join("audit.trail"),
+            format!("{}\n", crate::audit::hex(&TRAIL)),
+        )
+        .unwrap();
+        fs::remove_file(d.0.join("audit.jsonl")).unwrap();
+        let opening = signed(5, last.hash(), &fold);
+        fs::write(d.0.join(".audit-next.jsonl"), line(&opening)).unwrap();
+        assert!(
+            Sink::open(
+                &d.0,
+                Arc::new(KeySeed::parse(&"27".repeat(32)).unwrap()),
+                Config::default(),
+                None
+            )
+            .is_err()
+        );
+        assert!(!d.0.join("audit.jsonl").exists());
+    }
+    #[test]
+    fn internal_checkpoint_gap_and_resume_are_corrupt() {
+        let d = Temp::new();
+        let first = base(&d);
+        put(&d, 0, &[&first], &[]);
+        let kept = headless(&first, 3);
+        let mut fold = seeded_pair(&first, &kept);
+        let gap = signed(7, kept.hash(), &fold);
+        let resume = declaration(&gap, 3, kept.hash(), 6, None);
+        put(&d, 1, &[&kept, &gap, &resume], &[]);
+        fold.push(gap.hash()).unwrap();
+        fold.push(resume.hash()).unwrap();
+        close_run(&d, &resume, &fold);
+        corrupt_open(&d.0);
+    }
+    #[test]
+    fn fallback_requires_fragment_attestation() {
+        let d = Temp::new();
+        let first = base(&d);
+        put(&d, 0, &[&first], &[]);
+        let kept = headless(&first, 3);
+        let next = entry(&kept);
+        let bytes = [line(&kept), b"{\"torn\":\n".to_vec(), line(&next)].concat();
+        fs::write(segment(&d.0, 1), bytes).unwrap();
+        let mut fold = seeded_pair(&first, &kept);
+        fold.push(next.hash()).unwrap();
+        close_run(&d, &next, &fold);
+        corrupt_open(&d.0);
+    }
+    #[test]
+    fn identical_duplicate_inside_run_adds_no_leaf() {
+        let (d, _, kept, last, _) = attack_fixture();
+        put(&d, 1, &[&kept, &kept, &last], &[]);
+        open(&d.0);
+    }
+    fn genesis_size_probe(record_free: bool) {
+        {
+            let d = Temp::new();
+            let first = base(&d);
+            if record_free {
+                put(&d, 0, &[], b"{\"torn\":");
+            }
+            let checkpoint = signed(
+                5,
+                Record::genesis(&TRAIL),
+                &seeded_pair(&first, &entry(&first)),
+            );
+            let resume = declaration(&checkpoint, 0, Record::genesis(&TRAIL), 4, None);
+            write_records(&d.0, &[&checkpoint, &resume]);
+            corrupt_open(&d.0);
+        }
+    }
+    #[test]
+    fn genesis_resume_rejects_two_creation_leaves_without_history() {
+        genesis_size_probe(false);
+    }
+    #[test]
+    fn genesis_resume_rejects_two_creation_leaves_after_record_free_run() {
+        genesis_size_probe(true);
+    }
+    #[test]
+    fn interior_non_fragment_is_corrupt_inside_and_outside_run() {
+        for run in [false, true] {
+            let d = Temp::new();
+            let first = base(&d);
+            let kept = if run {
+                headless(&first, 3)
+            } else {
+                entry(&first)
+            };
+            let next = entry(&kept);
+            if run {
+                put(&d, 0, &[&first], &[]);
+            }
+            let bytes = [
+                if run { Vec::new() } else { line(&first) },
+                line(&kept),
+                b"not json\n".to_vec(),
+                line(&next),
+            ]
+            .concat();
+            if run {
+                fs::write(segment(&d.0, 1), bytes).unwrap();
+                let mut fold = seeded_pair(&first, &kept);
+                fold.push(next.hash()).unwrap();
+                close_run(&d, &next, &fold);
+            } else {
+                fs::write(d.0.join("audit.jsonl"), bytes).unwrap();
+            }
+            corrupt_open(&d.0);
+        }
+    }
     #[test]
     fn archived_forged_pair_is_documented_reader_residual() {
         let d = Temp::new();

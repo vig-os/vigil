@@ -97,7 +97,7 @@ impl TrailReader {
     /// fold of ADR-0005 amendment 6: an explicit writer/verifier exception.
     /// A forged archived checkpoint/resume pair can pass without signature trust;
     /// verification must detect BadSignature/NoReceipt. Record-free evidence can
-    /// be removed without changing the fold because file= is informational.
+    /// be inserted or removed without changing the fold because file= is informational.
     pub(crate) fn open_marked(
         path: &Path,
         expected: Option<Head>,
@@ -122,8 +122,9 @@ impl TrailReader {
     /// verifier reports, only when a matching immediate resume and the cumulative
     /// MMR fold close the run. State is never reset at a damaged boundary.
     /// A forged archived checkpoint/resume pair can still pass this reader;
-    /// verification reports BadSignature/NoReceipt. Removing record-free segments
-    /// or unparsable bytes also leaves the fold unchanged (file= is informational).
+    /// verification reports BadSignature/NoReceipt. Inserting empty segments into
+    /// a run, or removing record-free segments or unparsable bytes, leaves the
+    /// fold unchanged (file= is informational).
     pub(crate) fn open(
         path: &Path,
         trail: [u8; 16],
@@ -287,7 +288,9 @@ pub(crate) fn history_segment(
     let mut first = opening;
     let mut count = 0;
     let mut closing = false;
+    let mut must_close = false;
     let mut prefix = false;
+    let mut invalid_line = false;
     let mut gap = None::<blake3::Hasher>;
     let mut file = file.try_clone().map_err(io_error)?;
     let mut offset = if opening {
@@ -345,6 +348,7 @@ pub(crate) fn history_segment(
                     }
                 } else {
                     damaged = true;
+                    invalid_line = true;
                 }
                 if count == 0 {
                     prefix = true;
@@ -366,6 +370,19 @@ pub(crate) fn history_segment(
         if record.context.trail != trail {
             return Err(corrupt("trail identity differs from marker"));
         }
+        if invalid_line {
+            return Err(corrupt("unparsable line before complete record"));
+        }
+        if !(first || closing && count == 1)
+            && state.as_ref().is_some_and(|s| s.head == Head::of(record))
+        {
+            if let Some(hash) = gap.take()
+                && record.context.repaired != Some(*hash.finalize().as_bytes())
+            {
+                return Err(corrupt("missing or mismatched repair attestation"));
+            }
+            continue;
+        }
         if state
             .as_ref()
             .is_some_and(|s| record.context.seq <= s.head.seq)
@@ -386,7 +403,9 @@ pub(crate) fn history_segment(
         if state.is_none() && !matches!(record.kind, Kind::Checkpoint(_)) {
             return Err(corrupt("missing initial checkpoint"));
         }
+        let outside_run = inherited && !*run;
         if !first
+            && !outside_run
             && state
                 .as_ref()
                 .is_some_and(|s| record.context.seq != s.head.seq + 1)
@@ -403,14 +422,21 @@ pub(crate) fn history_segment(
             // same file, start another. Compare this checkpoint before treating
             // the remaining in-run checkpoints solely as leaves.
             let mut trial = state.clone();
+            must_close = inherited && matches!(record.kind, Kind::Checkpoint(_)) && !broken;
             closing = inherited
                 && !prefix
                 && !damaged
                 && apply(record, &mut trial, state.is_none()).is_ok();
+            if inherited && matches!(record.kind, Kind::Checkpoint(_)) && !broken && !closing {
+                return Err(corrupt("first successor does not close sealed run"));
+            }
         }
         let is_resume = matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume");
+        if count == 1 && closing && !is_resume {
+            return Err(corrupt("first successor lacks immediate resume"));
+        }
         let base = state.is_none();
-        apply_checked(record, &mut state, false, broken, base)?;
+        apply_checked(record, &mut state, false, broken, base || outside_run)?;
         if count == 1 && closing && is_resume {
             *run = false;
         }
@@ -422,6 +448,9 @@ pub(crate) fn history_segment(
         s.newline = newline;
         first = false;
         count += 1;
+    }
+    if must_close && *run {
+        return Err(corrupt("first successor lacks resume"));
     }
     if count == 0 {
         damaged = true;
@@ -707,6 +736,9 @@ fn apply_checked(
         };
         if (genesis || head.seq == 0) && !root_link {
             return Err(corrupt("initial checkpoint does not link genesis"));
+        }
+        if root_link && head.seq > 0 && cp.size != 1 {
+            return Err(corrupt("genesis resume must carry one creation leaf"));
         }
         Mmr::from_peaks(cp.size, cp.peaks.clone()).map_err(|_| corrupt("invalid opening peaks"))?
     };
