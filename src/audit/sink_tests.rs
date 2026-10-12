@@ -2027,6 +2027,35 @@ fn key_load_size_and_symlink() {
 
 #[test]
 fn keygen_fresh_round_trip_and_never_overwrites() {
+    const CHILD: &str = "VIGIL_KEYGEN_MODE_CHILD";
+    let public_mode = match std::env::var(CHILD).as_deref() {
+        Ok("022") => 0o644,
+        Ok("077") => 0o600,
+        Err(_) => {
+            for mask in ["022", "077"] {
+                assert!(
+                    std::process::Command::new("sh")
+                        .args([
+                            "-c",
+                            "umask \"$1\" && shift && exec \"$@\"",
+                            "keygen-mode-child",
+                            mask,
+                        ])
+                        .arg(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "audit::sink::tests::keygen_fresh_round_trip_and_never_overwrites",
+                        ])
+                        .env(CHILD, mask)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            return;
+        }
+        Ok(mask) => panic!("unexpected child umask: {mask}"),
+    };
     let t = Temp::new();
     let path = t.0.join("key.seed");
     let pub_path = t.0.join("key.seed.pub");
@@ -2046,7 +2075,7 @@ fn keygen_fresh_round_trip_and_never_overwrites() {
     );
     assert_eq!(
         fs::metadata(&pub_path).unwrap().permissions().mode() & 0o777,
-        0o644
+        public_mode
     );
     assert_eq!(public, format!("{}\n", hex(&key)).as_bytes());
     assert!(!t.0.join("key.pub").exists());
@@ -2164,10 +2193,22 @@ fn keygen_uses_entropy() {
 
 #[test]
 fn key_load_refuses_socket() {
+    const CHILD: &str = "VIGIL_KEY_SOCKET_CHILD";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let _listener = std::os::unix::net::UnixListener::bind("socket").unwrap();
+        assert!(KeyFileSigner::load(path).is_err());
+        return;
+    }
     let t = Temp::new();
-    let path = t.0.join("socket");
-    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-    assert!(KeyFileSigner::load(&path).is_err());
+    assert!(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "audit::sink::tests::key_load_refuses_socket"])
+            .env(CHILD, t.0.canonicalize().unwrap().join("socket"))
+            .current_dir(&t.0)
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 #[test]
