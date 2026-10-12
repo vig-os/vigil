@@ -510,7 +510,11 @@ fn rotation_reads_only_new_data() {
         .unwrap()
         .map(|p| p.unwrap().metadata().unwrap().len())
         .sum();
-    eprintln!("rotation bytes scanned={scanned}, new={added}, trail={total}");
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "rotation bytes scanned={scanned}, new={added}, trail={total}"
+    );
     assert_eq!(scanned as u64, added);
 }
 #[test]

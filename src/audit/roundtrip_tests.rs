@@ -109,7 +109,7 @@ fn value() -> BoxedStrategy<Option<Value>> {
     ])
     .boxed()
 }
-fn generated() -> impl Strategy<Value = (Record, AnyValue)> {
+pub(crate) fn generated() -> impl Strategy<Value = (Record, AnyValue)> {
     (
         prop::collection::vec(unicode(), 6),
         (
