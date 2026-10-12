@@ -254,20 +254,10 @@ fn settle(dir: &File, trail: [u8; 16], poisoned: &AtomicBool) -> Result<(), Audi
                 return false;
             }
             let seq = prior.as_ref().map_or(0, |s| s.head.seq.saturating_add(1));
-            let previous = prior
-                .as_ref()
-                .map_or_else(|| Record::genesis(&trail), |s| s.head.hash);
-            if first.context.previous != previous
-                || (count == 1 && first.context.seq != seq)
-                || (count == 2 && first.context.seq < seq)
-            {
+            if count == 1 && first.context.seq != seq {
                 return false;
             }
-            if count == 2
-                && !matches!(&records[1].kind, Kind::Entry(e) if e.action == "vigil.audit.resume")
-            {
-                return false;
-            }
+            // Scan enforces hash links, forward sequence and immediate resume action for discard.
             scan(&staged, trail, prior.clone(), true, None, &mut false).is_ok()
         });
         if valid {
@@ -347,6 +337,7 @@ impl Sink {
                     Path::new("audit.jsonl"),
                 )
                 .map_err(io_error)?;
+                // #90: amendment 3 rule 2 requires shared poison after this rename fsync fails.
                 sync(dir, "promote-dir", &poisoned)?;
                 Ok(Head {
                     seq: 0,
