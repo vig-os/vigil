@@ -4,6 +4,7 @@ Rows the facade rejects (d24) are checked against the translator only.
 The Rust exclusion guard proves that no accepted name can bypass this path.
 """
 
+import http.client
 import json
 import os
 import pathlib
@@ -76,14 +77,23 @@ def query(port, expression, deadline):
             with urllib.request.urlopen(url, timeout=min(2, remaining)) as response:
                 data = json.load(response)
             break
-        except (urllib.error.URLError, OSError) as error:
+        except urllib.error.HTTPError as error:
+            if 400 <= error.code < 500:
+                raise AssertionError(f"query {expression!r}: {error}") from error
             last_error = str(error)
-            remaining = deadline - time.monotonic()
-            require(
-                remaining > 0,
-                f"query {expression!r}: deadline reached; last error: {last_error}",
-            )
-            time.sleep(min(0.25, remaining))
+        except (
+            urllib.error.URLError,
+            OSError,
+            http.client.IncompleteRead,
+            json.JSONDecodeError,
+        ) as error:
+            last_error = str(error)
+        remaining = deadline - time.monotonic()
+        require(
+            remaining > 0,
+            f"query {expression!r}: deadline reached; last error: {last_error}",
+        )
+        time.sleep(min(0.25, remaining))
     require(data["status"] == "success", f"query failed: {data}")
     return data["data"]["result"]
 

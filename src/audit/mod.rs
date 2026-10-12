@@ -94,6 +94,7 @@ pub enum FindingKind {
 }
 
 /// An audit failure with a matchable category and diagnostic context.
+/// The `Display` text is for people; it is not part of the stability promise. Match on `kind()`.
 #[derive(Debug)]
 pub struct AuditError {
     kind: AuditErrorKind,

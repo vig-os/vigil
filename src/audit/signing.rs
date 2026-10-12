@@ -7,6 +7,7 @@ use std::{
 };
 
 /// A key-custody failure, containing no secret material.
+/// The `Display` text is for people; it is not part of the stability promise. Do not parse it.
 #[derive(Debug)]
 pub struct SignerError(String);
 impl SignerError {

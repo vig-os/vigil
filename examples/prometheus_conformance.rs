@@ -9,17 +9,9 @@ mod enabled {
     use vigil::metrics::{Counter, CounterF64, Gauge, Histogram, Scope, UpDownCounter};
 
     // Oracle metadata is independent of the exported OTLP scope labels.
+    // The end-to-end oracle guards against hardcoded scope names (ruling 7b3-d2).
     fn package_scope() -> (&'static str, &'static str) {
         (env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
-    }
-
-    #[test]
-    fn oracle_scope_matches_declaring_package() {
-        // The real scope guard is the end-to-end run (ruling 7b3-d2).
-        assert_eq!(
-            package_scope(),
-            ("vigil-telemetry", env!("CARGO_PKG_VERSION"))
-        );
     }
 
     enum Instrument {
