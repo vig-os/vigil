@@ -759,20 +759,47 @@ fn hostname() -> Option<String> {
 }
 
 #[derive(Debug, Default)]
-struct Failures {
+pub(crate) struct Failures {
     dropped: usize,
     reported: usize,
     last_report: Option<Instant>,
 }
 impl Failures {
-    fn report(&mut self) {
-        let _ = writeln!(
-            std::io::stderr(),
-            "vigil: runtime log export losses; dropped records: {}",
-            self.dropped
-        );
-        self.reported = self.dropped;
-        self.last_report = Some(Instant::now());
+    pub(crate) fn record(
+        &mut self,
+        signal: &str,
+        unit: &str,
+        lost: usize,
+        result: &opentelemetry_sdk::error::OTelSdkResult,
+        shutting_down: bool,
+    ) -> u64 {
+        self.dropped = self.dropped.saturating_add(lost);
+        if (lost != 0 || result.is_err())
+            && !shutting_down
+            && self
+                .last_report
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(60))
+        {
+            let unreported = self.dropped.saturating_sub(self.reported);
+            if let Some(error) = result.as_ref().err().filter(|_| self.last_report.is_none()) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "vigil: runtime {signal} export failed: {error}; dropped {unit}: {}",
+                    self.dropped
+                );
+            } else {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "vigil: runtime {signal} export losses; dropped {unit}: {}",
+                    self.dropped
+                );
+            }
+            self.reported = self.dropped;
+            self.last_report = Some(Instant::now());
+            unreported as u64
+        } else {
+            0
+        }
     }
 }
 
@@ -789,32 +816,18 @@ impl LogExporter for ReportingExporter {
         let result = self.inner.export(batch).await;
         let lost = self.inner.take_dropped_records();
         self.losses.record(lost as u64, result.is_err());
-        if lost != 0 {
-            let mut failures = self
-                .failures
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            failures.dropped = failures.dropped.saturating_add(lost);
-            if !self.losses.shutting_down.load(Ordering::Acquire)
-                && failures
-                    .last_report
-                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(60))
-            {
-                let unreported = failures.dropped.saturating_sub(failures.reported);
-                if let Err(error) = result {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "vigil: runtime log export failed: {error}; dropped records: {}",
-                        failures.dropped
-                    );
-                    failures.reported = failures.dropped;
-                    failures.last_report = Some(Instant::now());
-                } else {
-                    failures.report();
-                }
-                self.losses.reported(unreported as u64);
-            }
-        }
+        let reported = self
+            .failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(
+                "log",
+                "records",
+                lost,
+                &result,
+                self.losses.shutting_down.load(Ordering::Acquire),
+            );
+        self.losses.reported(reported);
         Ok(())
     }
     fn set_resource(&mut self, resource: &Resource) {
@@ -1071,5 +1084,56 @@ mod entropy_failure_tests {
         assert!(!stderr.contains("cannot open log storage"), "{stderr}");
         assert!(stderr.contains("entropy fallback is alive"), "{stderr}");
         assert!(std::fs::read(temp.0.join("logs.jsonl")).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod failure_reporting_tests {
+    use super::*;
+    use opentelemetry_sdk::error::OTelSdkError;
+    #[test]
+    fn log_shutdown_gate_suppresses_an_otherwise_due_report() {
+        let mut failures = Failures::default();
+        let result = Err(OTelSdkError::InternalFailure("shutdown failure".into()));
+        assert_eq!(failures.record("log", "records", 2, &result, true), 0);
+        assert_eq!(failures.dropped, 2);
+        assert_eq!(failures.reported, 0);
+        assert!(failures.last_report.is_none());
+        assert_eq!(failures.record("log", "records", 0, &result, false), 2);
+    }
+
+    #[test]
+    fn first_failure_and_rate_limited_summaries_name_signal_and_unit() {
+        const CHILD: &str = "VIGIL_FAILURE_REPORT_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            for (signal, unit) in [("log", "records"), ("metric", "data points")] {
+                let mut failures = Failures::default();
+                let result = Err(OTelSdkError::InternalFailure("deliberate failure".into()));
+                assert_eq!(failures.record(signal, unit, 2, &result, false), 2);
+                assert_eq!(failures.record(signal, unit, 3, &result, false), 0);
+                failures.last_report = Some(Instant::now() - Duration::from_secs(61));
+                assert_eq!(failures.record(signal, unit, 4, &result, false), 7);
+                assert_eq!(failures.record(signal, unit, 1, &result, true), 0);
+                assert_eq!(failures.dropped, 10);
+                assert_eq!(failures.reported, 9);
+            }
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "init::failure_reporting_tests::first_failure_and_rate_limited_summaries_name_signal_and_unit", "--nocapture"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        for (signal, unit) in [("log", "records"), ("metric", "data points")] {
+            assert_eq!(
+                stderr
+                    .matches(&format!("runtime {signal} export failed:"))
+                    .count(),
+                1
+            );
+            assert!(stderr.contains(&format!(
+                "runtime {signal} export losses; dropped {unit}: 9"
+            )));
+        }
     }
 }

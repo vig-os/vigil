@@ -77,3 +77,18 @@ mod tests {
 }
 
 mod ordered_json;
+
+#[cfg(vigil_unstable)]
+#[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
+pub mod envelope;
+#[cfg(not(vigil_unstable))]
+mod envelope;
+#[cfg(all(feature = "metrics", vigil_unstable))]
+#[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
+pub mod metric_export;
+#[cfg(all(feature = "metrics", not(vigil_unstable)))]
+#[expect(dead_code, reason = "reader wiring follows in #7's lifecycle part")]
+mod metric_export;
+
+#[cfg(test)]
+mod order_tests;

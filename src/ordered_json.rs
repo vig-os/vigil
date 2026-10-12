@@ -13,6 +13,28 @@ pub(crate) const LOGS: Rules = &[
     ("logRecords", &["observedTimeUnixNano", "timeUnixNano"]),
 ];
 
+#[cfg(feature = "metrics")]
+pub(crate) const METRICS: Rules = &[
+    ("resourceMetrics", &["scopeMetrics"]),
+    ("scopeMetrics", &["metrics"]),
+    (
+        "metrics",
+        &[
+            "gauge",
+            "sum",
+            "histogram",
+            "exponentialHistogram",
+            "summary",
+        ],
+    ),
+    ("sum", &["dataPoints"]),
+    ("gauge", &["dataPoints"]),
+    ("histogram", &["dataPoints"]),
+    ("exponentialHistogram", &["dataPoints"]),
+    ("summary", &["dataPoints"]),
+    ("dataPoints", &["timeUnixNano"]),
+];
+
 pub(crate) fn encode(value: &Value, context: &str, rules: Rules) -> Result<String, String> {
     serde_json::to_string(&Ordered {
         value,
