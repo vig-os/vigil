@@ -24,6 +24,14 @@ pub enum AuditErrorKind {
     /// A storage operation failed.
     Io,
     /// A previous durability failure makes further writes unsafe.
+    ///
+    /// To clear `audit.poison`, first restart the machine or unmount and remount
+    /// the filesystem to discard the page cache, then run `vigil-audit verify`,
+    /// and only after verification passes remove `audit.poison`. Leave staging
+    /// files for normal settlement. The poison file is not fsynced: a power loss
+    /// may drop it, silently skipping verification and removal after restart;
+    /// running verification anyway is recommended. A poisoned handle must be
+    /// reopened, using the highest held receipt as its expected head.
     Poisoned,
     /// Encoded data exceeds a format field or JSON payload limit.
     TooLarge,

@@ -68,6 +68,8 @@ fn poison_check(dir: &File) -> Result<(), AuditError> {
     }
 }
 fn new_file(dir: &File, name: &str, mode: Mode) -> Result<File, AuditError> {
+    #[cfg(test)]
+    hooks::event(name_to_create_site(name)).map_err(io_error)?;
     rfs::openat(
         dir,
         name,
@@ -138,15 +140,17 @@ fn sync_io(file: &File, site: &'static str) -> std::io::Result<()> {
     #[cfg(test)]
     hooks::event(site)?;
     if site.ends_with("dir") || site == "marker" {
-        file.sync_all()
+        file.sync_all()?;
     } else {
-        file.sync_data()
+        file.sync_data()?;
     }
+    #[cfg(test)]
+    hooks::durable(file)?;
+    Ok(())
 }
 fn sync(file: &File, site: &'static str, poisoned: &AtomicBool) -> Result<(), AuditError> {
     sync_io(file, site).map_err(|e| {
         poisoned.store(true, Ordering::Relaxed);
-        // #90: no pre-write length at staging/directory sites; marker creation has no handle.
         io_error(e)
     })
 }
@@ -183,13 +187,41 @@ fn append(
         let rollback = truncate_io(file, length);
         if let Err(truncate) = rollback {
             // Persist the barrier before releasing the directory lock (d6).
-            if let Ok(mut marker) = new_file(dir, "audit.poison", Mode::RUSR | Mode::WUSR) {
-                let _ = write!(marker, "{original}; rollback: {truncate}");
-            }
+            poison(dir, &format!("{original}; rollback: {truncate}"));
         }
         return Err(original);
     }
     Ok(())
+}
+fn poison(dir: &File, cause: &str) {
+    if let Ok(file) = new_file(dir, "audit.poison", Mode::RUSR | Mode::WUSR) {
+        let _ = write_io(&file, cause.as_bytes());
+    }
+}
+fn sync_renamed(
+    dir: &File,
+    site: &'static str,
+    staging: &str,
+    poisoned: &AtomicBool,
+) -> Result<(), AuditError> {
+    sync(dir, site, poisoned).inspect_err(|error| {
+        let segments = match rotate::rotated_names_at(dir, "audit") {
+            Ok(names) => format!("{names:?}"),
+            Err(cause) => format!("segment names unavailable: {cause}"),
+        };
+        poison(
+            dir,
+            &format!("{error}; directory fsync after rename: audit.jsonl, {staging}, {segments}"),
+        );
+    })
+}
+#[cfg(test)]
+fn name_to_create_site(name: &str) -> &'static str {
+    match name {
+        "audit.poison" => "create-poison",
+        "audit.trail" => "create-marker",
+        _ => "create-staging",
+    }
 }
 fn linked_live(dir: &File) -> Result<bool, AuditError> {
     let live = existing(dir, Path::new("audit.jsonl"), false)?;
@@ -222,7 +254,6 @@ fn predecessor(dir: &File, trail: [u8; 16]) -> Result<Option<State>, AuditError>
     Ok(state)
 }
 fn settle(dir: &File, trail: [u8; 16], poisoned: &AtomicBool) -> Result<(), AuditError> {
-    // #90: order of poison check vs settlement, and settlement on poisoned handles.
     for (name, count) in [(".audit-next.jsonl", 1), (".audit-resume.jsonl", 2)] {
         if !exists(dir, name)? {
             continue;
@@ -276,11 +307,11 @@ fn settle(dir: &File, trail: [u8; 16], poisoned: &AtomicBool) -> Result<(), Audi
             hooks::event("promote").map_err(io_error)?;
             rotate::rename_no_replace(dir, Path::new(name), Path::new("audit.jsonl"))
                 .map_err(io_error)?;
-            // #90: shared poisoning after a directory failure has no pre-write length.
-            sync(dir, "settle-promote-dir", poisoned)?;
+            sync_renamed(dir, "settle-promote-dir", name, poisoned)?;
         } else {
+            #[cfg(test)]
+            hooks::event("unlink").map_err(io_error)?;
             rfs::unlinkat(dir, name, AtFlags::empty()).map_err(io_error)?;
-            // #90: shared poisoning after a directory failure has no pre-write length.
             sync(dir, "settle-discard-dir", poisoned)?;
         }
     }
@@ -316,10 +347,8 @@ impl Sink {
                 let mut trail = [0; 16];
                 getrandom::fill(&mut trail).map_err(io_error)?;
                 let poisoned = AtomicBool::new(false);
-                let mut marker = new_file(dir, "audit.trail", Mode::RUSR)?;
-                rotate::write_once(&mut marker, format!("{}\n", hex(&trail)).as_bytes())
-                    .map_err(io_error)?;
-                // #90: marker fsync during create has no handle to poison.
+                let marker = new_file(dir, "audit.trail", Mode::RUSR)?;
+                write_io(&marker, format!("{}\n", hex(&trail)).as_bytes()).map_err(io_error)?;
                 sync(&marker, "marker", &poisoned)?;
                 sync(dir, "marker-dir", &poisoned)?;
                 let context = RecordContext::new(
@@ -339,8 +368,7 @@ impl Sink {
                     Path::new("audit.jsonl"),
                 )
                 .map_err(io_error)?;
-                // #90: amendment 3 rule 2 requires shared poison after this rename fsync fails.
-                sync(dir, "promote-dir", &poisoned)?;
+                sync_renamed(dir, "promote-dir", ".audit-next.jsonl", &poisoned)?;
                 Ok(Head {
                     seq: 0,
                     hash: cp.hash(),
@@ -411,14 +439,33 @@ impl Sink {
         Self::signed(&*self.signer, self.context(state, time)?, &state.mmr)
     }
     fn stage(dir: &File, bytes: &[u8], poisoned: &AtomicBool) -> Result<(), AuditError> {
-        let mut file = new_file(dir, ".audit-next.jsonl", Mode::RUSR | Mode::WUSR)?;
-        rotate::write_once(&mut file, bytes).map_err(io_error)?;
-        // #90: staging truncation and shared poisoning without a pre-write length.
-        sync(&file, "staging", poisoned)?;
-        sync(dir, "staging-dir", poisoned)
+        let file = new_file(dir, ".audit-next.jsonl", Mode::RUSR | Mode::WUSR)?;
+        let result = write_io(&file, bytes)
+            .map_err(io_error)
+            .and_then(|()| sync(&file, "staging", poisoned))
+            .and_then(|()| sync(dir, "staging-dir", poisoned));
+        if let Err(original) = result {
+            if let Err(truncate) = truncate_io(&file, 0)
+                && poisoned.load(Ordering::Relaxed)
+            {
+                poison(
+                    dir,
+                    &format!("{original}; .audit-next.jsonl rollback: {truncate}"),
+                );
+            }
+            return Err(original);
+        }
+        Ok(())
+    }
+    fn healthy(&self) -> Result<(), AuditError> {
+        if self.poisoned.load(Ordering::Relaxed) {
+            Err(error(AuditErrorKind::Poisoned, "handle durability failure"))
+        } else {
+            Ok(())
+        }
     }
     fn prepare(&self, dir: &File) -> Result<(), AuditError> {
-        // #90: checkpoint/close/Drop on poisoned handles or with audit.poison.
+        self.healthy()?;
         poison_check(dir)?;
         settle(dir, self.trail, &self.poisoned)
     }
@@ -573,13 +620,13 @@ impl Sink {
             Path::new("audit.jsonl"),
         )
         .map_err(io_error)?;
-        // #90: shared poisoning without a pre-write length.
-        sync(dir, "promote-dir", &self.poisoned)?;
+        sync_renamed(dir, "promote-dir", ".audit-next.jsonl", &self.poisoned)?;
         *live = existing(dir, Path::new("audit.jsonl"), true)?;
         *state = opened;
         Ok(())
     }
     pub(crate) fn checkpoint(&self) -> Result<Record, AuditError> {
+        self.healthy()?;
         self.reader.with_current(
             |dir| self.prepare(dir),
             |dir, file, state| {
@@ -603,9 +650,18 @@ impl Sink {
 }
 impl Drop for Sink {
     fn drop(&mut self) {
-        // #90: best-effort settlement/checkpoint behavior after poisoning.
-        if !self.closed {
-            let _ = self.checkpoint();
+        if !self.closed
+            && !self.poisoned.load(Ordering::Relaxed)
+            && let Err(error) = self.checkpoint()
+        {
+            let message = format!(
+                "vigil audit: best-effort checkpoint failed: {}",
+                error.to_string().escape_debug()
+            );
+            #[cfg(test)]
+            hooks::stderr(&message);
+            // A failed stderr write must not turn best-effort Drop into a panic.
+            let _ = writeln!(std::io::stderr().lock(), "{message}");
         }
     }
 }
@@ -622,7 +678,25 @@ mod hooks {
         pub(super) static FAIL: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
         pub(super) static EVENTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     }
+    pub(super) fn stderr(message: &str) {
+        STDERR.with(|lines| lines.borrow_mut().push(message.to_owned()));
+    }
+    thread_local! {
+        pub(super) static STDERR: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+    pub(super) fn durable(file: &std::fs::File) -> io::Result<()> {
+        super::durability::sync(file)
+    }
+    type Observer = Box<dyn Fn(&str)>;
+    thread_local! {
+        pub(super) static OBSERVE: RefCell<Option<Observer>> = const { RefCell::new(None) };
+    }
     pub(super) fn event(site: &'static str) -> io::Result<()> {
+        OBSERVE.with(|observe| {
+            if let Some(observe) = observe.borrow().as_ref() {
+                observe(site);
+            }
+        });
         EVENTS.with(|events| events.borrow_mut().push(site));
         FAIL.with(|fail| {
             let mut fail = fail.borrow_mut();
@@ -635,6 +709,9 @@ mod hooks {
         })
     }
 }
+#[cfg(test)]
+#[path = "durability_tests.rs"]
+mod durability;
 #[cfg(test)]
 #[path = "sink_tests.rs"]
 mod tests;
