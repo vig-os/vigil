@@ -130,7 +130,7 @@ pub struct CheckpointFields {
     pub(super) size: u64,
     pub(super) root: [u8; 32],
     pub(super) peaks: Vec<[u8; 32]>,
-    key: [u8; 32],
+    pub(super) key: [u8; 32],
     signature: [u8; 64],
 }
 impl CheckpointFields {

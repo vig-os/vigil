@@ -175,9 +175,16 @@ fn reserved_prefix_size_and_one_write_checkpoint() {
     assert_eq!(events, ["clock", "write", "record-data"]);
     assert_eq!(records(&t).len(), 3);
     let h = s
-        .record_internal(&Entry::new("actor", "vigil.audit.test", "object"))
+        .record_internal(
+            &Entry::new("actor", "vigil.audit.test", "object"),
+            ReservedAction::KeyRotated,
+        )
         .unwrap();
     assert_eq!(h.seq, 3);
+    let Kind::Entry(internal) = &records(&t)[3].kind else {
+        panic!("expected entry")
+    };
+    assert_eq!(internal.action, "vigil.audit.key_rotated");
 }
 #[test]
 fn short_write_rolls_back() {

@@ -330,9 +330,64 @@ fn clean_stop_process_head_and_killed_orphan() {
     assert!(matches!(all.last().unwrap().kind, Kind::Checkpoint(_)));
     assert_eq!(held.len(), count * (knob("VIGIL_CRASH_RECORDS", 3) + 1));
     assert_receipts(&all, &held);
+    let expected = Head {
+        seq: max.0,
+        hash: all.last().unwrap().hash(),
+    };
+    super::operators::clean_stop_attacks(&t, expected);
+    let operation = || OperatorOp::Rotate {
+        bound: expected,
+        actor: "operator".into(),
+        reason: "scheduled".into(),
+    };
+    let new_key = super::operators::SignOnly::new("22", false);
+    bad(
+        Sink::open(&t.0, new_key.clone(), Config::default(), None)
+            .unwrap()
+            .operator_write(
+                Head {
+                    seq: expected.seq - 1,
+                    ..expected
+                },
+                OperatorOp::Rotate {
+                    bound: Head {
+                        seq: all[0].context.seq,
+                        hash: all[0].hash(),
+                    },
+                    actor: "operator".into(),
+                    reason: "scheduled".into(),
+                },
+            ),
+        AuditErrorKind::HeadMismatch,
+    );
+    let rotated = Sink::open(&t.0, new_key.clone(), Config::default(), None)
+        .unwrap()
+        .operator_write(expected, operation())
+        .unwrap();
+    let rotated_head = Head {
+        seq: rotated.checkpoint.context.seq,
+        hash: rotated.checkpoint.hash(),
+    };
     let mut orphan = Process::spawn(&t.0, "orphan", "");
     orphan.ready();
     orphan.kill();
+    let before_refusal = bytes(&t);
+    new_key.calls.store(0, Ordering::Relaxed);
+    bad(
+        Sink::open(&t.0, new_key.clone(), Config::default(), None)
+            .unwrap()
+            .operator_write(
+                rotated_head,
+                OperatorOp::Rotate {
+                    bound: expected,
+                    actor: "operator".into(),
+                    reason: "scheduled".into(),
+                },
+            ),
+        AuditErrorKind::HeadMismatch,
+    );
+    assert_eq!(bytes(&t), before_refusal);
+    assert_eq!(new_key.calls.load(Ordering::Relaxed), 0);
     let restarted = open(&t);
     assert!(scan_head(&restarted).seq > max.0);
     let closed = restarted.close().unwrap();

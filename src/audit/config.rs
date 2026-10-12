@@ -1,9 +1,11 @@
-use super::{AuditError, AuditErrorKind, AuditTrail, Signer, sink, storage::Head};
+use super::{
+    AuditError, AuditErrorKind, AuditTrail, Checkpoint, Receipt, Signer, sink, storage::Head,
+};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 /// Reviewed audit policy, independent of telemetry and `VIGIL_*` variables.
 ///
-/// Builders defer validation until [`Self::create`] or [`Self::open`]. The
+/// Builders defer validation until create, open, rotate or checkpoint. The
 /// default directory is `$XDG_STATE_HOME/<service>/audit`, falling back to
 /// `$HOME/.local/state/<service>/audit`; relative environment paths are ignored.
 #[derive(Debug, Clone)]
@@ -35,7 +37,7 @@ impl AuditConfig {
         self
     }
     /// Sets the segment size threshold, default 50 MiB. Zero is invalid.
-    /// Sealing checkpoints and signer outages may make a segment exceed it.
+    /// Sealing checkpoints, signer outages and operator writes may exceed it.
     pub fn max_bytes(mut self, bytes: u64) -> Self {
         self.config.max_bytes = bytes;
         self
@@ -89,6 +91,15 @@ impl AuditConfig {
             })
             .ok_or_else(|| invalid("missing absolute XDG_STATE_HOME and HOME".into()))
     }
+    fn validate_operator(&self) -> Result<PathBuf, AuditError> {
+        if self.expected.is_some() {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                "rotate/checkpoint take an explicit expected head; builder expect_head is invalid",
+            ));
+        }
+        self.validate(false)
+    }
     /// Creates a new trail explicitly and returns its handle. Pin its random
     /// [`AuditTrail::trail`] id outside the audit directory before use.
     ///
@@ -105,6 +116,117 @@ impl AuditConfig {
         let dir = self.validate(true)?;
         let sink = sink::Sink::create(&dir, signer, self.config)?;
         Ok(AuditTrail::new(sink, dir, self.mirror))
+    }
+    /// Rotates the signing key under ADR-0005 decision 9, returning the
+    /// rotation record's receipt and the new-key checkpoint covering it.
+    /// `bound` names a present checkpoint whose key is being revoked; restore
+    /// an archived segment first, or choose a bound that remains present.
+    /// Actor and reason must be nonempty and contain no NUL.
+    ///
+    /// `expect_head` must come from the application's newest receipt or an
+    /// anchor, never from the disk (one exception: the crash outcome (ii) of
+    /// amendment 8, where R's hash is pinned to the held head through `prev_hash`).
+    /// The sequence and hash must exactly equal the disk head or nothing is signed.
+    /// This call holds one lock and writes one record plus one checkpoint without
+    /// sealing; the live file may exceed `max_bytes` by those two lines.
+    ///
+    /// # Crash recovery
+    /// For a call that returned `Io` or never returned, clear poison first.
+    /// After the held head H, nothing or a fragment permits the same rotate again.
+    /// A complete rotation record R at h+1 must link to H and match this call's
+    /// actor, reason, trail object and exact old-key/bound details, with its time
+    /// inside the call window. R alone (possibly followed by a fragment) permits
+    /// [`Self::checkpoint`] with the new key and R's sequence and hash. This is
+    /// amendment 8's sole sanctioned disk read of an expected head. R followed
+    /// by a complete new-key checkpoint C at h+2 linking to R needs no write.
+    /// Anything else requires restarting decision 9 at verification, without signing.
+    ///
+    /// In the R cases, waive only R, using the operator's record of exact arguments,
+    /// start time and observed ending, and one of these fixed reason forms:
+    /// `operator rotate started <UTC>: returned Io: <error>` or
+    /// `operator rotate started <UTC>: did not return (<killed|host stopped> at <UTC>)`.
+    /// With nothing or a fragment, store the re-run's receipt/checkpoint and waive
+    /// nothing. Verification reports `NoReceipt` for R, `TornWrite` for a fragment,
+    /// and `UncoveredTail`/`RevocationUnconfirmed` until C exists (amendment 8).
+    ///
+    /// # Errors
+    /// Returns `InvalidConfig` for invalid policy, a builder `expect_head`, a bound
+    /// above the expected head, or reuse of the bound's key; `InvalidEntry` for
+    /// invalid actor/reason; `HeadMismatch` for a mismatched exact head or bound;
+    /// and signer, corruption, poison or storage errors. Refusals never sign on Drop.
+    pub fn rotate(
+        self,
+        signer: Arc<dyn Signer>,
+        bound: (u64, [u8; 32]),
+        expect_head: (u64, [u8; 32]),
+        actor: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<(Receipt, Checkpoint), AuditError> {
+        let dir = self.validate_operator()?;
+        let expect = Head {
+            seq: expect_head.0,
+            hash: expect_head.1,
+        };
+        let op = sink::OperatorOp::Rotate {
+            bound: Head {
+                seq: bound.0,
+                hash: bound.1,
+            },
+            actor: actor.into(),
+            reason: reason.into(),
+        };
+        op.validate(expect)?;
+        let sink = sink::Sink::open(&dir, signer, self.config, None)?;
+        let trail = sink.trail();
+        let written = sink.operator_write(expect, op)?;
+        let record = written.record.ok_or_else(|| {
+            AuditError::new(AuditErrorKind::CorruptTrail, "missing rotation record")
+        })?;
+        let receipt = Receipt {
+            trail,
+            seq: record.context.seq,
+            hash: record.hash(),
+            unsigned_records: 0,
+        };
+        if self.mirror
+            && let super::format::Kind::Entry(entry) = &record.kind
+        {
+            super::trail::mirror(entry, &receipt);
+        }
+        Ok((receipt, super::trail::checkpoint(written.checkpoint)?))
+    }
+    /// Writes one operator checkpoint under ADR-0005 decision 9.
+    /// `expect_head` must come from the application's newest receipt or an anchor,
+    /// never from the disk (one exception: the crash outcome (ii) of amendment 8,
+    /// where R's hash is pinned to the held head through `prev_hash`).
+    /// The sequence and hash must exactly equal the disk head or nothing is signed.
+    /// No sealing or cadence checkpoint occurs.
+    ///
+    /// For rotation crash outcome (ii), use the new key and the matching rotation
+    /// record R's head, following [`Self::rotate`]'s content, time and waiver rules.
+    /// If C already follows R (outcome (iii)), write nothing. The rotation's
+    /// `Io` or never-returned ending and fixed waiver reason forms are documented
+    /// on [`Self::rotate`].
+    ///
+    /// # Errors
+    /// Returns `InvalidConfig` for invalid policy or a builder `expect_head`,
+    /// `HeadMismatch` for a different disk head, and signer, corruption, poison
+    /// or storage errors. Refusals never sign on Drop.
+    pub fn checkpoint(
+        self,
+        signer: Arc<dyn Signer>,
+        expect_head: (u64, [u8; 32]),
+    ) -> Result<Checkpoint, AuditError> {
+        let dir = self.validate_operator()?;
+        let sink = sink::Sink::open(&dir, signer, self.config, None)?;
+        let written = sink.operator_write(
+            Head {
+                seq: expect_head.0,
+                hash: expect_head.1,
+            },
+            sink::OperatorOp::Checkpoint,
+        )?;
+        super::trail::checkpoint(written.checkpoint)
     }
     /// Opens an existing trail without writing or signing new trail content.
     /// Interrupted staging is settled and the chain is scanned.

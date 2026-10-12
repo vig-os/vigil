@@ -56,9 +56,7 @@ impl AuditTrail {
             unsigned_records: recorded.unsigned_records,
         };
         if self.mirror {
-            tracing::event!(target: "vigil::audit", tracing::Level::INFO,
-                action = entry.action.as_str(), object = entry.object.as_str(),
-                seq = receipt.seq, hash = receipt.hash_string());
+            mirror(entry, &receipt);
         }
         Ok(receipt)
     }
@@ -90,7 +88,7 @@ impl AuditTrail {
         self.sink.trail()
     }
 }
-fn checkpoint(record: Record) -> Result<Checkpoint, AuditError> {
+pub(super) fn checkpoint(record: Record) -> Result<Checkpoint, AuditError> {
     let bytes = sink::line(&record)?;
     let line = std::str::from_utf8(&bytes)
         .map_err(|e| AuditError::new(AuditErrorKind::CorruptTrail, e.to_string()))?;
@@ -101,10 +99,10 @@ fn checkpoint(record: Record) -> Result<Checkpoint, AuditError> {
 /// Store outside the trail directory so rollback can be detected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Receipt {
-    trail: [u8; 16],
-    seq: u64,
-    hash: [u8; 32],
-    unsigned_records: u64,
+    pub(super) trail: [u8; 16],
+    pub(super) seq: u64,
+    pub(super) hash: [u8; 32],
+    pub(super) unsigned_records: u64,
 }
 impl Receipt {
     /// Returns the trail identity by value.
@@ -129,4 +127,11 @@ impl Receipt {
     pub fn unsigned_records(&self) -> u64 {
         self.unsigned_records
     }
+}
+
+/// Emits the optional audit mirror after the caller has released the audit lock.
+pub(super) fn mirror(entry: &Entry, receipt: &Receipt) {
+    tracing::event!(target: "vigil::audit", tracing::Level::INFO,
+        action = entry.action.as_str(), object = entry.object.as_str(),
+        seq = receipt.seq(), hash = receipt.hash_string());
 }

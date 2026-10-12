@@ -157,6 +157,23 @@ impl TrailReader {
         })
     }
 
+    /// Operator boundary: settlement and a full history scan under one lock.
+    /// Unlike refresh, this observes same-length rewrites of cached records.
+    pub(crate) fn with_initial<T>(
+        &self,
+        bound: Option<Head>,
+        prepare: impl FnOnce(&File) -> Result<(), AuditError>,
+        f: impl FnOnce(&File, &File, &State, Option<Record>) -> Result<T, AuditError>,
+    ) -> Result<T, AuditError> {
+        self.directory
+            .with_lock(|dir| {
+                prepare(dir)?;
+                let (cache, record) = initial_record(dir, self.trail, bound)?;
+                f(dir, &cache.file, &cache.state, record)
+            })
+            .map_err(io_error)?
+    }
+
     /// B2b's append boundary: recheck the live inode and validate every newly
     /// observed record before handing the current descriptor to the writer.
     /// B2b must settle staging *inside this same directory lock*, before refresh;
@@ -231,8 +248,15 @@ pub(crate) fn existing(dir: &File, name: &Path, writable: bool) -> Result<File, 
     })
 }
 fn initial(dir: &File, trail: [u8; 16], expected: Option<Head>) -> Result<Cache, AuditError> {
+    initial_record(dir, trail, expected).map(|(cache, _)| cache)
+}
+fn initial_record(
+    dir: &File,
+    trail: [u8; 16],
+    expected: Option<Head>,
+) -> Result<(Cache, Option<Record>), AuditError> {
     let mut chain = None;
-    let mut found = false;
+    let mut found = None;
     let mut run = false;
     let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
     for name in &names {
@@ -241,17 +265,20 @@ fn initial(dir: &File, trail: [u8; 16], expected: Option<Head>) -> Result<Cache,
     }
     let file = existing(dir, Path::new("audit.jsonl"), true)?;
     let state = scan_closing(&file, trail, chain, expected, &mut found, run)?;
-    if expected.is_some() && !found {
+    if expected.is_some() && found.is_none() {
         return Err(AuditError::new(
             AuditErrorKind::HeadMismatch,
             "expected head absent or different",
         ));
     }
-    Ok(Cache {
-        file,
-        state,
-        sealed_before: names.last().cloned(),
-    })
+    Ok((
+        Cache {
+            file,
+            state,
+            sealed_before: names.last().cloned(),
+        },
+        found,
+    ))
 }
 // Normal segments keep the single-pass strict path. Only damaged history, or
 // history already inside a run, needs the amendment-6 exception. No records are
@@ -266,7 +293,7 @@ pub(crate) fn history_segment(
     mut state: Option<State>,
     opening: bool,
     expected: Option<Head>,
-    found: &mut bool,
+    found: &mut Option<Record>,
     run: &mut bool,
 ) -> Result<Option<State>, AuditError> {
     // Decision 8 still applies when a malformed suffix makes the successor
@@ -461,7 +488,7 @@ pub(crate) fn history_segment(
             s.run_loss = false;
         }
         if expected == Some(s.head) {
-            *found = true;
+            *found = Some(record.clone());
         }
         s.offset = offset;
         s.newline = newline;
@@ -497,14 +524,14 @@ pub(crate) fn scan_staged(
     state: Option<State>,
     run: bool,
 ) -> Result<State, AuditError> {
-    scan_inner(file, trail, state, true, None, &mut false, true, run)
+    scan_inner(file, trail, state, true, None, &mut None, true, run)
 }
 fn scan_closing(
     file: &File,
     trail: [u8; 16],
     state: Option<State>,
     expected: Option<Head>,
-    found: &mut bool,
+    found: &mut Option<Record>,
     run: bool,
 ) -> Result<State, AuditError> {
     scan_inner(file, trail, state, true, expected, found, false, run)
@@ -522,7 +549,7 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
             io_error(e.into())
         }
     })?;
-    let mut found = false;
+    let mut found = None;
     if (old.dev(), old.ino()) == (live.st_dev as u64, live.st_ino as u64) {
         if old.len() < cache.state.length {
             return Err(corrupt("live file shrank below cached length"));
@@ -595,7 +622,7 @@ pub(crate) fn scan(
     state: Option<State>,
     opening: bool,
     expected: Option<Head>,
-    found: &mut bool,
+    found: &mut Option<Record>,
     genesis: bool,
 ) -> Result<State, AuditError> {
     scan_inner(file, trail, state, opening, expected, found, genesis, false)
@@ -608,7 +635,7 @@ fn scan_inner(
     mut state: Option<State>,
     opening: bool,
     expected: Option<Head>,
-    found: &mut bool,
+    found: &mut Option<Record>,
     genesis: bool,
     run: bool,
 ) -> Result<State, AuditError> {
@@ -714,7 +741,7 @@ fn scan_inner(
         }
         let s = state.as_mut().ok_or_else(|| corrupt("missing head"))?;
         if expected == Some(s.head) {
-            *found = true;
+            *found = Some(record.clone());
         }
         s.offset = offset;
         s.newline = newline;

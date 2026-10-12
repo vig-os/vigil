@@ -59,7 +59,7 @@ fn public_receipt_checkpoint_and_close_roundtrip() {
     assert_eq!(receipt.seq(), 1);
     assert_eq!(receipt.unsigned_records(), 0);
     assert_eq!(receipt.hash_string(), digest_string(&receipt.hash()));
-    let mut found = false;
+    let mut found = None;
     let state = storage::scan(
         &fs::File::open(temp.0.join("audit.jsonl")).unwrap(),
         receipt.trail(),
@@ -73,7 +73,7 @@ fn public_receipt_checkpoint_and_close_roundtrip() {
         true,
     )
     .unwrap();
-    assert!(found);
+    assert!(found.is_some());
     assert_eq!(state.head.seq, receipt.seq());
     assert_eq!(state.head.hash, receipt.hash());
     let records = temp.records();
@@ -265,6 +265,44 @@ fn mirror_fires_after_directory_unlock_and_contains_only_four_fields() {
         );
         off.close().unwrap();
         assert_eq!(events.lock().unwrap().len(), 1);
+    });
+}
+
+#[test]
+fn operator_mirror_is_after_unlock() {
+    let temp = Temp::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(Probe {
+        dir: temp.0.clone(),
+        events: events.clone(),
+    });
+    tracing::subscriber::with_default(subscriber, || {
+        let head = temp.config().create(signer()).unwrap().close().unwrap();
+        let key = Arc::new(KeyFileSigner::from_hex(&"22".repeat(32)).unwrap());
+        let (r, c) = temp
+            .config()
+            .mirror_to_logs(true)
+            .rotate(
+                key.clone(),
+                (head.seq(), head.hash()),
+                (head.seq(), head.hash()),
+                "operator",
+                "scheduled",
+            )
+            .unwrap();
+        temp.config()
+            .mirror_to_logs(true)
+            .checkpoint(key, (c.seq(), c.hash()))
+            .unwrap();
+        let captured = events.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].keys().map(String::as_str).collect::<Vec<_>>(),
+            ["action", "hash", "object", "seq"]
+        );
+        assert_eq!(captured[0]["action"], "\"vigil.audit.key_rotated\"");
+        assert_eq!(captured[0]["seq"], r.seq().to_string());
+        assert_eq!(captured[0]["hash"].trim_matches('"'), r.hash_string());
     });
 }
 

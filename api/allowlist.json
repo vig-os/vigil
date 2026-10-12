@@ -171,5 +171,12 @@
       "vigil::audit::KeyFileSigner::fmt": "fn",
       "vigil::audit::keygen": "fn"
     }
+  },
+  {
+    "justification": "ADR-0005 decision 9 and decision 13 amended by amendment 8: exact-head operator rotation and checkpoint",
+    "items": {
+      "vigil::audit::AuditConfig::rotate": "fn",
+      "vigil::audit::AuditConfig::checkpoint": "fn"
+    }
   }
 ]
