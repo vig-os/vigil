@@ -181,6 +181,10 @@ fn reserved_prefix_size_and_one_write_checkpoint() {
         )
         .unwrap();
     assert_eq!(h.seq, 3);
+    let Kind::Entry(internal) = &records(&t)[3].kind else {
+        panic!("expected entry")
+    };
+    assert_eq!(internal.action, "vigil.audit.key_rotated");
 }
 #[test]
 fn short_write_rolls_back() {

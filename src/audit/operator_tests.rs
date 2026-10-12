@@ -259,17 +259,20 @@ fn validation_happens_before_any_disk_access() {
         config.clone().rotate(signer(), (2, [1; 32]), h, "a", "r"),
         AuditErrorKind::InvalidConfig,
     );
-    bad(
-        config
-            .clone()
-            .expect_head(1, [1; 32])
-            .rotate(signer(), h, h, "a", "r"),
-        AuditErrorKind::InvalidConfig,
-    );
-    bad(
-        config.expect_head(1, [1; 32]).checkpoint(signer(), h),
-        AuditErrorKind::InvalidConfig,
-    );
+    for checkpoint in [false, true] {
+        let config = config.clone().expect_head(1, [1; 32]);
+        let error = if checkpoint {
+            config.checkpoint(signer(), h).map(|_| ())
+        } else {
+            config.rotate(signer(), h, h, "a", "r").map(|_| ())
+        }
+        .unwrap_err();
+        assert_eq!(error.kind(), AuditErrorKind::InvalidConfig);
+        assert_eq!(
+            error.to_string(),
+            "InvalidConfig: rotate/checkpoint take an explicit expected head; builder expect_head is invalid"
+        );
+    }
     assert_eq!(fs::read_dir(&t.0).unwrap().count(), 0);
 }
 #[test]
@@ -443,6 +446,53 @@ fn failed_fsync_rollback_and_poison_barrier() {
             }
         }
     }
+}
+fn repaired_tail_round_trip(checkpoint: bool) {
+    let t = Temp::new();
+    let h = clean(&t);
+    let original = bytes(&t);
+    let generated = invoke(&t, SignOnly::new("22", false), h, op(h)).unwrap();
+    let r = generated.record.unwrap();
+    let rb = line(&r).unwrap();
+    let cb = line(&generated.checkpoint).unwrap();
+    let mut expected = original;
+    let (expect, operation, fragment) = if checkpoint {
+        expected.extend(&rb);
+        (head(&r), OperatorOp::Checkpoint, &cb[..cb.len() / 2])
+    } else {
+        (h, op(h), &rb[..rb.len() / 2])
+    };
+    expected.extend(fragment);
+    fs::write(t.0.join("audit.jsonl"), &expected).unwrap();
+    let key = SignOnly::new("22", false);
+    let recovered = invoke(&t, key.clone(), expect, operation).unwrap();
+    expected.push(b'\n');
+    if let Some(record) = &recovered.record {
+        assert!(record.context.repaired.is_some());
+        expected.extend(line(record).unwrap());
+    } else {
+        assert!(recovered.checkpoint.context.repaired.is_some());
+    }
+    expected.extend(line(&recovered.checkpoint).unwrap());
+    assert_eq!(bytes(&t), expected);
+    assert_eq!(key.calls.load(Ordering::Relaxed), 1);
+    let reopened = Sink::open(
+        &t.0,
+        key,
+        Config::default(),
+        Some(head(&recovered.checkpoint)),
+    )
+    .unwrap();
+    assert_eq!(bytes(&t), expected);
+    reopened.close().unwrap();
+}
+#[test]
+fn rotate_repair_preserves_fragment_and_frames_records_on_disk() {
+    repaired_tail_round_trip(false);
+}
+#[test]
+fn checkpoint_repair_preserves_fragment_and_frames_records_on_disk() {
+    repaired_tail_round_trip(true);
 }
 #[test]
 fn crash_rotation_fragment_record_and_complete_checkpoint_states() {

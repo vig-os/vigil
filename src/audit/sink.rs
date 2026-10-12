@@ -73,6 +73,35 @@ pub(crate) enum OperatorOp {
     },
     Checkpoint,
 }
+impl OperatorOp {
+    pub(crate) fn validate(&self, expect: Head) -> Result<Option<Head>, AuditError> {
+        match self {
+            OperatorOp::Rotate {
+                bound,
+                actor,
+                reason,
+            } => {
+                if bound.seq > expect.seq {
+                    return Err(error(
+                        AuditErrorKind::InvalidConfig,
+                        "bound exceeds expected head",
+                    ));
+                }
+                if [actor, reason]
+                    .into_iter()
+                    .any(|s| s.is_empty() || s.contains('\0'))
+                {
+                    return Err(error(
+                        AuditErrorKind::InvalidEntry,
+                        "invalid operator actor or reason",
+                    ));
+                }
+                Ok(Some(*bound))
+            }
+            OperatorOp::Checkpoint => Ok(None),
+        }
+    }
+}
 pub(crate) struct OperatorWritten {
     pub(crate) record: Option<Record>,
     pub(crate) checkpoint: Record,
@@ -673,31 +702,7 @@ impl Sink {
         op: OperatorOp,
     ) -> Result<OperatorWritten, AuditError> {
         self.closed = true;
-        let bound = match &op {
-            OperatorOp::Rotate {
-                bound,
-                actor,
-                reason,
-            } => {
-                if bound.seq > expect.seq {
-                    return Err(error(
-                        AuditErrorKind::InvalidConfig,
-                        "bound exceeds expected head",
-                    ));
-                }
-                if [actor, reason]
-                    .into_iter()
-                    .any(|s| s.is_empty() || s.contains('\0'))
-                {
-                    return Err(error(
-                        AuditErrorKind::InvalidEntry,
-                        "invalid operator actor or reason",
-                    ));
-                }
-                Some(*bound)
-            }
-            OperatorOp::Checkpoint => None,
-        };
+        let bound = op.validate(expect)?;
         self.healthy()?;
         #[cfg(test)]
         hooks::point("operator-before-lock");

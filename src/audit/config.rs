@@ -91,6 +91,15 @@ impl AuditConfig {
             })
             .ok_or_else(|| invalid("missing absolute XDG_STATE_HOME and HOME".into()))
     }
+    fn validate_operator(&self) -> Result<PathBuf, AuditError> {
+        if self.expected.is_some() {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                "rotate/checkpoint take an explicit expected head; builder expect_head is invalid",
+            ));
+        }
+        self.validate(false)
+    }
     /// Creates a new trail explicitly and returns its handle. Pin its random
     /// [`AuditTrail::trail`] id outside the audit directory before use.
     ///
@@ -153,40 +162,23 @@ impl AuditConfig {
         actor: impl Into<String>,
         reason: impl Into<String>,
     ) -> Result<(Receipt, Checkpoint), AuditError> {
-        let dir = self.validate(true)?;
-        if bound.0 > expect_head.0 {
-            return Err(AuditError::new(
-                AuditErrorKind::InvalidConfig,
-                "bound exceeds expected head",
-            ));
-        }
-        let actor = actor.into();
-        let reason = reason.into();
-        if [&actor, &reason]
-            .into_iter()
-            .any(|s| s.is_empty() || s.contains('\0'))
-        {
-            return Err(AuditError::new(
-                AuditErrorKind::InvalidEntry,
-                "invalid operator actor or reason",
-            ));
-        }
+        let dir = self.validate_operator()?;
+        let expect = Head {
+            seq: expect_head.0,
+            hash: expect_head.1,
+        };
+        let op = sink::OperatorOp::Rotate {
+            bound: Head {
+                seq: bound.0,
+                hash: bound.1,
+            },
+            actor: actor.into(),
+            reason: reason.into(),
+        };
+        op.validate(expect)?;
         let sink = sink::Sink::open(&dir, signer, self.config, None)?;
         let trail = sink.trail();
-        let written = sink.operator_write(
-            Head {
-                seq: expect_head.0,
-                hash: expect_head.1,
-            },
-            sink::OperatorOp::Rotate {
-                bound: Head {
-                    seq: bound.0,
-                    hash: bound.1,
-                },
-                actor,
-                reason,
-            },
-        )?;
+        let written = sink.operator_write(expect, op)?;
         let record = written.record.ok_or_else(|| {
             AuditError::new(AuditErrorKind::CorruptTrail, "missing rotation record")
         })?;
@@ -199,9 +191,7 @@ impl AuditConfig {
         if self.mirror
             && let super::format::Kind::Entry(entry) = &record.kind
         {
-            tracing::event!(target: "vigil::audit", tracing::Level::INFO,
-                action = entry.action.as_str(), object = entry.object.as_str(),
-                seq = receipt.seq(), hash = receipt.hash_string());
+            super::trail::mirror(entry, &receipt);
         }
         Ok((receipt, super::trail::checkpoint(written.checkpoint)?))
     }
@@ -227,7 +217,7 @@ impl AuditConfig {
         signer: Arc<dyn Signer>,
         expect_head: (u64, [u8; 32]),
     ) -> Result<Checkpoint, AuditError> {
-        let dir = self.validate(true)?;
+        let dir = self.validate_operator()?;
         let sink = sink::Sink::open(&dir, signer, self.config, None)?;
         let written = sink.operator_write(
             Head {

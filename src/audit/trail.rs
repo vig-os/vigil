@@ -56,9 +56,7 @@ impl AuditTrail {
             unsigned_records: recorded.unsigned_records,
         };
         if self.mirror {
-            tracing::event!(target: "vigil::audit", tracing::Level::INFO,
-                action = entry.action.as_str(), object = entry.object.as_str(),
-                seq = receipt.seq, hash = receipt.hash_string());
+            mirror(entry, &receipt);
         }
         Ok(receipt)
     }
@@ -129,4 +127,11 @@ impl Receipt {
     pub fn unsigned_records(&self) -> u64 {
         self.unsigned_records
     }
+}
+
+/// Emits the optional audit mirror after the caller has released the audit lock.
+pub(super) fn mirror(entry: &Entry, receipt: &Receipt) {
+    tracing::event!(target: "vigil::audit", tracing::Level::INFO,
+        action = entry.action.as_str(), object = entry.object.as_str(),
+        seq = receipt.seq(), hash = receipt.hash_string());
 }
