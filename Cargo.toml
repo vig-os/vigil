@@ -59,6 +59,10 @@ harness = false
 name = "flock"
 test = true
 
+[[example]]
+name = "prometheus_conformance"
+test = true
+
 # Public documentation is a build contract for stable and vigil_unstable APIs.
 # Cargo applies these levels to every feature set, including flake/CI clippy.
 [lints.clippy]

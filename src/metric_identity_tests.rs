@@ -178,77 +178,33 @@ cases! {
 
 #[test]
 fn every_translation_row() {
-    for (unit, suffix) in [
-        ("d", "days"),
-        ("h", "hours"),
-        ("min", "minutes"),
-        ("s", "seconds"),
-        ("ms", "milliseconds"),
-        ("us", "microseconds"),
-        ("ns", "nanoseconds"),
-        ("By", "bytes"),
-        ("KiBy", "kibibytes"),
-        ("MiBy", "mebibytes"),
-        ("GiBy", "gibibytes"),
-        ("TiBy", "tibibytes"),
-        ("KBy", "kilobytes"),
-        ("MBy", "megabytes"),
-        ("GBy", "gigabytes"),
-        ("TBy", "terabytes"),
-        ("m", "meters"),
-        ("V", "volts"),
-        ("A", "amperes"),
-        ("J", "joules"),
-        ("W", "watts"),
-        ("g", "grams"),
-        ("Cel", "celsius"),
-        ("Hz", "hertz"),
-        ("%", "percent"),
-    ] {
+    let rows: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/prometheus_names.json")).unwrap();
+    for row in rows.as_array().unwrap() {
+        let kind = match row["kind"].as_str().unwrap() {
+            "Counter" => Kind::Counter,
+            "CounterF64" => Kind::CounterF64,
+            "UpDownCounter" => Kind::UpDownCounter,
+            "Gauge" => Kind::Gauge,
+            "Histogram" => Kind::Histogram,
+            kind => panic!("unknown fixture kind {kind}"),
+        };
+        let expected: Vec<_> = row["expected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap())
+            .collect();
         assert_eq!(
-            series_names("app.x", Kind::Counter, unit),
-            [format!("app_x_{suffix}_total")]
-        );
-        assert_eq!(
-            series_names(&format!("app.{suffix}.x"), Kind::Counter, unit),
-            [format!("app_{suffix}_x_total")]
+            series_names(
+                row["name"].as_str().unwrap(),
+                kind,
+                row["unit"].as_str().unwrap()
+            ),
+            expected,
+            "{row}"
         );
     }
-    for (unit, suffix) in [
-        ("s", "second"),
-        ("m", "minute"),
-        ("h", "hour"),
-        ("d", "day"),
-        ("w", "week"),
-        ("mo", "month"),
-        ("y", "year"),
-    ] {
-        assert_eq!(
-            series_names("app.x", Kind::Gauge, &format!("By/{unit}")),
-            [format!("app_x_bytes_per_{suffix}")]
-        );
-    }
-    for (name, kind, unit, expected) in [
-        ("app.total.x", Kind::Counter, "", "app_x_total"),
-        ("app__y", Kind::CounterF64, "", "app_y_total"),
-        ("app.r", Kind::Gauge, "1", "app_r_ratio"),
-        ("app.ratio.x", Kind::Gauge, "1", "app_x_ratio"),
-        ("app.x", Kind::UpDownCounter, "1", "app_x"),
-        ("app.x", Kind::Gauge, "{requests}/s", "app_x_per_second"),
-        ("app.x", Kind::Gauge, "By/{requests}", "app_x_bytes"),
-        ("app.x", Kind::Gauge, "custom-unit", "app_x_custom_unit"),
-        ("1x", Kind::Gauge, "", "_1x"),
-    ] {
-        assert_eq!(series_names(name, kind, unit), [expected]);
-    }
-    assert_eq!(
-        series_names("app.y", Kind::Histogram, "ms"),
-        [
-            "app_y_milliseconds_bucket",
-            "app_y_milliseconds_sum",
-            "app_y_milliseconds_count"
-        ]
-    );
 }
 
 #[test]

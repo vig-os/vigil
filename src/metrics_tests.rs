@@ -908,3 +908,17 @@ fn identity_determinism_zero_compares_separate_processes() {
     };
     assert_eq!(line(&forward), line(&reverse));
 }
+
+#[test]
+fn prometheus_fixture_exclusions_match_name_validation() {
+    let rows: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/prometheus_names.json")).unwrap();
+    for row in rows.as_array().unwrap() {
+        let name = row["name"].as_str().unwrap();
+        let accepted = catch_unwind(|| validate_name(name)).is_ok();
+        assert_eq!(accepted, row.get("translation_only").is_none(), "{row}");
+        if !accepted {
+            assert!(row["translation_only"].as_str().unwrap().contains("d24"));
+        }
+    }
+}

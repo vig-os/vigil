@@ -94,6 +94,67 @@ Add a test that records every instrument once to surface all conflicts in CI.
 aggregated before the conflict are excluded. Poisoning itself marks its reporting
 period as `DataLost`, even when no later record is dropped.
 
+### Prometheus
+
+Prometheus maps OTLP metrics using its default translation (ADR-0003 d12):
+
+| OTLP input | Prometheus output |
+| --- | --- |
+| Runs of characters other than ASCII letters, digits and `:`, including `.` and `_` | One `_` between name tokens; `:` is preserved |
+| Unit | Fixed unit words and per-unit suffixes as detailed below; no repeated suffix token |
+| Monotonic counter | `_total`; inner `total` words are dropped (`app.total.x` → `app_x_total`) |
+| Gauge with unit `1` | `_ratio` (`app.x` → `app_x_ratio`) |
+| Up-down counter with unit `1` | No suffix (`app.x` → `app_x`) |
+| Monotonic counter with unit `1` | `_total` only (`app.x` → `app_x_total`) |
+| Histogram | `_bucket`, `_sum`, `_count` after the unit suffix |
+| Resource `service.name` | `job` label |
+| Resource `service.instance.id` | `instance` label |
+
+The fixed numerator unit table is:
+`d` → `days`, `h` → `hours`, `min` → `minutes`, `s` → `seconds`,
+`ms` → `milliseconds`, `us` → `microseconds`, `ns` → `nanoseconds`,
+`By` → `bytes`, `KiBy` → `kibibytes`, `MiBy` → `mebibytes`,
+`GiBy` → `gibibytes`, `TiBy` → `tibibytes`, `KBy` → `kilobytes`,
+`MBy` → `megabytes`, `GBy` → `gigabytes`, `TBy` → `terabytes`,
+`m` → `meters`, `V` → `volts`, `A` → `amperes`, `J` → `joules`,
+`W` → `watts`, `g` → `grams`, `Cel` → `celsius`, `Hz` → `hertz`,
+and `%` → `percent`. Unit `1` contributes no unit word; the instrument-kind
+rules in the table above apply (histograms still get their three suffixes).
+
+Units split at the first `/`: the denominator contributes `_per_<unit>`, with
+`s`, `m`, `h`, `d`, `w`, `mo`, `y` mapped to `second`, `minute`, `hour`,
+`day`, `week`, `month`, `year`. Thus `By/s` becomes `_bytes_per_second`.
+Empty unit parts and annotation parts containing `{` or `}` are dropped.
+Unknown unit parts are kept verbatim after trimming whitespace and sanitizing:
+characters other than ASCII letters, digits and `:` become `_`, repeated `_`
+collapse, and a leading `_` is removed. Already-present suffix tokens are
+not added again. Up-down counters and gauges have no `_total` suffix.
+
+The authoritative [shared translation fixture](tests/fixtures/prometheus_names.json)
+checks these rules against Prometheus 3.12.0 / otlptranslator v1.0.0 for all
+148 accepted declarations; its additional facade-rejected row is translator-only.
+
+Prometheus must be configured with `otlp.promote_scope_metadata: true`
+(ADR-0003 d12). Start it with `--web.enable-otlp-receiver` and include:
+
+```yaml
+otlp:
+  promote_scope_metadata: true
+```
+
+The scope is the declaring crate's package name and version (ADR-0004 d8).
+This preserves `otel_scope_name` and `otel_scope_version` as labels, keeping
+compatible metrics from different crates distinct. A crate's version is a label,
+so a dependency upgrade starts new series; aggregate with
+`sum without (otel_scope_version)`. Other Prometheus-compatible backends need
+the equivalent setting. Collector configurations use the `otlp_http` exporter.
+
+The [Prometheus conformance script](scripts/prometheus_conformance.py) is the
+mapping oracle: it checks exact series sets and values through the Collector and
+Prometheus against [the shared fixture](tests/fixtures/prometheus_names.json).
+Rows the facade rejects (d24) are checked against the translator only; a Rust
+test guards these exclusions so every accepted fixture name runs end to end.
+
 ## Unstable SDK access
 
 Exporters and sinks are crate-private by default. Applications composing their
@@ -358,8 +419,12 @@ The comparison checks complete resources, scopes and records, including nested
 attributes, bodies, severity, timestamps and trace/span IDs across two resources,
 allowing protobuf
 default omission and integer spelling changes. Valid unterminated final records
-are delivered; unterminated garbage is dropped. Metrics (#7) and traces (#8) are
-planned extensions.
+are delivered; unterminated garbage is dropped. Metrics include non-finite values,
+line splitting and poisoned-name filtering. Run
+`nix develop -c python3 scripts/prometheus_conformance.py` for the
+[Prometheus oracle](scripts/prometheus_conformance.py), including cross-scope
+sharing, collision poisoning and every valid shared translation fixture row.
+Traces (#8) remain a planned extension.
 
 ## Semver
 
