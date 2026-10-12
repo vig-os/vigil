@@ -234,7 +234,7 @@ fn structural_ties_retain_record_sequence_and_point_attribute_order() {
     let second = json!({"scope":{},"metrics":[{"name":"same","sum":{"dataPoints":[{"timeUnixNano":"100","attributes":[{"key":"key","value":{"intValue":"1"}}],"asInt":"1"}]}}]});
     permutations(&[first.clone(), second], |scopes| {
         let mut value = json!({"scopeMetrics":scopes});
-        crate::envelope::normalize(&mut value, "", crate::ordered_json::METRICS).unwrap();
+        crate::envelope::normalize(&mut value, "", crate::ordered_json::LOGS).unwrap();
         assert_eq!(value["scopeMetrics"][0], first);
     });
 }
