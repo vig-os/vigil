@@ -4,6 +4,9 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
+        durability::stop();
+        hooks::OBSERVE.with(|o| *o.borrow_mut() = None);
+        hooks::STDERR.with(|lines| lines.borrow_mut().clear());
         hooks::CHECK_CLOCK.with(|check| *check.borrow_mut() = None);
         hooks::TIME.with(|t| t.set(Some(1_000_000_000)));
         hooks::FAIL.with(|f| f.borrow_mut().clear());
@@ -88,9 +91,13 @@ fn creation_marker_is_canonical() {
     assert_eq!(
         events,
         [
+            "create-marker",
+            "write",
             "marker",
             "marker-dir",
             "clock",
+            "create-staging",
+            "write",
             "staging",
             "staging-dir",
             "promote",
@@ -363,6 +370,8 @@ fn sealing_order_and_refresh() {
         hooks::EVENTS.with(|e| e.borrow().clone()),
         [
             "clock",
+            "create-staging",
+            "write",
             "staging",
             "staging-dir",
             "write",
@@ -1021,4 +1030,816 @@ fn resume_without_predecessor_discards_nonzero_genesis_head() {
     assert!(!t.0.join(".audit-resume.jsonl").exists());
     assert!(!t.0.join("audit.jsonl").exists());
     assert!(t.0.join("audit.trail").exists());
+}
+
+// ADR-0005 amendment 3: each test below identifies its acceptance line.
+fn fail(sites: &[&'static str]) {
+    hooks::FAIL.with(|f| *f.borrow_mut() = sites.to_vec());
+}
+fn snapshot(t: &Temp) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fs::read_dir(&t.0)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (PathBuf::from(e.file_name()), fs::read(e.path()).unwrap())
+        })
+        .collect()
+}
+fn silent(s: &mut Sink) {
+    s.closed = true;
+}
+fn assert_inert(s: &Sink, t: &Temp) {
+    let before = snapshot(t);
+    bad(s.record(&entry()), AuditErrorKind::Poisoned);
+    bad(s.checkpoint(), AuditErrorKind::Poisoned);
+    assert_eq!(snapshot(t), before);
+}
+fn promotable(s: &Sink, t: &Temp, resume: bool) -> Vec<u8> {
+    let state = predecessor(&File::open(&t.0).unwrap(), s.trail)
+        .unwrap()
+        .unwrap();
+    if resume {
+        resume_bytes(
+            s,
+            &state,
+            state.head.seq + 1,
+            state.head.hash,
+            "vigil.audit.resume",
+        )
+    } else {
+        line(&s.checkpoint_record(&state, 2_000_000_000).unwrap()).unwrap()
+    }
+}
+fn replay_staging_outcome(t: &Temp, complete: bool) {
+    durability::start(&t.0);
+    let path = t.0.clone();
+    hooks::OBSERVE.with(|o| {
+        *o.borrow_mut() = Some(Box::new(move |site| {
+            if site == "staging" {
+                if complete {
+                    durability::persist_staging(&path);
+                } else {
+                    // A durable name with no successfully flushed data replays empty.
+                    let dir = File::open(&path).unwrap();
+                    dir.sync_all().unwrap();
+                    durability::sync(&dir).unwrap();
+                }
+            }
+        }))
+    });
+}
+#[test]
+fn poison_831_staging_fsync() {
+    for creating in [false, true] {
+        let t = Temp::new();
+        if creating {
+            fail(&["staging"]);
+            bad(
+                Sink::create(&t.0, signer(), Config::default()),
+                AuditErrorKind::Io,
+            );
+            assert_eq!(fs::read(t.0.join(".audit-next.jsonl")).unwrap(), b"");
+            assert_eq!(fs::read(t.0.join("audit.trail")).unwrap().len(), 33);
+            bad_open(&t, None, AuditErrorKind::CorruptTrail);
+            bad(
+                Sink::create(&t.0, signer(), Config::default()),
+                AuditErrorKind::TrailExists,
+            );
+        } else {
+            let mut a = create(&t);
+            let mut b = open(&t);
+            let before = bytes(&t);
+            let head = scan_head(&b);
+            a.config.max_bytes = 1;
+            fail(&["staging"]);
+            bad(a.record(&entry()), AuditErrorKind::Io);
+            assert_eq!(bytes(&t), before);
+            assert_eq!(fs::read(t.0.join(".audit-next.jsonl")).unwrap(), b"");
+            assert_inert(&a, &t);
+            hooks::EVENTS.with(|e| e.borrow_mut().clear());
+            let receipt = b.record(&entry()).unwrap();
+            assert_eq!(receipt.seq, head.seq + 1);
+            assert!(!t.0.join(".audit-next.jsonl").exists());
+            assert!(hooks::EVENTS.with(|e| e.borrow().contains(&"settle-discard-dir")));
+            silent(&mut a);
+            silent(&mut b);
+        }
+        assert!(!t.0.join("audit.poison").exists());
+    }
+}
+#[test]
+fn poison_832_failed_staging_truncate_restart() {
+    for creating in [false, true] {
+        for complete in [false, true] {
+            let t = Temp::new();
+            let mut writers = if creating {
+                None
+            } else {
+                Some((create(&t), open(&t)))
+            };
+            replay_staging_outcome(&t, complete);
+            fail(&["staging", "truncate"]);
+            if let Some((a, _)) = writers.as_mut() {
+                a.config.max_bytes = 1;
+                bad(a.record(&entry()), AuditErrorKind::Io);
+            } else {
+                bad(
+                    Sink::create(&t.0, signer(), Config::default()),
+                    AuditErrorKind::Io,
+                );
+            }
+            let stage = fs::read(t.0.join(".audit-next.jsonl")).unwrap();
+            assert!(!stage.is_empty());
+            assert!(
+                fs::read_to_string(t.0.join("audit.poison"))
+                    .unwrap()
+                    .contains(".audit-next.jsonl")
+            );
+            let before = snapshot(&t);
+            bad_open(&t, None, AuditErrorKind::Poisoned);
+            if let Some((a, b)) = writers.as_mut() {
+                assert_inert(a, &t);
+                assert_inert(b, &t);
+                silent(a);
+                silent(b);
+            }
+            assert_eq!(snapshot(&t), before);
+            drop(writers);
+            hooks::OBSERVE.with(|o| *o.borrow_mut() = None);
+            durability::replay();
+            if t.0.join("audit.poison").exists() {
+                fs::remove_file(t.0.join("audit.poison")).unwrap();
+            }
+            if creating && !complete {
+                bad_open(&t, None, AuditErrorKind::CorruptTrail);
+                bad(
+                    Sink::create(&t.0, signer(), Config::default()),
+                    AuditErrorKind::TrailExists,
+                );
+            } else {
+                let mut reopened = open(&t);
+                if creating {
+                    assert_eq!(bytes(&t), stage);
+                    assert_eq!(
+                        fs::read(t.0.join("audit.trail")).unwrap(),
+                        format!("{}\n", hex(&reopened.trail)).as_bytes()
+                    );
+                }
+                reopened.record(&entry()).unwrap();
+                assert!(!t.0.join(".audit-next.jsonl").exists());
+                silent(&mut reopened);
+            }
+        }
+    }
+}
+#[test]
+fn poison_833_failed_staging_write() {
+    for truncate_fails in [false, true] {
+        let t = Temp::new();
+        let mut s = create(&t);
+        let before = bytes(&t);
+        s.config.max_bytes = 1;
+        hooks::SHORT.with(|cap| cap.set(Some(13)));
+        if truncate_fails {
+            fail(&["truncate"]);
+        }
+        bad(s.record(&entry()), AuditErrorKind::Io);
+        assert!(!s.poisoned.load(Ordering::Relaxed));
+        assert!(!t.0.join("audit.poison").exists());
+        assert_eq!(bytes(&t), before);
+        let stage = fs::read(t.0.join(".audit-next.jsonl")).unwrap();
+        assert_eq!(stage.len(), if truncate_fails { 13 } else { 0 });
+        s.record(&entry()).unwrap();
+        silent(&mut s);
+    }
+    let t = Temp::new();
+    fail(&["create-staging"]);
+    bad(
+        Sink::create(&t.0, signer(), Config::default()),
+        AuditErrorKind::Io,
+    );
+    assert!(!t.0.join(".audit-next.jsonl").exists());
+    assert!(!t.0.join("audit.poison").exists());
+}
+#[test]
+fn poison_835_rename_directory_fsync() {
+    // Sealing, creation, and running/open settlement of both staging names.
+    for mode in 0..6 {
+        let t = Temp::new();
+        let mut writers = if mode == 2 {
+            None
+        } else {
+            Some((create(&t), open(&t)))
+        };
+        let mut held = None;
+        if let Some((a, _)) = writers.as_mut() {
+            held = Some(a.record(&entry()).unwrap());
+            if mode == 0 {
+                a.config.max_bytes = 1;
+            } else {
+                a.checkpoint().unwrap();
+                let staged = promotable(a, &t, mode >= 4);
+                let name = if mode >= 4 {
+                    ".audit-resume.jsonl"
+                } else {
+                    ".audit-next.jsonl"
+                };
+                fs::write(t.0.join(name), staged).unwrap();
+            }
+        }
+        durability::start(&t.0);
+        fail(&[if matches!(mode, 1 | 3 | 4 | 5) {
+            "settle-promote-dir"
+        } else {
+            "promote-dir"
+        }]);
+        if mode == 2 {
+            bad(
+                Sink::create(&t.0, signer(), Config::default()),
+                AuditErrorKind::Io,
+            );
+        } else if mode == 3 || mode == 5 {
+            bad_open(&t, None, AuditErrorKind::Io);
+        } else {
+            bad(
+                writers.as_ref().unwrap().0.record(&entry()),
+                AuditErrorKind::Io,
+            );
+        }
+        let poison = fs::read_to_string(t.0.join("audit.poison")).unwrap();
+        assert!(poison.contains("directory fsync after rename"));
+        assert!(poison.contains("audit.jsonl"));
+        assert!(poison.contains(if mode >= 4 {
+            ".audit-resume.jsonl"
+        } else {
+            ".audit-next.jsonl"
+        }));
+        let before = snapshot(&t);
+        if let Some((a, b)) = writers.as_mut() {
+            if mode != 3 && mode != 5 {
+                assert!(a.poisoned.load(Ordering::Relaxed));
+            }
+            bad(b.record(&entry()), AuditErrorKind::Poisoned);
+            assert_eq!(snapshot(&t), before);
+            silent(a);
+            silent(b);
+        }
+        bad_open(&t, None, AuditErrorKind::Poisoned);
+        assert_eq!(snapshot(&t), before);
+        drop(writers);
+        durability::replay();
+        if t.0.join("audit.poison").exists() {
+            fs::remove_file(t.0.join("audit.poison")).unwrap();
+        }
+        if mode == 2 {
+            // Step 2 persisted the complete creation checkpoint and marker.
+            let mut recovered = open(&t);
+            assert_eq!(scan_head(&recovered).seq, 0);
+            silent(&mut recovered);
+        } else {
+            let mut recovered = Sink::open(&t.0, signer(), Config::default(), held).unwrap();
+            recovered.record(&entry()).unwrap();
+            silent(&mut recovered);
+        }
+    }
+}
+#[test]
+fn poison_836_failed_poison_creation_residual() {
+    let t = Temp::new();
+    let mut a = create(&t);
+    let mut b = open(&t);
+    a.config.max_bytes = 1;
+    fail(&["promote-dir", "create-poison"]);
+    bad(a.record(&entry()), AuditErrorKind::Io);
+    assert_inert(&a, &t);
+    assert!(!t.0.join("audit.poison").exists());
+    b.record(&entry()).unwrap();
+    let mut reopened = open(&t);
+    silent(&mut reopened);
+    silent(&mut a);
+    silent(&mut b);
+}
+#[test]
+fn poison_837_other_directory_fsync() {
+    for site in ["staging-dir", "settle-discard-dir"] {
+        for opening in [false, true] {
+            if opening && site == "staging-dir" {
+                continue;
+            }
+            let t = Temp::new();
+            let mut a = create(&t);
+            let mut b = open(&t);
+            let held = a.record(&entry()).unwrap();
+            if site == "settle-discard-dir" {
+                fs::write(t.0.join(".audit-next.jsonl"), b"{").unwrap();
+            }
+            durability::start(&t.0);
+            let before = bytes(&t);
+            a.config.max_bytes = 1;
+            fail(&[site]);
+            if opening {
+                bad_open(&t, None, AuditErrorKind::Io);
+            } else {
+                bad(a.record(&entry()), AuditErrorKind::Io);
+                assert!(a.poisoned.load(Ordering::Relaxed));
+            }
+            assert_eq!(bytes(&t), before);
+            assert!(!t.0.join("audit.poison").exists());
+            let acknowledged = b.record(&entry()).unwrap();
+            silent(&mut a);
+            silent(&mut b);
+            drop(a);
+            drop(b);
+            durability::replay();
+            if site == "settle-discard-dir" {
+                assert!(t.0.join(".audit-next.jsonl").exists());
+            }
+            let mut recovered =
+                Sink::open(&t.0, signer(), Config::default(), Some(acknowledged)).unwrap();
+            assert!(!t.0.join(".audit-next.jsonl").exists());
+            assert!(
+                records(&t)
+                    .iter()
+                    .any(|r| r.context.seq == held.seq && r.hash() == held.hash)
+            );
+            silent(&mut recovered);
+        }
+    }
+}
+#[test]
+fn poison_838_discard_then_seal_replay() {
+    let t = Temp::new();
+    let mut a = create(&t);
+    let mut b = open(&t);
+    fs::write(t.0.join(".audit-next.jsonl"), b"{").unwrap();
+    durability::start(&t.0);
+    fail(&["settle-discard-dir"]);
+    bad(a.record(&entry()), AuditErrorKind::Io);
+    b.config.max_bytes = 1;
+    let acknowledged = b.record(&entry()).unwrap();
+    silent(&mut a);
+    silent(&mut b);
+    drop(a);
+    drop(b);
+    durability::replay();
+    let mut recovered = Sink::open(&t.0, signer(), Config::default(), Some(acknowledged)).unwrap();
+    assert!(records(&t).iter().any(|r| r.hash() == acknowledged.hash));
+    silent(&mut recovered);
+}
+#[test]
+fn poison_839_create_final_failure() {
+    let t = Temp::new();
+    fail(&["promote-dir"]);
+    bad(
+        Sink::create(&t.0, signer(), Config::default()),
+        AuditErrorKind::Io,
+    );
+    assert!(t.0.join("audit.poison").exists());
+    let id = fs::read(t.0.join("audit.trail")).unwrap();
+    assert_eq!(id.len(), 33);
+    assert_eq!(
+        records(&t)[0].context.trail.as_slice(),
+        marker(&File::open(&t.0).unwrap()).unwrap()
+    );
+    // The operator's alternative is to remove the failed creation directory.
+    fs::remove_dir_all(&t.0).unwrap();
+    fs::create_dir(&t.0).unwrap();
+    let mut fresh = create(&t);
+    assert_ne!(fs::read(t.0.join("audit.trail")).unwrap(), id);
+    silent(&mut fresh);
+}
+#[test]
+fn poison_841_cause_and_clearing_rustdoc() {
+    let t = Temp::new();
+    let mut s = create(&t);
+    s.config.max_bytes = 1;
+    fail(&["promote-dir"]);
+    bad(s.record(&entry()), AuditErrorKind::Io);
+    let text = fs::read_to_string(t.0.join("audit.poison")).unwrap();
+    assert!(text.contains("injected promote-dir"));
+    assert!(text.contains("directory fsync after rename"));
+    assert!(text.contains("audit.jsonl") && text.contains(".audit-next.jsonl"));
+    let source = include_str!("mod.rs");
+    let doc = source.split("    Poisoned,").next().unwrap();
+    let restart = doc.find("first restart").unwrap();
+    let verify = doc[restart..].find("vigil-audit verify").unwrap() + restart;
+    let remove = doc[verify..].find("remove `audit.poison`").unwrap() + verify;
+    assert!(restart < verify && verify < remove);
+    silent(&mut s);
+}
+#[test]
+fn poison_842_step7_does_not_run() {
+    let t = Temp::new();
+    let mut s = create(&t);
+    s.config.max_bytes = 1;
+    fail(&["promote-dir"]);
+    hooks::EVENTS.with(|e| e.borrow_mut().clear());
+    bad(s.record(&entry()), AuditErrorKind::Io);
+    let events = hooks::EVENTS.with(|e| e.borrow().clone());
+    assert!(!events.contains(&"record-data"));
+    assert!(
+        records(&t)
+            .iter()
+            .all(|r| matches!(r.kind, Kind::Checkpoint(_)))
+    );
+    silent(&mut s);
+}
+#[test]
+fn poison_843_marker_failure() {
+    for site in ["marker", "marker-dir"] {
+        let t = Temp::new();
+        let path = t.0.clone();
+        let saved = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = saved.clone();
+        hooks::OBSERVE.with(|o| {
+            *o.borrow_mut() = Some(Box::new(move |event| {
+                if event == "marker" {
+                    *capture.lock().unwrap() = fs::read(path.join("audit.trail")).unwrap();
+                }
+            }))
+        });
+        fail(&[site]);
+        bad(
+            Sink::create(&t.0, signer(), Config::default()),
+            AuditErrorKind::Io,
+        );
+        hooks::OBSERVE.with(|o| *o.borrow_mut() = None);
+        let id = fs::read(t.0.join("audit.trail")).unwrap();
+        assert_eq!(id.len(), 33);
+        assert_eq!(id, *saved.lock().unwrap());
+        assert_eq!(snapshot(&t).len(), 1);
+        bad_open(&t, None, AuditErrorKind::CorruptTrail);
+        bad(
+            Sink::create(&t.0, signer(), Config::default()),
+            AuditErrorKind::TrailExists,
+        );
+        fs::remove_dir_all(&t.0).unwrap();
+        fs::create_dir(&t.0).unwrap();
+        let mut fresh = create(&t);
+        assert_ne!(fs::read(t.0.join("audit.trail")).unwrap(), id);
+        silent(&mut fresh);
+    }
+}
+#[test]
+fn poison_844_check_before_settlement() {
+    for mode in 0..3 {
+        for op in 0..4 {
+            let t = Temp::new();
+            let mut s = create(&t);
+            let staged = if mode == 2 {
+                bytes(&t)
+            } else {
+                promotable(&s, &t, mode == 1)
+            };
+            let name = if mode == 1 {
+                ".audit-resume.jsonl"
+            } else {
+                ".audit-next.jsonl"
+            };
+            if mode == 2 {
+                fs::remove_file(t.0.join("audit.jsonl")).unwrap();
+            }
+            fs::write(t.0.join(name), &staged).unwrap();
+            fs::write(t.0.join("audit.poison"), b"another process").unwrap();
+            let before = snapshot(&t);
+            match op {
+                0 => bad_open(&t, None, AuditErrorKind::Poisoned),
+                1 => bad(s.record(&entry()), AuditErrorKind::Poisoned),
+                2 => bad(s.checkpoint(), AuditErrorKind::Poisoned),
+                _ => {
+                    silent(&mut s);
+                    bad(s.close(), AuditErrorKind::Poisoned);
+                    assert_eq!(snapshot(&t), before);
+                    fs::remove_file(t.0.join("audit.poison")).unwrap();
+                    let mut recovered = open(&t);
+                    assert_eq!(bytes(&t), staged);
+                    silent(&mut recovered);
+                    continue;
+                }
+            }
+            assert_eq!(snapshot(&t), before);
+            silent(&mut s);
+            drop(s);
+            fs::remove_file(t.0.join("audit.poison")).unwrap();
+            let mut recovered = open(&t);
+            assert_eq!(bytes(&t), staged);
+            assert!(!t.0.join(name).exists());
+            silent(&mut recovered);
+        }
+    }
+}
+#[derive(Debug)]
+struct CountingSigner {
+    calls: AtomicUsize,
+    inner: Arc<dyn Signer>,
+}
+impl Signer for CountingSigner {
+    fn public_key(&self) -> [u8; 32] {
+        self.inner.public_key()
+    }
+    fn sign(&self, message: &[u8]) -> Result<[u8; 64], SignerError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.sign(message)
+    }
+}
+fn counting() -> Arc<CountingSigner> {
+    Arc::new(CountingSigner {
+        calls: AtomicUsize::new(0),
+        inner: signer(),
+    })
+}
+#[test]
+fn poison_845_inert_handle_and_lock() {
+    for drop_handle in [false, true] {
+        let t = Temp::new();
+        let key = counting();
+        let s = Sink::create(&t.0, key.clone(), Config::default()).unwrap();
+        let held = s.record(&entry()).unwrap();
+        fail(&["record-data"]);
+        bad(s.record(&entry()), AuditErrorKind::Io);
+        fs::write(t.0.join(".audit-next.jsonl"), promotable(&s, &t, false)).unwrap();
+        let before = snapshot(&t);
+        let count = key.calls.load(Ordering::Relaxed);
+        assert_inert(&s, &t);
+        let lock = File::open(&t.0).unwrap();
+        lock.lock().unwrap();
+        // A watchdog releases the separate lock if a regression waits for it.
+        let released = Arc::new(AtomicBool::new(false));
+        let flag = released.clone();
+        let worker = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while !flag.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            lock.unlock().unwrap();
+        });
+        let start = std::time::Instant::now();
+        if drop_handle {
+            drop(s);
+        } else {
+            bad(s.close(), AuditErrorKind::Poisoned);
+        }
+        let elapsed = start.elapsed();
+        released.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        assert!(elapsed < Duration::from_secs(1));
+        assert_eq!(key.calls.load(Ordering::Relaxed), count);
+        assert_eq!(snapshot(&t), before);
+        assert!(hooks::STDERR.with(|l| l.borrow().is_empty()));
+        let fresh = Sink::open(&t.0, key.clone(), Config::default(), Some(held)).unwrap();
+        let cp = fresh.close().unwrap();
+        let disk = records(&t).pop().unwrap();
+        assert_eq!(cp.hash(), disk.hash());
+    }
+}
+#[test]
+fn poison_846_checkpoint_close_drop_failure() {
+    for op in 0..3 {
+        for truncate_fails in [false, true] {
+            let t = Temp::new();
+            let s = create(&t);
+            let before = bytes(&t);
+            fail(if truncate_fails {
+                &["checkpoint-data", "truncate"]
+            } else {
+                &["checkpoint-data"]
+            });
+            match op {
+                0 => {
+                    bad(s.checkpoint(), AuditErrorKind::Io);
+                    assert_inert(&s, &t);
+                    drop(s);
+                }
+                1 => bad(s.close(), AuditErrorKind::Io),
+                _ => assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(s))).is_ok()
+                ),
+            }
+            assert_eq!(t.0.join("audit.poison").exists(), truncate_fails);
+            if !truncate_fails {
+                assert_eq!(bytes(&t), before);
+            }
+            let lines = hooks::STDERR.with(|l| l.borrow().clone());
+            assert_eq!(lines.len(), usize::from(op == 2));
+            if op == 2 {
+                assert!(lines[0].contains("injected checkpoint-data"));
+            }
+        }
+    }
+}
+#[test]
+fn poison_847_shared_poison_checkpoint_close_drop() {
+    for op in 0..3 {
+        let t = Temp::new();
+        let key = counting();
+        let s = Sink::create(&t.0, key.clone(), Config::default()).unwrap();
+        let count = key.calls.load(Ordering::Relaxed);
+        let path = t.0.clone();
+        std::thread::spawn(move || fs::write(path.join("audit.poison"), b"second writer").unwrap())
+            .join()
+            .unwrap();
+        let before = snapshot(&t);
+        match op {
+            0 => {
+                bad(s.checkpoint(), AuditErrorKind::Poisoned);
+                bad(s.close(), AuditErrorKind::Poisoned);
+            }
+            1 => bad(s.close(), AuditErrorKind::Poisoned),
+            _ => drop(s),
+        }
+        assert_eq!(snapshot(&t), before);
+        assert_eq!(key.calls.load(Ordering::Relaxed), count);
+        assert_eq!(
+            hooks::STDERR.with(|l| l.borrow().len()),
+            usize::from(op == 2)
+        );
+        if op == 2 {
+            assert!(hooks::STDERR.with(|l| l.borrow()[0].contains("audit.poison exists")));
+        }
+    }
+}
+
+#[test]
+fn poison_832_staging_name_failure_and_failed_truncate() {
+    for creating in [false, true] {
+        let t = Temp::new();
+        let mut a = if creating { None } else { Some(create(&t)) };
+        let mut b = if creating { None } else { Some(open(&t)) };
+        durability::start(&t.0);
+        fail(&["staging-dir", "truncate"]);
+        if let Some(a) = a.as_mut() {
+            a.config.max_bytes = 1;
+            bad(a.record(&entry()), AuditErrorKind::Io);
+            assert_inert(a, &t);
+            silent(a);
+        } else {
+            bad(
+                Sink::create(&t.0, signer(), Config::default()),
+                AuditErrorKind::Io,
+            );
+        }
+        assert!(
+            fs::read_to_string(t.0.join("audit.poison"))
+                .unwrap()
+                .contains(".audit-next.jsonl")
+        );
+        let before = snapshot(&t);
+        if let Some(b) = b.as_mut() {
+            assert_inert(b, &t);
+            silent(b);
+        }
+        bad_open(&t, None, AuditErrorKind::Poisoned);
+        assert_eq!(snapshot(&t), before);
+        drop(a);
+        drop(b);
+        durability::replay();
+        if t.0.join("audit.poison").exists() {
+            fs::remove_file(t.0.join("audit.poison")).unwrap();
+        }
+        if creating {
+            bad_open(&t, None, AuditErrorKind::CorruptTrail);
+        } else {
+            let mut recovered = open(&t);
+            recovered.record(&entry()).unwrap();
+            silent(&mut recovered);
+        }
+    }
+}
+#[test]
+fn poison_836_no_handle_and_settlement_residuals() {
+    for mode in 0..3 {
+        let t = Temp::new();
+        let mut writers = if mode == 0 {
+            None
+        } else {
+            Some((create(&t), open(&t)))
+        };
+        if let Some((a, _)) = writers.as_ref() {
+            fs::write(t.0.join(".audit-next.jsonl"), promotable(a, &t, false)).unwrap();
+        }
+        fail(&[
+            if mode == 0 {
+                "promote-dir"
+            } else {
+                "settle-promote-dir"
+            },
+            "create-poison",
+        ]);
+        match mode {
+            0 => bad(
+                Sink::create(&t.0, signer(), Config::default()),
+                AuditErrorKind::Io,
+            ),
+            1 => bad_open(&t, None, AuditErrorKind::Io),
+            _ => {
+                let a = &writers.as_ref().unwrap().0;
+                bad(a.record(&entry()), AuditErrorKind::Io);
+                assert_inert(a, &t);
+            }
+        }
+        assert!(!t.0.join("audit.poison").exists());
+        if let Some((a, b)) = writers.as_mut() {
+            b.record(&entry()).unwrap();
+            silent(a);
+            silent(b);
+        }
+        let mut reopened = open(&t);
+        reopened.record(&entry()).unwrap();
+        silent(&mut reopened);
+    }
+}
+#[test]
+fn durable_model_retains_last_success_and_inode_identity() {
+    let t = Temp::new();
+    let old = t.0.join("old");
+    fs::write(&old, b"initial").unwrap();
+    fs::hard_link(&old, t.0.join("alias")).unwrap();
+    durability::start(&t.0);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&old)
+        .unwrap();
+    file.set_len(0).unwrap();
+    (&file).write_all(b"durable").unwrap();
+    sync_io(&file, "record-data").unwrap();
+    file.set_len(0).unwrap();
+    (&file).write_all(b"not durable").unwrap();
+    fail(&["record-data"]);
+    assert!(sync_io(&file, "record-data").is_err());
+    fs::rename(&old, t.0.join("moved")).unwrap();
+    let dir = File::open(&t.0).unwrap();
+    sync_io(&dir, "staging-dir").unwrap();
+    durability::replay();
+    assert_eq!(fs::read(t.0.join("moved")).unwrap(), b"durable");
+    assert_eq!(fs::read(t.0.join("alias")).unwrap(), b"durable");
+    durability::start(&t.0);
+    fs::remove_file(t.0.join("alias")).unwrap();
+    fs::remove_file(t.0.join("moved")).unwrap();
+    fs::write(&old, b"new inode, never flushed").unwrap();
+    sync_io(&dir, "staging-dir").unwrap();
+    durability::replay();
+    assert_eq!(fs::read(&old).unwrap(), b"");
+    assert_eq!(snapshot(&t).len(), 1);
+    // A distinct replay demonstrates durable contents and durable hard links.
+    fs::write(&old, b"initial").unwrap();
+    fs::hard_link(&old, t.0.join("alias")).unwrap();
+    durability::start(&t.0);
+    fs::write(&old, b"cache only").unwrap();
+    durability::replay();
+    assert_eq!(fs::read(&old).unwrap(), b"initial");
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        fs::metadata(&old).unwrap().ino(),
+        fs::metadata(t.0.join("alias")).unwrap().ino()
+    );
+}
+
+#[test]
+fn poison_833_create_staging_write() {
+    for truncate_fails in [false, true] {
+        let t = Temp::new();
+        hooks::OBSERVE.with(|o| {
+            *o.borrow_mut() = Some(Box::new(move |site| {
+                if site == "create-staging" {
+                    hooks::SHORT.with(|short| short.set(Some(13)));
+                    if truncate_fails {
+                        fail(&["truncate"]);
+                    }
+                }
+            }))
+        });
+        bad(
+            Sink::create(&t.0, signer(), Config::default()),
+            AuditErrorKind::Io,
+        );
+        hooks::OBSERVE.with(|o| *o.borrow_mut() = None);
+        assert_eq!(
+            fs::read(t.0.join(".audit-next.jsonl")).unwrap().len(),
+            if truncate_fails { 13 } else { 0 }
+        );
+        assert!(!t.0.join("audit.poison").exists());
+        bad_open(&t, None, AuditErrorKind::CorruptTrail);
+        bad(
+            Sink::create(&t.0, signer(), Config::default()),
+            AuditErrorKind::TrailExists,
+        );
+    }
+}
+#[test]
+fn poison_831_create_staging_name_fsync() {
+    let t = Temp::new();
+    fail(&["staging-dir"]);
+    bad(
+        Sink::create(&t.0, signer(), Config::default()),
+        AuditErrorKind::Io,
+    );
+    assert_eq!(fs::read(t.0.join(".audit-next.jsonl")).unwrap(), b"");
+    assert_eq!(fs::read(t.0.join("audit.trail")).unwrap().len(), 33);
+    assert!(!t.0.join("audit.poison").exists());
+    bad_open(&t, None, AuditErrorKind::CorruptTrail);
+    bad(
+        Sink::create(&t.0, signer(), Config::default()),
+        AuditErrorKind::TrailExists,
+    );
 }
