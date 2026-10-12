@@ -41,7 +41,7 @@ impl Drop for Temp {
     }
 }
 fn signer() -> Arc<dyn Signer> {
-    Arc::new(KeySeed::parse(&"11".repeat(32)).unwrap())
+    Arc::new(KeyFileSigner::from_hex(&"11".repeat(32)).unwrap())
 }
 fn entry() -> Entry {
     Entry::new("actor", "change", "object")
@@ -154,7 +154,7 @@ fn public_validation_and_reserved_action() {
 }
 #[derive(Debug)]
 struct Flaky {
-    key: KeySeed,
+    key: KeyFileSigner,
     down: AtomicBool,
 }
 impl Signer for Flaky {
@@ -173,7 +173,7 @@ impl Signer for Flaky {
 fn unsigned_count_is_a_cumulative_per_handle_snapshot() {
     let temp = Temp::new();
     let signer = Arc::new(Flaky {
-        key: KeySeed::parse(&"11".repeat(32)).unwrap(),
+        key: KeyFileSigner::from_hex(&"11".repeat(32)).unwrap(),
         down: AtomicBool::new(false),
     });
     let trail = temp
@@ -328,7 +328,7 @@ fn environment_directory_in_child() {
 fn concurrent_receipts_snapshot_under_the_lock() {
     let temp = Temp::new();
     let signer = Arc::new(Flaky {
-        key: KeySeed::parse(&"11".repeat(32)).unwrap(),
+        key: KeyFileSigner::from_hex(&"11".repeat(32)).unwrap(),
         down: AtomicBool::new(false),
     });
     let trail = temp
@@ -353,7 +353,7 @@ fn concurrent_receipts_snapshot_under_the_lock() {
 fn failed_close_is_consumed_without_a_drop_retry() {
     let temp = Temp::new();
     let signer = Arc::new(Flaky {
-        key: KeySeed::parse(&"11".repeat(32)).unwrap(),
+        key: KeyFileSigner::from_hex(&"11".repeat(32)).unwrap(),
         down: AtomicBool::new(false),
     });
     let trail = temp.config().create(signer.clone()).unwrap();

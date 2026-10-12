@@ -13,6 +13,7 @@ impl Temp {
         hooks::SHORT.with(|s| s.set(None));
         hooks::HALF.with(|s| s.set(false));
         hooks::EVENTS.with(|e| e.borrow_mut().clear());
+        hooks::SYNC_EVENTS.with(|e| e.borrow_mut().clear());
         let path = std::env::temp_dir().join(format!(
             "vigil-sink-{}-{}",
             std::process::id(),
@@ -28,7 +29,7 @@ impl Drop for Temp {
     }
 }
 pub(super) fn signer() -> Arc<dyn Signer> {
-    Arc::new(KeySeed::parse(&"11".repeat(32)).unwrap())
+    Arc::new(KeyFileSigner::from_hex(&"11".repeat(32)).unwrap())
 }
 pub(super) fn create(t: &Temp) -> Sink {
     Sink::create(&t.0, signer(), Config::default()).unwrap()
@@ -1910,4 +1911,317 @@ fn poison_846_drop_signer_error_is_one_line() {
     assert_eq!(lines[0].lines().count(), 1);
     assert!(lines[0].contains("offline\\nsecond line\\rthird line"));
     assert_eq!(snapshot(&t), before);
+}
+
+// B3b: key custody and operator key generation (ADR-0005 d9).
+#[test]
+fn key_metadata_policy() {
+    use crate::audit::signing::check_key_metadata;
+    let path = std::path::Path::new("key.seed");
+    for mode in [0o600, 0o400, 0o700] {
+        check_key_metadata(path, mode, 12, 12).unwrap();
+    }
+    for mode in [0o640, 0o604, 0o660] {
+        assert_eq!(
+            check_key_metadata(path, mode, 12, 12)
+                .unwrap_err()
+                .to_string(),
+            format!("key file has group or other permission bits: key.seed ({mode:o})")
+        );
+    }
+    assert_eq!(
+        check_key_metadata(path, 0o600, 12, 13)
+            .unwrap_err()
+            .to_string(),
+        "key file owned by uid 12, not the current user 13: key.seed"
+    );
+}
+
+#[test]
+fn key_load_checks_descriptor() {
+    let t = Temp::new();
+    let path = t.0.join("key.seed");
+    crate::audit::keygen(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    assert_eq!(
+        KeyFileSigner::load(&path).unwrap_err().to_string(),
+        format!(
+            "key file has group or other permission bits: {} (640)",
+            path.display()
+        )
+    );
+    assert_eq!(
+        KeyFileSigner::load(&t.0).unwrap_err().to_string(),
+        format!("key file is not a regular file: {}", t.0.display())
+    );
+}
+
+#[test]
+fn key_load_fifo_without_blocking() {
+    // Isolate a missing NONBLOCK mutant in a child so it cannot hang the suite.
+    const CHILD: &str = "VIGIL_KEY_FIFO_CHILD";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let path = PathBuf::from(path);
+        assert_eq!(
+            KeyFileSigner::load(&path).unwrap_err().to_string(),
+            format!("key file is not a regular file: {}", path.display())
+        );
+        return;
+    }
+    let t = Temp::new();
+    let fifo = t.0.join("fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "audit::sink::tests::key_load_fifo_without_blocking",
+        ])
+        .env(CHILD, &fifo)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("load blocked on FIFO");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn key_load_size_and_symlink() {
+    let t = Temp::new();
+    let path = t.0.join("key.seed");
+    let key = crate::audit::keygen(&path).unwrap();
+    let link = t.0.join("link");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert_eq!(KeyFileSigner::load(&link).unwrap().public_key(), key);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.resize(1024, b' ');
+    fs::write(&path, &bytes).unwrap();
+    assert_eq!(KeyFileSigner::load(&path).unwrap().public_key(), key);
+    bytes.push(b' ');
+    fs::write(&path, &bytes).unwrap();
+    assert_eq!(
+        KeyFileSigner::load(&path).unwrap_err().to_string(),
+        format!("key file too large: {}", path.display())
+    );
+    for bad in [b"00".as_slice(), &[0xff; 64], &[b'z'; 64]] {
+        fs::write(&path, bad).unwrap();
+        let error = KeyFileSigner::load(&path).unwrap_err().to_string();
+        assert!(!error.contains(&"z".repeat(64)));
+    }
+}
+
+#[test]
+fn keygen_fresh_round_trip_and_never_overwrites() {
+    const CHILD: &str = "VIGIL_KEYGEN_MODE_CHILD";
+    let public_mode = match std::env::var(CHILD).as_deref() {
+        Ok("022") => 0o644,
+        Ok("077") => 0o600,
+        Err(_) => {
+            for mask in ["022", "077"] {
+                assert!(
+                    std::process::Command::new("sh")
+                        .args([
+                            "-c",
+                            "umask \"$1\" && shift && exec \"$@\"",
+                            "keygen-mode-child",
+                            mask,
+                        ])
+                        .arg(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "audit::sink::tests::keygen_fresh_round_trip_and_never_overwrites",
+                        ])
+                        .env(CHILD, mask)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            return;
+        }
+        Ok(mask) => panic!("unexpected child umask: {mask}"),
+    };
+    let t = Temp::new();
+    let path = t.0.join("key.seed");
+    let pub_path = t.0.join("key.seed.pub");
+    let key = crate::audit::keygen(&path).unwrap();
+    let seed = fs::read(&path).unwrap();
+    let public = fs::read(&pub_path).unwrap();
+    assert_eq!(seed.len(), 65);
+    assert_eq!(seed[64], b'\n');
+    assert!(
+        seed[..64]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    );
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&pub_path).unwrap().permissions().mode() & 0o777,
+        public_mode
+    );
+    assert_eq!(public, format!("{}\n", hex(&key)).as_bytes());
+    assert!(!t.0.join("key.pub").exists());
+    let signer = KeyFileSigner::load(&path).unwrap();
+    assert_eq!(signer.public_key(), key);
+    let message = b"key custody round trip";
+    crate::audit::signing::verify_signature(&key, message, &signer.sign(message).unwrap()).unwrap();
+    assert_eq!(
+        crate::audit::keygen(&path).unwrap_err().to_string(),
+        format!("key file exists: {}", path.display())
+    );
+    assert_eq!(fs::read(&path).unwrap(), seed);
+    assert_eq!(fs::read(&pub_path).unwrap(), public);
+}
+
+#[test]
+fn keygen_preexisting_public_and_dangling_symlink() {
+    let t = Temp::new();
+    let path = t.0.join("key.seed");
+    let pub_path = t.0.join("key.seed.pub");
+    fs::write(&pub_path, b"original").unwrap();
+    assert_eq!(
+        crate::audit::keygen(&path).unwrap_err().to_string(),
+        format!("key file exists: {}", pub_path.display())
+    );
+    assert!(!path.exists());
+    assert_eq!(fs::read(&pub_path).unwrap(), b"original");
+    let target = t.0.join("absent");
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    assert_eq!(
+        crate::audit::keygen(&path).unwrap_err().to_string(),
+        format!("key file exists: {}", path.display())
+    );
+    assert!(!target.exists());
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn keygen_sync_order_and_cleanup() {
+    let t = Temp::new();
+    let path = t.0.join("key.seed");
+    crate::audit::keygen(&path).unwrap();
+    hooks::EVENTS.with(|events| {
+        assert_eq!(
+            *events.borrow(),
+            ["keygen-seed", "keygen-pub", "keygen-dir"]
+        )
+    });
+    use std::os::unix::fs::MetadataExt as _;
+    let identity = |site, path: &std::path::Path| {
+        let metadata = fs::metadata(path).unwrap();
+        (site, metadata.dev(), metadata.ino())
+    };
+    hooks::SYNC_EVENTS.with(|events| {
+        assert_eq!(
+            *events.borrow(),
+            [
+                identity("keygen-seed", &path),
+                identity("keygen-pub", &t.0.join("key.seed.pub")),
+                identity("keygen-dir", &t.0),
+            ]
+        )
+    });
+    for site in ["keygen-seed", "keygen-pub", "keygen-dir"] {
+        let path = t.0.join(site);
+        hooks::FAIL.with(|fail| *fail.borrow_mut() = vec![site]);
+        let error = crate::audit::keygen(&path).unwrap_err();
+        assert!(error.to_string().contains(&format!("injected {site}")));
+        assert!(!path.exists());
+        assert!(!t.0.join(format!("{site}.pub")).exists());
+        hooks::FAIL.with(|fail| assert!(fail.borrow().is_empty()));
+    }
+}
+
+#[test]
+fn keygen_bare_relative_name() {
+    const CHILD: &str = "VIGIL_KEYGEN_RELATIVE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let key = crate::audit::keygen("key.seed").unwrap();
+        assert_eq!(KeyFileSigner::load("key.seed").unwrap().public_key(), key);
+        assert!(std::path::Path::new("key.seed.pub").exists());
+        return;
+    }
+    let t = Temp::new();
+    assert!(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "audit::sink::tests::keygen_bare_relative_name"])
+            .env(CHILD, "1")
+            .current_dir(&t.0)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn keygen_uses_entropy() {
+    let first = Temp::new();
+    let second = Temp::new();
+    let first_path = first.0.join("key.seed");
+    let second_path = second.0.join("key.seed");
+    let first_key = crate::audit::keygen(&first_path).unwrap();
+    let second_key = crate::audit::keygen(&second_path).unwrap();
+    assert_ne!(first_key, second_key);
+    assert_ne!(
+        fs::read(first_path).unwrap(),
+        fs::read(second_path).unwrap()
+    );
+}
+
+#[test]
+fn key_load_refuses_socket() {
+    const CHILD: &str = "VIGIL_KEY_SOCKET_CHILD";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let _listener = std::os::unix::net::UnixListener::bind("socket").unwrap();
+        assert!(KeyFileSigner::load(path).is_err());
+        return;
+    }
+    let t = Temp::new();
+    assert!(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "audit::sink::tests::key_load_refuses_socket"])
+            .env(CHILD, t.0.canonicalize().unwrap().join("socket"))
+            .current_dir(&t.0)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn key_load_ascii_whitespace_only() {
+    let t = Temp::new();
+    let path = t.0.join("key.seed");
+    let key = crate::audit::keygen(&path).unwrap();
+    let seed = fs::read_to_string(&path).unwrap();
+    fs::write(&path, format!(" \t\r\n{}\r\n\t ", seed.trim_ascii())).unwrap();
+    assert_eq!(KeyFileSigner::load(&path).unwrap().public_key(), key);
+    fs::write(&path, format!("\u{00a0}{}\u{00a0}", seed.trim_ascii())).unwrap();
+    assert_eq!(
+        KeyFileSigner::load(&path).unwrap_err().to_string(),
+        "seed contains non-hex characters"
+    );
 }

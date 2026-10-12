@@ -18,7 +18,7 @@ pub(crate) mod storage;
 mod trail;
 pub use config::AuditConfig;
 pub use format::{Checkpoint, Entry, Value};
-pub use signing::{KeySeed, Signer, SignerError};
+pub use signing::{KeyFileSigner, Signer, SignerError, keygen};
 pub use trail::{AuditTrail, Receipt};
 
 #[cfg(vigil_unstable)]

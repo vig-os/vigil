@@ -66,14 +66,14 @@ pub fn vigil::audit::Entry::before(self, value: vigil::audit::Value) -> Self
 pub fn vigil::audit::Entry::details(self, value: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn vigil::audit::Entry::new(actor: impl core::convert::Into<alloc::string::String>, action: impl core::convert::Into<alloc::string::String>, object: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn vigil::audit::Entry::reason(self, value: impl core::convert::Into<alloc::string::String>) -> Self
-pub struct vigil::audit::KeySeed(_)
-impl vigil::audit::KeySeed
-pub fn vigil::audit::KeySeed::parse(text: &str) -> core::result::Result<Self, vigil::audit::SignerError>
-impl core::fmt::Debug for vigil::audit::KeySeed
-pub fn vigil::audit::KeySeed::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl vigil::audit::Signer for vigil::audit::KeySeed
-pub fn vigil::audit::KeySeed::public_key(&self) -> [u8; 32]
-pub fn vigil::audit::KeySeed::sign(&self, message: &[u8]) -> core::result::Result<[u8; 64], vigil::audit::SignerError>
+pub struct vigil::audit::KeyFileSigner(_)
+impl vigil::audit::KeyFileSigner
+pub fn vigil::audit::KeyFileSigner::load(path: impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, vigil::audit::SignerError>
+impl core::fmt::Debug for vigil::audit::KeyFileSigner
+pub fn vigil::audit::KeyFileSigner::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl vigil::audit::Signer for vigil::audit::KeyFileSigner
+pub fn vigil::audit::KeyFileSigner::public_key(&self) -> [u8; 32]
+pub fn vigil::audit::KeyFileSigner::sign(&self, message: &[u8]) -> core::result::Result<[u8; 64], vigil::audit::SignerError>
 pub struct vigil::audit::Receipt
 impl vigil::audit::Receipt
 pub fn vigil::audit::Receipt::hash(&self) -> [u8; 32]
@@ -90,9 +90,10 @@ pub fn vigil::audit::SignerError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -
 pub trait vigil::audit::Signer: core::marker::Send + core::marker::Sync + core::fmt::Debug
 pub fn vigil::audit::Signer::public_key(&self) -> [u8; 32]
 pub fn vigil::audit::Signer::sign(&self, message: &[u8]) -> core::result::Result<[u8; 64], vigil::audit::SignerError>
-impl vigil::audit::Signer for vigil::audit::KeySeed
-pub fn vigil::audit::KeySeed::public_key(&self) -> [u8; 32]
-pub fn vigil::audit::KeySeed::sign(&self, message: &[u8]) -> core::result::Result<[u8; 64], vigil::audit::SignerError>
+impl vigil::audit::Signer for vigil::audit::KeyFileSigner
+pub fn vigil::audit::KeyFileSigner::public_key(&self) -> [u8; 32]
+pub fn vigil::audit::KeyFileSigner::sign(&self, message: &[u8]) -> core::result::Result<[u8; 64], vigil::audit::SignerError>
+pub fn vigil::audit::keygen(path: impl core::convert::AsRef<std::path::Path>) -> core::result::Result<[u8; 32], vigil::audit::SignerError>
 pub mod vigil::rotate
 pub struct vigil::rotate::RotatingFile
 impl vigil::rotate::RotatingFile

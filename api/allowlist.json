@@ -93,11 +93,6 @@
       "vigil::audit::Entry::details": "fn",
       "vigil::audit::Entry::new": "fn",
       "vigil::audit::Entry::reason": "fn",
-      "vigil::audit::KeySeed": "struct",
-      "vigil::audit::KeySeed::fmt": "fn",
-      "vigil::audit::KeySeed::parse": "fn",
-      "vigil::audit::KeySeed::public_key": "fn",
-      "vigil::audit::KeySeed::sign": "fn",
       "vigil::audit::Signer": "trait",
       "vigil::audit::Signer::public_key": "fn",
       "vigil::audit::Signer::sign": "fn",
@@ -164,6 +159,17 @@
     "items": {
       "vigil::Config::metrics": "fn",
       "vigil::Config::metrics_interval": "fn"
+    }
+  },
+  {
+    "justification": "ADR-0005 decision 13, ADR-0004 d1",
+    "items": {
+      "vigil::audit::KeyFileSigner": "struct",
+      "vigil::audit::KeyFileSigner::load": "fn",
+      "vigil::audit::KeyFileSigner::public_key": "fn",
+      "vigil::audit::KeyFileSigner::sign": "fn",
+      "vigil::audit::KeyFileSigner::fmt": "fn",
+      "vigil::audit::keygen": "fn"
     }
   }
 ]
