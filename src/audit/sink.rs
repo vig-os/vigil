@@ -46,6 +46,37 @@ impl std::ops::Deref for Recorded {
         &self.head
     }
 }
+/// Actions that only an operator write may construct.
+#[derive(Clone, Copy)]
+pub(crate) enum ReservedAction {
+    #[expect(dead_code, reason = "resume follows in #11 B3d")]
+    Resume,
+    KeyRotated,
+}
+impl ReservedAction {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Resume => "vigil.audit.resume",
+            Self::KeyRotated => "vigil.audit.key_rotated",
+        }
+    }
+    fn record(self, context: RecordContext, mut entry: Entry) -> Result<Record, AuditError> {
+        entry.action = self.name().into();
+        Record::new_internal(context, entry)
+    }
+}
+pub(crate) enum OperatorOp {
+    Rotate {
+        bound: Head,
+        actor: String,
+        reason: String,
+    },
+    Checkpoint,
+}
+pub(crate) struct OperatorWritten {
+    pub(crate) record: Option<Record>,
+    pub(crate) checkpoint: Record,
+}
 pub(crate) struct Sink {
     reader: TrailReader,
     trail: [u8; 16],
@@ -262,7 +293,7 @@ fn predecessor_run(dir: &File, trail: [u8; 16]) -> Result<(Option<State>, bool),
             state,
             true,
             None,
-            &mut false,
+            &mut None,
             &mut run,
         )?;
     }
@@ -273,7 +304,7 @@ fn predecessor_run(dir: &File, trail: [u8; 16]) -> Result<(Option<State>, bool),
             state,
             true,
             None,
-            &mut false,
+            &mut None,
             &mut run,
         )?;
     }
@@ -520,17 +551,22 @@ impl Sink {
         }
     }
     pub(crate) fn record(&self, entry: &Entry) -> Result<Recorded, AuditError> {
-        self.record_impl(entry, false)
+        self.record_impl(entry, None)
     }
-    /// One internal path for all reserved actions, including resume and key rotation (B3).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "operator writes follow in #11 B3c/B3d")
-    )]
-    pub(crate) fn record_internal(&self, entry: &Entry) -> Result<Recorded, AuditError> {
-        self.record_impl(entry, true)
+    /// Reserved action names are selected by the caller's typed capability.
+    #[cfg(test)]
+    pub(crate) fn record_internal(
+        &self,
+        entry: &Entry,
+        action: ReservedAction,
+    ) -> Result<Recorded, AuditError> {
+        self.record_impl(entry, Some(action))
     }
-    fn record_impl(&self, entry: &Entry, internal: bool) -> Result<Recorded, AuditError> {
+    fn record_impl(
+        &self,
+        entry: &Entry,
+        internal: Option<ReservedAction>,
+    ) -> Result<Recorded, AuditError> {
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(error(AuditErrorKind::Poisoned, "handle durability failure"));
         }
@@ -543,8 +579,8 @@ impl Sink {
             },
             |dir, live, state| {
                 let time = clock()?;
-                let mut record = if internal {
-                    Record::new_internal(self.context(state, time)?, entry.clone())?
+                let mut record = if let Some(action) = internal {
+                    action.record(self.context(state, time)?, entry.clone())?
                 } else {
                     Record::new(self.context(state, time)?, entry.clone())?
                 };
@@ -562,8 +598,8 @@ impl Sink {
                         Ok(()) => {
                             file = live.try_clone().map_err(io_error)?;
                             current = state.clone();
-                            record = if internal {
-                                Record::new_internal(self.context(&current, time)?, entry.clone())?
+                            record = if let Some(action) = internal {
+                                action.record(self.context(&current, time)?, entry.clone())?
                             } else {
                                 Record::new(self.context(&current, time)?, entry.clone())?
                             };
@@ -627,6 +663,104 @@ impl Sink {
                     head: receipt,
                     unsigned_records: self.unsigned_records.load(Ordering::Relaxed),
                 })
+            },
+        )
+    }
+    /// Consumes a one-shot handle: every refusal suppresses Drop's checkpoint.
+    pub(crate) fn operator_write(
+        mut self,
+        expect: Head,
+        op: OperatorOp,
+    ) -> Result<OperatorWritten, AuditError> {
+        self.closed = true;
+        let bound = match &op {
+            OperatorOp::Rotate {
+                bound,
+                actor,
+                reason,
+            } => {
+                if bound.seq > expect.seq {
+                    return Err(error(
+                        AuditErrorKind::InvalidConfig,
+                        "bound exceeds expected head",
+                    ));
+                }
+                if [actor, reason]
+                    .into_iter()
+                    .any(|s| s.is_empty() || s.contains('\0'))
+                {
+                    return Err(error(
+                        AuditErrorKind::InvalidEntry,
+                        "invalid operator actor or reason",
+                    ));
+                }
+                Some(*bound)
+            }
+            OperatorOp::Checkpoint => None,
+        };
+        self.healthy()?;
+        #[cfg(test)]
+        hooks::point("operator-before-lock");
+        self.reader.with_initial(
+            bound,
+            |dir| self.prepare(dir),
+            |dir, file, state, bound_record| {
+                if state.head != expect {
+                    return Err(error(
+                        AuditErrorKind::HeadMismatch,
+                        "operator requires the exact disk head",
+                    ));
+                }
+                let record = match op {
+                    OperatorOp::Rotate {
+                        bound,
+                        actor,
+                        reason,
+                    } => {
+                        let old_key = match bound_record.map(|r| r.kind) {
+                            Some(Kind::Checkpoint(fields)) => fields.key,
+                            _ => {
+                                return Err(error(
+                                    AuditErrorKind::HeadMismatch,
+                                    "bound is not a matching checkpoint",
+                                ));
+                            }
+                        };
+                        if self.signer.public_key() == old_key {
+                            return Err(error(
+                                AuditErrorKind::InvalidConfig,
+                                "rotation requires a different key",
+                            ));
+                        }
+                        let entry =
+                            Entry::new(actor, ReservedAction::KeyRotated.name(), hex(&self.trail))
+                                .reason(reason)
+                                .details(format!(
+                                    "old_key={} bound={}:{}",
+                                    hex(&old_key),
+                                    bound.seq,
+                                    digest_string(&bound.hash)
+                                ));
+                        Some(
+                            ReservedAction::KeyRotated
+                                .record(self.context(state, clock()?)?, entry)?,
+                        )
+                    }
+                    OperatorOp::Checkpoint => None,
+                };
+                let mut bytes = Vec::new();
+                let mut next = state.clone();
+                if let Some(record) = &record {
+                    bytes.extend(line(record)?);
+                    next = next.after(record, state.length + bytes.len() as u64)?;
+                }
+                let checkpoint = self.checkpoint_record(&next, clock()?)?;
+                bytes.extend(line(&checkpoint)?);
+                if state.needs_newline() {
+                    bytes.insert(0, b'\n');
+                }
+                append(dir, file, &bytes, "operator-data", &self.poisoned)?;
+                Ok(OperatorWritten { record, checkpoint })
             },
         )
     }
@@ -807,3 +941,7 @@ mod crashes;
 #[cfg(test)]
 #[path = "crash_fixtures.rs"]
 pub(crate) mod crash_fixtures;
+
+#[cfg(test)]
+#[path = "operator_tests.rs"]
+mod operators;

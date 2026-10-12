@@ -2,8 +2,8 @@
 //!
 //! Call [`AuditConfig::create`] once at deployment, then [`AuditConfig::open`]
 //! with the highest held receipt as the expected head. Store receipts outside
-//! the trail directory. Operator rotation and checkpoint commands follow in
-//! #11 B3c; resume follows in #11 B3d and offline verification in #13.
+//! the trail directory. Operator rotation and checkpoints require the exact
+//! expected head; resume follows in #11 B3d and offline verification in #13.
 //!
 //! Format primitives require `--cfg vigil_unstable` and are provisional. Pin
 //! vigil with `~1.N` when opting in; they may change in a minor release.
@@ -61,7 +61,8 @@ pub enum AuditErrorKind {
     InvalidEntry,
     /// Existing trail bytes violate the format or chain.
     CorruptTrail,
-    /// The application's expected head is absent or different.
+    /// The application's expected head is absent or different. Operator rotate
+    /// and checkpoint require the exact disk head, matching both sequence and hash.
     HeadMismatch,
     /// The trail marker is missing.
     MissingTrail,

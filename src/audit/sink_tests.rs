@@ -175,7 +175,10 @@ fn reserved_prefix_size_and_one_write_checkpoint() {
     assert_eq!(events, ["clock", "write", "record-data"]);
     assert_eq!(records(&t).len(), 3);
     let h = s
-        .record_internal(&Entry::new("actor", "vigil.audit.test", "object"))
+        .record_internal(
+            &Entry::new("actor", "vigil.audit.test", "object"),
+            ReservedAction::KeyRotated,
+        )
         .unwrap();
     assert_eq!(h.seq, 3);
 }
