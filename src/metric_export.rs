@@ -607,6 +607,56 @@ mod tests {
     }
 
     #[test]
+    fn packing_points_and_metrics_includes_the_exact_limit() {
+        let point = serde_json::json!({"timeUnixNano": "2", "asInt": "1"});
+        let metric = |points| serde_json::json!({"name": "n", "gauge": {"dataPoints": points}});
+        let one = metric(vec![point.clone()]);
+        let two = metric(vec![point.clone(), point.clone()]);
+        let three = metric(vec![point.clone(), point.clone(), point]);
+        let wrap = |metrics| {
+            serde_json::json!({"resourceMetrics": [{
+                "scopeMetrics": [{"metrics": metrics}]
+            }]})
+        };
+        let length = |json: &Json| {
+            crate::ordered_json::encode(json, "", crate::ordered_json::METRICS)
+                .unwrap()
+                .len()
+        };
+        // Three points force the slow path; exactly two must share a fragment.
+        let limit = length(&two);
+        let packed = fit_metric(&three, 0, limit).unwrap();
+        assert_eq!(
+            packed.iter().map(BoundedLine::records).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        for line in &packed {
+            serde_json::from_str::<Json>(line.text()).unwrap();
+        }
+        assert_eq!(packed[0].text().len(), limit);
+        let smaller = fit_metric(&three, 0, limit - 1).unwrap();
+        assert_eq!(
+            smaller.iter().map(BoundedLine::records).collect::<Vec<_>>(),
+            [1, 1, 1]
+        );
+        // Three metrics force envelope packing, independently of point splitting.
+        let limit = length(&wrap(vec![one.clone(), one.clone()]));
+        for (cap, expected) in [(limit, vec![2, 1]), (limit - 1, vec![1, 1, 1])] {
+            let lines =
+                envelope::bounded_lines(&wrap(vec![one.clone(); 3]), cap, Envelope::Metrics)
+                    .unwrap();
+            assert_eq!(
+                lines.iter().map(BoundedLine::records).collect::<Vec<_>>(),
+                expected
+            );
+            for line in &lines {
+                serde_json::from_str::<Json>(line.text()).unwrap();
+                assert!(line.text().len() <= cap);
+            }
+        }
+    }
+
+    #[test]
     fn split_without_metric_metadata_is_valid_at_exact_point_limit() {
         let point = serde_json::json!({"timeUnixNano": "2", "asInt": "1"});
         let single = serde_json::json!({"gauge": {"dataPoints": [point.clone()]}});

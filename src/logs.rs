@@ -546,10 +546,11 @@ fn proto_depth_ok(value: &AnyValue, depth: usize) -> bool {
 /// a `HashMap` keyed by `InstrumentationScope`, whose `PartialEq` and `Hash`
 /// disagree for floats (`0.0 == -0.0` but their hashes differ; `NaN != NaN`), so
 /// scopes with such attributes merge or split depending on the hash seed.
-/// Here the key is the canonical text of the sanitized scope (attributes sorted
-/// by key, floats printed so that `-0.0` and `NaN` stay distinct), in a
-/// `BTreeMap`. Records keep the order the batch delivered them in within their
-/// scope. The batch has one resource, so there is exactly one `ResourceLogs`.
+/// Group identity uses name, version, schema URL and sorted attributes, with
+/// Debug retaining distinct non-finite doubles. Shared normalization orders the
+/// projected scopes by decoded name/version/schema URL and metadata values;
+/// strings compare in byte order. Records retain their batch order within each
+/// scope. The batch has one resource, hence exactly one `ResourceLogs`.
 fn group_batch(
     batch: &LogBatch<'_>,
     resource: &ResourceAttributesWithSchema,
@@ -1140,6 +1141,45 @@ mod ordered_tests {
     use super::*;
 
     #[test]
+    #[ignore = "release timing probe; run explicitly without timing assertions"]
+    fn projection_20k_release_probe() {
+        let record = LogRecord {
+            time_unix_nano: 1,
+            observed_time_unix_nano: 2,
+            severity_number: 9,
+            body: Some(AnyValue {
+                value: Some(Value::StringValue("x".repeat(128))),
+            }),
+            ..Default::default()
+        };
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope {
+                        name: "probe".into(),
+                        ..Default::default()
+                    }),
+                    log_records: vec![record; 20_000],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            for _ in 0..10 {
+                std::hint::black_box(project_json(std::hint::black_box(&request)).unwrap());
+            }
+            samples.push(start.elapsed().as_secs_f64());
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "project_json 20k x 10: median {:.6}s; samples {samples:?}",
+            samples[2]
+        );
+    }
+    #[test]
     fn shared_ordering_sorts_log_scopes_without_reordering_records() {
         let scope = |name: &str| ScopeLogs {
             scope: Some(InstrumentationScope {
@@ -1160,7 +1200,7 @@ mod ordered_tests {
         };
         let mut request = ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
-                scope_logs: vec![scope("z"), scope("a")],
+                scope_logs: vec![scope("a!"), scope("a")],
                 ..Default::default()
             }],
         };
@@ -1171,6 +1211,48 @@ mod ordered_tests {
         let records = &a["resourceLogs"][0]["scopeLogs"][0]["logRecords"];
         assert_eq!(records[0]["timeUnixNano"], "2");
         assert_eq!(records[1]["timeUnixNano"], "1");
+    }
+
+    #[test]
+    fn shared_ordering_compares_decoded_versions_and_attribute_values() {
+        let scope = |version: &str, value: &str| ScopeLogs {
+            scope: Some(InstrumentationScope {
+                name: "same".into(),
+                version: version.into(),
+                attributes: vec![opentelemetry_proto::tonic::common::v1::KeyValue {
+                    key: "key".into(),
+                    value: Some(AnyValue {
+                        value: Some(Value::StringValue(value.into())),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for scopes in [
+            vec![scope("a!", "same"), scope("a", "same")],
+            vec![scope("same", "a!"), scope("same", "a")],
+            vec![scope("same", "a!"), scope("same", "a\n")],
+        ] {
+            let mut request = ExportLogsServiceRequest {
+                resource_logs: vec![ResourceLogs {
+                    scope_logs: scopes,
+                    ..Default::default()
+                }],
+            };
+            let forward = project_json(&request).unwrap();
+            request.resource_logs[0].scope_logs.reverse();
+            assert_eq!(forward, project_json(&request).unwrap());
+            let first = &forward["resourceLogs"][0]["scopeLogs"][0]["scope"];
+            assert!(
+                first["version"] == "a"
+                    || matches!(
+                        first["attributes"][0]["value"]["stringValue"].as_str(),
+                        Some("a" | "a\n")
+                    )
+            );
+        }
     }
 
     #[test]

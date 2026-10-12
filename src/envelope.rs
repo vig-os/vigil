@@ -250,18 +250,85 @@ pub(crate) fn patch_any_value(value: &AnyValue, json: &mut Json) {
     }
 }
 
-// Canonical texts are computed once, after sanitizing. They form a total
-// ordering even for distinct number types and non-finite attribute values.
+// Compare decoded strings, including prefix and escape characters, rather than
+// their JSON spelling. Object key order must not depend on preserve_order.
+fn compare_json(a: &Json, b: &Json) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let rank = |v: &Json| match v {
+        Json::Null => 0,
+        Json::Bool(_) => 1,
+        Json::Number(_) => 2,
+        Json::String(_) => 3,
+        Json::Array(_) => 4,
+        Json::Object(_) => 5,
+    };
+    match (a, b) {
+        (Json::Bool(a), Json::Bool(b)) => a.cmp(b),
+        (Json::Number(a), Json::Number(b)) => {
+            match (a.as_i64(), b.as_i64(), a.as_u64(), b.as_u64()) {
+                (Some(a), Some(b), _, _) => a.cmp(&b),
+                (_, _, Some(a), Some(b)) => a.cmp(&b),
+                _ => a
+                    .as_f64()
+                    .unwrap_or_default()
+                    .total_cmp(&b.as_f64().unwrap_or_default())
+                    .then_with(|| a.to_string().cmp(&b.to_string())),
+            }
+        }
+        (Json::String(a), Json::String(b)) => a.cmp(b),
+        (Json::Array(a), Json::Array(b)) => a
+            .iter()
+            .zip(b)
+            .map(|(a, b)| compare_json(a, b))
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or_else(|| a.len().cmp(&b.len())),
+        (Json::Object(a), Json::Object(b)) => {
+            let mut a: Vec<_> = a.iter().collect();
+            let mut b: Vec<_> = b.iter().collect();
+            a.sort_unstable_by_key(|(k, _)| *k);
+            b.sort_unstable_by_key(|(k, _)| *k);
+            a.iter()
+                .zip(&b)
+                .map(|((ka, a), (kb, b))| ka.cmp(kb).then_with(|| compare_json(a, b)))
+                .find(|o| *o != Ordering::Equal)
+                .unwrap_or_else(|| a.len().cmp(&b.len()))
+        }
+        _ => rank(a).cmp(&rank(b)),
+    }
+}
+
+// Traverse envelope containers only: records, attributes and point values have
+// already been normalized by the typed hooks. Never encode a log batch to sort it.
 pub(crate) fn normalize(value: &mut Json, context: &str, rules: Rules) -> Result<(), String> {
     match value {
         Json::Object(fields) => {
             for (key, value) in fields {
-                normalize(value, key, rules)?;
+                if matches!(
+                    key.as_str(),
+                    "resourceLogs"
+                        | "resourceMetrics"
+                        | "scopeLogs"
+                        | "scopeMetrics"
+                        | "metrics"
+                        | "gauge"
+                        | "sum"
+                        | "histogram"
+                        | "exponentialHistogram"
+                        | "summary"
+                        | "dataPoints"
+                ) {
+                    normalize(value, key, rules)?;
+                }
             }
         }
         Json::Array(values) => {
-            for value in values.iter_mut() {
-                normalize(value, context, rules)?;
+            if context != "dataPoints" {
+                for value in values.iter_mut() {
+                    normalize(value, context, rules)?;
+                }
+            }
+            if values.len() < 2 {
+                return Ok(());
             }
             let key = match context {
                 "resourceLogs" | "resourceMetrics" => Some("resource"),
@@ -274,25 +341,40 @@ pub(crate) fn normalize(value: &mut Json, context: &str, rules: Rules) -> Result
                 let mut ordered = values
                     .drain(..)
                     .map(|v| {
-                        let identity = if key == "scope" {
-                            serde_json::json!([
-                                v[key]["name"],
-                                v[key]["version"],
-                                v["schemaUrl"],
-                                v[key]["attributes"]
-                            ])
+                        // Only metric/point ties need the canonical payload, once per
+                        // element. Scope/resource ties keep their input order.
+                        let tie = if matches!(context, "metrics" | "dataPoints") {
+                            ordered_json::encode(&v, context, rules)?
                         } else {
-                            v[key].clone()
+                            String::new()
                         };
-                        Ok((
-                            ordered_json::encode(&identity, key, rules)?,
-                            ordered_json::encode(&v, context, rules)?,
-                            v,
-                        ))
+                        Ok((v, tie))
                     })
                     .collect::<Result<Vec<_>, String>>()?;
-                ordered.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-                values.extend(ordered.into_iter().map(|(_, _, v)| v));
+                ordered.sort_by(|(a, ta), (b, tb)| {
+                    let primary = if key == "scope" {
+                        ["name", "version"]
+                            .into_iter()
+                            .map(|field| {
+                                a[key][field]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .cmp(b[key][field].as_str().unwrap_or_default())
+                            })
+                            .chain(std::iter::once_with(|| {
+                                a["schemaUrl"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .cmp(b["schemaUrl"].as_str().unwrap_or_default())
+                            }))
+                            .find(|o| !o.is_eq())
+                            .unwrap_or_else(|| compare_json(&a[key], &b[key]))
+                    } else {
+                        compare_json(&a[key], &b[key])
+                    };
+                    primary.then_with(|| ta.cmp(tb))
+                });
+                values.extend(ordered.into_iter().map(|(v, _)| v));
             }
         }
         _ => {}
