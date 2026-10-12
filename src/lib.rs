@@ -38,8 +38,8 @@ mod sink;
 ///
 /// Enable `--cfg vigil_unstable` in the application's build and pin `~1.N`.
 /// Libraries using these paths require their applications to enable the cfg.
-/// The tracing integration re-export follows with traces in #8; global provider
-/// installation remains deferred to #7/#8.
+/// Global-provider installation is available (meter only; the tracer in #8).
+/// The tracing integration re-export follows with traces in #8.
 #[cfg(vigil_unstable)]
 #[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
 pub mod unstable {
@@ -114,6 +114,8 @@ mod envelope;
 pub mod metric_export;
 #[cfg(all(feature = "metrics", not(vigil_unstable)))]
 mod metric_export;
+#[cfg(feature = "metrics")]
+mod metric_identity;
 
 #[cfg(test)]
 mod order_tests;

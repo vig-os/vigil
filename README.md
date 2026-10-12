@@ -19,8 +19,7 @@ being built, and the pre-1.0 `dev` branch may change it.
   [ADR-0004](docs/adr/0004-public-api-and-stability.md) decisions 1, 5 and 7. CI checks the committed public API snapshot and the ADR allowlist, including
   hidden items and macro expansions, alongside the semver gate ([Semver](#semver)).
 - **`vigil_unstable` is excluded.** Items behind `--cfg vigil_unstable` (the exporters,
-  sinks and the re-exported OpenTelemetry crates; global-provider installation
-  remains deferred to #7/#8) may
+  sinks and the re-exported OpenTelemetry crates; global-provider installation (meter only; the tracer in #8)) may
   change in any minor release. Applications that set the cfg should pin `~1.N`
   ([ADR-0004](docs/adr/0004-public-api-and-stability.md) decision 4).
 - **On-disk format.** Every line is valid OTLP/JSON, one signal per file, with the
@@ -80,6 +79,20 @@ Instruments bind on their first record after initialization; earlier records
 are dropped and counted, with one report when the pipeline starts. Metrics use
 `metrics.jsonl` and are flushed and shut down with the guard.
 
+Conflicting declarations poison every name involved: future records are dropped,
+and exports remove all streams under those names. Conflicts include incompatible
+kinds, units or histogram boundaries, spelling or description differences within
+one scope, and overlapping Prometheus series names (ADR-0003 d21). Compatible
+sharing across scopes requires Prometheus `otlp.promote_scope_metadata: true`;
+vigil prints a reminder once per shared name.
+
+Binding is lazy. A conflict that only some runs reach, for example on an error
+path, removes the metric only in those runs, with a diagnostic on stderr.
+Add a test that records every instrument once to surface all conflicts in CI.
+`lost(Signal::Metrics)` counts records dropped after poisoning; measurements
+aggregated before the conflict are excluded. Poisoning itself marks its reporting
+period as `DataLost`, even when no later record is dropped.
+
 ## Unstable SDK access
 
 Exporters and sinks are crate-private by default. Applications composing their
@@ -90,8 +103,8 @@ for the exact versions linked by vigil. These APIs may change in any minor;
 applications should pin vigil with `~1.N`. A library using them forces its
 applications to enable the cfg, must document that requirement, and should avoid
 pinning `~1.N` itself because that constrains every dependent in the graph.
-Global-provider installation and the tracing integration re-export follow in
-#7/#8; neither is implemented today.
+Global-provider installation is available for the meter provider. The tracer
+provider and the tracing integration re-export follow in #8.
 
 Cargo uses one rustflags source, in precedence order: `CARGO_ENCODED_RUSTFLAGS`,
 `RUSTFLAGS`, matching target rustflags (including `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`),

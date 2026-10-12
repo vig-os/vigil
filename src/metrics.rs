@@ -4,12 +4,16 @@
 //! The startup report still prints when metrics are off. Records after shutdown
 //! warn once and are not counted.
 
-use crate::{init::PublishedPipeline, lifecycle::Losses};
+use crate::{
+    init::PublishedPipeline,
+    lifecycle::Losses,
+    metric_identity::{Declaration as Identity, Kind},
+};
 use opentelemetry::{InstrumentationScope, KeyValue, metrics::MeterProvider as _};
 use std::{
     borrow::Cow,
     sync::{
-        OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -120,7 +124,8 @@ pub(crate) fn drain_before_init(losses: &Losses, starting: bool) {
 }
 
 struct Bound<T> {
-    handle: T,
+    handle: Option<T>,
+    poisoned: Arc<AtomicBool>,
     pipeline: &'static PublishedPipeline,
 }
 struct Declaration<T> {
@@ -143,7 +148,11 @@ impl<T> Declaration<T> {
             handle: OnceLock::new(),
         }
     }
-    fn handle(&self, build: impl FnOnce(opentelemetry::metrics::Meter) -> T) -> Option<&T> {
+    fn handle(
+        &self,
+        kind: Kind,
+        build: impl FnOnce(opentelemetry::metrics::Meter) -> T,
+    ) -> Option<&T> {
         let bound = if let Some(bound) = self.handle.get() {
             bound.as_ref()?
         } else {
@@ -160,12 +169,24 @@ impl<T> Declaration<T> {
             }
             self.handle
                 .get_or_init(|| {
-                    // #7 / 7b2b: register and check identity here before creating the SDK handle.
+                    let identity = Identity {
+                        scope: (self.scope.name, self.scope.version),
+                        name: self.name,
+                        kind,
+                        unit: self.unit,
+                        description: self.description,
+                        boundaries: self.boundaries,
+                    };
                     let scope = InstrumentationScope::builder(self.scope.name)
                         .with_version(self.scope.version)
                         .build();
+                    let (poisoned, handle) =
+                        pipeline.registry.bind(identity, &pipeline.losses, || {
+                            build(provider.meter_with_scope(scope))
+                        });
                     Some(Bound {
-                        handle: build(provider.meter_with_scope(scope)),
+                        handle,
+                        poisoned,
                         pipeline,
                     })
                 })
@@ -173,8 +194,11 @@ impl<T> Declaration<T> {
         };
         if stopped(bound.pipeline) {
             None
+        } else if bound.poisoned.load(Ordering::Acquire) {
+            bound.pipeline.losses.measurements_dropped(1);
+            None
         } else {
-            Some(&bound.handle)
+            bound.handle.as_ref()
         }
     }
 }
@@ -273,7 +297,7 @@ macro_rules! instrument {
             }
             /// Record one measurement with its attributes.
             pub fn $record(&self, value: $value, attrs: &[(&'static str, Value)]) {
-                if let Some(handle) = self.0.handle(|meter| {
+                if let Some(handle) = self.0.handle(Kind::$name, |meter| {
                     meter
                         .$builder(self.0.name)
                         .with_unit(self.0.unit)
@@ -391,7 +415,7 @@ impl Histogram {
     }
     /// Record one observation with its attributes.
     pub fn record(&self, value: f64, attrs: &[(&'static str, Value)]) {
-        if let Some(handle) = self.0.handle(|meter| {
+        if let Some(handle) = self.0.handle(Kind::Histogram, |meter| {
             let mut builder = meter
                 .f64_histogram(self.0.name)
                 .with_unit(self.0.unit)

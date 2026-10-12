@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Metric identity registry poisons conflicting declarations and filters their exports; unstable `Config::install_opentelemetry_globals` installs the meter provider ([#7](https://github.com/vig-os/vigil/issues/7)).
+
 - Audit `keygen` creates durable seed/public-key files without overwriting ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - Stable `vigil::metrics` facade with five static instruments, crate scopes, compile-time validation, late binding and recording-side measurement loss accounting ([#7](https://github.com/vig-os/vigil/issues/7)).
 - Public audit writer surface (`AuditConfig`, `AuditTrail`, `Receipt`) and optional log mirroring ([#11](https://github.com/vig-os/vigil/issues/11)).

@@ -56,6 +56,7 @@ pub struct FlushError {
     logs: u64,
     measurements: u64,
     data_points_lost: bool,
+    metric_names_poisoned: bool,
     sources: [Option<OTelSdkError>; 2],
 }
 impl FlushError {
@@ -116,7 +117,18 @@ impl fmt::Display for FlushError {
                 self.measurements
             )?;
         }
-        if logs_part || self.measurements != 0 {
+        if self.metric_names_poisoned {
+            write!(
+                f,
+                "{}metric names poisoned by conflicting declarations",
+                if logs_part || self.measurements != 0 {
+                    "; "
+                } else {
+                    ": "
+                }
+            )?;
+        }
+        if logs_part || self.measurements != 0 || self.metric_names_poisoned {
             match self.signal_kind(Signal::Metrics) {
                 Some(FlushErrorKind::Timeout) => write!(f, "; metric export timed out")?,
                 Some(FlushErrorKind::Failed) => write!(f, "; metric export failed")?,
@@ -148,6 +160,7 @@ struct Period {
     measurements: u64,
     metrics_failed: bool,
     metrics_data_lost: bool,
+    metric_names_poisoned: bool,
     failed: bool,
     timeout: bool,
     metrics_timeout: bool,
@@ -209,6 +222,10 @@ impl Losses {
         state.period.failed |= failed;
         state.pending_failed |= failed;
         state.pending_stderr = state.pending_stderr.saturating_add(logs);
+    }
+    #[cfg(feature = "metrics")]
+    pub(crate) fn metric_name_poisoned(&self) {
+        self.state().period.metric_names_poisoned = true;
     }
     #[cfg(feature = "metrics")]
     pub(crate) fn measurements_dropped(&self, n: u64) {
@@ -319,7 +336,11 @@ impl Losses {
             FlushErrorKind::Timeout
         } else if period.failed || period.metrics_failed || result.is_err() {
             FlushErrorKind::Failed
-        } else if period.logs != 0 || period.measurements != 0 || period.metrics_data_lost {
+        } else if period.logs != 0
+            || period.measurements != 0
+            || period.metrics_data_lost
+            || period.metric_names_poisoned
+        {
             FlushErrorKind::DataLost
         } else {
             return Ok(());
@@ -346,12 +367,15 @@ impl Losses {
                 signal_kind(
                     period.metrics_timeout,
                     period.metrics_failed,
-                    period.metrics_data_lost || period.measurements != 0,
+                    period.metrics_data_lost
+                        || period.measurements != 0
+                        || period.metric_names_poisoned,
                 ),
             ],
             logs: period.logs,
             measurements: period.measurements,
             data_points_lost: period.metrics_data_lost,
+            metric_names_poisoned: period.metric_names_poisoned,
             sources: [result.err(), metrics.err()],
         })
     }
