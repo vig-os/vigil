@@ -47,17 +47,23 @@ pub enum FlushErrorKind {
 
 /// A flush/shutdown error with per-signal lower bounds on loss.
 /// Concrete error sources are not stable; downcasting is unsupported.
+/// `Error::source()` returns the logs source when present, otherwise the
+/// metrics source. Display keeps each source on its own signal's part.
 #[derive(Debug)]
 pub struct FlushError {
     kind: FlushErrorKind,
+    signal_kinds: [Option<FlushErrorKind>; 2],
     logs: u64,
-    metric_data_points: bool,
-    source: Option<OTelSdkError>,
+    sources: [Option<OTelSdkError>; 2],
 }
 impl FlushError {
     /// The highest-priority outcome: Timeout, then Failed, then DataLost.
     pub fn kind(&self) -> FlushErrorKind {
         self.kind
+    }
+
+    pub(crate) fn signal_kind(&self, signal: Signal) -> Option<FlushErrorKind> {
+        self.signal_kinds[if signal == Signal::Metrics { 1 } else { 0 }]
     }
 
     /// A lower bound on lost data, in the signal's own unit.
@@ -90,13 +96,22 @@ impl FlushError {
 impl fmt::Display for FlushError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self.kind)?;
-        if self.logs != 0 || !self.metric_data_points {
+        let logs_part = self.logs != 0 || self.sources[0].is_some();
+        if self.logs != 0 {
             write!(f, ": at least {} log records lost", self.logs)?;
         }
-        if self.metric_data_points {
-            write!(f, ": metric data-point export losses")?;
+        if let Some(source) = &self.sources[0] {
+            write!(f, ": {source}")?;
         }
-        if let Some(source) = &self.source {
+        if logs_part {
+            match self.signal_kind(Signal::Metrics) {
+                Some(FlushErrorKind::Timeout) => write!(f, "; metric export timed out")?,
+                Some(FlushErrorKind::Failed) => write!(f, "; metric export failed")?,
+                Some(FlushErrorKind::DataLost) => write!(f, "; metric data points dropped")?,
+                None => return Ok(()),
+            }
+        }
+        if let Some(source) = &self.sources[1] {
             write!(f, ": {source}")?;
         }
         Ok(())
@@ -104,16 +119,21 @@ impl fmt::Display for FlushError {
 }
 impl std::error::Error for FlushError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|source| source as _)
+        self.sources[0]
+            .as_ref()
+            .or(self.sources[1].as_ref())
+            .map(|source| source as _)
     }
 }
 
 #[derive(Debug, Default)]
 struct Period {
     logs: u64,
-    metric_data_points: bool,
+    metrics_failed: bool,
+    metrics_data_lost: bool,
     failed: bool,
     timeout: bool,
+    metrics_timeout: bool,
 }
 
 #[derive(Debug, Default)]
@@ -125,13 +145,40 @@ struct State {
     sdk_overflow: u64,
     pending_stderr: u64,
     pending_failed: bool,
+    #[cfg(feature = "metrics")]
+    pending_points: u64,
+    #[cfg(feature = "metrics")]
+    pending_metrics_failed: bool,
 }
+#[cfg(all(test, feature = "metrics"))]
+#[derive(Debug)]
+pub(crate) struct FlushOrderProbe {
+    pub(crate) started: std::sync::mpsc::Receiver<()>,
+    pub(crate) release: std::sync::mpsc::Sender<()>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Losses {
     state: Mutex<State>,
     pub(crate) shutting_down: AtomicBool,
+    #[cfg(all(test, feature = "metrics"))]
+    pub(crate) metric_export_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(all(test, feature = "metrics"))]
+    pub(crate) before_logs_flush: Mutex<Option<FlushOrderProbe>>,
 }
 impl Losses {
+    #[cfg(all(test, feature = "metrics"))]
+    pub(crate) fn observe_flush_order(&self) {
+        if let Some(probe) = self.before_logs_flush.lock().unwrap().take() {
+            let observed = probe.started.recv_timeout(Duration::from_secs(2));
+            probe.release.send(()).unwrap();
+            assert!(
+                observed.is_ok(),
+                "metrics collection must start before logs flush"
+            );
+        }
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
@@ -147,8 +194,39 @@ impl Losses {
     #[cfg(feature = "metrics")]
     pub(crate) fn metric_data_points(&self, failed: bool) {
         let mut state = self.state();
-        state.period.metric_data_points = true;
-        state.period.failed |= failed;
+        state.period.metrics_failed |= failed;
+        state.period.metrics_data_lost |= !failed;
+        state.pending_metrics_failed |= failed;
+    }
+    #[cfg(feature = "metrics")]
+    pub(crate) fn metric_pending(&self, lost: u64, reported: u64) {
+        let mut state = self.state();
+        state.pending_points = state
+            .pending_points
+            .saturating_add(lost)
+            .saturating_sub(reported);
+        if reported != 0 && state.pending_points == 0 {
+            state.pending_metrics_failed = false;
+        }
+    }
+    #[cfg(feature = "metrics")]
+    pub(crate) fn pending_metrics(&self) -> (u64, bool) {
+        let state = self.state();
+        (state.pending_points, state.pending_metrics_failed)
+    }
+    pub(crate) fn outcome(&self, signal: Signal, result: &OTelSdkResult) {
+        let mut state = self.state();
+        let timeout = matches!(result, Err(OTelSdkError::Timeout(_)));
+        match signal {
+            Signal::Metrics => {
+                state.period.metrics_timeout |= timeout;
+                state.period.metrics_failed |= result.is_err() && !timeout;
+            }
+            _ => {
+                state.period.timeout |= timeout;
+                state.period.failed |= result.is_err() && !timeout;
+            }
+        }
     }
     pub(crate) fn reached(&self, logs: u64) {
         let mut state = self.state();
@@ -184,22 +262,59 @@ impl Losses {
             Self::overflow(&mut state, total);
         }
     }
+    #[cfg(test)]
     pub(crate) fn finish(&self, result: OTelSdkResult) -> Result<(), FlushError> {
-        let period = std::mem::take(&mut self.state().period);
-        let kind = if period.timeout || matches!(result, Err(OTelSdkError::Timeout(_))) {
+        self.finish_signals(result, Ok(()))
+    }
+    pub(crate) fn finish_signals(
+        &self,
+        result: OTelSdkResult,
+        metrics: OTelSdkResult,
+    ) -> Result<(), FlushError> {
+        let mut period = std::mem::take(&mut self.state().period);
+        // Each caller retains its own outcome even if another concurrent
+        // flush consumed the period's shared counts and exporter flags.
+        period.metrics_timeout |= matches!(metrics, Err(OTelSdkError::Timeout(_)));
+        period.metrics_failed |= metrics.is_err() && !period.metrics_timeout;
+        let kind = if period.timeout
+            || period.metrics_timeout
+            || matches!(result, Err(OTelSdkError::Timeout(_)))
+        {
             FlushErrorKind::Timeout
-        } else if period.failed || result.is_err() {
+        } else if period.failed || period.metrics_failed || result.is_err() {
             FlushErrorKind::Failed
-        } else if period.logs != 0 || period.metric_data_points {
+        } else if period.logs != 0 || period.metrics_data_lost {
             FlushErrorKind::DataLost
         } else {
             return Ok(());
         };
+        let signal_kind = |timeout: bool, failed: bool, lost: bool| {
+            if timeout {
+                Some(FlushErrorKind::Timeout)
+            } else if failed {
+                Some(FlushErrorKind::Failed)
+            } else if lost {
+                Some(FlushErrorKind::DataLost)
+            } else {
+                None
+            }
+        };
         Err(FlushError {
             kind,
+            signal_kinds: [
+                signal_kind(
+                    period.timeout || matches!(result, Err(OTelSdkError::Timeout(_))),
+                    period.failed || result.is_err(),
+                    period.logs != 0,
+                ),
+                signal_kind(
+                    period.metrics_timeout,
+                    period.metrics_failed,
+                    period.metrics_data_lost,
+                ),
+            ],
             logs: period.logs,
-            metric_data_points: period.metric_data_points,
-            source: result.err(),
+            sources: [result.err(), metrics.err()],
         })
     }
 
@@ -456,7 +571,7 @@ mod tests {
             assert_eq!(error.lost(Signal::Metrics), 0);
             assert_eq!(error.lost(Signal::Logs), 0);
             assert!(!error.to_string().contains("log records"));
-            assert!(error.to_string().contains("metric"));
+            assert_eq!(error.to_string(), format!("{:?}", error.kind()));
             assert!(losses.finish(Ok(())).is_ok());
         }
         losses.metric_data_points(true);
@@ -472,6 +587,90 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             FlushErrorKind::Timeout
+        );
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn each_signal_keeps_its_own_kind_and_concurrent_callers_keep_timeouts() {
+        let losses = Losses::default();
+        losses.record(3, true);
+        losses.metric_data_points(false);
+        let error = losses.finish(Ok(())).unwrap_err();
+        assert_eq!(error.kind(), FlushErrorKind::Failed);
+        assert_eq!(
+            error.signal_kind(Signal::Logs),
+            Some(FlushErrorKind::Failed)
+        );
+        assert_eq!(
+            error.signal_kind(Signal::Metrics),
+            Some(FlushErrorKind::DataLost)
+        );
+        assert_eq!(
+            error.to_string(),
+            "Failed: at least 3 log records lost; metric data points dropped"
+        );
+        losses.record(2, false);
+        losses.metric_data_points(true);
+        let error = losses.finish(Ok(())).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Failed: at least 2 log records lost; metric export failed"
+        );
+        for _ in 0..2 {
+            let error = losses
+                .finish_signals(Ok(()), Err(OTelSdkError::Timeout(Duration::ZERO)))
+                .unwrap_err();
+            assert_eq!(error.kind(), FlushErrorKind::Timeout);
+            assert_eq!(
+                error.signal_kind(Signal::Metrics),
+                Some(FlushErrorKind::Timeout)
+            );
+            assert_eq!(error.signal_kind(Signal::Logs), None);
+        }
+    }
+
+    #[test]
+    fn display_keeps_source_without_lost_logs() {
+        let error = Losses::default()
+            .finish(Err(OTelSdkError::InternalFailure("source detail".into())))
+            .unwrap_err();
+        assert!(error.to_string().contains("source detail"));
+        assert!(!error.to_string().contains("log records"));
+    }
+
+    #[test]
+    fn display_orders_log_losses_before_metric_timeout_or_failure() {
+        let losses = Losses::default();
+        losses.record(2, false);
+        let metrics = OTelSdkError::Timeout(Duration::from_secs(1));
+        let metrics_text = metrics.to_string();
+        let error = losses.finish_signals(Ok(()), Err(metrics)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Timeout: at least 2 log records lost; metric export timed out: {metrics_text}"
+            )
+        );
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            metrics_text
+        );
+        losses.record(2, false);
+        let logs = OTelSdkError::InternalFailure("logs source".into());
+        let metrics = OTelSdkError::InternalFailure("metrics source".into());
+        let logs_text = logs.to_string();
+        let metrics_text = metrics.to_string();
+        let error = losses.finish_signals(Err(logs), Err(metrics)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Failed: at least 2 log records lost: {logs_text}; metric export failed: {metrics_text}"
+            )
+        );
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            logs_text
         );
     }
 

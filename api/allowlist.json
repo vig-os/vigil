@@ -158,5 +158,12 @@
       "vigil::audit::Receipt::hash_string": "fn",
       "vigil::audit::Receipt::unsigned_records": "fn"
     }
+  },
+  {
+    "justification": "ADR-0003 decisions 5 and 9 (A4 l.~75), ADR-0004 l.~351",
+    "items": {
+      "vigil::Config::metrics": "fn",
+      "vigil::Config::metrics_interval": "fn"
+    }
   }
 ]

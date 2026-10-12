@@ -135,6 +135,8 @@ pub fn vigil::Config::filter_env(self, name: impl core::convert::Into<alloc::str
 pub fn vigil::Config::init(self) -> core::result::Result<vigil::Guard, vigil::InitError>
 pub fn vigil::Config::layer<S>(self) -> core::result::Result<(alloc::boxed::Box<(dyn tracing_subscriber::layer::Layer<S> + core::marker::Send + core::marker::Sync + 'static)>, vigil::Guard), vigil::InitError> where S: tracing_core::subscriber::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + core::marker::Send + core::marker::Sync + 'static
 pub fn vigil::Config::max_bytes(self, bytes: u64) -> Self
+pub fn vigil::Config::metrics(self, enabled: bool) -> Self
+pub fn vigil::Config::metrics_interval(self, interval: core::time::Duration) -> Self
 pub fn vigil::Config::new(service: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn vigil::Config::queue_size(self, size: usize) -> Self
 pub fn vigil::Config::retention(self, retention: core::option::Option<core::time::Duration>) -> Self

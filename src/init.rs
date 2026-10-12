@@ -1,8 +1,6 @@
 //! Process-wide tracing initialization.
 use std::{
-    env,
-    error::Error as _,
-    fmt,
+    env, fmt,
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{
@@ -12,8 +10,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::{FlushErrorKind, Signal};
 use opentelemetry::{InstrumentationScope, KeyValue, logs::LoggerProvider};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_sdk::error::OTelSdkError;
+#[cfg(feature = "metrics")]
+use opentelemetry_sdk::error::OTelSdkResult;
+#[cfg(feature = "metrics")]
+use opentelemetry_sdk::metrics::{PeriodicReader, PeriodicReaderBuilder, SdkMeterProvider};
 use opentelemetry_sdk::{
     Resource,
     logs::{
@@ -126,6 +130,108 @@ impl std::error::Error for InitError {
     }
 }
 
+#[cfg(feature = "metrics")]
+#[derive(Debug, Default)]
+struct MetricFlushState {
+    started: u64,
+    finished: u64,
+    result: Option<(u64, Arc<OTelSdkResult>)>,
+    waiters: std::collections::BTreeMap<u64, usize>,
+    #[cfg(test)]
+    calls: usize,
+    #[cfg(test)]
+    threads: usize,
+}
+
+#[cfg(feature = "metrics")]
+#[derive(Debug, Default)]
+struct MetricFlushes {
+    state: Mutex<MetricFlushState>,
+    changed: std::sync::Condvar,
+}
+#[cfg(feature = "metrics")]
+impl MetricFlushes {
+    fn state(&self) -> std::sync::MutexGuard<'_, MetricFlushState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn register(self: &Arc<Self>, provider: SdkMeterProvider, stopped: Arc<AtomicBool>) -> u64 {
+        let mut state = self.state();
+        let target = state.started + 1;
+        *state.waiters.entry(target).or_default() += 1;
+        if state.started == state.finished {
+            state.started = target;
+            let shared = self.clone();
+            let spawned = std::thread::Builder::new()
+                .name("vigil-metric-flush".into())
+                .spawn(move || {
+                    loop {
+                        #[cfg(test)]
+                        {
+                            shared.state().calls += 1;
+                        }
+                        let result = provider.force_flush();
+                        let mut state = shared.state();
+                        state.finished = state.started;
+                        state.result = Some((state.finished, Arc::new(result)));
+                        shared.changed.notify_all();
+                        if stopped.load(Ordering::Acquire)
+                            || !state.waiters.keys().any(|target| *target > state.finished)
+                        {
+                            break;
+                        }
+                        state.started += 1;
+                    }
+                });
+            match spawned {
+                Ok(_) => {
+                    #[cfg(test)]
+                    {
+                        state.threads += 1;
+                    }
+                }
+                Err(error) => {
+                    state.finished = target;
+                    state.result = Some((
+                        target,
+                        Arc::new(Err(OTelSdkError::InternalFailure(error.to_string()))),
+                    ));
+                }
+            }
+        }
+        self.changed.notify_all();
+        target
+    }
+    fn wait(&self, target: u64, deadline: Instant) -> OTelSdkResult {
+        let mut state = self.state();
+        while state.finished < target && Instant::now() < deadline {
+            state = self
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        if let Some(waiters) = state.waiters.get_mut(&target) {
+            *waiters -= 1;
+            if *waiters == 0 {
+                state.waiters.remove(&target);
+            }
+        }
+        match &state.result {
+            Some((generation, result)) if *generation >= target => match result.as_ref() {
+                Ok(()) => Ok(()),
+                Err(OTelSdkError::Timeout(duration)) => Err(OTelSdkError::Timeout(*duration)),
+                Err(OTelSdkError::AlreadyShutdown) => Err(OTelSdkError::AlreadyShutdown),
+                Err(OTelSdkError::InternalFailure(reason)) => {
+                    Err(OTelSdkError::InternalFailure(reason.clone()))
+                }
+            },
+            _ => Err(OTelSdkError::Timeout(Duration::from_secs(5))),
+        }
+    }
+}
+
 /// Owns the batch processor. Keep this alive until logging is finished.
 /// Drop waits up to five seconds, including time blocked on the directory lock.
 /// On timeout it warns on stderr; remaining records may be lost. The SDK worker
@@ -134,17 +240,28 @@ impl std::error::Error for InitError {
 #[derive(Debug)]
 pub struct Guard {
     provider: Option<SdkLoggerProvider>,
+    // 7b2: d9 pipeline slot
+    #[cfg(feature = "metrics")]
+    metrics: Option<SdkMeterProvider>,
+    #[cfg(feature = "metrics")]
+    metrics_flushing: Arc<MetricFlushes>,
     stopped: Arc<AtomicBool>,
     dir: Option<PathBuf>,
     losses: Arc<Losses>,
+    #[cfg(all(test, feature = "metrics"))]
+    signal_files: [std::sync::Weak<RotatingFile>; 2],
 }
 impl Guard {
-    /// The actual log directory, or `None` when storage fell back to stderr.
+    /// The actual log directory, or `None` when logs fell back to stderr.
+    /// Metrics may still write `metrics.jsonl` there; `None` does not mean
+    /// that no file is written.
     pub fn dir(&self) -> Option<&Path> {
         self.dir.as_deref()
     }
     /// Export queued records without stopping the pipeline, waiting up to five
-    /// seconds. For cargo test, share a `static LazyLock<Guard>` per binary;
+    /// seconds. A timed-out metrics flush may still write to `metrics.jsonl`
+    /// after flush or shutdown returns; at most one such collection runs at once.
+    /// For cargo test, share a `static LazyLock<Guard>` per binary;
     /// each test flushes and selects records carrying its unique field.
     /// Never shut down that shared guard. See [`init`] for nextest isolation
     /// and the scoped-default restrictions.
@@ -166,19 +283,50 @@ impl Guard {
     ///
     /// # Errors
     /// Returns timeout, SDK/sink failure or data loss since the previous flush.
+    /// Logs falling back to stderr contribute no error; metrics still report
+    /// their outcome.
     /// Queue overflow is counted independently of SDK diagnostics and filters.
     /// Concurrent arrivals can make this a lower bound; see [`FlushError::lost`].
-    /// More than 64 concurrent requests can saturate the SDK control channel
+    /// More than 64 concurrent requests can saturate the logs SDK control channel
     /// and return [`crate::FlushErrorKind::Failed`] before the timeout.
     pub fn flush(&self) -> Result<(), FlushError> {
-        match &self.provider {
-            Some(provider) => self.losses.finish(crate::lifecycle::flush(provider)),
-            None => Ok(()),
-        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        #[cfg(feature = "metrics")]
+        let metrics = self.start_metrics_flush();
+        #[cfg(all(test, feature = "metrics"))]
+        self.losses.observe_flush_order();
+        let logs = self
+            .provider
+            .as_ref()
+            .map_or(Ok(()), crate::lifecycle::flush);
+        self.losses.outcome(Signal::Logs, &logs);
+        #[cfg(feature = "metrics")]
+        let metrics = metrics.map_or(Ok(()), |target| {
+            self.metrics_flushing.wait(target, deadline)
+        });
+        #[cfg(not(feature = "metrics"))]
+        let metrics = Ok(());
+        let _ = deadline;
+        self.losses.finish_signals(logs, metrics)
+    }
+
+    #[cfg(feature = "metrics")]
+    fn start_metrics_flush(&self) -> Option<u64> {
+        let provider = self.metrics.as_ref()?.clone();
+        Some(
+            self.metrics_flushing
+                .register(provider, self.stopped.clone()),
+        )
+    }
+
+    #[cfg(all(test, feature = "metrics"))]
+    pub(crate) fn meter_provider(&self) -> Option<&SdkMeterProvider> {
+        self.metrics.as_ref()
     }
 
     /// Flush and stop the pipeline with a five-second timeout. Drop then does
-    /// nothing. Stderr fallback succeeds. The process slot remains occupied.
+    /// nothing. Logs falling back to stderr contribute no error; metrics
+    /// still report their outcome. The process slot remains occupied.
     ///
     /// # Errors
     /// Returns timeout, SDK/sink failure or data loss. See `FlushError::lost`.
@@ -189,70 +337,158 @@ impl Guard {
     /// Flush and stop with an explicit timeout. Queued records may be lost
     /// on timeout; the SDK worker may continue until storage unblocks.
     /// If a shutdown thread cannot be created, shutdown runs inline.
+    /// The timeout bounds vigil's waits, but SDK 0.33's periodic reader can
+    /// hold a blocked metrics shutdown for its fixed five seconds even with a
+    /// shorter timeout, returning metrics `Timeout` ([ADR-0003 decision 4](https://github.com/vig-os/vigil/blob/dev/docs/adr/0003-metrics-and-traces.md#decision)).
     ///
     /// # Errors
     /// Returns timeout, SDK/sink failure or data loss. See `FlushError::lost`.
     pub fn shutdown_with_timeout(mut self, timeout: Duration) -> Result<(), FlushError> {
-        self.stop(timeout)
+        let result = self.stop(timeout);
+        self.summaries(result.as_ref().err(), false);
+        result
     }
 
     fn stop(&mut self, timeout: Duration) -> Result<(), FlushError> {
-        self.stop_with_builder(timeout, std::thread::Builder::new())
+        self.stop_with_builder(
+            timeout,
+            std::thread::Builder::new(),
+            std::thread::Builder::new(),
+        )
     }
     fn stop_with_builder(
         &mut self,
         timeout: Duration,
-        builder: std::thread::Builder,
+        logs_builder: std::thread::Builder,
+        metrics_builder: std::thread::Builder,
     ) -> Result<(), FlushError> {
         self.stopped.store(true, Ordering::Release);
         self.losses.shutting_down.store(true, Ordering::Release);
-        let Some(provider) = self.provider.take() else {
-            return Ok(());
-        };
+        let provider = self.provider.take();
+        #[cfg(feature = "metrics")]
+        let metrics = self.metrics.take();
+        let forward = tracing::dispatcher::get_default(Clone::clone);
         let capture = || ShutdownCapture {
-            forward: tracing::dispatcher::get_default(Clone::clone),
+            forward: forward.clone(),
             losses: self.losses.clone(),
         };
-        let subscriber = capture();
-        let shutdown = || {
-            tracing::subscriber::with_default(subscriber, || {
-                provider.shutdown_with_timeout(timeout)
-            })
+        let started = Instant::now();
+        let logs_shutdown = || {
+            let result = provider.as_ref().map_or(Ok(()), |provider| {
+                tracing::subscriber::with_default(capture(), || {
+                    provider.shutdown_with_timeout(timeout.saturating_sub(started.elapsed()))
+                })
+            });
+            self.losses.outcome(Signal::Logs, &result);
+            result
         };
-        let result = std::thread::scope(|scope| match builder.spawn_scoped(scope, shutdown) {
-            Ok(thread) => thread.join().unwrap_or_else(|_| {
-                Err(opentelemetry_sdk::error::OTelSdkError::InternalFailure(
-                    "log shutdown thread panicked".into(),
-                ))
-            }),
-            Err(_) => tracing::subscriber::with_default(capture(), || {
-                provider.shutdown_with_timeout(timeout)
-            }),
+        #[cfg(feature = "metrics")]
+        let metrics_shutdown = || {
+            let mut result = metrics.as_ref().map_or(Ok(()), |provider| {
+                tracing::dispatcher::with_default(&forward, || {
+                    provider.shutdown_with_timeout(timeout.saturating_sub(started.elapsed()))
+                })
+            });
+            // SDK 0.33 ignores the timeout argument. Retain the actual deadline outcome.
+            if metrics.is_some() && started.elapsed() > timeout {
+                result = Err(OTelSdkError::Timeout(timeout));
+            }
+            self.losses.outcome(Signal::Metrics, &result);
+            result
+        };
+        let result = std::thread::scope(|scope| {
+            let logs_thread = logs_builder.spawn_scoped(scope, logs_shutdown);
+            #[cfg(feature = "metrics")]
+            let metrics_thread = metrics_builder.spawn_scoped(scope, metrics_shutdown);
+            let logs = match logs_thread {
+                Ok(thread) => thread.join().unwrap_or_else(|_| {
+                    Err(OTelSdkError::InternalFailure(
+                        "log shutdown thread panicked".into(),
+                    ))
+                }),
+                Err(_) => logs_shutdown(),
+            };
+            #[cfg(feature = "metrics")]
+            let metrics = {
+                let metrics = match metrics_thread {
+                    Ok(thread) => thread.join().unwrap_or_else(|_| {
+                        Err(OTelSdkError::InternalFailure(
+                            "metric shutdown thread panicked".into(),
+                        ))
+                    }),
+                    Err(_) => metrics_shutdown(),
+                };
+                self.losses.outcome(Signal::Metrics, &metrics);
+                metrics
+            };
+            #[cfg(not(feature = "metrics"))]
+            let metrics = Ok(());
+            self.losses.outcome(Signal::Logs, &logs);
+            (logs, metrics)
         });
-        self.losses.finish(result)
+        #[cfg(not(feature = "metrics"))]
+        let _ = metrics_builder;
+        self.losses.finish_signals(result.0, result.1)
+    }
+
+    fn summaries(&self, error: Option<&FlushError>, dropping: bool) {
+        let (logs, failed) = self.losses.pending_stderr();
+        let kind = error
+            .and_then(|error| error.signal_kind(Signal::Logs))
+            .unwrap_or(if failed {
+                FlushErrorKind::Failed
+            } else {
+                FlushErrorKind::DataLost
+            });
+        if (dropping && (logs != 0 || kind != FlushErrorKind::DataLost))
+            || (!dropping && kind == FlushErrorKind::Timeout)
+        {
+            if dropping {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "vigil: log shutdown: {kind:?}; dropped records: {logs}; remaining records may be lost"
+                );
+            } else {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "vigil: log shutdown: {kind:?}; remaining records may be lost"
+                );
+            }
+        }
+        #[cfg(feature = "metrics")]
+        {
+            let (points, failed) = self.losses.pending_metrics();
+            let kind = error
+                .and_then(|error| error.signal_kind(Signal::Metrics))
+                .unwrap_or(if failed {
+                    FlushErrorKind::Failed
+                } else {
+                    FlushErrorKind::DataLost
+                });
+            if points != 0
+                || (dropping && kind != FlushErrorKind::DataLost)
+                || kind == FlushErrorKind::Timeout
+            {
+                let _ = write!(std::io::stderr(), "vigil: metric shutdown: {kind:?}");
+                if points != 0 {
+                    let _ = write!(std::io::stderr(), "; dropped data points: {points}");
+                }
+                let _ = writeln!(std::io::stderr());
+            }
+        }
     }
 }
 impl Drop for Guard {
     fn drop(&mut self) {
-        if self.provider.is_none() {
+        #[cfg(feature = "metrics")]
+        let metrics = self.metrics.is_some();
+        #[cfg(not(feature = "metrics"))]
+        let metrics = false;
+        if self.provider.is_none() && !metrics {
             return;
         }
-        let error = self.stop(Duration::from_secs(5)).err();
-        let (pending, failed) = self.losses.pending_stderr();
-        if pending == 0 && error.as_ref().is_none_or(|e| e.source().is_none()) {
-            return;
-        }
-        use crate::FlushErrorKind::{DataLost, Failed, Timeout};
-        let kind = match error.as_ref().map(FlushError::kind) {
-            Some(Timeout) => Timeout,
-            _ if failed => Failed,
-            Some(kind) => kind,
-            None => DataLost,
-        };
-        let _ = writeln!(
-            std::io::stderr(),
-            "vigil: log shutdown: {kind:?}; dropped records: {pending}; remaining records may be lost"
-        );
+        let result = self.stop(Duration::from_secs(5));
+        self.summaries(result.as_ref().err(), true);
     }
 }
 
@@ -325,6 +561,10 @@ pub struct Config {
     filter_env: String,
     default_filter: String,
     console: Console,
+    #[cfg(feature = "metrics")]
+    metrics: Option<bool>,
+    #[cfg(feature = "metrics")]
+    metrics_interval: Option<Duration>,
 }
 impl Config {
     /// Configure a service. Names may contain ASCII letters, digits, `-`, `_`,
@@ -342,7 +582,30 @@ impl Config {
             filter_env: "RUST_LOG".into(),
             default_filter: "info".into(),
             console: Console::Off,
+            #[cfg(feature = "metrics")]
+            metrics: None,
+            #[cfg(feature = "metrics")]
+            metrics_interval: None,
         }
+    }
+    /// Enable metrics (default true); overrides `VIGIL_METRICS` (`0` or `1`).
+    /// Disabled metrics create no storage, provider or reader thread.
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+    #[must_use]
+    pub fn metrics(mut self, enabled: bool) -> Self {
+        self.metrics = Some(enabled);
+        self
+    }
+    /// Metrics collection interval (default 60 seconds); overrides
+    /// `VIGIL_METRICS_INTERVAL` in whole seconds. Values below one second
+    /// clamp to one second. OpenTelemetry environment settings have no effect.
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+    #[must_use]
+    pub fn metrics_interval(mut self, interval: Duration) -> Self {
+        self.metrics_interval = Some(interval.max(Duration::from_secs(1)));
+        self
     }
     /// Full state directory; overrides `VIGIL_DIR`.
     #[must_use]
@@ -582,43 +845,77 @@ impl Config {
             || "<unresolved state directory>".into(),
             |p| p.display().to_string(),
         );
+        let id =
+            instance_id().map_err(|error| format!("cannot generate service instance id: {error}"));
+        let resource = id.as_ref().ok().map(|id| {
+            let mut attrs = vec![
+                KeyValue::new("service.name", self.service),
+                KeyValue::new("service.instance.id", id.clone()),
+                KeyValue::new("process.pid", i64::from(std::process::id())),
+            ];
+            if let Some(host) = hostname() {
+                attrs.push(KeyValue::new("host.name", host));
+            }
+            if let Some(version) = self.version {
+                attrs.push(KeyValue::new("service.version", version));
+            }
+            if let Some(revision) = self.revision.or_else(|| {
+                env::var("VIGIL_VCS_REVISION")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            }) {
+                attrs.push(KeyValue::new("vcs.ref.head.revision", revision));
+            }
+            Resource::builder_empty().with_attributes(attrs).build()
+        });
+        #[cfg(all(test, feature = "metrics"))]
+        let mut signal_files: [std::sync::Weak<RotatingFile>; 2] = Default::default();
+        #[cfg(feature = "metrics")]
+        let metrics_enabled = self.metrics.unwrap_or_else(metrics_enabled);
+        #[cfg(feature = "metrics")]
+        let metrics = if metrics_enabled {
+            let interval = metrics_interval(self.metrics_interval);
+            resource.as_ref().and_then(|resource| {
+                dir.as_ref().and_then(|dir| {
+                    match RotatingFile::open(dir, "metrics", rotation.clone()) {
+                        Ok(file) => {
+                            let file = Arc::new(file);
+                            #[cfg(all(test, feature = "metrics"))]
+                            { signal_files[1] = Arc::downgrade(&file); }
+                            Some(build_metrics(file, resource.clone(), interval, losses.clone()))
+                        },
+                        Err(error) => {
+                            let _ = writeln!(std::io::stderr(), "vigil: cannot open metrics storage at {}: {error}; disabling metrics", dir.display());
+                            None
+                        }
+                    }
+                })
+            })
+        } else {
+            None
+        };
         let file = dir.as_ref()
             .ok_or_else(|| std::io::Error::other(format!("neither XDG_STATE_HOME nor HOME provides an absolute path; rejected XDG_STATE_HOME={:?}, HOME={:?}", env::var_os("XDG_STATE_HOME"), env::var_os("HOME"))))
             .and_then(|dir| RotatingFile::open(dir, "logs", rotation))
             .map_err(|error| format!("cannot open log storage at {path_description}: {error}"))
-            .and_then(|file| {
-                instance_id()
-                    .map(|id| (file, id))
-                    .map_err(|error| format!("cannot generate service instance id: {error}"))
-            });
-        let (destination, guard): (PipelineLayer<S>, Guard) = match file {
-            Ok((file, id)) => {
-                let mut attrs = vec![
-                    KeyValue::new("service.name", self.service),
-                    KeyValue::new("service.instance.id", id),
-                    KeyValue::new("process.pid", i64::from(std::process::id())),
-                ];
-                if let Some(host) = hostname() {
-                    attrs.push(KeyValue::new("host.name", host));
-                }
-                if let Some(version) = self.version {
-                    attrs.push(KeyValue::new("service.version", version));
-                }
-                if let Some(revision) = self.revision.or_else(|| {
-                    env::var("VIGIL_VCS_REVISION")
-                        .ok()
-                        .filter(|s| !s.is_empty())
-                }) {
-                    attrs.push(KeyValue::new("vcs.ref.head.revision", revision));
+            .and_then(|file| id.map(|_| file));
+        #[cfg(feature = "metrics")]
+        let metrics_disabled = metrics_enabled && (resource.is_none() || dir.is_none());
+        let (destination, provider, log_dir): (PipelineLayer<S>, _, _) = match file {
+            Ok(file) => {
+                let file = Arc::new(file);
+                #[cfg(all(test, feature = "metrics"))]
+                {
+                    signal_files[0] = Arc::downgrade(&file);
                 }
                 let provider = SdkLoggerProvider::builder()
-                    .with_resource(Resource::builder_empty().with_attributes(attrs).build())
+                    .with_resource(resource.unwrap_or_else(|| Resource::builder_empty().build()))
                     .with_log_processor(ReportingProcessor {
                         losses: losses.clone(),
                         inner: BatchLogProcessor::builder(ReportingExporter {
                             failures: Mutex::new(Failures::default()),
                             losses: losses.clone(),
-                            inner: OtlpJsonLogExporter::new(Arc::new(file)),
+                            inner: OtlpJsonLogExporter::new(file),
                         })
                         .with_batch_config(log_batch_config(queue_size))
                         .build(),
@@ -630,31 +927,42 @@ impl Config {
                         .with_writer(std::io::stderr)
                         .with_ansi(std::io::stderr().is_terminal())
                 });
-                (
-                    bridge.and_then(console).boxed(),
-                    Guard {
-                        provider: Some(provider),
-                        stopped,
-                        losses: losses.clone(),
-                        dir,
-                    },
-                )
+                (bridge.and_then(console).boxed(), Some(provider), dir)
             }
             Err(error) => {
-                let _ = writeln!(std::io::stderr(), "vigil: {error}; falling back to stderr");
+                #[cfg(feature = "metrics")]
+                let disabled = if metrics_disabled {
+                    " for logs; disabling metrics"
+                } else {
+                    ""
+                };
+                #[cfg(not(feature = "metrics"))]
+                let disabled = "";
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "vigil: {error}; falling back to stderr{disabled}"
+                );
                 (
                     tracing_subscriber::fmt::layer()
                         .with_writer(std::io::stderr)
                         .with_ansi(std::io::stderr().is_terminal())
                         .boxed(),
-                    Guard {
-                        provider: None,
-                        stopped,
-                        losses: losses.clone(),
-                        dir: None,
-                    },
+                    None,
+                    None,
                 )
             }
+        };
+        let guard = Guard {
+            provider,
+            #[cfg(feature = "metrics")]
+            metrics,
+            #[cfg(feature = "metrics")]
+            metrics_flushing: Arc::new(MetricFlushes::default()),
+            stopped,
+            losses: losses.clone(),
+            dir: log_dir,
+            #[cfg(all(test, feature = "metrics"))]
+            signal_files,
         };
         let destination = destination
             .with_filter(shutdown_filter)
@@ -671,6 +979,150 @@ impl Config {
         ))
     }
 }
+#[cfg(feature = "metrics")]
+fn metrics_interval(explicit: Option<Duration>) -> Duration {
+    explicit
+        .or_else(|| number("VIGIL_METRICS_INTERVAL", 1).map(Duration::from_secs))
+        .unwrap_or(Duration::from_secs(60))
+}
+
+#[cfg(feature = "metrics")]
+fn metrics_enabled() -> bool {
+    match env::var_os("VIGIL_METRICS").filter(|value| !value.is_empty()) {
+        None => true,
+        Some(value) if value == "0" => false,
+        Some(value) if value == "1" => true,
+        Some(value) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "vigil: invalid VIGIL_METRICS={value:?}; expected 0 or 1; using default"
+            );
+            true
+        }
+    }
+}
+
+#[cfg(feature = "metrics")]
+fn metrics_reader<E: opentelemetry_sdk::metrics::exporter::PushMetricExporter>(
+    exporter: E,
+    interval: Duration,
+) -> PeriodicReaderBuilder<E> {
+    PeriodicReader::builder(exporter).with_interval(interval.max(Duration::from_secs(1)))
+}
+
+#[cfg(feature = "metrics")]
+fn build_metrics(
+    file: Arc<RotatingFile>,
+    resource: Resource,
+    interval: Duration,
+    losses: Arc<Losses>,
+) -> SdkMeterProvider {
+    let storage = Arc::new(MetricStorage(Mutex::new(Some(file))));
+    let exporter = PipelineMetricExporter {
+        inner: crate::metric_export::OtlpJsonMetricExporter::new(storage)
+            .with_losses(losses.clone()),
+    };
+    SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(ReportingMetricReader {
+            inner: metrics_reader(exporter, interval).build(),
+            losses,
+        })
+        .build()
+}
+
+// PeriodicReader acknowledges shutdown before dropping its exporter Arc.
+// Close storage in the exporter's shutdown, before the SDK acknowledgement.
+// A timed-out worker can still write, then releases storage when it stops,
+// even while an external provider clone retains the SDK exporter.
+#[cfg(feature = "metrics")]
+#[derive(Debug)]
+struct MetricStorage(Mutex<Option<Arc<RotatingFile>>>);
+#[cfg(feature = "metrics")]
+impl crate::sink::LineSink for MetricStorage {
+    fn write_line(&self, line: &[u8]) -> std::io::Result<()> {
+        let file = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        file.as_ref()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "metric storage closed")
+            })?
+            .write_line(line)
+    }
+}
+#[cfg(feature = "metrics")]
+impl MetricStorage {
+    fn close(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
+#[cfg(feature = "metrics")]
+#[derive(Debug)]
+struct PipelineMetricExporter {
+    inner: crate::metric_export::OtlpJsonMetricExporter<Arc<MetricStorage>>,
+}
+#[cfg(feature = "metrics")]
+impl opentelemetry_sdk::metrics::exporter::PushMetricExporter for PipelineMetricExporter {
+    async fn export(
+        &self,
+        metrics: &opentelemetry_sdk::metrics::data::ResourceMetrics,
+    ) -> OTelSdkResult {
+        self.inner.export(metrics).await
+    }
+    fn force_flush(&self) -> OTelSdkResult {
+        self.inner.force_flush()
+    }
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        let result = self.inner.shutdown_with_timeout(timeout);
+        self.inner.sink().close();
+        result
+    }
+    fn temporality(&self) -> opentelemetry_sdk::metrics::Temporality {
+        self.inner.temporality()
+    }
+}
+
+// Preserve typed reader timeouts before SdkMeterProvider stringifies them.
+// This requires the SDK's custom-reader feature, without its testing feature.
+#[cfg(feature = "metrics")]
+#[derive(Debug)]
+struct ReportingMetricReader {
+    inner: PeriodicReader<PipelineMetricExporter>,
+    losses: Arc<Losses>,
+}
+#[cfg(feature = "metrics")]
+impl opentelemetry_sdk::metrics::reader::MetricReader for ReportingMetricReader {
+    fn register_pipeline(&self, pipeline: std::sync::Weak<opentelemetry_sdk::metrics::Pipeline>) {
+        self.inner.register_pipeline(pipeline);
+    }
+    fn collect(
+        &self,
+        metrics: &mut opentelemetry_sdk::metrics::data::ResourceMetrics,
+    ) -> OTelSdkResult {
+        self.inner.collect(metrics)
+    }
+    fn force_flush(&self) -> OTelSdkResult {
+        self.inner.force_flush()
+    }
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        let result = self.inner.shutdown_with_timeout(timeout);
+        self.losses.outcome(Signal::Metrics, &result);
+        result
+    }
+    fn temporality(
+        &self,
+        kind: opentelemetry_sdk::metrics::InstrumentKind,
+    ) -> opentelemetry_sdk::metrics::Temporality {
+        self.inner.temporality(kind)
+    }
+}
+
 // The upstream bridge requests an empty scope; supply a named scope to avoid
 // the SDK's LoggerNameEmpty diagnostic before subscriber installation.
 struct NamedProvider(SdkLoggerProvider);
@@ -897,10 +1349,16 @@ mod install_race_tests {
         }
         let dir = std::env::temp_dir().join(format!("vigil-install-race-{}", std::process::id()));
         let mut provider = None;
+        #[cfg(feature = "metrics")]
+        let mut metrics = None;
         let error = Config::new("race")
             .dir(&dir)
             .init_with(|guard| {
                 provider = guard.provider.clone();
+                #[cfg(feature = "metrics")]
+                {
+                    metrics = guard.metrics.clone();
+                }
                 #[cfg(target_os = "linux")]
                 {
                     let handles = storage_handles(&dir);
@@ -908,6 +1366,8 @@ mod install_race_tests {
                         handles.contains(&dir),
                         "test must observe the directory lock handle"
                     );
+                    #[cfg(feature = "metrics")]
+                    assert!(handles.contains(&dir.join("metrics.jsonl")));
                     assert!(
                         handles.contains(&dir.join("logs.jsonl")),
                         "test must observe the live log handle"
@@ -918,11 +1378,20 @@ mod install_race_tests {
             .unwrap_err();
         assert_eq!(error.kind(), InitErrorKind::ForeignSubscriber);
         assert!(std::error::Error::source(&error).is_some());
+        #[cfg(feature = "metrics")]
+        let metrics = metrics.unwrap();
+        #[cfg(feature = "metrics")]
+        assert!(matches!(
+            metrics.shutdown(),
+            Err(OTelSdkError::AlreadyShutdown)
+        ));
         #[cfg(target_os = "linux")]
         assert!(
             storage_handles(&dir).is_empty(),
-            "lost install must close storage handles"
+            "lost install must close storage handles, even with a retained metrics provider"
         );
+        #[cfg(feature = "metrics")]
+        drop(metrics);
         assert!(
             matches!(
                 provider.unwrap().shutdown_with_timeout(Duration::ZERO),
@@ -953,8 +1422,14 @@ mod guard_tests {
         let retained = provider.clone();
         let mut guard = Guard {
             provider: Some(provider),
+            #[cfg(feature = "metrics")]
+            metrics: None,
+            #[cfg(feature = "metrics")]
+            metrics_flushing: Arc::new(MetricFlushes::default()),
             stopped: Arc::new(AtomicBool::new(false)),
             dir: None,
+            #[cfg(all(test, feature = "metrics"))]
+            signal_files: Default::default(),
             losses: Arc::new(Losses::default()),
         };
         guard.flush().unwrap();
@@ -964,6 +1439,7 @@ mod guard_tests {
         guard
             .stop_with_builder(
                 Duration::from_millis(17),
+                std::thread::Builder::new().stack_size(usize::MAX / 2 + 1),
                 std::thread::Builder::new().stack_size(usize::MAX / 2 + 1),
             )
             .unwrap();
@@ -1040,6 +1516,8 @@ mod entropy_failure_tests {
                 .unwrap();
             assert!(guard.provider.is_none());
             assert!(guard.dir().is_none());
+            #[cfg(feature = "metrics")]
+            assert!(guard.metrics.is_none());
             tracing::info!("entropy fallback is alive");
             guard.flush().unwrap();
             guard.shutdown().unwrap();
@@ -1060,6 +1538,18 @@ mod entropy_failure_tests {
         assert!(output.status.success(), "{output:?}");
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert_eq!(stderr.matches("cannot generate service instance id: injected entropy failure; falling back to stderr").count(), 1, "{stderr}");
+        #[cfg(feature = "metrics")]
+        {
+            assert_eq!(stderr.matches("disabling metrics").count(), 1, "{stderr}");
+            assert_eq!(
+                stderr
+                    .lines()
+                    .filter(|line| line.starts_with("vigil:"))
+                    .count(),
+                1,
+                "{stderr}"
+            );
+        }
         assert!(!stderr.contains("cannot open log storage"), "{stderr}");
         assert!(stderr.contains("entropy fallback is alive"), "{stderr}");
         assert!(std::fs::read(temp.0.join("logs.jsonl")).unwrap().is_empty());
@@ -1142,4 +1632,1112 @@ pub(crate) fn state_directory(service: &str) -> Option<PathBuf> {
                 .filter(|s| std::path::Path::new(s).is_absolute())
                 .map(|s| PathBuf::from(s).join(".local/state").join(service))
         })
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod metrics_lifecycle_tests {
+    use super::*;
+    use opentelemetry::metrics::MeterProvider as _;
+    use serde_json::Value;
+    use std::{fs, process::Command, sync::mpsc};
+
+    fn directory(case: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("vigil-metrics-{case}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    fn child(test: &str, mode: &str, vars: &[(&str, &str)]) -> Option<std::process::Output> {
+        if env::var_os("VIGIL_METRICS_TEST_MODE").is_some() {
+            return None;
+        }
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("init::metrics_lifecycle_tests::{test}"),
+                "--nocapture",
+            ])
+            .env_remove("VIGIL_METRICS")
+            .env_remove("VIGIL_METRICS_INTERVAL")
+            .env_remove("RUST_LOG")
+            .env("VIGIL_METRICS_TEST_MODE", mode)
+            .envs(vars.iter().copied())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(output)
+    }
+    fn record(guard: &Guard) {
+        guard
+            .meter_provider()
+            .unwrap()
+            .meter("test")
+            .u64_counter("requests")
+            .build()
+            .add(7, &[]);
+    }
+    fn points(dir: &Path) -> Vec<Value> {
+        fs::read_to_string(dir.join("metrics.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+    fn block_directory(dir: &Path) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let file = fs::File::open(dir).unwrap();
+        let (ready, waiting) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            file.lock().unwrap();
+            ready.send(()).unwrap();
+            released.recv().unwrap();
+            file.unlock().unwrap();
+        });
+        waiting.recv().unwrap();
+        (release, thread)
+    }
+
+    #[test]
+    fn init_creates_both_signal_files_without_lock_files() {
+        if !crate::subscriber_test_child(
+            "init::metrics_lifecycle_tests::init_creates_both_signal_files_without_lock_files",
+        ) {
+            return;
+        }
+        let dir = directory("layout");
+        let guard = Config::new("layout").dir(&dir).init().unwrap();
+        assert!(dir.join("logs.jsonl").is_file());
+        assert!(dir.join("metrics.jsonl").is_file());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        drop(guard);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shared_lock_flush_shutdown_cumulative_time_first_and_empty_exemplars() {
+        if child(
+            "shared_lock_flush_shutdown_cumulative_time_first_and_empty_exemplars",
+            "layout",
+            &[],
+        )
+        .is_some()
+        {
+            return;
+        }
+        let dir = directory("shared-lock");
+        let guard = Config::new("shared").dir(&dir).init().unwrap();
+        let logs = guard.signal_files[0].upgrade().unwrap();
+        let metrics = guard.signal_files[1].upgrade().unwrap();
+        assert!(logs.shares_lock(&metrics));
+        record(&guard);
+        tracing::info!("a log");
+        guard.flush().unwrap();
+        guard.shutdown().unwrap();
+        assert!(
+            !fs::read_to_string(dir.join("logs.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
+        let text = fs::read_to_string(dir.join("metrics.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        for line in text.lines() {
+            assert!(line.starts_with("{\"resourceMetrics\":[{\"scopeMetrics\":[{\"metrics\":[{\"sum\":{\"dataPoints\":[{\"timeUnixNano\":"), "{line}");
+            let json: Value = serde_json::from_str(line).unwrap();
+            let sum = &json["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"];
+            assert_eq!(sum["aggregationTemporality"], 2);
+            assert_eq!(sum["dataPoints"][0]["asInt"], 7);
+            assert!(
+                sum["dataPoints"][0]
+                    .get("exemplars")
+                    .is_none_or(|v| v.as_array().unwrap().is_empty())
+            );
+        }
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        drop((logs, metrics));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fallback_logs_still_return_metric_failure_without_measurement_loss() {
+        if let Some(output) = child(
+            "fallback_logs_still_return_metric_failure_without_measurement_loss",
+            "fallback",
+            &[],
+        ) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("metric shutdown: Failed; dropped data points: 1"),
+                "{stderr}"
+            );
+            return;
+        }
+        let dir = directory("fallback-failed-metrics");
+        fs::create_dir(dir.join("logs.jsonl")).unwrap();
+        let guard = Config::new("fallback").dir(&dir).init().unwrap();
+        assert!(guard.dir().is_none());
+        record(&guard);
+        fs::remove_file(dir.join("metrics.jsonl")).unwrap();
+        fs::create_dir(dir.join("metrics.jsonl")).unwrap();
+        let error = guard.shutdown().unwrap_err();
+        assert_eq!(
+            error.signal_kind(Signal::Metrics),
+            Some(FlushErrorKind::Failed)
+        );
+        assert_eq!(error.lost(Signal::Metrics), 0);
+        let source = std::error::Error::source(&error).expect("metrics shutdown source");
+        assert!(error.to_string().contains(&source.to_string()));
+        assert!(
+            source.to_string().contains("Failed to shutdown"),
+            "{source}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn metrics_collection_starts_before_logs_flush() {
+        if child("metrics_collection_starts_before_logs_flush", "order", &[]).is_some() {
+            return;
+        }
+        let dir = directory("flush-order");
+        let guard = Config::new("order").dir(&dir).init().unwrap();
+        record(&guard);
+        let (release, thread) = block_directory(&dir);
+        let (started, observed) = mpsc::channel();
+        *guard.losses.metric_export_started.lock().unwrap() = Some(started);
+        *guard.losses.before_logs_flush.lock().unwrap() = Some(crate::lifecycle::FlushOrderProbe {
+            started: observed,
+            release,
+        });
+        guard.flush().unwrap();
+        thread.join().unwrap();
+        guard.shutdown().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_shutdown_returns_failures_without_printing_them() {
+        for signal in ["logs", "metrics"] {
+            if let Some(output) = child(
+                "explicit_shutdown_returns_failures_without_printing_them",
+                signal,
+                &[],
+            ) {
+                assert!(
+                    output.stderr.is_empty(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            } else {
+                let dir = directory("explicit-failed");
+                let guard = Config::new("failed").dir(&dir).init().unwrap();
+                let signal = if env::var("VIGIL_METRICS_TEST_MODE").unwrap() == "logs" {
+                    Signal::Logs
+                } else {
+                    Signal::Metrics
+                };
+                guard.losses.outcome(
+                    signal,
+                    &Err(OTelSdkError::InternalFailure("injected".into())),
+                );
+                let error = guard.shutdown().unwrap_err();
+                assert_eq!(error.signal_kind(signal), Some(FlushErrorKind::Failed));
+                fs::remove_dir_all(dir).unwrap();
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn flush_returns_losses_without_final_stderr_summary() {
+        if let Some(output) = child(
+            "flush_returns_losses_without_final_stderr_summary",
+            "flush",
+            &[],
+        ) {
+            assert!(
+                output.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = directory("flush-silent");
+        let guard = Config::new("silent").dir(&dir).init().unwrap();
+        guard.losses.record(2, true);
+        guard.losses.metric_data_points(true);
+        guard.losses.metric_pending(3, 0);
+        let error = guard.flush().unwrap_err();
+        assert_eq!(error.kind(), FlushErrorKind::Failed);
+        assert_eq!(error.lost(Signal::Logs), 2);
+        guard.losses.reported(2);
+        guard.losses.metric_pending(0, 3);
+        guard.shutdown().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn short_shutdown_retains_metrics_deadline_after_blocked_export() {
+        if child(
+            "short_shutdown_retains_metrics_deadline_after_blocked_export",
+            "short",
+            &[],
+        )
+        .is_some()
+        {
+            return;
+        }
+        let dir = directory("short-shutdown");
+        let guard = Config::new("short").dir(&dir).init().unwrap();
+        record(&guard);
+        let (release, lock_thread) = block_directory(&dir);
+        let timeout = Duration::from_millis(100);
+        let start = Instant::now();
+        let error = guard.shutdown_with_timeout(timeout).unwrap_err();
+        let elapsed = start.elapsed();
+        release.send(()).unwrap();
+        lock_thread.join().unwrap();
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+        assert_eq!(
+            error.signal_kind(Signal::Metrics),
+            Some(FlushErrorKind::Timeout)
+        );
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            OTelSdkError::Timeout(timeout).to_string()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unresolved_directory_warning_covers_logs_and_metrics_once() {
+        if let Some(output) = child(
+            "unresolved_directory_warning_covers_logs_and_metrics_once",
+            "unresolved",
+            &[
+                ("VIGIL_DIR", ""),
+                ("XDG_STATE_HOME", "relative"),
+                ("HOME", "relative"),
+            ],
+        ) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                stderr
+                    .lines()
+                    .filter(|line| line.starts_with("vigil:"))
+                    .count(),
+                1,
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains("falling back to stderr for logs; disabling metrics"),
+                "{stderr}"
+            );
+            return;
+        }
+        let guard = Config::new("unresolved").init().unwrap();
+        assert!(guard.dir().is_none());
+        assert!(guard.meter_provider().is_none());
+        guard.shutdown().unwrap();
+    }
+
+    #[test]
+    fn signal_switch_environment_and_builder_precedence() {
+        for (mode, value, enabled, warning) in [
+            ("off", "0", false, false),
+            ("on", "1", true, false),
+            ("empty", "", true, false),
+            ("invalid", "false", true, true),
+            ("builder", "0", true, false),
+        ] {
+            if let Some(output) = child(
+                "signal_switch_environment_and_builder_precedence",
+                mode,
+                &[("VIGIL_METRICS", value)],
+            ) {
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .matches("invalid VIGIL_METRICS=")
+                        .count(),
+                    usize::from(warning)
+                );
+            } else {
+                let mode = env::var("VIGIL_METRICS_TEST_MODE").unwrap();
+                let dir = directory("switch");
+                let mut config = Config::new("switch").dir(&dir);
+                if mode == "builder" {
+                    config = config.metrics(true);
+                }
+                let guard = config.init().unwrap();
+                let enabled = mode != "off";
+                assert_eq!(guard.meter_provider().is_some(), enabled);
+                assert_eq!(dir.join("metrics.jsonl").exists(), enabled);
+                tracing::info!("logs work");
+                guard.shutdown().unwrap();
+                assert!(
+                    !fs::read_to_string(dir.join("logs.jsonl"))
+                        .unwrap()
+                        .is_empty()
+                );
+                fs::remove_dir_all(dir).unwrap();
+                return;
+            }
+            let _ = enabled;
+        }
+    }
+
+    #[test]
+    fn storage_failures_disable_only_the_affected_signal() {
+        for signal in ["logs", "metrics"] {
+            if let Some(output) = child(
+                "storage_failures_disable_only_the_affected_signal",
+                signal,
+                &[],
+            ) {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if signal == "metrics" {
+                    assert_eq!(stderr.matches("cannot open metrics storage").count(), 1);
+                    assert!(stderr.contains("disabling metrics"));
+                }
+            } else {
+                let signal = env::var("VIGIL_METRICS_TEST_MODE").unwrap();
+                let dir = directory("storage-failure");
+                fs::create_dir(dir.join(format!("{signal}.jsonl"))).unwrap();
+                let guard = Config::new("storage").dir(&dir).init().unwrap();
+                if signal == "logs" {
+                    record(&guard);
+                } else {
+                    assert!(guard.meter_provider().is_none());
+                }
+                tracing::info!("logs still work");
+                guard.shutdown().unwrap();
+                let other = if signal == "logs" { "metrics" } else { "logs" };
+                assert!(
+                    !fs::read_to_string(dir.join(format!("{other}.jsonl")))
+                        .unwrap()
+                        .is_empty()
+                );
+                fs::remove_dir_all(dir).unwrap();
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn vigil_interval_overrides_otel_and_clamps_zero() {
+        if child(
+            "vigil_interval_overrides_otel_and_clamps_zero",
+            "interval",
+            &[("OTEL_METRIC_EXPORT_INTERVAL", "1")],
+        )
+        .is_some()
+        {
+            return;
+        }
+        let exporter =
+            || crate::metric_export::OtlpJsonMetricExporter::new(crate::sink::MemorySink::new());
+        assert!(
+            format!("{:?}", metrics_reader(exporter(), Duration::from_secs(60)))
+                .contains("interval: 60s")
+        );
+        assert!(
+            format!("{:?}", metrics_reader(exporter(), Duration::ZERO)).contains("interval: 1s")
+        );
+        assert_eq!(
+            Config::new("interval")
+                .metrics_interval(Duration::ZERO)
+                .metrics_interval,
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn sdk_default_cardinality_overflows_without_exemplars() {
+        if child(
+            "sdk_default_cardinality_overflows_without_exemplars",
+            "cardinality",
+            &[],
+        )
+        .is_some()
+        {
+            return;
+        }
+        let dir = directory("cardinality");
+        let guard = Config::new("cardinality").dir(&dir).init().unwrap();
+        let counter = guard
+            .meter_provider()
+            .unwrap()
+            .meter("test")
+            .u64_counter("many")
+            .build();
+        for series in 0..2001 {
+            counter.add(1, &[KeyValue::new("series", series)]);
+        }
+        guard.flush().unwrap();
+        guard.shutdown().unwrap();
+        for json in points(&dir) {
+            let sum = &json["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"];
+            assert_eq!(sum["aggregationTemporality"], 2);
+            let points = sum["dataPoints"].as_array().unwrap();
+            assert_eq!(points.len(), 2001);
+            assert!(points.iter().any(|point| {
+                point["attributes"].as_array().unwrap().iter().any(|attr| {
+                    attr["key"] == "otel.metric.overflow" && attr["value"]["boolValue"] == true
+                })
+            }));
+            for point in points {
+                assert!(
+                    point
+                        .get("exemplars")
+                        .is_none_or(|v| v.as_array().unwrap().is_empty())
+                );
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn blocked_flush_is_bounded_and_does_not_queue_another_collection() {
+        if child(
+            "blocked_flush_is_bounded_and_does_not_queue_another_collection",
+            "flush",
+            &[],
+        )
+        .is_some()
+        {
+            return;
+        }
+        let dir = directory("blocked-flush");
+        let guard = Config::new("flush").dir(&dir).init().unwrap();
+        record(&guard);
+        let (release, thread) = block_directory(&dir);
+        let start = Instant::now();
+        assert_eq!(guard.flush().unwrap_err().kind(), FlushErrorKind::Timeout);
+        assert!(start.elapsed() < Duration::from_secs(6));
+        {
+            let state = guard.metrics_flushing.state();
+            assert_ne!(state.started, state.finished);
+        }
+        let start = Instant::now();
+        assert_eq!(guard.flush().unwrap_err().kind(), FlushErrorKind::Timeout);
+        assert!(start.elapsed() < Duration::from_secs(6));
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        guard.shutdown().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn blocked_shutdown_runs_both_providers_concurrently() {
+        if let Some(output) = child(
+            "blocked_shutdown_runs_both_providers_concurrently",
+            "shutdown",
+            &[],
+        ) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.matches("vigil: log shutdown: Timeout").count(), 1);
+            assert_eq!(stderr.matches("vigil: metric shutdown: Timeout").count(), 1);
+            return;
+        }
+        let dir = directory("concurrent-shutdown");
+        let guard = Config::new("shutdown").dir(&dir).init().unwrap();
+        record(&guard);
+        let (release, thread) = block_directory(&dir);
+        tracing::info!("block logs too");
+        let start = Instant::now();
+        let error = guard
+            .shutdown_with_timeout(Duration::from_secs(5))
+            .unwrap_err();
+        let elapsed = start.elapsed();
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        assert_eq!(
+            error.signal_kind(Signal::Logs),
+            Some(FlushErrorKind::Timeout)
+        );
+        assert_eq!(
+            error.signal_kind(Signal::Metrics),
+            Some(FlushErrorKind::Timeout)
+        );
+        assert!(elapsed < Duration::from_millis(7500), "{elapsed:?}");
+        // Detached SDK workers may finish their final append after return.
+    }
+
+    fn summary_case(test: &str, mode: &str) {
+        if let Some(output) = child(test, mode, &[]) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let metrics = usize::from(matches!(
+                mode,
+                "drop-points"
+                    | "drop-both"
+                    | "explicit-points"
+                    | "metric-timeout"
+                    | "metric-failed"
+            ));
+            let logs = usize::from(matches!(mode, "drop-both" | "log-timeout"));
+            assert_eq!(
+                stderr.matches("vigil: metric shutdown:").count(),
+                metrics,
+                "{mode}: {stderr}"
+            );
+            assert_eq!(
+                stderr.matches("vigil: log shutdown:").count(),
+                logs,
+                "{mode}: {stderr}"
+            );
+            if mode.contains("points") || mode == "drop-both" {
+                assert!(stderr.contains("dropped data points: 3"), "{stderr}");
+            }
+            if mode.contains("timeout") {
+                assert!(stderr.contains("Timeout"), "{stderr}");
+            }
+            if mode == "metric-failed" {
+                assert!(stderr.contains("metric shutdown: Failed"));
+            }
+        } else {
+            let mode = env::var("VIGIL_METRICS_TEST_MODE").unwrap();
+            let dir = directory("summaries");
+            let guard = Config::new("summary").dir(&dir).init().unwrap();
+            if mode.contains("points") || mode == "drop-both" {
+                guard.losses.metric_data_points(false);
+                guard.losses.metric_pending(3, 0);
+            }
+            if mode == "drop-both" || mode == "explicit-logs" {
+                guard.losses.record(2, false);
+            }
+            if mode == "metric-failed" {
+                guard.losses.outcome(
+                    Signal::Metrics,
+                    &Err(OTelSdkError::InternalFailure("failure".into())),
+                );
+            }
+            if mode.contains("timeout") {
+                guard.losses.outcome(
+                    if mode == "metric-timeout" {
+                        Signal::Metrics
+                    } else {
+                        Signal::Logs
+                    },
+                    &Err(OTelSdkError::Timeout(Duration::ZERO)),
+                );
+            }
+            if mode.starts_with("explicit") {
+                let error = guard.shutdown().unwrap_err();
+                assert_eq!(error.kind(), FlushErrorKind::DataLost);
+                assert_eq!(
+                    error.lost(Signal::Logs),
+                    if mode == "explicit-logs" { 2 } else { 0 }
+                );
+                assert_eq!(error.lost(Signal::Metrics), 0);
+            } else {
+                drop(guard);
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn drop_with_only_data_points() {
+        summary_case("drop_with_only_data_points", "drop-points");
+    }
+    #[test]
+    fn drop_with_logs_and_data_points() {
+        summary_case("drop_with_logs_and_data_points", "drop-both");
+    }
+    #[test]
+    fn explicit_shutdown_with_only_data_points() {
+        summary_case("explicit_shutdown_with_only_data_points", "explicit-points");
+    }
+    #[test]
+    fn explicit_shutdown_with_only_logs() {
+        summary_case("explicit_shutdown_with_only_logs", "explicit-logs");
+    }
+    #[test]
+    fn clean_period_prints_nothing() {
+        summary_case("clean_period_prints_nothing", "clean");
+    }
+    #[test]
+    fn metrics_only_timeout_prints_its_own_kind() {
+        summary_case("metrics_only_timeout_prints_its_own_kind", "metric-timeout");
+    }
+    #[test]
+    fn logs_timeout_with_zero_records_still_prints() {
+        summary_case("logs_timeout_with_zero_records_still_prints", "log-timeout");
+    }
+    #[test]
+    fn metrics_failed_with_zero_points_still_prints_on_drop() {
+        summary_case(
+            "metrics_failed_with_zero_points_still_prints_on_drop",
+            "metric-failed",
+        );
+    }
+
+    #[test]
+    fn interval_environment_defaults_validation_and_builder_precedence() {
+        for (value, expected, invalid) in [
+            ("", 60, false),
+            ("2", 2, false),
+            ("0", 60, true),
+            ("1.5", 60, true),
+            ("bad", 60, true),
+        ] {
+            if let Some(output) = child(
+                "interval_environment_defaults_validation_and_builder_precedence",
+                &expected.to_string(),
+                &[("VIGIL_METRICS_INTERVAL", value)],
+            ) {
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .matches("invalid VIGIL_METRICS_INTERVAL=")
+                        .count(),
+                    usize::from(invalid)
+                );
+            } else {
+                let expected: u64 = env::var("VIGIL_METRICS_TEST_MODE")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_eq!(metrics_interval(None), Duration::from_secs(expected));
+                assert_eq!(
+                    metrics_interval(
+                        Config::new("interval")
+                            .metrics_interval(Duration::from_secs(3))
+                            .metrics_interval
+                    ),
+                    Duration::from_secs(3)
+                );
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_shutdown_timeout_retains_metrics_kind_with_a_longer_caller_budget() {
+        if child(
+            "sdk_shutdown_timeout_retains_metrics_kind_with_a_longer_caller_budget",
+            "sdk-timeout",
+            &[],
+        )
+        .is_some()
+        {
+            return;
+        }
+        let dir = directory("sdk-timeout");
+        let guard = Config::new("timeout").dir(&dir).init().unwrap();
+        record(&guard);
+        let (release, thread) = block_directory(&dir);
+        let error = guard
+            .shutdown_with_timeout(Duration::from_secs(10))
+            .unwrap_err();
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        assert_eq!(
+            error.signal_kind(Signal::Metrics),
+            Some(FlushErrorKind::Timeout)
+        );
+        assert_eq!(error.signal_kind(Signal::Logs), None);
+    }
+
+    #[test]
+    fn both_shutdown_spawn_failures_run_inline_and_short_clean_shutdown_is_bounded() {
+        if child(
+            "both_shutdown_spawn_failures_run_inline_and_short_clean_shutdown_is_bounded",
+            "inline",
+            &[],
+        )
+        .is_some()
+        {
+            return;
+        }
+        let dir = directory("inline");
+        let (_, mut guard) = Config::new("inline").dir(&dir).layer::<Registry>().unwrap();
+        record(&guard);
+        let metrics = guard.metrics.clone().unwrap();
+        let start = Instant::now();
+        guard
+            .stop_with_builder(
+                Duration::from_secs(1),
+                std::thread::Builder::new().stack_size(usize::MAX / 2 + 1),
+                std::thread::Builder::new().stack_size(usize::MAX / 2 + 1),
+            )
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(guard.metrics.is_none() && guard.provider.is_none());
+        assert!(matches!(
+            metrics.shutdown(),
+            Err(OTelSdkError::AlreadyShutdown)
+        ));
+        drop(metrics);
+        assert!(!points(&dir).is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn first_metrics_failure_during_shutdown_suppresses_runtime_warning() {
+        if let Some(output) = child(
+            "first_metrics_failure_during_shutdown_suppresses_runtime_warning",
+            "shutdown-failure",
+            &[],
+        ) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains("runtime metric export"), "{stderr}");
+            assert_eq!(
+                stderr
+                    .matches("metric shutdown: Failed; dropped data points: 1")
+                    .count(),
+                1
+            );
+            return;
+        }
+        let dir = directory("first-shutdown-failure");
+        let guard = Config::new("failure").dir(&dir).init().unwrap();
+        record(&guard);
+        fs::remove_file(dir.join("metrics.jsonl")).unwrap();
+        fs::create_dir(dir.join("metrics.jsonl")).unwrap();
+        assert_eq!(guard.shutdown().unwrap_err().kind(), FlushErrorKind::Failed);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exporter_data_point_drop_reaches_the_guards_shared_loss_period() {
+        if child(
+            "exporter_data_point_drop_reaches_the_guards_shared_loss_period",
+            "point-drop",
+            &[],
+        )
+        .is_some()
+        {
+            return;
+        }
+        let dir = directory("point-drop");
+        let guard = Config::new("drop").dir(&dir).init().unwrap();
+        let counter = guard
+            .meter_provider()
+            .unwrap()
+            .meter("test")
+            .u64_counter("oversize")
+            .build();
+        counter.add(1, &[KeyValue::new("identity", "x".repeat(1_100_000))]);
+        let error = guard.flush().unwrap_err();
+        assert_eq!(error.kind(), FlushErrorKind::DataLost);
+        assert_eq!(error.lost(Signal::Metrics), 0);
+        assert_eq!(error.lost(Signal::Logs), 0);
+        assert!(points(&dir).is_empty());
+        assert_eq!(
+            guard.shutdown().unwrap_err().kind(),
+            FlushErrorKind::DataLost
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn wait_for_registrations(guard: &Guard, count: usize) {
+        let mut state = guard.metrics_flushing.state();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state.waiters.values().sum::<usize>() < count {
+            assert!(
+                Instant::now() < deadline,
+                "only {:?} registered",
+                state.waiters
+            );
+            state = guard
+                .metrics_flushing
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+                .0;
+        }
+    }
+
+    #[test]
+    fn concurrent_flush_collects_measurements_after_the_first_collection_started() {
+        if child(
+            "concurrent_flush_collects_measurements_after_the_first_collection_started",
+            "generation",
+            &[],
+        )
+        .is_some()
+        {
+            return;
+        }
+        let dir = directory("generations");
+        let guard = Config::new("generations")
+            .dir(&dir)
+            .metrics_interval(Duration::from_secs(3600))
+            .init()
+            .unwrap();
+        record(&guard);
+        let (started, observed) = mpsc::channel();
+        *guard.losses.metric_export_started.lock().unwrap() = Some(started);
+        let (release, thread) = block_directory(&dir);
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| guard.flush());
+            observed.recv_timeout(Duration::from_secs(2)).unwrap();
+            // A has collected its snapshot and is blocked writing it.
+            record(&guard);
+            let b = scope.spawn(|| guard.flush());
+            wait_for_registrations(&guard, 2);
+            release.send(()).unwrap();
+            a.join().unwrap().unwrap();
+            b.join().unwrap().unwrap();
+        });
+        thread.join().unwrap();
+        let lines = points(&dir);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines.last().unwrap()["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"]
+                [0]["asInt"],
+            14
+        );
+        guard.shutdown().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn timed_out_generations(test: &str, count: usize) {
+        if child(test, "waiters", &[]).is_some() {
+            return;
+        }
+        let dir = directory("timed-out-generations");
+        let guard = Config::new("waiters")
+            .dir(&dir)
+            .metrics_interval(Duration::from_secs(3600))
+            .init()
+            .unwrap();
+        record(&guard);
+        let (started, observed) = mpsc::channel();
+        *guard.losses.metric_export_started.lock().unwrap() = Some(started);
+        let (release, thread) = block_directory(&dir);
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| guard.flush());
+            observed.recv_timeout(Duration::from_secs(2)).unwrap();
+            let others: Vec<_> = (1..count).map(|_| scope.spawn(|| guard.flush())).collect();
+            wait_for_registrations(&guard, count);
+            {
+                let state = guard.metrics_flushing.state();
+                assert_eq!(state.calls, 1);
+                assert_eq!(state.threads, 1);
+            }
+            assert!(a.join().unwrap().is_err());
+            for other in others {
+                assert!(other.join().unwrap().is_err());
+            }
+        });
+        assert!(start.elapsed() < Duration::from_secs(6));
+        {
+            let state = guard.metrics_flushing.state();
+            assert!(state.waiters.is_empty());
+            assert_eq!(state.calls, 1);
+        }
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        let mut state = guard.metrics_flushing.state();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state.finished < state.started {
+            assert!(Instant::now() < deadline);
+            state = guard
+                .metrics_flushing
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+                .0;
+        }
+        assert_eq!(state.calls, 1, "no orphan successor collection");
+        assert_eq!(state.threads, 1);
+        drop(state);
+        guard.shutdown().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shutdown_prevents_registered_successor_collection_and_worker() {
+        if child(
+            "shutdown_prevents_registered_successor_collection_and_worker",
+            "stopped",
+            &[],
+        )
+        .is_some()
+        {
+            return;
+        }
+        let dir = directory("stopped-successor");
+        let guard = Config::new("stopped")
+            .dir(&dir)
+            .metrics_interval(Duration::from_secs(3600))
+            .init()
+            .unwrap();
+        record(&guard);
+        let (release, thread) = block_directory(&dir);
+        let (started, observed) = mpsc::channel();
+        *guard.losses.metric_export_started.lock().unwrap() = Some(started);
+        let flushing = guard.metrics_flushing.clone();
+        let first = guard.start_metrics_flush().unwrap();
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let successor = guard.start_metrics_flush().unwrap();
+        assert_eq!(successor, first + 1);
+        assert_eq!(
+            guard
+                .shutdown_with_timeout(Duration::from_millis(100))
+                .unwrap_err()
+                .signal_kind(Signal::Metrics),
+            Some(FlushErrorKind::Timeout)
+        );
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        flushing
+            .wait(first, Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        {
+            let state = flushing.state();
+            assert_eq!(state.started, first, "no successor after shutdown begins");
+            assert_eq!(state.calls, 1, "no new force_flush after shutdown begins");
+            assert_eq!(state.threads, 1, "no new worker after shutdown begins");
+        }
+        assert!(flushing.wait(successor, Instant::now()).is_err());
+    }
+
+    #[test]
+    fn metrics_wait_uses_remaining_budget_after_blocked_logs_flush() {
+        if child(
+            "metrics_wait_uses_remaining_budget_after_blocked_logs_flush",
+            "budget",
+            &[],
+        )
+        .is_some()
+        {
+            return;
+        }
+        let dir = directory("remaining-budget");
+        let guard = Config::new("budget")
+            .dir(&dir)
+            .metrics_interval(Duration::from_secs(3600))
+            .init()
+            .unwrap();
+        record(&guard);
+        let (release, thread) = block_directory(&dir);
+        tracing::info!("block logs flush too");
+        let start = Instant::now();
+        let error = guard.flush().unwrap_err();
+        let elapsed = start.elapsed();
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        assert_eq!(
+            error.signal_kind(Signal::Logs),
+            Some(FlushErrorKind::Timeout)
+        );
+        assert_eq!(
+            error.signal_kind(Signal::Metrics),
+            Some(FlushErrorKind::Timeout)
+        );
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+        guard.shutdown().unwrap();
+    }
+
+    #[test]
+    fn two_timed_out_flushes_leave_no_orphan_collection() {
+        timed_out_generations("two_timed_out_flushes_leave_no_orphan_collection", 2);
+    }
+    #[test]
+    fn hundred_concurrent_flushes_use_one_detached_worker() {
+        timed_out_generations("hundred_concurrent_flushes_use_one_detached_worker", 100);
+    }
+
+    #[test]
+    fn real_export_failure_is_returned_and_shutdown_suppresses_runtime_summary() {
+        if let Some(output) = child(
+            "real_export_failure_is_returned_and_shutdown_suppresses_runtime_summary",
+            "failure",
+            &[],
+        ) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.matches("runtime metric export failed").count(), 1);
+            assert_eq!(stderr.matches("runtime metric export losses").count(), 0);
+            assert_eq!(
+                stderr
+                    .matches("metric shutdown: Failed; dropped data points: 1")
+                    .count(),
+                1
+            );
+            assert!(!stderr.contains("log shutdown"));
+            return;
+        }
+        let dir = directory("export-failure");
+        let guard = Config::new("failure").dir(&dir).init().unwrap();
+        record(&guard);
+        fs::remove_file(dir.join("metrics.jsonl")).unwrap();
+        fs::create_dir(dir.join("metrics.jsonl")).unwrap();
+        let error = guard.flush().unwrap_err();
+        assert_eq!(error.kind(), FlushErrorKind::Failed);
+        assert_eq!(error.signal_kind(Signal::Logs), None);
+        assert_eq!(
+            error.signal_kind(Signal::Metrics),
+            Some(FlushErrorKind::Failed)
+        );
+        assert_eq!(guard.shutdown().unwrap_err().kind(), FlushErrorKind::Failed);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod metrics_rotation_tests {
+    use super::*;
+    use crate::sink::LineSink as _;
+    use opentelemetry::metrics::MeterProvider as _;
+    use std::fs;
+
+    #[test]
+    fn rotation_and_retention_are_per_signal() {
+        if !crate::subscriber_test_child(
+            "init::metrics_rotation_tests::rotation_and_retention_are_per_signal",
+        ) {
+            return;
+        }
+        let dir = env::temp_dir().join(format!("vigil-metrics-rotation-{}", std::process::id()));
+        let guard = Config::new("rotation")
+            .dir(&dir)
+            .max_bytes(1)
+            .retention(None)
+            .init()
+            .unwrap();
+        let counter = guard
+            .meter_provider()
+            .unwrap()
+            .meter("rotation")
+            .u64_counter("requests")
+            .build();
+        for _ in 0..2 {
+            counter.add(1, &[]);
+            tracing::info!("rotating log");
+            guard.flush().unwrap();
+        }
+        guard.shutdown().unwrap();
+        let logs = crate::rotate::segments(&dir, "logs").unwrap();
+        let metrics = crate::rotate::segments(&dir, "metrics").unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(metrics.len(), 3);
+        for path in logs.iter().chain(&metrics) {
+            assert_eq!(fs::read_to_string(path).unwrap().lines().count(), 1);
+        }
+        // Pruning a signal cannot remove another signal's rotated segments.
+        for path in logs.iter().take(1).chain(metrics.iter().take(2)) {
+            fs::File::open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+                .unwrap();
+        }
+        let config = RotationConfig::default()
+            .max_bytes(1)
+            .retention(Some(Duration::ZERO));
+        let logs_writer = RotatingFile::open(&dir, "logs", config.clone()).unwrap();
+        logs_writer.write_line(b"one").unwrap();
+        assert_eq!(crate::rotate::segments(&dir, "logs").unwrap().len(), 1);
+        assert_eq!(crate::rotate::segments(&dir, "metrics").unwrap().len(), 3);
+        let metrics_writer = RotatingFile::open(&dir, "metrics", config).unwrap();
+        assert_eq!(crate::rotate::segments(&dir, "metrics").unwrap().len(), 1);
+        assert!(logs_writer.shares_lock(&metrics_writer));
+        drop((logs_writer, metrics_writer));
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

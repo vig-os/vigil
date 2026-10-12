@@ -352,6 +352,11 @@ impl std::fmt::Debug for RotatingFile {
 }
 
 impl RotatingFile {
+    #[cfg(all(test, feature = "metrics"))]
+    pub(crate) fn shares_lock(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lock, &other.lock)
+    }
+
     /// Open (creating as needed) the signal's directory (`0700`) and live file
     /// (`0600`), and prune expired segments once.
     ///
