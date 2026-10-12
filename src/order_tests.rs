@@ -197,9 +197,13 @@ fn structural_ties_compare_typed_values_recursively() {
         json!({"stringValue":"a\n"}),
         json!({"stringValue":"a!"}),
         json!({"bytesValue":"AA=="}),
+        json!({"arrayValue":{"values":[]}}),
         json!({"arrayValue":{"values":[{"intValue":"9"}]}}),
+        json!({"arrayValue":{"values":[{"intValue":"9"},{"intValue":"10"}]}}),
         json!({"arrayValue":{"values":[{"intValue":"10"}]}}),
+        json!({"kvlistValue":{"values":[]}}),
         json!({"kvlistValue":{"values":[{"key":"key","value":{"intValue":"9"}}]}}),
+        json!({"kvlistValue":{"values":[{"key":"key","value":{"intValue":"9"}},{"key":"z","value":{"intValue":"10"}}]}}),
         json!({"kvlistValue":{"values":[{"key":"key","value":{"intValue":"10"}}]}}),
     ];
     for values in ordered.windows(2) {
@@ -211,4 +215,26 @@ fn structural_ties_compare_typed_values_recursively() {
             assert_eq!(value["scopeLogs"][0], first);
         });
     }
+}
+
+#[test]
+fn structural_ties_retain_record_sequence_and_point_attribute_order() {
+    use serde_json::json;
+    let a = json!({"timeUnixNano":"2","body":{"stringValue":"a"}});
+    let b = json!({"timeUnixNano":"2","body":{"stringValue":"b"}});
+    let first = json!({"scope":{},"logRecords":[a,b]});
+    let second = json!({"scope":{},"logRecords":[b,a]});
+    permutations(&[first.clone(), second], |scopes| {
+        let mut value = json!({"scopeLogs":scopes});
+        crate::envelope::normalize(&mut value, "", crate::ordered_json::LOGS).unwrap();
+        assert_eq!(value["scopeLogs"][0], first);
+        assert_eq!(value["scopeLogs"][1]["logRecords"], json!([b, a]));
+    });
+    let first = json!({"scope":{},"metrics":[{"name":"same","sum":{"dataPoints":[{"timeUnixNano":"900","asInt":"100"}]}}]});
+    let second = json!({"scope":{},"metrics":[{"name":"same","sum":{"dataPoints":[{"timeUnixNano":"100","attributes":[{"key":"key","value":{"intValue":"1"}}],"asInt":"1"}]}}]});
+    permutations(&[first.clone(), second], |scopes| {
+        let mut value = json!({"scopeMetrics":scopes});
+        crate::envelope::normalize(&mut value, "", crate::ordered_json::METRICS).unwrap();
+        assert_eq!(value["scopeMetrics"][0], first);
+    });
 }
