@@ -910,3 +910,115 @@ fn resume_without_predecessor_promotes_genesis_link() {
     assert_eq!(scan_head(&reopened).seq, 6);
     assert!(!t.0.join(".audit-resume.jsonl").exists());
 }
+
+#[test]
+fn live_creation_checkpoint_rejects_non_genesis_link() {
+    let t = Temp::new();
+    let mut s = create(&t);
+    s.closed = true;
+    let forged = Sink::signed(
+        &*s.signer,
+        RecordContext::new(s.trail, 0, 1_000_000_000, "vigil", [42; 32]),
+        &Mmr::new(),
+    )
+    .unwrap();
+    fs::write(t.0.join("audit.jsonl"), line(&forged).unwrap()).unwrap();
+    bad_open(&t, None, AuditErrorKind::CorruptTrail);
+}
+#[test]
+fn resume_settlement_promotes_over_archived_live_prefix() {
+    let t = Temp::new();
+    let mut s = create(&t);
+    s.config.max_bytes = 1;
+    s.record(&entry()).unwrap();
+    s.closed = true;
+    let dir = File::open(&t.0).unwrap();
+    let state = predecessor(&dir, s.trail).unwrap().unwrap();
+    let live = bytes(&t);
+    assert!(records(&t)[0].context.seq > 0);
+    assert_ne!(records(&t)[0].context.previous, Record::genesis(&s.trail));
+    for name in rotate::rotated_names_at(&dir, "audit").unwrap() {
+        fs::remove_file(t.0.join(name)).unwrap();
+    }
+    let staged = resume_bytes(
+        &s,
+        &state,
+        state.head.seq + 1,
+        state.head.hash,
+        "vigil.audit.resume",
+    );
+    fs::write(t.0.join(".audit-resume.jsonl"), &staged).unwrap();
+    let mut reopened = open(&t);
+    reopened.closed = true;
+    assert_eq!(bytes(&t), staged);
+    assert_eq!(scan_head(&reopened).seq, state.head.seq + 2);
+    assert!(!t.0.join(".audit-resume.jsonl").exists());
+    let sealed = rotate::rotated_names_at(&dir, "audit").unwrap();
+    assert_eq!(sealed.len(), 1);
+    assert_eq!(fs::read(t.0.join(&sealed[0])).unwrap(), live);
+}
+#[test]
+fn sealing_settlement_promotes_after_archived_prefix_without_live() {
+    let t = Temp::new();
+    let mut s = create(&t);
+    s.config.max_bytes = 1;
+    s.record(&entry()).unwrap();
+    s.closed = true;
+    let dir = File::open(&t.0).unwrap();
+    let state = predecessor(&dir, s.trail).unwrap().unwrap();
+    let closing = s.checkpoint_record(&state, 2_000_000_000).unwrap();
+    let mut mmr = state.mmr.clone();
+    mmr.push(closing.hash()).unwrap();
+    let opening = Sink::signed(
+        &*s.signer,
+        RecordContext::new(
+            s.trail,
+            closing.context.seq + 1,
+            2_000_000_000,
+            "vigil",
+            closing.hash(),
+        ),
+        &mmr,
+    )
+    .unwrap();
+    for name in rotate::rotated_names_at(&dir, "audit").unwrap() {
+        fs::remove_file(t.0.join(name)).unwrap();
+    }
+    fs::write(
+        t.0.join("audit.jsonl"),
+        [bytes(&t), line(&closing).unwrap()].concat(),
+    )
+    .unwrap();
+    let sealed_bytes = bytes(&t);
+    assert!(records(&t)[0].context.seq > 0);
+    assert_ne!(records(&t)[0].context.previous, Record::genesis(&s.trail));
+    rotate::rotate(&dir, "audit", Path::new("audit.jsonl")).unwrap();
+    let sealed = rotate::rotated_names_at(&dir, "audit").unwrap();
+    let staged = line(&opening).unwrap();
+    fs::write(t.0.join(".audit-next.jsonl"), &staged).unwrap();
+    let mut reopened = open(&t);
+    reopened.closed = true;
+    assert_eq!(bytes(&t), staged);
+    assert_eq!(scan_head(&reopened).seq, opening.context.seq);
+    assert!(!t.0.join(".audit-next.jsonl").exists());
+    assert_eq!(rotate::rotated_names_at(&dir, "audit").unwrap(), sealed);
+    assert_eq!(fs::read(t.0.join(&sealed[0])).unwrap(), sealed_bytes);
+}
+#[test]
+fn resume_without_predecessor_discards_nonzero_genesis_head() {
+    let t = Temp::new();
+    let mut s = create(&t);
+    s.closed = true;
+    let mut state = predecessor(&File::open(&t.0).unwrap(), s.trail)
+        .unwrap()
+        .unwrap();
+    state.head.hash = Record::genesis(&s.trail);
+    state.head.seq = 3;
+    let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume");
+    fs::remove_file(t.0.join("audit.jsonl")).unwrap();
+    fs::write(t.0.join(".audit-resume.jsonl"), staged).unwrap();
+    bad_open(&t, None, AuditErrorKind::CorruptTrail);
+    assert!(!t.0.join(".audit-resume.jsonl").exists());
+    assert!(!t.0.join("audit.jsonl").exists());
+    assert!(t.0.join("audit.trail").exists());
+}

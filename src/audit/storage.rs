@@ -525,6 +525,9 @@ fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<()
                 || seq >= s.head.seq
                 || hash != crate::audit::digest_string(&s.checkpoint_previous)
                 || s.checkpoint_predecessor.is_some_and(|p| p.seq != seq)
+                || (s.checkpoint_predecessor.is_none()
+                    && s.checkpoint_previous == Record::genesis(&record.context.trail)
+                    && seq != 0)
                 || file.is_empty()
                 || file.bytes().any(|b| b.is_ascii_whitespace())
             {
