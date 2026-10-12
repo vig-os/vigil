@@ -106,6 +106,10 @@ pub fn checkpoint_message(unsigned_fields: &[u8]) -> Vec<u8> {
 /// Returns [`SignerError`] if the public key cannot be decoded or strict
 /// Ed25519 verification rejects the signature for the supplied key and message,
 /// including noncanonical signatures and small-order keys or signature points.
+#[cfg_attr(
+    not(any(test, vigil_unstable)),
+    expect(dead_code, reason = "verification follows in #13")
+)]
 pub fn verify_signature(
     key: &[u8; 32],
     message: &[u8],

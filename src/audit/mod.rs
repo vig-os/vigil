@@ -1,21 +1,43 @@
-//! Audit v1 format primitives and strict OTLP decoding (ADR-0005), enabled by `audit`.
+//! Durable, signed audit trails, independent of telemetry (ADR-0005).
 //!
-//! Public format primitives perform no I/O and make no durability or authentication
-//! claim about supplied identities. The internal reader validates existing storage. The durable trail API follows in #11; offline
-//! trail verification follows in #13. Storage must honour flushes. Local keys
-//! cannot protect a trail against an attacker who can read keys and rewrite it.
-//! These low-level building blocks are provisional until the 1.0 format freeze.
+//! Call [`AuditConfig::create`] once at deployment, then [`AuditConfig::open`]
+//! with the highest held receipt as the expected head. Store receipts outside
+//! the trail directory. Operator rotation and checkpoint commands follow in
+//! #11 B3c; resume follows in #11 B3d and offline verification in #13.
+//!
+//! Format primitives require `--cfg vigil_unstable` and are provisional. Pin
+//! vigil with `~1.N` when opting in; they may change in a minor release.
 
+mod config;
 mod format;
 mod mmr;
 mod signing;
-#[allow(dead_code)] // Internal writer; public facade follows in #11 B3.
 mod sink;
-#[cfg_attr(not(test), allow(dead_code))] // Internal reader; writes follow in #11.
+#[cfg_attr(not(test), allow(dead_code))] // Verifier wiring follows in #13.
 pub(crate) mod storage;
-pub use format::{Checkpoint, CheckpointFields, Entry, Record, RecordContext, Value};
+mod trail;
+pub use config::AuditConfig;
+pub use format::{Checkpoint, Entry, Value};
+pub use signing::{KeySeed, Signer, SignerError};
+pub use trail::{AuditTrail, Receipt};
+
+#[cfg(vigil_unstable)]
+#[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
+pub use format::{CheckpointFields, Record, RecordContext};
+#[cfg(not(vigil_unstable))]
+pub(crate) use format::{CheckpointFields, Record, RecordContext};
+#[cfg(vigil_unstable)]
+#[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
 pub use mmr::Mmr;
-pub use signing::{KeySeed, Signer, SignerError, checkpoint_message, verify_signature};
+#[cfg(not(vigil_unstable))]
+pub(crate) use mmr::Mmr;
+#[cfg(not(vigil_unstable))]
+pub(crate) use signing::checkpoint_message;
+#[cfg(all(test, not(vigil_unstable)))]
+use signing::verify_signature;
+#[cfg(vigil_unstable)]
+#[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
+pub use signing::{checkpoint_message, verify_signature};
 
 /// Stable categories for fail-closed audit operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,3 +150,6 @@ mod tests;
 
 #[cfg(test)]
 mod codec_tests;
+
+#[cfg(test)]
+mod trail_tests;

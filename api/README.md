@@ -3,7 +3,8 @@
 `public-api.txt` is the all-features stable surface, including hidden items, on
 the flake-pinned compiler.
 `allowlist.json` names its justified item paths, required declaration kinds and accepted ADRs. Audit format
-primitives are covered by ADR-0005 and #12, in addition to ADR-0004's lifecycle,
+primitives are `vigil_unstable` only (ADR-0005 decision 13); the stable audit
+writer joins ADR-0004's lifecycle,
 composition and rotating-file surface. Standard trait implementations belong to
 the listed type's contract. Exporters, sinks and OpenTelemetry re-exports require
 `vigil_unstable` and must never enter this snapshot.

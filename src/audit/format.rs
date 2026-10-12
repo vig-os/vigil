@@ -32,7 +32,7 @@ impl Value {
 pub struct Entry {
     actor: String,
     pub(super) action: String,
-    object: String,
+    pub(super) object: String,
     reason: Option<String>,
     before: Option<Value>,
     after: Option<Value>,

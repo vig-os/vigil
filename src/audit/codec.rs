@@ -332,7 +332,7 @@ impl Record {
 ///
 /// Parsing does not establish signature validity, key trust, or consistency with
 /// trail history. Keep anchors outside the trail directory; verification belongs
-/// to #13. The sink's consuming close operation follows in B3.
+/// to #13. [`super::super::AuditTrail::close`] returns the clean-stop head.
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
     seq: u64,
@@ -347,7 +347,8 @@ impl Checkpoint {
     ///
     /// # Errors
     ///
-    /// Propagates [`Record::parse_line`] errors; returns
+    /// Returns decoder errors for malformed, oversized or hash-mismatched input;
+    /// returns
     /// [`AuditErrorKind::CorruptTrail`] for an ordinary record or multiple records.
     pub fn parse(line: &str) -> Result<Self, AuditError> {
         let mut records = Record::parse_line(line.as_bytes())?;
