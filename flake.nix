@@ -88,9 +88,8 @@
 
         rustChecks =
           rust.checks
-          // nixpkgs.lib.mapAttrs' (
-            name: value: nixpkgs.lib.nameValuePair "audit-${name}" value
-          ) audit.checks;
+          // nixpkgs.lib.mapAttrs' (name: value: nixpkgs.lib.nameValuePair "audit-${name}" value) audit.checks
+          // featureClippyChecks;
 
         # ADR-0004 covers every combination of user features. `default` is
         # Cargo's feature selector; test-preserve-order is CI-only consumer
@@ -106,43 +105,80 @@
             builtins.length userFeatures <= 4
           ) "Clippy feature powerset would exceed 16 sets; request a ruling before adding more features";
           builtins.foldl' (sets: feature: sets ++ map (set: set ++ [ feature ]) sets) [ [ ] ] userFeatures;
-        featureClippyChecks = builtins.listToAttrs (
+        dependencyTables = pkgs.lib.concatMap (
+          manifest:
+          map (section: manifest.${section} or { }) [
+            "dependencies"
+            "build-dependencies"
+            "dev-dependencies"
+          ]
+        ) ([ cargoManifest ] ++ builtins.attrValues (cargoManifest.target or { }));
+        implicitFeatures = pkgs.lib.unique (
           pkgs.lib.concatMap (
-            features:
-            let
-              suffix = if features == [ ] then "no-default" else pkgs.lib.concatStringsSep "-" features;
-              featureArgs =
-                "--no-default-features"
-                + pkgs.lib.optionalString (features != [ ]) (
-                  " --features " + pkgs.lib.concatStringsSep "," features
-                );
-              # Reuse the all-features dependency artifacts. Cargo rebuilds
-              # only where feature selection or RUSTFLAGS changes fingerprints.
-              clippyFor =
-                unstable:
-                audit.craneLib.cargoClippy (
-                  audit.commonArgs
-                  // {
-                    inherit (audit) cargoArtifacts;
-                    cargoExtraArgs = featureArgs;
-                    cargoClippyExtraArgs = "--all-targets -- -D warnings";
-                  }
-                  // pkgs.lib.optionalAttrs unstable {
-                    RUSTFLAGS = (audit.commonArgs.RUSTFLAGS or "") + " --cfg vigil_unstable";
-                  }
-                );
-            in
-            map
-              (unstable: {
-                name = "clippy-${suffix}" + pkgs.lib.optionalString unstable "-unstable";
-                value = clippyFor unstable;
-              })
-              [
-                false
-                true
-              ]
-          ) featureSets
+            deps:
+            builtins.filter (
+              name:
+              builtins.isAttrs deps.${name}
+              && (deps.${name}.optional or false)
+              && !(builtins.elem "dep:${name}" (
+                pkgs.lib.concatLists (builtins.attrValues cargoManifest.features)
+              ))
+            ) (builtins.attrNames deps)
+          ) dependencyTables
         );
+        featureArgsFor =
+          features:
+          "--no-default-features"
+          + pkgs.lib.optionalString (features != [ ]) (
+            " --features " + pkgs.lib.concatStringsSep "," features
+          );
+        unstableArgs = audit.commonArgs // {
+          RUSTFLAGS = (audit.commonArgs.RUSTFLAGS or "") + " --cfg vigil_unstable";
+        };
+        # Cache check artifacts for every dependency feature variant with the
+        # same cfg as clippy; all-features also covers consumer unification.
+        unstableArtifacts = audit.craneLib.buildDepsOnly (
+          unstableArgs
+          // {
+            doCheck = false;
+            buildPhaseCargoCommand = pkgs.lib.concatMapStringsSep "\n" (
+              args: "cargoWithProfile check --locked --all-targets ${args}"
+            ) ([ "--all-features" ] ++ map featureArgsFor featureSets);
+          }
+        );
+        featureClippyEntries = pkgs.lib.concatMap (
+          features:
+          let
+            suffix = if features == [ ] then "no-default" else pkgs.lib.concatStringsSep "-" features;
+            clippyFor =
+              unstable:
+              audit.craneLib.cargoClippy (
+                (if unstable then unstableArgs else audit.commonArgs)
+                // {
+                  cargoArtifacts = if unstable then unstableArtifacts else audit.cargoArtifacts;
+                  cargoExtraArgs = featureArgsFor features;
+                  cargoClippyExtraArgs = "--all-targets -- -D warnings";
+                }
+              );
+          in
+          map
+            (unstable: {
+              name = "clippy-${suffix}" + pkgs.lib.optionalString unstable "-unstable";
+              value = clippyFor unstable;
+            })
+            [
+              false
+              true
+            ]
+        ) featureSets;
+        featureClippyChecks =
+          assert pkgs.lib.assertMsg (implicitFeatures == [ ])
+            "Optional dependencies have implicit features that would go unchecked: ${pkgs.lib.concatStringsSep "," implicitFeatures}; reference each as dep:<name> in a feature";
+          assert pkgs.lib.assertMsg (
+            builtins.length featureClippyEntries
+            == builtins.length (pkgs.lib.unique (map (entry: entry.name) featureClippyEntries))
+          ) "Clippy check names collide; request a ruling before adding these features";
+          builtins.listToAttrs featureClippyEntries;
 
         # Independent of rust-toolchain.toml: ADR-0004 decision 11.
         fenix = vigos.inputs.fenix.packages.${system};
@@ -349,32 +385,33 @@
 
         };
 
-        checks =
-          rustChecks
-          // featureClippyChecks
-          // {
-            # Docs.rs exposes this surface too. Enforce the Cargo documentation
-            # lints for all features with vigil_unstable, as CI already does.
-            unstable-clippy = audit.checks.clippy.overrideAttrs (old: {
-              RUSTFLAGS = (old.RUSTFLAGS or "") + " --cfg vigil_unstable";
-            });
-            changelog =
-              pkgs.runCommand "changelog-check"
-                {
-                  nativeBuildInputs = [
-                    pkgs.python3
-                    pkgs.git
-                  ];
-                }
-                ''
-                  export HOME="$TMPDIR"
-                  cd ${self}
-                  python3 scripts/check_changelog.py
-                  python3 -m unittest discover -s scripts -p test_check_changelog.py -v
-                  python3 -m unittest discover -s scripts -p test_check_rust_version.py -v
-                  touch "$out"
-                '';
-          };
+        checks = rustChecks // {
+          # Docs.rs exposes this surface too. Enforce the Cargo documentation
+          # lints for all features with vigil_unstable, as CI already does.
+          unstable-clippy = audit.craneLib.cargoClippy (
+            unstableArgs
+            // {
+              cargoArtifacts = unstableArtifacts;
+              cargoClippyExtraArgs = "--all-targets -- -D warnings";
+            }
+          );
+          changelog =
+            pkgs.runCommand "changelog-check"
+              {
+                nativeBuildInputs = [
+                  pkgs.python3
+                  pkgs.git
+                ];
+              }
+              ''
+                export HOME="$TMPDIR"
+                cd ${self}
+                python3 scripts/check_changelog.py
+                python3 -m unittest discover -s scripts -p test_check_changelog.py -v
+                python3 -m unittest discover -s scripts -p test_check_rust_version.py -v
+                touch "$out"
+              '';
+        };
         packages = rust.packages // {
           vigil = rust.packages.default;
         };
