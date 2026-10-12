@@ -428,7 +428,7 @@ fn fsync_failure_sites_poison_handle_and_rollback() {
             ) {
                 s.config.max_bytes = 1;
             }
-            s.record(&entry())
+            s.record(&entry()).map(|r| r.head)
         };
         bad(result, AuditErrorKind::Io);
         bad(s.record(&entry()), AuditErrorKind::Poisoned);
@@ -590,7 +590,7 @@ fn expect_head_structural_priority_and_running_rollback() {
         let creation = bytes(&t);
         let h = s.record(&entry()).unwrap();
         let mut expected = h;
-        let mut reopened = Sink::open(&t.0, signer(), Config::default(), Some(h)).unwrap();
+        let mut reopened = Sink::open(&t.0, signer(), Config::default(), Some(h.head)).unwrap();
         reopened.closed = true;
         bad_open(
             &t,
@@ -625,7 +625,7 @@ fn expect_head_structural_priority_and_running_rollback() {
         } else {
             AuditErrorKind::HeadMismatch
         };
-        bad_open(&t, Some(expected), kind);
+        bad_open(&t, Some(expected.head), kind);
         if matches!(attack, 0 | 3) {
             let mut unpinned = open(&t);
             unpinned.closed = true;
@@ -1298,7 +1298,8 @@ fn poison_835_rename_directory_fsync() {
             assert_eq!(scan_head(&recovered).seq, 0);
             silent(&mut recovered);
         } else {
-            let mut recovered = Sink::open(&t.0, signer(), Config::default(), held).unwrap();
+            let mut recovered =
+                Sink::open(&t.0, signer(), Config::default(), held.map(|r| r.head)).unwrap();
             recovered.record(&entry()).unwrap();
             silent(&mut recovered);
         }
@@ -1356,7 +1357,7 @@ fn poison_837_other_directory_fsync() {
                 assert!(t.0.join(".audit-next.jsonl").exists());
             }
             let mut recovered =
-                Sink::open(&t.0, signer(), Config::default(), Some(acknowledged)).unwrap();
+                Sink::open(&t.0, signer(), Config::default(), Some(acknowledged.head)).unwrap();
             assert!(!t.0.join(".audit-next.jsonl").exists());
             assert!(
                 records(&t)
@@ -1383,7 +1384,8 @@ fn poison_838_discard_then_seal_replay() {
     drop(a);
     drop(b);
     durability::replay();
-    let mut recovered = Sink::open(&t.0, signer(), Config::default(), Some(acknowledged)).unwrap();
+    let mut recovered =
+        Sink::open(&t.0, signer(), Config::default(), Some(acknowledged.head)).unwrap();
     assert!(records(&t).iter().any(|r| r.hash() == acknowledged.hash));
     silent(&mut recovered);
 }
@@ -1588,7 +1590,7 @@ fn poison_845_inert_handle_and_lock() {
         assert_eq!(key.calls.load(Ordering::Relaxed), count);
         assert_eq!(snapshot(&t), before);
         assert!(hooks::STDERR.with(|l| l.borrow().is_empty()));
-        let fresh = Sink::open(&t.0, key.clone(), Config::default(), Some(held)).unwrap();
+        let fresh = Sink::open(&t.0, key.clone(), Config::default(), Some(held.head)).unwrap();
         let cp = fresh.close().unwrap();
         let disk = records(&t).pop().unwrap();
         assert_eq!(cp.hash(), disk.hash());

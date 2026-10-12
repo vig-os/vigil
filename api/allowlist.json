@@ -87,8 +87,6 @@
       "vigil::audit::AuditErrorKind::Signer": "variant",
       "vigil::audit::AuditErrorKind::TooLarge": "variant",
       "vigil::audit::AuditErrorKind::TrailExists": "variant",
-      "vigil::audit::CheckpointFields": "struct",
-      "vigil::audit::CheckpointFields::new": "fn",
       "vigil::audit::Entry": "struct",
       "vigil::audit::Entry::after": "fn",
       "vigil::audit::Entry::before": "fn",
@@ -100,23 +98,6 @@
       "vigil::audit::KeySeed::parse": "fn",
       "vigil::audit::KeySeed::public_key": "fn",
       "vigil::audit::KeySeed::sign": "fn",
-      "vigil::audit::Mmr": "struct",
-      "vigil::audit::Mmr::from_peaks": "fn",
-      "vigil::audit::Mmr::new": "fn",
-      "vigil::audit::Mmr::peaks": "fn",
-      "vigil::audit::Mmr::push": "fn",
-      "vigil::audit::Mmr::root": "fn",
-      "vigil::audit::Mmr::size": "fn",
-      "vigil::audit::Record": "struct",
-      "vigil::audit::Record::canonical": "fn",
-      "vigil::audit::Record::checkpoint": "fn",
-      "vigil::audit::Record::genesis": "fn",
-      "vigil::audit::Record::hash": "fn",
-      "vigil::audit::Record::new": "fn",
-      "vigil::audit::Record::signing_message": "fn",
-      "vigil::audit::RecordContext": "struct",
-      "vigil::audit::RecordContext::host": "fn",
-      "vigil::audit::RecordContext::new": "fn",
       "vigil::audit::Signer": "trait",
       "vigil::audit::Signer::public_key": "fn",
       "vigil::audit::Signer::sign": "fn",
@@ -126,9 +107,7 @@
       "vigil::audit::Value": "enum",
       "vigil::audit::Value::Digest": "variant",
       "vigil::audit::Value::Text": "variant",
-      "vigil::audit::Value::digest_of": "fn",
-      "vigil::audit::checkpoint_message": "fn",
-      "vigil::audit::verify_signature": "fn"
+      "vigil::audit::Value::digest_of": "fn"
     }
   },
   {
@@ -149,12 +128,35 @@
       "vigil::audit::FindingKind::MissingField": "variant",
       "vigil::audit::FindingKind::UnknownField": "variant",
       "vigil::audit::FindingKind::UnknownVersion": "variant",
-      "vigil::audit::FindingKind::Unparsable": "variant",
-      "vigil::audit::Record::parse_line": "fn"
+      "vigil::audit::FindingKind::Unparsable": "variant"
     }
   },
   {
-    "justification": "ADR-0005 amendment 2 decisions 3–5; #79 authenticated repair digest on format context",
-    "items": {"vigil::audit::RecordContext::repaired": "fn"}
+    "justification": "ADR-0005 decision 13 (l.~874), ADR-0004 d6: public audit writer surface",
+    "items": {
+      "vigil::audit::AuditConfig": "struct",
+      "vigil::audit::AuditConfig::new": "fn",
+      "vigil::audit::AuditConfig::dir": "fn",
+      "vigil::audit::AuditConfig::max_bytes": "fn",
+      "vigil::audit::AuditConfig::checkpoint_every": "fn",
+      "vigil::audit::AuditConfig::checkpoint_interval": "fn",
+      "vigil::audit::AuditConfig::mirror_to_logs": "fn",
+      "vigil::audit::AuditConfig::expect_head": "fn",
+      "vigil::audit::AuditConfig::create": "fn",
+      "vigil::audit::AuditConfig::open": "fn",
+      "vigil::audit::AuditTrail": "struct",
+      "vigil::audit::AuditTrail::fmt": "fn",
+      "vigil::audit::AuditTrail::record": "fn",
+      "vigil::audit::AuditTrail::checkpoint": "fn",
+      "vigil::audit::AuditTrail::close": "fn",
+      "vigil::audit::AuditTrail::dir": "fn",
+      "vigil::audit::AuditTrail::trail": "fn",
+      "vigil::audit::Receipt": "struct",
+      "vigil::audit::Receipt::trail": "fn",
+      "vigil::audit::Receipt::seq": "fn",
+      "vigil::audit::Receipt::hash": "fn",
+      "vigil::audit::Receipt::hash_string": "fn",
+      "vigil::audit::Receipt::unsigned_records": "fn"
+    }
   }
 ]

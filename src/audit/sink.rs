@@ -18,6 +18,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) service: String,
     pub(crate) checkpoint_every: u64,
@@ -30,8 +31,19 @@ impl Default for Config {
             service: "vigil".into(),
             checkpoint_every: 1000,
             checkpoint_interval: Duration::from_secs(60),
-            max_bytes: 10 * 1024 * 1024,
+            max_bytes: 50 * 1024 * 1024,
         }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Recorded {
+    pub(crate) head: Head,
+    pub(crate) unsigned_records: u64,
+}
+impl std::ops::Deref for Recorded {
+    type Target = Head;
+    fn deref(&self) -> &Head {
+        &self.head
     }
 }
 pub(crate) struct Sink {
@@ -125,7 +137,7 @@ fn clock() -> Result<u64, AuditError> {
     )
     .map_err(io_error)
 }
-fn line(record: &Record) -> Result<Vec<u8>, AuditError> {
+pub(super) fn line(record: &Record) -> Result<Vec<u8>, AuditError> {
     let context = AnyValue {
         value: Some(any_value::Value::StringValue("vigil".into())),
     };
@@ -327,6 +339,13 @@ fn settle(dir: &File, trail: [u8; 16], poisoned: &AtomicBool) -> Result<(), Audi
     Ok(())
 }
 impl Sink {
+    pub(super) fn service(&self) -> &str {
+        &self.config.service
+    }
+    pub(super) fn trail(&self) -> [u8; 16] {
+        self.trail
+    }
+
     pub(crate) fn create(
         path: &Path,
         signer: Arc<dyn Signer>,
@@ -495,14 +514,18 @@ impl Sink {
             let _ = writeln!(std::io::stderr().lock(), "{message}");
         }
     }
-    pub(crate) fn record(&self, entry: &Entry) -> Result<Head, AuditError> {
+    pub(crate) fn record(&self, entry: &Entry) -> Result<Recorded, AuditError> {
         self.record_impl(entry, false)
     }
     /// One internal path for all reserved actions, including resume and key rotation (B3).
-    pub(crate) fn record_internal(&self, entry: &Entry) -> Result<Head, AuditError> {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "operator writes follow in #11 B3c/B3d")
+    )]
+    pub(crate) fn record_internal(&self, entry: &Entry) -> Result<Recorded, AuditError> {
         self.record_impl(entry, true)
     }
-    fn record_impl(&self, entry: &Entry, internal: bool) -> Result<Head, AuditError> {
+    fn record_impl(&self, entry: &Entry, internal: bool) -> Result<Recorded, AuditError> {
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(error(AuditErrorKind::Poisoned, "handle durability failure"));
         }
@@ -595,7 +618,10 @@ impl Sink {
                 if signer_down {
                     self.unsigned_records.fetch_add(1, Ordering::Relaxed);
                 }
-                Ok(receipt)
+                Ok(Recorded {
+                    head: receipt,
+                    unsigned_records: self.unsigned_records.load(Ordering::Relaxed),
+                })
             },
         )
     }

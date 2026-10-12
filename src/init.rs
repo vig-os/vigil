@@ -513,19 +513,7 @@ impl Config {
     where
         S: tracing::Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
     {
-        if self.service.is_empty()
-            || self.service == "."
-            || self.service == ".."
-            || !self
-                .service
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-        {
-            return Err(InitError::new(
-                InitErrorKind::InvalidServiceName,
-                "invalid service name: expected ASCII letters, digits, '-', '_' or '.'",
-            ));
-        }
+        validate_service(&self.service)?;
         let default = EnvFilter::try_new(&self.default_filter).map_err(|source| InitError {
             kind: InitErrorKind::InvalidFilter,
             message: format!("invalid default filter: {source}"),
@@ -570,16 +558,7 @@ impl Config {
                     }
                 })
             })
-            .or_else(|| {
-                env::var_os("XDG_STATE_HOME")
-                    .filter(|s| std::path::Path::new(s).is_absolute())
-                    .map(|s| PathBuf::from(s).join(&self.service))
-            })
-            .or_else(|| {
-                env::var_os("HOME")
-                    .filter(|s| std::path::Path::new(s).is_absolute())
-                    .map(|s| PathBuf::from(s).join(".local/state").join(&self.service))
-            });
+            .or_else(|| state_directory(&self.service));
         let mut rotation = RotationConfig::default();
         if let Some(bytes) = self.max_bytes.or_else(|| number("VIGIL_MAX_BYTES", 1)) {
             rotation = rotation.max_bytes(bytes);
@@ -1136,4 +1115,31 @@ mod failure_reporting_tests {
             )));
         }
     }
+}
+
+// Shared by telemetry and audit; VIGIL_DIR is a telemetry-only override.
+pub(crate) fn validate_service(service: &str) -> Result<(), InitError> {
+    if service.is_empty()
+        || service == "."
+        || service == ".."
+        || !service
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    {
+        return Err(InitError::new(
+            InitErrorKind::InvalidServiceName,
+            "invalid service name: expected ASCII letters, digits, '-', '_' or '.'",
+        ));
+    }
+    Ok(())
+}
+pub(crate) fn state_directory(service: &str) -> Option<PathBuf> {
+    env::var_os("XDG_STATE_HOME")
+        .filter(|s| std::path::Path::new(s).is_absolute())
+        .map(|s| PathBuf::from(s).join(service))
+        .or_else(|| {
+            env::var_os("HOME")
+                .filter(|s| std::path::Path::new(s).is_absolute())
+                .map(|s| PathBuf::from(s).join(".local/state").join(service))
+        })
 }

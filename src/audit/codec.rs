@@ -271,6 +271,9 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
     Ok(record)
 }
 impl Record {
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Decodes one complete OTLP/JSON LogsData value, preserving nested record order.
     ///
     /// Rejects duplicate JSON keys after unescaping, unknown record attributes or
@@ -332,7 +335,7 @@ impl Record {
 ///
 /// Parsing does not establish signature validity, key trust, or consistency with
 /// trail history. Keep anchors outside the trail directory; verification belongs
-/// to #13. The sink's consuming close operation follows in B3.
+/// to #13. [`super::super::AuditTrail::close`] returns the clean-stop head.
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
     seq: u64,
@@ -347,7 +350,8 @@ impl Checkpoint {
     ///
     /// # Errors
     ///
-    /// Propagates [`Record::parse_line`] errors; returns
+    /// Returns decoder errors for malformed, oversized or hash-mismatched input;
+    /// returns
     /// [`AuditErrorKind::CorruptTrail`] for an ordinary record or multiple records.
     pub fn parse(line: &str) -> Result<Self, AuditError> {
         let mut records = Record::parse_line(line.as_bytes())?;

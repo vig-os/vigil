@@ -267,7 +267,8 @@ static REGISTRY: LazyLock<Mutex<HashMap<PathBuf, Weak<DirLock>>>> =
 ///
 /// Lock order is registry (released before locking), directory gate, flock,
 /// then caller state. Audit uses its own directory and never nests a logs
-/// lock; a future log mirror (#11) must run after releasing the audit lock.
+/// lock; the audit log mirror runs after Sink::record returns and releases
+/// the audit lock, before tracing can acquire a telemetry lock.
 /// Same-directory callback reentry returns `io::ErrorKind::WouldBlock`.
 #[derive(Clone)]
 pub(crate) struct Directory {

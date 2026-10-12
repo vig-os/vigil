@@ -6,6 +6,14 @@
 #[cfg_attr(docsrs, doc(cfg(feature = "audit")))]
 pub mod audit;
 
+#[cfg(feature = "audit")]
+const _: () = {
+    fn assert<T: Send + Sync>() {}
+    let _ = assert::<audit::Receipt>;
+    let _ = assert::<audit::AuditConfig>;
+    let _ = assert::<audit::AuditTrail>;
+};
+
 mod init;
 mod lifecycle;
 pub use init::{Config, Console, Guard, InitError, InitErrorKind, init};

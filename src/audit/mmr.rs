@@ -1,5 +1,8 @@
 use super::{AuditError, AuditErrorKind, digest_string};
 
+/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// Applications only: library pins constrain every dependent to that minor.
+///
 /// Trail-wide Merkle mountain range, compatible with tessera's construction.
 /// Peaks are ordered left to right; no tessera dependency is used.
 #[derive(Clone, Debug, Default)]
@@ -8,10 +11,16 @@ pub struct Mmr {
     peaks: Vec<[u8; 32]>,
 }
 impl Mmr {
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Starts an empty MMR whose root is BLAKE3 of empty input.
     pub fn new() -> Self {
         Self::default()
     }
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Restores peaks; their heights are the set bits of size, high to low.
     /// This checks shape only: callers must authenticate the checkpoint.
     ///
@@ -28,6 +37,9 @@ impl Mmr {
         }
         Ok(Self { size, peaks })
     }
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Appends a record hash (checkpoints are leaves too). At u64::MAX leaves,
     /// returns InvalidConfig without changing state.
     ///
@@ -55,14 +67,23 @@ impl Mmr {
         self.size = next;
         Ok(())
     }
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Returns the number of leaves.
     pub fn size(&self) -> u64 {
         self.size
     }
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Returns left-to-right peaks for a checkpoint.
     pub fn peaks(&self) -> &[[u8; 32]] {
         &self.peaks
     }
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Bags peaks right to left, using the same node domain as tree nodes.
     pub fn root(&self) -> [u8; 32] {
         let mut peaks = self.peaks.iter().rev();

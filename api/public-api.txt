@@ -23,6 +23,17 @@ pub vigil::audit::Value::Digest([u8; 32])
 pub vigil::audit::Value::Text(alloc::string::String)
 impl vigil::audit::Value
 pub fn vigil::audit::Value::digest_of(bytes: &[u8]) -> Self
+pub struct vigil::audit::AuditConfig
+impl vigil::audit::AuditConfig
+pub fn vigil::audit::AuditConfig::checkpoint_every(self, records: u64) -> Self
+pub fn vigil::audit::AuditConfig::checkpoint_interval(self, interval: core::time::Duration) -> Self
+pub fn vigil::audit::AuditConfig::create(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>) -> core::result::Result<vigil::audit::AuditTrail, vigil::audit::AuditError>
+pub fn vigil::audit::AuditConfig::dir(self, dir: impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn vigil::audit::AuditConfig::expect_head(self, seq: u64, hash: [u8; 32]) -> Self
+pub fn vigil::audit::AuditConfig::max_bytes(self, bytes: u64) -> Self
+pub fn vigil::audit::AuditConfig::mirror_to_logs(self, on: bool) -> Self
+pub fn vigil::audit::AuditConfig::new(service: impl core::convert::Into<alloc::string::String>) -> Self
+pub fn vigil::audit::AuditConfig::open(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>) -> core::result::Result<vigil::audit::AuditTrail, vigil::audit::AuditError>
 pub struct vigil::audit::AuditError
 impl vigil::audit::AuditError
 pub fn vigil::audit::AuditError::finding_kind(&self) -> core::option::Option<vigil::audit::FindingKind>
@@ -30,6 +41,15 @@ pub fn vigil::audit::AuditError::kind(&self) -> vigil::audit::AuditErrorKind
 impl core::error::Error for vigil::audit::AuditError
 impl core::fmt::Display for vigil::audit::AuditError
 pub fn vigil::audit::AuditError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct vigil::audit::AuditTrail
+impl vigil::audit::AuditTrail
+pub fn vigil::audit::AuditTrail::checkpoint(&self) -> core::result::Result<vigil::audit::Checkpoint, vigil::audit::AuditError>
+pub fn vigil::audit::AuditTrail::close(self) -> core::result::Result<vigil::audit::Checkpoint, vigil::audit::AuditError>
+pub fn vigil::audit::AuditTrail::dir(&self) -> &std::path::Path
+pub fn vigil::audit::AuditTrail::record(&self, entry: &vigil::audit::Entry) -> core::result::Result<vigil::audit::Receipt, vigil::audit::AuditError>
+pub fn vigil::audit::AuditTrail::trail(&self) -> [u8; 16]
+impl core::fmt::Debug for vigil::audit::AuditTrail
+pub fn vigil::audit::AuditTrail::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct vigil::audit::Checkpoint
 impl vigil::audit::Checkpoint
 pub fn vigil::audit::Checkpoint::hash(&self) -> [u8; 32]
@@ -39,9 +59,6 @@ pub fn vigil::audit::Checkpoint::mmr_root(&self) -> [u8; 32]
 pub fn vigil::audit::Checkpoint::mmr_size(&self) -> u64
 pub fn vigil::audit::Checkpoint::parse(line: &str) -> core::result::Result<Self, vigil::audit::AuditError>
 pub fn vigil::audit::Checkpoint::seq(&self) -> u64
-pub struct vigil::audit::CheckpointFields
-impl vigil::audit::CheckpointFields
-pub fn vigil::audit::CheckpointFields::new(size: u64, root: [u8; 32], peaks: alloc::vec::Vec<[u8; 32]>, key: [u8; 32], signature: [u8; 64]) -> core::result::Result<Self, vigil::audit::AuditError>
 pub struct vigil::audit::Entry
 impl vigil::audit::Entry
 pub fn vigil::audit::Entry::after(self, value: vigil::audit::Value) -> Self
@@ -57,29 +74,13 @@ pub fn vigil::audit::KeySeed::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> co
 impl vigil::audit::Signer for vigil::audit::KeySeed
 pub fn vigil::audit::KeySeed::public_key(&self) -> [u8; 32]
 pub fn vigil::audit::KeySeed::sign(&self, message: &[u8]) -> core::result::Result<[u8; 64], vigil::audit::SignerError>
-pub struct vigil::audit::Mmr
-impl vigil::audit::Mmr
-pub fn vigil::audit::Mmr::from_peaks(size: u64, peaks: alloc::vec::Vec<[u8; 32]>) -> core::result::Result<Self, vigil::audit::AuditError>
-pub fn vigil::audit::Mmr::new() -> Self
-pub fn vigil::audit::Mmr::peaks(&self) -> &[[u8; 32]]
-pub fn vigil::audit::Mmr::push(&mut self, hash: [u8; 32]) -> core::result::Result<(), vigil::audit::AuditError>
-pub fn vigil::audit::Mmr::root(&self) -> [u8; 32]
-pub fn vigil::audit::Mmr::size(&self) -> u64
-pub struct vigil::audit::Record
-impl vigil::audit::Record
-pub fn vigil::audit::Record::canonical(&self) -> alloc::vec::Vec<u8>
-pub fn vigil::audit::Record::checkpoint(context: vigil::audit::RecordContext, fields: vigil::audit::CheckpointFields) -> core::result::Result<Self, vigil::audit::AuditError>
-pub fn vigil::audit::Record::genesis(trail: &[u8; 16]) -> [u8; 32]
-pub fn vigil::audit::Record::hash(&self) -> [u8; 32]
-pub fn vigil::audit::Record::new(context: vigil::audit::RecordContext, entry: vigil::audit::Entry) -> core::result::Result<Self, vigil::audit::AuditError>
-pub fn vigil::audit::Record::signing_message(&self) -> core::option::Option<alloc::vec::Vec<u8>>
-impl vigil::audit::Record
-pub fn vigil::audit::Record::parse_line(bytes: &[u8]) -> core::result::Result<alloc::vec::Vec<Self>, vigil::audit::AuditError>
-pub struct vigil::audit::RecordContext
-impl vigil::audit::RecordContext
-pub fn vigil::audit::RecordContext::host(self, host: impl core::convert::Into<alloc::string::String>) -> Self
-pub fn vigil::audit::RecordContext::new(trail: [u8; 16], seq: u64, time: u64, service: impl core::convert::Into<alloc::string::String>, previous: [u8; 32]) -> Self
-pub fn vigil::audit::RecordContext::repaired(self, digest: [u8; 32]) -> Self
+pub struct vigil::audit::Receipt
+impl vigil::audit::Receipt
+pub fn vigil::audit::Receipt::hash(&self) -> [u8; 32]
+pub fn vigil::audit::Receipt::hash_string(&self) -> alloc::string::String
+pub fn vigil::audit::Receipt::seq(&self) -> u64
+pub fn vigil::audit::Receipt::trail(&self) -> [u8; 16]
+pub fn vigil::audit::Receipt::unsigned_records(&self) -> u64
 pub struct vigil::audit::SignerError(_)
 impl vigil::audit::SignerError
 pub fn vigil::audit::SignerError::new(detail: impl core::convert::Into<alloc::string::String>) -> Self
@@ -92,8 +93,6 @@ pub fn vigil::audit::Signer::sign(&self, message: &[u8]) -> core::result::Result
 impl vigil::audit::Signer for vigil::audit::KeySeed
 pub fn vigil::audit::KeySeed::public_key(&self) -> [u8; 32]
 pub fn vigil::audit::KeySeed::sign(&self, message: &[u8]) -> core::result::Result<[u8; 64], vigil::audit::SignerError>
-pub fn vigil::audit::checkpoint_message(unsigned_fields: &[u8]) -> alloc::vec::Vec<u8>
-pub fn vigil::audit::verify_signature(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> core::result::Result<(), vigil::audit::SignerError>
 pub mod vigil::rotate
 pub struct vigil::rotate::RotatingFile
 impl vigil::rotate::RotatingFile
