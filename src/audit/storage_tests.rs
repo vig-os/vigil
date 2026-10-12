@@ -298,7 +298,7 @@ fn gap_requires_matching_resume_declaration() {
     let first = fixture(&d.0);
     let mmr = seeded(&first);
     let opening = cp(7, first.hash(), &mmr);
-    let resume = Record::new(
+    let resume = Record::new_internal(
         context(8, opening.hash()),
         Entry::new("operator", "vigil.audit.resume", "trail")
             .reason("incident")
@@ -314,7 +314,7 @@ fn gap_requires_matching_resume_declaration() {
     corrupt_open(&d.0);
     write_records(&d.0, &[&first, &opening, &resume]);
     assert_eq!(head(&open(&d.0)), Head::of(&resume));
-    let wrong = Record::new(
+    let wrong = Record::new_internal(
         context(8, opening.hash()),
         Entry::new("operator", "vigil.audit.resume", "trail")
             .details("head=0:blake3:00 lost_through=6 file=-"),
@@ -554,7 +554,7 @@ fn callback_lock_reentry_returns_would_block() {
 fn resumed(path: &Path, last: &Record, mmr: &mut Mmr, id: usize, lost: u64) -> Record {
     fs::rename(path.join("audit.jsonl"), segment(path, id)).unwrap();
     let opening = cp(lost + 1, last.hash(), mmr);
-    let resume = Record::new(
+    let resume = Record::new_internal(
         context(lost + 2, opening.hash()),
         Entry::new("operator", "vigil.audit.resume", "trail")
             .reason("incident")
@@ -620,7 +620,7 @@ fn missing_closure_requires_matching_immediate_resume() {
         reject(reader.with_current(|_| Ok(()), |_, _, _| Ok(())));
         corrupt_open(&d.0);
     }
-    let wrong = Record::new(
+    let wrong = Record::new_internal(
         context(3, opening.hash()),
         Entry::new("operator", "vigil.audit.resume", "trail")
             .details("head=1:blake3:00 lost_through=1 file=-"),
@@ -686,7 +686,7 @@ fn declaration(
     if let Some(digest) = repaired {
         ctx = ctx.repaired(digest);
     }
-    Record::new(
+    Record::new_internal(
         ctx,
         Entry::new("operator", "vigil.audit.resume", "trail")
             .reason("incident")
@@ -802,4 +802,22 @@ fn archived_resume_rejects_head_sequence_above_opening_with_right_hash() {
     let wrong = declaration(&opening, 8, first.hash(), 6, None);
     write_records(&d.0, &[&opening, &wrong]);
     corrupt_open(&d.0);
+}
+
+#[test]
+fn genesis_resume_requires_immediate_matching_declaration() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    let genesis = Record::genesis(&TRAIL);
+    let opening = cp(5, genesis, &seeded(&first));
+    let resume = declaration(&opening, 0, genesis, 4, None);
+    write_records(&d.0, &[&opening]);
+    corrupt_open(&d.0);
+    write_records(&d.0, &[&opening, &entry(&opening)]);
+    corrupt_open(&d.0);
+    let wrong = declaration(&opening, 0, [42; 32], 4, None);
+    write_records(&d.0, &[&opening, &wrong]);
+    corrupt_open(&d.0);
+    write_records(&d.0, &[&opening, &resume]);
+    assert_eq!(head(&open(&d.0)), Head::of(&resume));
 }

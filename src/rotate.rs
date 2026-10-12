@@ -182,7 +182,7 @@ impl Live {
 
 /// Only an extra link under this signal's segment name proves that rotation
 /// left a duplicate. External backups must keep their live name and records.
-fn has_segment_link(dir: &File, signal: &str, live: &rfs::Stat) -> io::Result<bool> {
+pub(crate) fn has_segment_link(dir: &File, signal: &str, live: &rfs::Stat) -> io::Result<bool> {
     if live.st_nlink <= 1 {
         return Ok(false);
     }
@@ -542,7 +542,7 @@ fn tighten(path: &Path, mask: u32) -> io::Result<()> {
 
 /// One `write(2)`; a short write is an error (the caller rolls back), so a
 /// lock-free reader never sees a line completed by a second call.
-fn write_once(w: &mut impl Write, buf: &[u8]) -> io::Result<()> {
+pub(crate) fn write_once(w: &mut impl Write, buf: &[u8]) -> io::Result<()> {
     let n = loop {
         match w.write(buf) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -638,7 +638,7 @@ fn next_segment_name(signal: &str, now: &str, newest: Option<&str>) -> String {
 
 /// Rotate relative to the locked directory, atomically and without replacing
 /// an existing segment. Fall back only when the no-replace operation is absent.
-fn rotate(dir: &File, signal: &str, live_name: &Path) -> io::Result<()> {
+pub(crate) fn rotate(dir: &File, signal: &str, live_name: &Path) -> io::Result<()> {
     rotate_with(dir, signal, live_name, rename_new, unlink_name)
 }
 
@@ -684,6 +684,39 @@ fn rename_unsupported(error: &io::Error) -> bool {
         .any(|code| raw == Some(code.raw_os_error()))
 }
 
+/// Directory-relative no-replace publication, including the ADR-0002 fallback.
+#[cfg(feature = "audit")]
+pub(crate) fn rename_no_replace(dir: &File, old: &Path, new: &Path) -> io::Result<()> {
+    rename_with(dir, old, new, rename_new, unlink_name)
+}
+fn rename_with(
+    dir: &File,
+    live_name: &Path,
+    target: &Path,
+    mut rename: impl FnMut(&File, &Path, &Path) -> io::Result<()>,
+    mut unlink: impl FnMut(&File, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match rename(dir, live_name, target) {
+        Err(e) if rename_unsupported(&e) => {
+            match rfs::linkat(dir, live_name, dir, target, AtFlags::empty()) {
+                Ok(()) => {
+                    if let Err(original) = unlink(dir, live_name) {
+                        if let Err(undo) = unlink(dir, target) {
+                            return Err(io::Error::other(format!(
+                                "unlink live {live_name:?} failed: {original}; undo segment {target:?} failed: {undo}"
+                            )));
+                        }
+                        return Err(original);
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
+        result => result,
+    }
+}
+
 /// Injectable rename/unlink steps, like the partial-write seam in `append_with`.
 fn rotate_with(
     dir: &File,
@@ -699,25 +732,7 @@ fn rotate_with(
     loop {
         let name = next_segment_name(signal, &now, newest.as_deref());
         let target = Path::new(&name);
-        let result = match rename(dir, live_name, target) {
-            Err(e) if rename_unsupported(&e) => {
-                match rfs::linkat(dir, live_name, dir, target, AtFlags::empty()) {
-                    Ok(()) => {
-                        if let Err(original) = unlink(dir, live_name) {
-                            if let Err(undo) = unlink(dir, target) {
-                                return Err(io::Error::other(format!(
-                                    "unlink live {live_name:?} failed: {original}; undo segment {target:?} failed: {undo}"
-                                )));
-                            }
-                            return Err(original);
-                        }
-                        Ok(())
-                    }
-                    Err(e) => Err(e.into()),
-                }
-            }
-            result => result,
-        };
+        let result = rename_with(dir, live_name, target, &mut rename, &mut unlink);
         match result {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => newest = Some(name),

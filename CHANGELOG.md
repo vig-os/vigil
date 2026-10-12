@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Internal durable audit writer with shared checkpoint cadence, staged segment sealing and recovery with genesis-link validation, repair attestations, signer-outage handling and fsync poisoning ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - Internal audit trail scanning with shared directory locks, incremental state, stale-inode protection and resume-aware segment boundaries ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - Random UUID v4 `service.instance.id` on the shared resource built by `init` and `layer`, keeping concurrent producers distinct; entropy failures degrade to stderr with a warning naming the cause, and explicit synchronous log batch settings are tested against `OTEL_BLRP_*` overrides ([#7](https://github.com/vig-os/vigil/issues/7)).
 
@@ -49,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Audit `Record::new` rejects actions starting with `vigil.audit.` with `InvalidEntry`, reserving that prefix for internal records ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - Deny missing public documentation and missing error/panic sections across stable and unstable APIs with all features in flake and CI checks ([#44](https://github.com/vig-os/vigil/issues/44)).
 - Apply ADR-0006 decision 3 time-first JSON key order to logs ([#64](https://github.com/vig-os/vigil/issues/64)).
 - Drop log records whose body or attribute AnyValues nest deeper than 16 array/map edges and count them as lost log records; these records were previously exported ([#64](https://github.com/vig-os/vigil/issues/64)).

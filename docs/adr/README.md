@@ -8,7 +8,7 @@ Decisions that shape vigil's on-disk contract, its concurrency behaviour and its
 | [0002](0002-rotation-and-retention.md) | Multi-process rotation and retention | Accepted |
 | [0003](0003-metrics-and-traces.md) | Metrics and traces | Accepted |
 | [0004](0004-public-api-and-stability.md) | Public API, stability, composition and feature flags | Accepted |
-| [0005](0005-audit-trail.md) | Audit trail | Accepted (2026-10-11), amended by [#66](https://github.com/vig-os/vigil/issues/66); amendment 2 ([#68](https://github.com/vig-os/vigil/issues/68), [#70](https://github.com/vig-os/vigil/issues/70)) Accepted (2026-10-11); amendment 3 ([#90](https://github.com/vig-os/vigil/issues/90)) Proposed |
+| [0005](0005-audit-trail.md) | Audit trail | Accepted (2026-10-11), amended by [#66](https://github.com/vig-os/vigil/issues/66); amendment 2 ([#68](https://github.com/vig-os/vigil/issues/68), [#70](https://github.com/vig-os/vigil/issues/70)) Accepted (2026-10-11); amendment 3 ([#90](https://github.com/vig-os/vigil/issues/90)) Accepted (2026-10-12, [PR #91](https://github.com/vig-os/vigil/pull/91)); amendment 4 ([#11](https://github.com/vig-os/vigil/issues/11), marker form and trail-wide cadence) Accepted (2026-10-12, [PR #92](https://github.com/vig-os/vigil/pull/92)) |
 | [0006](0006-shipping.md) | Shipping: the Collector file shipper, an optional `push` feature, and the Alloy gap | Accepted |
 
 ## Template

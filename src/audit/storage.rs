@@ -42,8 +42,10 @@ pub(crate) struct State {
     pub(crate) head: Head,
     pub(crate) mmr: Mmr,
     offset: u64,
-    length: u64,
+    pub(crate) length: u64,
     checkpoint: bool,
+    pub(crate) checkpoint_time: u64,
+    pub(crate) since_checkpoint: u64,
     newline: bool,
     gap: Option<blake3::Hasher>,
     pending_resume: bool,
@@ -51,6 +53,15 @@ pub(crate) struct State {
     checkpoint_previous: [u8; 32],
 }
 impl State {
+    /// Advances from known writer output, never from a reread of our own bytes.
+    pub(crate) fn after(&self, record: &Record, length: u64) -> Result<Self, AuditError> {
+        let mut next = Some(self.clone());
+        apply(record, &mut next, false)?;
+        let mut next = next.ok_or_else(|| corrupt("missing written state"))?;
+        next.offset = length;
+        next.length = length;
+        Ok(next)
+    }
     /// Includes the repair LF that B2b will prepend to an unterminated tail.
     pub(crate) fn repair_digest(&self) -> Option<[u8; 32]> {
         self.gap.as_ref().map(|gap| {
@@ -81,6 +92,25 @@ pub(crate) struct TrailReader {
     cache: Mutex<Cache>,
 }
 impl TrailReader {
+    /// Reads the marker, settles staging and scans in one acquisition.
+    pub(crate) fn open_marked(
+        path: &Path,
+        expected: Option<Head>,
+        prepare: impl FnOnce(&File) -> Result<[u8; 16], AuditError>,
+    ) -> Result<Self, AuditError> {
+        let directory = Directory::open(path).map_err(io_error)?;
+        let (trail, cache) = directory
+            .with_lock(|dir| {
+                let trail = prepare(dir)?;
+                Ok::<_, AuditError>((trail, initial(dir, trail, expected)?))
+            })
+            .map_err(io_error)??;
+        Ok(Self {
+            directory,
+            trail,
+            cache: Mutex::new(cache),
+        })
+    }
     /// Scans an existing trail after B2b's staging settlement. `trail` comes
     /// from the checked marker. No signature trust is inferred from disk.
     pub(crate) fn open(
@@ -120,7 +150,7 @@ impl TrailReader {
     pub(crate) fn with_current<T>(
         &self,
         settle: impl FnOnce(&File) -> Result<(), AuditError>,
-        f: impl FnOnce(&File, &File, &State) -> Result<T, AuditError>,
+        f: impl FnOnce(&File, &mut File, &mut State) -> Result<T, AuditError>,
     ) -> Result<T, AuditError> {
         self.directory
             .with_lock(|dir| {
@@ -130,7 +160,21 @@ impl TrailReader {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 refresh(dir, self.trail, &mut cache)?;
-                f(dir, &cache.file, &cache.state)
+                let old = cache.file.metadata().map_err(io_error)?;
+                let Cache { file, state, .. } = &mut *cache;
+                let result = f(dir, file, state);
+                let new = cache.file.metadata().map_err(io_error)?;
+                if (old.dev(), old.ino()) != (new.dev(), new.ino()) {
+                    cache.sealed_before = crate::rotate::rotated_names_at(dir, "audit")
+                        .map_err(io_error)?
+                        .pop();
+                }
+                let result = result?;
+                // Writer callbacks retain known writes directly, including after a later
+                // rename failure. This refresh also supports reader/test callbacks
+                // that append without updating State; for writers it is a no-op.
+                refresh(dir, self.trail, &mut cache)?;
+                Ok(result)
             })
             .map_err(io_error)?
     }
@@ -141,7 +185,7 @@ fn corrupt(detail: &str) -> AuditError {
 fn io_error(error: io::Error) -> AuditError {
     AuditError::new(AuditErrorKind::Io, error.to_string())
 }
-fn existing(dir: &File, name: &Path, writable: bool) -> Result<File, AuditError> {
+pub(crate) fn existing(dir: &File, name: &Path, writable: bool) -> Result<File, AuditError> {
     let access = if writable {
         OFlags::RDWR | OFlags::APPEND
     } else {
@@ -177,10 +221,12 @@ fn initial(dir: &File, trail: [u8; 16], expected: Option<Head>) -> Result<Cache,
     let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
     for name in &names {
         let file = existing(dir, name, false)?;
-        chain = Some(scan(&file, trail, chain, true, expected, &mut found)?);
+        chain = Some(scan(
+            &file, trail, chain, true, expected, &mut found, false,
+        )?);
     }
     let file = existing(dir, Path::new("audit.jsonl"), true)?;
-    let state = scan(&file, trail, chain, true, expected, &mut found)?;
+    let state = scan(&file, trail, chain, true, expected, &mut found, false)?;
     if expected.is_some() && !found {
         return Err(AuditError::new(
             AuditErrorKind::HeadMismatch,
@@ -219,6 +265,7 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
                 false,
                 None,
                 &mut found,
+                false,
             )?;
         }
         return Ok(());
@@ -233,6 +280,7 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
         false,
         None,
         &mut found,
+        false,
     )?;
     // Locate the old descriptor by metadata, never by rereading historical
     // contents. If archived, the previous sealed name remains a lower bound.
@@ -253,10 +301,10 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
             continue;
         }
         let file = existing(dir, name, false)?;
-        state = scan(&file, trail, Some(state), true, None, &mut found)?;
+        state = scan(&file, trail, Some(state), true, None, &mut found, false)?;
     }
     let file = existing(dir, Path::new("audit.jsonl"), true)?;
-    let state = scan(&file, trail, Some(state), true, None, &mut found)?;
+    let state = scan(&file, trail, Some(state), true, None, &mut found, false)?;
     *cache = Cache {
         file,
         state,
@@ -268,13 +316,16 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
 const MAX_READ_BYTES: u64 = MAX_PAYLOAD_BYTES as u64 + 2; // LF plus one excess byte.
 
 /// Bounded reads: each payload is capped even when it is only a fragment.
-fn scan(
+/// `genesis` requires a root link when no predecessor exists (staging settlement).
+/// Otherwise decision 2 permits a self-contained archived prefix checkpoint.
+pub(crate) fn scan(
     file: &File,
     trail: [u8; 16],
     mut state: Option<State>,
     opening: bool,
     expected: Option<Head>,
     found: &mut bool,
+    genesis: bool,
 ) -> Result<State, AuditError> {
     let mut file = file.try_clone().map_err(io_error)?;
     let start = if opening {
@@ -371,7 +422,7 @@ fn scan(
         {
             return Err(corrupt("unclosed segment lacks matching immediate resume"));
         }
-        apply(record, &mut state)?;
+        apply(record, &mut state, genesis)?;
         if !first {
             boundary_resume = false;
         }
@@ -394,21 +445,25 @@ fn scan(
     state.gap = gap;
     Ok(state)
 }
-fn apply(record: &Record, state: &mut Option<State>) -> Result<(), AuditError> {
+fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<(), AuditError> {
     let head = Head::of(record);
+    let root_link =
+        state.is_none() && record.context.previous == Record::genesis(&record.context.trail);
+    // A root checkpoint above zero declares loss and needs an immediate resume;
+    // an archived prefix instead carries its predecessor hash and MMR (d2/d8).
+    let mut pending = state.is_none() && head.seq > 0 && root_link;
     let mut mmr = if let Some(s) = state.as_ref() {
         s.mmr.clone()
     } else {
         let Kind::Checkpoint(cp) = &record.kind else {
             return Err(corrupt("missing initial checkpoint"));
         };
-        if head.seq == 0 && record.context.previous != Record::genesis(&record.context.trail) {
-            return Err(corrupt("creation checkpoint does not link genesis"));
+        if (genesis || head.seq == 0) && !root_link {
+            return Err(corrupt("initial checkpoint does not link genesis"));
         }
         Mmr::from_peaks(cp.size, cp.peaks.clone()).map_err(|_| corrupt("invalid opening peaks"))?
     };
     let prior = state.as_ref().map(|s| s.head);
-    let mut pending = false;
     if let Some(s) = state.as_ref() {
         if head == s.head {
             return Ok(());
@@ -470,6 +525,9 @@ fn apply(record: &Record, state: &mut Option<State>) -> Result<(), AuditError> {
                 || seq >= s.head.seq
                 || hash != crate::audit::digest_string(&s.checkpoint_previous)
                 || s.checkpoint_predecessor.is_some_and(|p| p.seq != seq)
+                || (s.checkpoint_predecessor.is_none()
+                    && s.checkpoint_previous == Record::genesis(&record.context.trail)
+                    && seq != 0)
                 || file.is_empty()
                 || file.bytes().any(|b| b.is_ascii_whitespace())
             {
@@ -485,6 +543,16 @@ fn apply(record: &Record, state: &mut Option<State>) -> Result<(), AuditError> {
         offset: 0,
         length: 0,
         checkpoint: matches!(record.kind, Kind::Checkpoint(_)),
+        checkpoint_time: if matches!(record.kind, Kind::Checkpoint(_)) {
+            record.context.time
+        } else {
+            state.as_ref().map_or(0, |s| s.checkpoint_time)
+        },
+        since_checkpoint: if matches!(record.kind, Kind::Checkpoint(_)) {
+            0
+        } else {
+            state.as_ref().map_or(1, |s| s.since_checkpoint + 1)
+        },
         newline: true,
         gap: None,
         pending_resume: pending,
