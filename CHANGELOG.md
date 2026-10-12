@@ -77,6 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reject audit service names over 255 bytes before disk access; verify success-only mirroring and complete public writer traits and unstable rustdoc ([#11](https://github.com/vig-os/vigil/issues/11)).
+
 - Audit signer-outage reporting tolerates unwritable stderr without panicking or failing an acknowledged record ([#100](https://github.com/vig-os/vigil/issues/100)).
 
 - Make OTLP/JSON output independent of consumer `serde_json/preserve_order` feature unification ([#64](https://github.com/vig-os/vigil/issues/64)).

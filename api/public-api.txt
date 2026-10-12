@@ -48,6 +48,8 @@ pub fn vigil::audit::AuditTrail::close(self) -> core::result::Result<vigil::audi
 pub fn vigil::audit::AuditTrail::dir(&self) -> &std::path::Path
 pub fn vigil::audit::AuditTrail::record(&self, entry: &vigil::audit::Entry) -> core::result::Result<vigil::audit::Receipt, vigil::audit::AuditError>
 pub fn vigil::audit::AuditTrail::trail(&self) -> [u8; 16]
+impl core::fmt::Debug for vigil::audit::AuditTrail
+pub fn vigil::audit::AuditTrail::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct vigil::audit::Checkpoint
 impl vigil::audit::Checkpoint
 pub fn vigil::audit::Checkpoint::hash(&self) -> [u8; 32]

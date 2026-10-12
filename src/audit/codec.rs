@@ -271,6 +271,9 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
     Ok(record)
 }
 impl Record {
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Decodes one complete OTLP/JSON LogsData value, preserving nested record order.
     ///
     /// Rejects duplicate JSON keys after unescaping, unknown record attributes or

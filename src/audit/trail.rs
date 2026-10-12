@@ -20,6 +20,15 @@ pub struct AuditTrail {
     dir: PathBuf,
     mirror: bool,
 }
+impl std::fmt::Debug for AuditTrail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditTrail")
+            .field("dir", &self.dir)
+            .field("trail", &self.trail())
+            .field("service", &self.sink.service())
+            .finish()
+    }
+}
 impl AuditTrail {
     pub(super) fn new(sink: sink::Sink, dir: PathBuf, mirror: bool) -> Self {
         Self { sink, dir, mirror }
@@ -90,6 +99,7 @@ fn checkpoint(record: Record) -> Result<Checkpoint, AuditError> {
 
 /// An application-side anchor for one acknowledged durable record.
 /// Store outside the trail directory so rollback can be detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Receipt {
     trail: [u8; 16],
     seq: u64,

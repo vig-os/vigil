@@ -145,6 +145,7 @@
       "vigil::audit::AuditConfig::create": "fn",
       "vigil::audit::AuditConfig::open": "fn",
       "vigil::audit::AuditTrail": "struct",
+      "vigil::audit::AuditTrail::fmt": "fn",
       "vigil::audit::AuditTrail::record": "fn",
       "vigil::audit::AuditTrail::checkpoint": "fn",
       "vigil::audit::AuditTrail::close": "fn",

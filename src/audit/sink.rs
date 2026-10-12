@@ -18,6 +18,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) service: String,
     pub(crate) checkpoint_every: u64,
@@ -338,6 +339,9 @@ fn settle(dir: &File, trail: [u8; 16], poisoned: &AtomicBool) -> Result<(), Audi
     Ok(())
 }
 impl Sink {
+    pub(super) fn service(&self) -> &str {
+        &self.config.service
+    }
     pub(super) fn trail(&self) -> [u8; 16] {
         self.trail
     }

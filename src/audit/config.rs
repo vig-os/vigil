@@ -6,6 +6,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 /// Builders defer validation until [`Self::create`] or [`Self::open`]. The
 /// default directory is `$XDG_STATE_HOME/<service>/audit`, falling back to
 /// `$HOME/.local/state/<service>/audit`; relative environment paths are ignored.
+#[derive(Debug, Clone)]
 #[must_use]
 pub struct AuditConfig {
     config: sink::Config,
@@ -15,7 +16,8 @@ pub struct AuditConfig {
 }
 impl AuditConfig {
     /// Sets the service name (ASCII letters, digits, `.`, `_` and `-`, excluding
-    /// empty, `.` and `..`), with 50 MiB segments and 1000-record / 60 s cadence.
+    /// empty, `.` and `..`; at most 255 bytes), with 50 MiB segments and
+    /// 1000-record / 60 s cadence.
     pub fn new(service: impl Into<String>) -> Self {
         Self {
             config: sink::Config {
@@ -65,6 +67,9 @@ impl AuditConfig {
     }
     fn validate(&self, create: bool) -> Result<PathBuf, AuditError> {
         let invalid = |text| AuditError::new(AuditErrorKind::InvalidConfig, text);
+        if self.config.service.len() > 255 {
+            return Err(invalid("service name exceeds 255 bytes".into()));
+        }
         crate::init::validate_service(&self.config.service).map_err(|e| invalid(e.to_string()))?;
         if self.config.max_bytes == 0
             || self.config.checkpoint_every == 0

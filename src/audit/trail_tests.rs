@@ -53,6 +53,8 @@ fn entry() -> Entry {
 fn public_receipt_checkpoint_and_close_roundtrip() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<AuditTrail>();
+    send_sync::<AuditConfig>();
+    send_sync::<Receipt>();
     let temp = Temp::new();
     let trail = temp.config().create(signer()).unwrap();
     assert_eq!(trail.dir(), temp.0);
@@ -251,6 +253,12 @@ fn mirror_fires_after_directory_unlock_and_contains_only_four_fields() {
         assert_eq!(fields["seq"], receipt.seq().to_string());
         assert_eq!(fields["hash"].trim_matches('"'), receipt.hash_string());
         drop(captured);
+        let error = trail
+            .record(&Entry::new("actor", "vigil.audit.test", "object"))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), AuditErrorKind::InvalidEntry);
+        assert_eq!(events.lock().unwrap().len(), 1);
         trail.checkpoint().unwrap();
         trail.close().unwrap();
         let off = temp.config().open(signer()).unwrap();
@@ -396,4 +404,49 @@ fn missing_marker_recovery_and_expected_head_errors() {
         AuditErrorKind::HeadMismatch
     );
     assert_eq!(fs::read(other.0.join("audit.jsonl")).unwrap(), before);
+}
+
+#[test]
+fn oversized_service_leaves_directory_reusable() {
+    for length in [256, 1_000_100] {
+        let temp = Temp::new();
+        for create in [true, false] {
+            let config = AuditConfig::new("a".repeat(length)).dir(&temp.0);
+            let result = if create {
+                config.create(signer())
+            } else {
+                config.open(signer())
+            };
+            assert_eq!(result.err().unwrap().kind(), AuditErrorKind::InvalidConfig);
+            assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 0);
+        }
+        AuditConfig::new("a".repeat(255))
+            .dir(&temp.0)
+            .create(signer())
+            .unwrap()
+            .close()
+            .unwrap();
+    }
+}
+
+#[test]
+fn public_debug_and_value_traits() {
+    fn receipt_traits<T: std::fmt::Debug + Clone + Copy + PartialEq + Eq + std::hash::Hash>() {}
+    fn config_traits<T: std::fmt::Debug + Clone>() {}
+    receipt_traits::<Receipt>();
+    config_traits::<AuditConfig>();
+    let temp = Temp::new();
+    let config = temp.config();
+    assert!(format!("{config:?}").contains("svc"));
+    let trail = config.clone().create(signer()).unwrap();
+    assert_eq!(
+        format!("{trail:?}"),
+        format!(
+            "AuditTrail {{ dir: {:?}, trail: {:?}, service: {:?} }}",
+            temp.0,
+            trail.trail(),
+            "svc"
+        )
+    );
+    trail.close().unwrap();
 }

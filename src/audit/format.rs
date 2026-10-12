@@ -121,6 +121,9 @@ impl Entry {
         fields
     }
 }
+/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// Applications only: library pins constrain every dependent to that minor.
+///
 /// Checkpoint commitment to all leaves preceding its own sequence number.
 #[derive(Clone, Debug)]
 pub struct CheckpointFields {
@@ -131,6 +134,9 @@ pub struct CheckpointFields {
     signature: [u8; 64],
 }
 impl CheckpointFields {
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Creates fields; peak count must equal the population count of `size`.
     /// The caller supplies the MMR root and left-to-right peaks. Signature
     /// verification and consistency with trail history belong to #13.
@@ -179,6 +185,9 @@ pub(super) enum Kind {
     Checkpoint(CheckpointFields),
 }
 
+/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// Applications only: library pins constrain every dependent to that minor.
+///
 /// Context supplied by a writer under its lock; times are nanoseconds since epoch.
 #[derive(Clone, Debug)]
 pub struct RecordContext {
@@ -191,6 +200,9 @@ pub struct RecordContext {
     pub(super) previous: [u8; 32],
 }
 impl RecordContext {
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Sets trail identity, order, timestamp, service and previous chain hash.
     pub fn new(
         trail: [u8; 16],
@@ -209,6 +221,9 @@ impl RecordContext {
             previous,
         }
     }
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Attests a torn-tail gap repaired by the writer, including repair newlines.
     /// Supply BLAKE3 of `b"vigil.audit.v1.repaired\0"` followed by the gap bytes.
     /// Only the first record or checkpoint after a repair carries this digest;
@@ -217,6 +232,9 @@ impl RecordContext {
         self.repaired = Some(digest);
         self
     }
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Adds the authenticated host name when present in the writer's resource.
     pub fn host(mut self, host: impl Into<String>) -> Self {
         self.host = Some(host.into());
@@ -224,6 +242,9 @@ impl RecordContext {
     }
 }
 
+/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// Applications only: library pins constrain every dependent to that minor.
+///
 /// A validated v1 record with explicit format context. This is an I/O-free
 /// building block: the future trail writer supplies time inside its lock.
 #[derive(Clone, Debug)]
@@ -232,6 +253,9 @@ pub struct Record {
     pub(super) kind: Kind,
 }
 impl Record {
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Builds a record. `previous` must be the genesis hash at sequence zero,
     /// or the preceding record hash; the writer is responsible for that link.
     ///
@@ -257,6 +281,9 @@ impl Record {
         entry.validate()?;
         Self::build(context, Kind::Entry(entry))
     }
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Builds a checkpoint. MMR size counts records preceding this checkpoint,
     /// while sequence numbers can skip lost records at a declared resume gap.
     /// Size must not exceed sequence; equality holds before any resume gap.
@@ -330,11 +357,17 @@ impl Record {
         fields.push((0x7f, self.context.previous.to_vec()));
         fields
     }
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Returns canonical tag + u32 big-endian length + value bytes.
     /// Optional fields are omitted and tags always ascend.
     pub fn canonical(&self) -> Vec<u8> {
         encode(self.fields(), false)
     }
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Returns the domain-separated BLAKE3 record hash, including a
     /// checkpoint's signature when present.
     pub fn hash(&self) -> [u8; 32] {
@@ -343,6 +376,9 @@ impl Record {
         hasher.update(&self.canonical());
         *hasher.finalize().as_bytes()
     }
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Returns the signing message for a checkpoint, omitting only tag 0x24.
     /// An ordinary action has no checkpoint signing message.
     pub fn signing_message(&self) -> Option<Vec<u8>> {
@@ -351,6 +387,9 @@ impl Record {
             Kind::Checkpoint(_) => Some(super::checkpoint_message(&encode(self.fields(), true))),
         }
     }
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// Applications only: library pins constrain every dependent to that minor.
+    ///
     /// Computes the sequence-zero previous hash for a trail id.
     pub fn genesis(trail: &[u8; 16]) -> [u8; 32] {
         let mut h = blake3::Hasher::new();

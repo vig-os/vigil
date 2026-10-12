@@ -90,6 +90,9 @@ impl Signer for KeySeed {
     }
 }
 
+/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// Applications only: library pins constrain every dependent to that minor.
+///
 /// Builds `vigil.audit.v1.checkpoint\0 || blake3(fields without tag 0x24)`.
 /// The result is exactly 58 bytes; supply canonical fields, not JSON bytes.
 pub fn checkpoint_message(unsigned_fields: &[u8]) -> Vec<u8> {
@@ -98,6 +101,9 @@ pub fn checkpoint_message(unsigned_fields: &[u8]) -> Vec<u8> {
     message
 }
 
+/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// Applications only: library pins constrain every dependent to that minor.
+///
 /// Checks a pure Ed25519 signature with strict canonical/small-order checks.
 /// This validates a message signature only, not trust policy or trail history.
 ///
