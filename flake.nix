@@ -64,10 +64,11 @@
           doctest = true;
           toolchainHash = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
           # The crate's rustdoc front page is the README (include_str!); the
-          # golden fixtures are read at test time, and crane's source filter
+          # ADR assertions and golden fixtures are checked in tests; crane's source filter
           # would otherwise drop them (a missing fixture fails the golden test).
           extraSrcFiles = [
             "README.md"
+            "docs/adr/0005-audit-trail.md"
             ".config/nextest.toml"
             "tests/fixtures"
           ];
@@ -81,6 +82,7 @@
           toolchainHash = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
           extraSrcFiles = [
             "README.md"
+            "docs/adr/0005-audit-trail.md"
             ".config/nextest.toml"
             "tests/fixtures"
           ];

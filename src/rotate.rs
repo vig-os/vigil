@@ -601,7 +601,7 @@ const STAMP_LEN: usize = "YYYYMMDDTHHMMSS.nnnnnnnnnZ".len();
 /// Parse `<signal>-<stamp>[_NNNNNN].jsonl` into `(stamp, counter)`. Only this
 /// exact shape counts, so `logs-2.jsonl` is not a segment of `logs`. The counter
 /// has at least six digits (it grows a digit past 999 999).
-fn parse_segment<'a>(name: &'a str, signal: &str) -> Option<(&'a str, u64)> {
+pub(crate) fn parse_segment<'a>(name: &'a str, signal: &str) -> Option<(&'a str, u64)> {
     let rest = name
         .strip_prefix(signal)?
         .strip_prefix('-')?
@@ -633,7 +633,7 @@ fn parse_segment<'a>(name: &'a str, signal: &str) -> Option<(&'a str, u64)> {
 /// The name for the next rotated segment: sorts strictly after `newest`, the
 /// newest existing segment, even if the clock went backwards. The collision
 /// suffix `_NNNNNN` sorts after the bare name (`_` > `.`) and counts up.
-fn next_segment_name(signal: &str, now: &str, newest: Option<&str>) -> String {
+pub(crate) fn next_segment_name(signal: &str, now: &str, newest: Option<&str>) -> String {
     match newest.and_then(|n| parse_segment(n, signal)) {
         Some((stamp, counter)) if stamp >= now => {
             format!("{signal}-{stamp}_{:06}.jsonl", counter.saturating_add(1))
@@ -695,6 +695,11 @@ fn rename_unsupported(error: &io::Error) -> bool {
 pub(crate) fn rename_no_replace(dir: &File, old: &Path, new: &Path) -> io::Result<()> {
     rename_with(dir, old, new, rename_new, unlink_name)
 }
+#[cfg(test)]
+thread_local! {
+    // Force the otherwise unreachable Linux fallback, once on this thread.
+    pub(crate) static CRASH_AFTER_LINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 fn rename_with(
     dir: &File,
     live_name: &Path,
@@ -702,10 +707,22 @@ fn rename_with(
     mut rename: impl FnMut(&File, &Path, &Path) -> io::Result<()>,
     mut unlink: impl FnMut(&File, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    match rename(dir, live_name, target) {
+    #[cfg(test)]
+    let crash = CRASH_AFTER_LINK.with(std::cell::Cell::take);
+    #[cfg(test)]
+    let result = if crash {
+        Err(Errno::NOSYS.into())
+    } else {
+        rename(dir, live_name, target)
+    };
+    #[cfg(not(test))]
+    let result = rename(dir, live_name, target);
+    match result {
         Err(e) if rename_unsupported(&e) => {
             match rfs::linkat(dir, live_name, dir, target, AtFlags::empty()) {
                 Ok(()) => {
+                    #[cfg(test)]
+                    assert!(!crash, "injected crash between linkat and unlink");
                     if let Err(original) = unlink(dir, live_name) {
                         if let Err(undo) = unlink(dir, target) {
                             return Err(io::Error::other(format!(
