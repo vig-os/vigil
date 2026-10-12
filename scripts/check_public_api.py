@@ -36,6 +36,7 @@ def item_kinds(listing):
         line = re.sub(r"^(?:#\[[^\]]+\]\s*)+", "", line)
         if not line.startswith("pub "):
             continue
+        line = re.sub(r"^pub const fn ", "pub fn ", line)
         match = re.match(
             r"pub (?:(mod|struct|enum|trait|fn|const|static|type|macro|extern crate) )?"
             r"(vigil(?:::[A-Za-z_][A-Za-z_0-9]*)*)",

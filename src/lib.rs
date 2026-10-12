@@ -16,6 +16,9 @@ const _: () = {
 
 mod init;
 mod lifecycle;
+#[cfg(feature = "metrics")]
+#[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+pub mod metrics;
 pub use init::{Config, Console, Guard, InitError, InitErrorKind, init};
 pub use lifecycle::{FlushError, FlushErrorKind, Signal};
 

@@ -2,12 +2,12 @@
 
 *Verifiable Integrity-Guarded Instrumentation & Logging* (V·I·G·I·L): the opinionated observability crate for vig-os Rust projects.
 
-> **Pre-alpha.** The design is settled; the code is being built. Logs are implemented; other signals and audit are being built. Track progress in the milestones.
+> **Pre-alpha.** The design is settled; the code is being built. Logs and metrics are implemented; traces and audit are being built. Track progress in the milestones.
 
 ## Stability
 
 vigil publishes no 0.x: the first release is 1.0.0, so what follows is the 1.0
-promise. Logs are implemented today; the rest of the promised surface is still
+promise. Logs and metrics are implemented today; the rest of the promised surface is still
 being built, and the pre-1.0 `dev` branch may change it.
 
 - **Semver.** The stable API is every public item built without `--cfg vigil_unstable`,
@@ -52,6 +52,33 @@ being built, and the pre-1.0 `dev` branch may change it.
   (default histogram boundaries, span and cardinality limits, batch sizes), which may
   change in a minor release with a changelog entry; and copies of files that a shipper
   has rewritten.
+
+## Metrics
+
+With the default `metrics` feature, declare instruments in statics using the
+scope of their declaring crate:
+
+```rust
+# #[cfg(feature = "metrics")]
+# fn main() {
+use vigil::metrics::{Counter, CounterF64, Histogram, Gauge, UpDownCounter};
+static REQUESTS: Counter = Counter::new(vigil::scope!(), "app.requests").with_unit("{request}").with_description("Handled requests");
+static CPU: CounterF64 = CounterF64::new(vigil::scope!(), "process.cpu.time").with_unit("s");
+static LATENCY: Histogram = Histogram::new(vigil::scope!(), "app.latency").with_unit("ms").with_boundaries(&[5.0, 10.0, 50.0]);
+static INFLIGHT: UpDownCounter = UpDownCounter::new(vigil::scope!(), "app.inflight");
+static MEMORY: Gauge = Gauge::new(vigil::scope!(), "app.memory").with_unit("By");
+
+REQUESTS.add(1, &[("route", "/x".into())]);
+LATENCY.record(12.5, &[("route", "/x".into())]);
+# }
+# #[cfg(not(feature = "metrics"))]
+# fn main() {}
+```
+
+Names, units and histogram boundaries are validated at compile time in statics.
+Instruments bind on their first record after initialization; earlier records
+are dropped and counted, with one report when the pipeline starts. Metrics use
+`metrics.jsonl` and are flushed and shut down with the guard.
 
 ## Unstable SDK access
 
@@ -101,7 +128,7 @@ guard.shutdown()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Logs are available now; metrics, traces and audit are planned. Keep the guard
+Logs and metrics are available now; traces and audit are planned. Keep the guard
 alive until shutdown to flush queued logs. `let _ = vigil::init(..)` drops it immediately. The batch queue holds 65,536 records by default (512 per export, every second).
 Memory is bounded by queue size times record size; overflow drops records with
 a stderr warning. `VIGIL_QUEUE_SIZE` or `Config::queue_size` changes the bound

@@ -1,0 +1,521 @@
+use super::*;
+use crate::{Config, FlushErrorKind, Signal};
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use std::{
+    fs,
+    panic::catch_unwind,
+    process::{Command, Output},
+    sync::Arc,
+};
+use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+    let error = catch_unwind(f).expect_err("validation must panic");
+    error
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| error.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap()
+}
+#[test]
+fn name_rule_panics_at_runtime() {
+    for name in ["", "1bad", "bad!", "aé", &"a".repeat(256)] {
+        let name = Box::leak(name.to_owned().into_boxed_str());
+        assert!(
+            panic_message(|| {
+                let _ = Counter::new(crate::scope!(), name);
+            })
+            .starts_with("vigil::metrics: name")
+        );
+    }
+}
+#[test]
+fn unit_rule_panics_at_runtime() {
+    for unit in ["µs", &"a".repeat(64)] {
+        let unit = Box::leak(unit.to_owned().into_boxed_str());
+        assert!(
+            panic_message(|| {
+                let _ = Counter::new(crate::scope!(), "valid").with_unit(unit);
+            })
+            .starts_with("vigil::metrics: unit")
+        );
+    }
+}
+#[test]
+fn boundaries_rule_panics_at_runtime() {
+    for boundaries in [
+        &[f64::NAN][..],
+        &[f64::INFINITY],
+        &[f64::NEG_INFINITY],
+        &[2.0, 1.0],
+        &[1.0, 1.0],
+        &[-0.0, 0.0],
+    ] {
+        let boundaries = Box::leak(boundaries.to_vec().into_boxed_slice());
+        assert!(
+            panic_message(|| {
+                let _ = Histogram::new(crate::scope!(), "valid").with_boundaries(boundaries);
+            })
+            .starts_with("vigil::metrics: boundaries")
+        );
+    }
+}
+
+struct Rejected(Arc<AtomicBool>);
+impl<S: tracing::Subscriber> Layer<S> for Rejected {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().name() == "InstrumentCreationFailed" {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+}
+#[test]
+fn validation_matches_sdk() {
+    if !crate::subscriber_test_child("metrics::tests::validation_matches_sdk") {
+        return;
+    }
+    let rejected = Arc::new(AtomicBool::new(false));
+    let subscriber = tracing_subscriber::registry().with(Rejected(rejected.clone()));
+    let sink = crate::sink::MemorySink::new();
+    let provider = SdkMeterProvider::builder()
+        .with_reader(
+            PeriodicReader::builder(crate::metric_export::OtlpJsonMetricExporter::new(sink))
+                .build(),
+        )
+        .build();
+    let meter = provider.meter("validation");
+    tracing::subscriber::with_default(subscriber, || {
+        for name in [
+            "",
+            "a",
+            "A0_./-z",
+            "1bad",
+            "a b",
+            "aé",
+            &"a".repeat(255),
+            &"a".repeat(256),
+        ] {
+            rejected.store(false, Ordering::Relaxed);
+            let name = Box::leak(name.to_owned().into_boxed_str());
+            let ours = catch_unwind(|| {
+                let _ = Counter::new(crate::scope!(), name);
+            })
+            .is_ok();
+            let _ = meter.u64_counter(name as &'static str).build();
+            assert_eq!(ours, !rejected.load(Ordering::Relaxed), "name {name:?}");
+        }
+        for unit in ["", "s", "µs", "\0", &"a".repeat(63), &"a".repeat(64)] {
+            rejected.store(false, Ordering::Relaxed);
+            let unit = Box::leak(unit.to_owned().into_boxed_str());
+            let ours = catch_unwind(|| {
+                let _ = Counter::new(crate::scope!(), "valid").with_unit(unit);
+            })
+            .is_ok();
+            let _ = meter
+                .u64_counter("valid")
+                .with_unit(unit as &'static str)
+                .build();
+            assert_eq!(ours, !rejected.load(Ordering::Relaxed), "unit {unit:?}");
+        }
+        for boundaries in [
+            &[][..],
+            &[1.0],
+            &[-1.0, 0.0, 1.0],
+            &[f64::NAN],
+            &[f64::INFINITY],
+            &[f64::NEG_INFINITY],
+            &[2.0, 1.0],
+            &[1.0, 1.0],
+            &[-0.0, 0.0],
+        ] {
+            rejected.store(false, Ordering::Relaxed);
+            let boundaries = Box::leak(boundaries.to_vec().into_boxed_slice());
+            let ours = catch_unwind(|| {
+                let _ = Histogram::new(crate::scope!(), "valid").with_boundaries(boundaries);
+            })
+            .is_ok();
+            let _ = meter
+                .f64_histogram("hist")
+                .with_boundaries(boundaries.to_vec())
+                .build();
+            assert_eq!(
+                ours,
+                !rejected.load(Ordering::Relaxed),
+                "boundaries {boundaries:?}"
+            );
+        }
+    });
+    provider.shutdown().unwrap();
+}
+#[test]
+fn attribute_conversions_and_scope() {
+    assert_eq!(
+        crate::scope!(),
+        Scope::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+    );
+    assert_ne!(Scope::new("crate", "1"), Scope::new("crate", "2"));
+    assert_eq!(Value::from(true), Value::Bool(true));
+    macro_rules! signed { ($($t:ty),+) => { $(assert_eq!(Value::from(-1 as $t), Value::I64(-1));)+ }; }
+    signed!(i8, i16, i32, i64, isize);
+    macro_rules! unsigned { ($($t:ty),+) => { $(assert_eq!(Value::from(1 as $t), Value::I64(1));)+ }; }
+    unsigned!(u8, u16, u32, u64, usize);
+    assert_eq!(Value::from(i64::MAX as u64), Value::I64(i64::MAX));
+    assert_eq!(
+        Value::from(i64::MAX as u64 + 1),
+        Value::Str(Cow::Owned("9223372036854775808".into()))
+    );
+    assert_eq!(
+        Value::from(u64::MAX),
+        Value::Str(Cow::Owned("18446744073709551615".into()))
+    );
+    assert_eq!(Value::from(usize::MAX), Value::from(usize::MAX as u64));
+    assert_eq!(Value::from(1.5_f32), Value::F64(1.5));
+    assert_eq!(Value::from(1.5_f64), Value::F64(1.5));
+    assert_eq!(Value::from("x"), Value::Str(Cow::Borrowed("x")));
+    assert_eq!(
+        Value::from(String::from("x")),
+        Value::Str(Cow::Owned("x".into()))
+    );
+}
+fn child(test: &str) -> Option<Output> {
+    let test = format!("metrics::tests::{test}");
+    if std::env::var("VIGIL_FACADE_CHILD").as_deref() == Ok(&test) {
+        return None;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test, "--nocapture"])
+        .env("VIGIL_FACADE_CHILD", &test)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Some(output)
+}
+fn dir(test: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("vigil-facade-{test}-{}", std::process::id()))
+}
+fn metrics(path: &std::path::Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(path.join("metrics.jsonl"))
+        .unwrap()
+        .lines()
+        .flat_map(|line| {
+            let json: serde_json::Value = serde_json::from_str(line).unwrap();
+            json["resourceMetrics"][0]["scopeMetrics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|s| s["metrics"].as_array().unwrap().clone())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+#[test]
+fn late_binding_losses_and_five_instruments() {
+    if let Some(output) = child("late_binding_losses_and_five_instruments") {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr
+                .matches("vigil: 1 metric records before vigil::init were dropped")
+                .count(),
+            1
+        );
+        assert!(!stderr.contains("dropped measurements"));
+        return;
+    }
+    static C: Counter = Counter::new(crate::scope!(), "requests")
+        .with_unit("{request}")
+        .with_description("Handled");
+    static F: CounterF64 = CounterF64::new(crate::scope!(), "cpu").with_unit("s");
+    static U: UpDownCounter = UpDownCounter::new(crate::scope!(), "inflight");
+    static G: Gauge = Gauge::new(crate::scope!(), "memory").with_unit("By");
+    static H: Histogram = Histogram::new(crate::scope!(), "latency").with_boundaries(&[1.0, 10.0]);
+    C.add(99, &[]);
+    assert!(C.0.handle.get().is_none());
+    let path = dir("five");
+    let (_, guard) = Config::new("facade")
+        .dir(&path)
+        .layer::<tracing_subscriber::Registry>()
+        .unwrap();
+    let attrs = [
+        ("bool", true.into()),
+        ("int", (-1).into()),
+        ("double", 1.5.into()),
+        ("str", "x".into()),
+        ("large", u64::MAX.into()),
+    ];
+    C.add(3, &attrs);
+    F.add(1.5, &[]);
+    U.add(-2, &[]);
+    G.record(42.0, &[]);
+    H.record(4.0, &[]);
+    let error = guard.flush().unwrap_err();
+    assert_eq!(error.kind(), FlushErrorKind::DataLost);
+    assert_eq!(error.lost(Signal::Metrics), 1);
+    assert!(
+        error
+            .to_string()
+            .contains("at least 1 metric measurements lost")
+    );
+    guard.flush().unwrap();
+    drop(guard);
+    let all = metrics(&path);
+    let find = |name: &str| all.iter().find(|m| m["name"] == name).unwrap();
+    let c = find("requests");
+    assert_eq!(c["description"], "Handled");
+    assert_eq!(c["unit"], "{request}");
+    assert_eq!(c["sum"]["dataPoints"][0]["asInt"], 3);
+    assert_eq!(
+        c["sum"]["dataPoints"][0]["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["key"] == "large")
+            .unwrap()["value"]["stringValue"],
+        "18446744073709551615"
+    );
+    assert_eq!(find("cpu")["sum"]["dataPoints"][0]["asDouble"], 1.5);
+    assert_eq!(find("inflight")["sum"]["dataPoints"][0]["asInt"], -2);
+    assert_eq!(find("memory")["gauge"]["dataPoints"][0]["asDouble"], 42.0);
+    assert_eq!(
+        find("latency")["histogram"]["dataPoints"][0]["explicitBounds"],
+        serde_json::json!([1.0, 10.0])
+    );
+    fs::remove_dir_all(path).unwrap();
+}
+#[test]
+fn unset_empty_and_explicit_boundaries() {
+    if child("unset_empty_and_explicit_boundaries").is_some() {
+        return;
+    }
+    let path = dir("buckets");
+    let (_, guard) = Config::new("buckets")
+        .dir(&path)
+        .layer::<tracing_subscriber::Registry>()
+        .unwrap();
+    Histogram::new(crate::scope!(), "defaults").record(2.0, &[]);
+    Histogram::new(crate::scope!(), "empty")
+        .with_boundaries(&[])
+        .record(2.0, &[]);
+    guard.shutdown().unwrap();
+    let all = metrics(&path);
+    let point =
+        |name: &str| &all.iter().find(|m| m["name"] == name).unwrap()["histogram"]["dataPoints"][0];
+    assert!(
+        !point("defaults")["explicitBounds"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        point("empty")["explicitBounds"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
+    assert_eq!(point("empty")["bucketCounts"], serde_json::json!([]));
+    assert_eq!(point("empty")["explicitBounds"], serde_json::json!([]));
+    assert_eq!(point("empty")["count"], "1");
+    assert_eq!(point("empty")["sum"], 2.0);
+    assert_eq!(point("empty")["min"], 2.0);
+    assert_eq!(point("empty")["max"], 2.0);
+    fs::remove_dir_all(path).unwrap();
+}
+#[test]
+fn after_shutdown_never_counts_binds_or_calls_sdk() {
+    if let Some(output) = child("after_shutdown_never_counts_binds_or_calls_sdk") {
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr)
+                .matches("vigil: metric recorded after vigil shutdown; dropped")
+                .count(),
+            1
+        );
+        return;
+    }
+    struct Calls(AtomicU64);
+    impl opentelemetry::metrics::SyncInstrument<u64> for Calls {
+        fn measure(&self, _: u64, _: &[KeyValue]) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let path = dir("shutdown");
+    let (_, guard) = Config::new("shutdown")
+        .dir(&path)
+        .layer::<tracing_subscriber::Registry>()
+        .unwrap();
+    let pipeline = crate::init::published_pipeline().unwrap();
+    let calls = Arc::new(Calls(AtomicU64::new(0)));
+    let counter = Counter::new(crate::scope!(), "bound");
+    assert!(
+        counter
+            .0
+            .handle
+            .set(Some(Bound {
+                handle: opentelemetry::metrics::Counter::new(calls.clone()),
+                pipeline
+            }))
+            .is_ok()
+    );
+    counter.add(1, &[]);
+    assert_eq!(calls.0.load(Ordering::Relaxed), 1);
+    guard.shutdown().unwrap();
+    counter.add(1, &[]);
+    counter.add(1, &[]);
+    let late = Counter::new(crate::scope!(), "late");
+    late.add(1, &[]);
+    assert!(late.0.handle.get().is_none());
+    assert_eq!(calls.0.load(Ordering::Relaxed), 1);
+    pipeline.losses.finish(Ok(())).unwrap();
+    fs::remove_dir_all(path).unwrap();
+}
+#[test]
+fn disabled_metrics_are_silent_even_after_shutdown() {
+    if let Some(output) = child("disabled_metrics_are_silent_even_after_shutdown") {
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("after vigil shutdown"));
+        return;
+    }
+    let path = dir("off");
+    let counter = Counter::new(crate::scope!(), "off");
+    counter.add(1, &[]);
+    let (_, guard) = Config::new("off")
+        .dir(&path)
+        .metrics(false)
+        .layer::<tracing_subscriber::Registry>()
+        .unwrap();
+    counter.add(1, &[]);
+    assert!(matches!(counter.0.handle.get(), Some(None)));
+    assert_eq!(guard.flush().unwrap_err().lost(Signal::Metrics), 1);
+    guard.shutdown().unwrap();
+    counter.add(1, &[]);
+    assert!(!path.join("metrics.jsonl").exists());
+    fs::remove_dir_all(path).unwrap();
+}
+#[test]
+fn storage_failure_caches_no_handle() {
+    if let Some(output) = child("storage_failure_caches_no_handle") {
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("after vigil shutdown"));
+        return;
+    }
+    let path = dir("storage");
+    fs::create_dir_all(path.join("metrics.jsonl")).unwrap();
+    let counter = Counter::new(crate::scope!(), "failed");
+    counter.add(1, &[]);
+    let (_, guard) = Config::new("storage")
+        .dir(&path)
+        .layer::<tracing_subscriber::Registry>()
+        .unwrap();
+    counter.add(1, &[]);
+    assert!(matches!(counter.0.handle.get(), Some(None)));
+    assert_eq!(guard.flush().unwrap_err().lost(Signal::Metrics), 1);
+    guard.shutdown().unwrap();
+    counter.add(1, &[]);
+    fs::remove_dir_all(path).unwrap();
+}
+#[test]
+fn publication_race_drains_at_period_finish_and_drop() {
+    if let Some(output) = child("publication_race_drains_at_period_finish_and_drop") {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("before vigil::init"));
+        assert_eq!(stderr.matches("dropped measurements: 2").count(), 1);
+        return;
+    }
+    let path = dir("race");
+    let (_, guard) = Config::new("race")
+        .dir(&path)
+        .layer::<tracing_subscriber::Registry>()
+        .unwrap();
+    // A producer observed no publication before commit and increments after the startup drain.
+    BEFORE_INIT.fetch_add(2, Ordering::Relaxed);
+    assert_eq!(guard.flush().unwrap_err().lost(Signal::Metrics), 2);
+    guard.flush().unwrap();
+    drop(guard);
+    fs::remove_dir_all(path).unwrap();
+}
+#[test]
+fn mixed_losses_display_in_signal_order() {
+    let losses = Losses::default();
+    losses.record(3, false);
+    losses.measurements_dropped(2);
+    losses.metric_data_points(false);
+    let error = losses.finish(Ok(())).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "DataLost: at least 3 log records lost; at least 2 metric measurements lost; metric data points dropped"
+    );
+    assert_eq!(error.lost(Signal::Logs), 3);
+    assert_eq!(error.lost(Signal::Metrics), 2);
+}
+#[test]
+fn scope_versions_reach_disk_separately() {
+    if child("scope_versions_reach_disk_separately").is_some() {
+        return;
+    }
+    let path = dir("scopes");
+    let (_, guard) = Config::new("scopes")
+        .dir(&path)
+        .layer::<tracing_subscriber::Registry>()
+        .unwrap();
+    Counter::new(Scope::new("declaring", "1"), "requests").add(1, &[]);
+    Counter::new(Scope::new("declaring", "2"), "requests").add(2, &[]);
+    guard.shutdown().unwrap();
+    let json: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(path.join("metrics.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let scopes = json["resourceMetrics"][0]["scopeMetrics"]
+        .as_array()
+        .unwrap();
+    assert_eq!(scopes.len(), 2);
+    assert!(
+        scopes
+            .iter()
+            .any(|s| s["scope"]["name"] == "declaring" && s["scope"]["version"] == "1")
+    );
+    assert!(
+        scopes
+            .iter()
+            .any(|s| s["scope"]["name"] == "declaring" && s["scope"]["version"] == "2")
+    );
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn drop_stops_bound_and_unbound_instruments() {
+    if let Some(output) = child("drop_stops_bound_and_unbound_instruments") {
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr)
+                .matches("vigil: metric recorded after vigil shutdown; dropped")
+                .count(),
+            1
+        );
+        return;
+    }
+    let path = dir("drop");
+    let (_, guard) = Config::new("drop")
+        .dir(&path)
+        .layer::<tracing_subscriber::Registry>()
+        .unwrap();
+    let bound = Counter::new(crate::scope!(), "bound");
+    bound.add(1, &[]);
+    drop(guard);
+    assert!(
+        crate::init::published_pipeline()
+            .unwrap()
+            .stopped
+            .load(Ordering::Acquire)
+    );
+    bound.add(99, &[]);
+    let unbound = Counter::new(crate::scope!(), "unbound");
+    unbound.add(99, &[]);
+    assert!(unbound.0.handle.get().is_none());
+    let all = metrics(&path);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0]["sum"]["dataPoints"][0]["asInt"], 1);
+    fs::remove_dir_all(path).unwrap();
+}
