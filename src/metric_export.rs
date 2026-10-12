@@ -327,6 +327,39 @@ mod tests {
     };
     use std::task::{Context, Poll, Waker};
 
+    #[test]
+    fn metric_scope_permutations_have_identical_bytes() {
+        use opentelemetry_proto::tonic::metrics::v1::{Metric, ResourceMetrics, ScopeMetrics};
+        for family in crate::order_tests::families() {
+            let scopes: Vec<_> = family
+                .into_iter()
+                .enumerate()
+                .map(|(i, scope)| ScopeMetrics {
+                    scope: Some(scope),
+                    metrics: vec![Metric {
+                        name: format!("counter-{i}"),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .collect();
+            let mut expected = None;
+            crate::order_tests::permutations(&scopes, |scope_metrics| {
+                let request = ExportMetricsServiceRequest {
+                    resource_metrics: vec![ResourceMetrics {
+                        scope_metrics,
+                        ..Default::default()
+                    }],
+                };
+                let projected = project(request).unwrap();
+                let bytes =
+                    crate::ordered_json::encode(&projected, "", crate::ordered_json::METRICS)
+                        .unwrap();
+                assert_eq!(*expected.get_or_insert_with(|| bytes.clone()), bytes);
+            });
+        }
+    }
+
     fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
         let mut future = std::pin::pin!(future);
         match future

@@ -548,9 +548,9 @@ fn proto_depth_ok(value: &AnyValue, depth: usize) -> bool {
 /// scopes with such attributes merge or split depending on the hash seed.
 /// Group identity uses name, version, schema URL and sorted attributes, with
 /// Debug retaining distinct non-finite doubles. Shared normalization orders the
-/// projected scopes by decoded name/version/schema URL and metadata values;
-/// strings compare in byte order. Records retain their batch order within each
-/// scope. The batch has one resource, hence exactly one `ResourceLogs`.
+/// projected scopes by the total order in ADR-0001 decision 5, with canonical
+/// whole-element bytes breaking equal metadata ties. Records retain their batch
+/// order within each scope. The batch has one resource, hence exactly one `ResourceLogs`.
 fn group_batch(
     batch: &LogBatch<'_>,
     resource: &ResourceAttributesWithSchema,
@@ -1154,14 +1154,17 @@ mod ordered_tests {
         };
         let request = ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
-                scope_logs: vec![ScopeLogs {
-                    scope: Some(InstrumentationScope {
-                        name: "probe".into(),
+                scope_logs: (0..10)
+                    .rev()
+                    .map(|i| ScopeLogs {
+                        scope: Some(InstrumentationScope {
+                            name: format!("probe-{i:02}"),
+                            ..Default::default()
+                        }),
+                        log_records: vec![record.clone(); 2_000],
                         ..Default::default()
-                    }),
-                    log_records: vec![record; 20_000],
-                    ..Default::default()
-                }],
+                    })
+                    .collect(),
                 ..Default::default()
             }],
         };
@@ -1214,45 +1217,116 @@ mod ordered_tests {
     }
 
     #[test]
-    fn shared_ordering_compares_decoded_versions_and_attribute_values() {
-        let scope = |version: &str, value: &str| ScopeLogs {
-            scope: Some(InstrumentationScope {
-                name: "same".into(),
-                version: version.into(),
-                attributes: vec![opentelemetry_proto::tonic::common::v1::KeyValue {
-                    key: "key".into(),
-                    value: Some(AnyValue {
-                        value: Some(Value::StringValue(value.into())),
-                    }),
+    fn log_scope_permutations_have_identical_bytes() {
+        for family in crate::order_tests::families() {
+            let scopes: Vec<_> = family
+                .into_iter()
+                .enumerate()
+                .map(|(i, scope)| ScopeLogs {
+                    scope: Some(scope),
+                    log_records: vec![LogRecord {
+                        time_unix_nano: i as u64 + 1,
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                }],
+                })
+                .collect();
+            let mut expected = None;
+            crate::order_tests::permutations(&scopes, |scope_logs| {
+                let request = ExportLogsServiceRequest {
+                    resource_logs: vec![ResourceLogs {
+                        scope_logs,
+                        ..Default::default()
+                    }],
+                };
+                let bytes = encode_line(&request).unwrap();
+                assert_eq!(*expected.get_or_insert_with(|| bytes.clone()), bytes);
+            });
+        }
+    }
+
+    #[test]
+    fn shared_ordering_follows_documented_total_order() {
+        let ordered = crate::order_tests::ordered_scopes();
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: ordered
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .map(|scope| ScopeLogs {
+                        scope: Some(scope),
+                        ..Default::default()
+                    })
+                    .collect(),
                 ..Default::default()
-            }),
-            ..Default::default()
+            }],
         };
-        for scopes in [
-            vec![scope("a!", "same"), scope("a", "same")],
-            vec![scope("same", "a!"), scope("same", "a")],
-            vec![scope("same", "a!"), scope("same", "a\n")],
-        ] {
-            let mut request = ExportLogsServiceRequest {
-                resource_logs: vec![ResourceLogs {
-                    scope_logs: scopes,
-                    ..Default::default()
-                }],
-            };
-            let forward = project_json(&request).unwrap();
-            request.resource_logs[0].scope_logs.reverse();
-            assert_eq!(forward, project_json(&request).unwrap());
-            let first = &forward["resourceLogs"][0]["scopeLogs"][0]["scope"];
-            assert!(
-                first["version"] == "a"
-                    || matches!(
-                        first["attributes"][0]["value"]["stringValue"].as_str(),
-                        Some("a" | "a\n")
-                    )
+        let projected = project_json(&request).unwrap();
+        for (i, scope) in projected["resourceLogs"][0]["scopeLogs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                scope["scope"]["droppedAttributesCount"]
+                    .as_u64()
+                    .unwrap_or_default(),
+                i as u64
             );
         }
+        // Decoded version and schema strings precede attributes; attribute
+        // lists compare element-wise, with a common prefix sorting shorter first.
+        for (a, b) in [("a", "a!"), ("a\n", "a!")] {
+            for field in ["version", "schemaUrl"] {
+                let mut value = serde_json::json!({"resourceLogs":[{"scopeLogs":[
+                    {"scope":{"name":"same","version":b},"schemaUrl":b},
+                    {"scope":{"name":"same","version":a},"schemaUrl":a}
+                ]}]});
+                if field == "schemaUrl" {
+                    for scope in value["resourceLogs"][0]["scopeLogs"]
+                        .as_array_mut()
+                        .unwrap()
+                    {
+                        scope["scope"]["version"] = Json::Null;
+                    }
+                }
+                crate::envelope::normalize(&mut value, "", crate::ordered_json::LOGS).unwrap();
+                let first = &value["resourceLogs"][0]["scopeLogs"][0];
+                assert_eq!(
+                    if field == "version" {
+                        &first["scope"][field]
+                    } else {
+                        &first[field]
+                    },
+                    a
+                );
+            }
+        }
+        let family = crate::order_tests::families().pop().unwrap();
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: family[2..]
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .map(|scope| ScopeLogs {
+                        scope: Some(scope),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+        };
+        let projected = project_json(&request).unwrap();
+        assert_eq!(
+            projected["resourceLogs"][0]["scopeLogs"][0]["scope"]["attributes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

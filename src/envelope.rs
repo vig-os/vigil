@@ -250,55 +250,110 @@ pub(crate) fn patch_any_value(value: &AnyValue, json: &mut Json) {
     }
 }
 
-// Compare decoded strings, including prefix and escape characters, rather than
-// their JSON spelling. Object key order must not depend on preserve_order.
-fn compare_json(a: &Json, b: &Json) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let rank = |v: &Json| match v {
-        Json::Null => 0,
-        Json::Bool(_) => 1,
-        Json::Number(_) => 2,
-        Json::String(_) => 3,
-        Json::Array(_) => 4,
-        Json::Object(_) => 5,
-    };
-    match (a, b) {
-        (Json::Bool(a), Json::Bool(b)) => a.cmp(b),
-        (Json::Number(a), Json::Number(b)) => {
-            match (a.as_i64(), b.as_i64(), a.as_u64(), b.as_u64()) {
-                (Some(a), Some(b), _, _) => a.cmp(&b),
-                (_, _, Some(a), Some(b)) => a.cmp(&b),
-                _ => a
-                    .as_f64()
+// ADR-0001 decision 5: compare decoded OTLP values, not JSON spellings.
+fn text(value: &Json) -> &str {
+    value.as_str().unwrap_or_default()
+}
+
+fn compare_attributes(a: &Json, b: &Json) -> std::cmp::Ordering {
+    let a = a.as_array().map(Vec::as_slice).unwrap_or_default();
+    let b = b.as_array().map(Vec::as_slice).unwrap_or_default();
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| {
+            text(&a["key"])
+                .cmp(text(&b["key"]))
+                .then_with(|| compare_any_value(&a["value"], &b["value"]))
+        })
+        .find(|order| !order.is_eq())
+        .unwrap_or_else(|| a.len().cmp(&b.len()))
+}
+
+fn compare_any_value(a: &Json, b: &Json) -> std::cmp::Ordering {
+    const TYPES: [&str; 7] = [
+        "boolValue",
+        "intValue",
+        "doubleValue",
+        "stringValue",
+        "bytesValue",
+        "arrayValue",
+        "kvlistValue",
+    ];
+    let rank = |v: &Json| TYPES.iter().position(|key| !v[*key].is_null());
+    let ra = rank(a);
+    let rb = rank(b);
+    if ra != rb {
+        return ra.cmp(&rb);
+    }
+    match ra {
+        Some(0) => a["boolValue"].as_bool().cmp(&b["boolValue"].as_bool()),
+        Some(1) => {
+            let integer = |v: &Json| {
+                v.as_i64()
+                    .or_else(|| text(v).parse::<i64>().ok())
                     .unwrap_or_default()
-                    .total_cmp(&b.as_f64().unwrap_or_default())
-                    .then_with(|| a.to_string().cmp(&b.to_string())),
-            }
+            };
+            integer(&a["intValue"]).cmp(&integer(&b["intValue"]))
         }
-        (Json::String(a), Json::String(b)) => a.cmp(b),
-        (Json::Array(a), Json::Array(b)) => a
-            .iter()
-            .zip(b)
-            .map(|(a, b)| compare_json(a, b))
-            .find(|o| *o != Ordering::Equal)
-            .unwrap_or_else(|| a.len().cmp(&b.len())),
-        (Json::Object(a), Json::Object(b)) => {
-            let mut a: Vec<_> = a.iter().collect();
-            let mut b: Vec<_> = b.iter().collect();
-            a.sort_unstable_by_key(|(k, _)| *k);
-            b.sort_unstable_by_key(|(k, _)| *k);
+        Some(2) => {
+            let double = |v: &Json| {
+                v.as_f64().unwrap_or_else(|| match text(v) {
+                    "NaN" => f64::NAN,
+                    "Infinity" => f64::INFINITY,
+                    "-Infinity" => f64::NEG_INFINITY,
+                    _ => 0.0,
+                })
+            };
+            double(&a["doubleValue"]).total_cmp(&double(&b["doubleValue"]))
+        }
+        Some(3 | 4) => {
+            let key = TYPES[ra.unwrap_or_default()];
+            text(&a[key]).cmp(text(&b[key]))
+        }
+        Some(5) => {
+            let a = a["arrayValue"]["values"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let b = b["arrayValue"]["values"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             a.iter()
-                .zip(&b)
-                .map(|((ka, a), (kb, b))| ka.cmp(kb).then_with(|| compare_json(a, b)))
-                .find(|o| *o != Ordering::Equal)
+                .zip(b)
+                .map(|(a, b)| compare_any_value(a, b))
+                .find(|order| !order.is_eq())
                 .unwrap_or_else(|| a.len().cmp(&b.len()))
         }
-        _ => rank(a).cmp(&rank(b)),
+        Some(6) => compare_attributes(&a["kvlistValue"]["values"], &b["kvlistValue"]["values"]),
+        _ => std::cmp::Ordering::Equal,
     }
 }
 
+fn compare_element(a: &Json, b: &Json, context: &str) -> std::cmp::Ordering {
+    let key = match context {
+        "scopeLogs" | "scopeMetrics" => "scope",
+        "resourceLogs" | "resourceMetrics" => "resource",
+        _ => "",
+    };
+    if context == "metrics" {
+        return text(&a["name"]).cmp(text(&b["name"]));
+    }
+    if context == "dataPoints" {
+        return compare_attributes(&a["attributes"], &b["attributes"]);
+    }
+    ["name", "version"]
+        .into_iter()
+        .map(|field| text(&a[key][field]).cmp(text(&b[key][field])))
+        .chain(std::iter::once_with(|| {
+            text(&a["schemaUrl"]).cmp(text(&b["schemaUrl"]))
+        }))
+        .find(|order| !order.is_eq())
+        .unwrap_or_else(|| compare_attributes(&a[key]["attributes"], &b[key]["attributes"]))
+}
+
 // Traverse envelope containers only: records, attributes and point values have
-// already been normalized by the typed hooks. Never encode a log batch to sort it.
+// already been normalized by the typed hooks. Encode payloads only to resolve ties.
 pub(crate) fn normalize(value: &mut Json, context: &str, rules: Rules) -> Result<(), String> {
     match value {
         Json::Object(fields) => {
@@ -330,51 +385,40 @@ pub(crate) fn normalize(value: &mut Json, context: &str, rules: Rules) -> Result
             if values.len() < 2 {
                 return Ok(());
             }
-            let key = match context {
-                "resourceLogs" | "resourceMetrics" => Some("resource"),
-                "scopeLogs" | "scopeMetrics" => Some("scope"),
-                "metrics" => Some("name"),
-                "dataPoints" => Some("attributes"),
-                _ => None,
-            };
-            if let Some(key) = key {
-                let mut ordered = values
-                    .drain(..)
-                    .map(|v| {
-                        // Only metric/point ties need the canonical payload, once per
-                        // element. Scope/resource ties keep their input order.
-                        let tie = if matches!(context, "metrics" | "dataPoints") {
-                            ordered_json::encode(&v, context, rules)?
-                        } else {
-                            String::new()
-                        };
-                        Ok((v, tie))
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                ordered.sort_by(|(a, ta), (b, tb)| {
-                    let primary = if key == "scope" {
-                        ["name", "version"]
-                            .into_iter()
-                            .map(|field| {
-                                a[key][field]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .cmp(b[key][field].as_str().unwrap_or_default())
+            if matches!(
+                context,
+                "resourceLogs"
+                    | "resourceMetrics"
+                    | "scopeLogs"
+                    | "scopeMetrics"
+                    | "metrics"
+                    | "dataPoints"
+            ) {
+                values.sort_by(|a, b| compare_element(a, b, context));
+                let mut start = 0;
+                while start < values.len() {
+                    let mut end = start + 1;
+                    while end < values.len()
+                        && compare_element(&values[start], &values[end], context).is_eq()
+                    {
+                        end += 1;
+                    }
+                    if end - start > 1 {
+                        // Encode once, and only inside equal-primary-key groups.
+                        let mut tied = values[start..end]
+                            .iter_mut()
+                            .map(|value| {
+                                let bytes = ordered_json::encode(value, context, rules)?;
+                                Ok((bytes, value.take()))
                             })
-                            .chain(std::iter::once_with(|| {
-                                a["schemaUrl"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .cmp(b["schemaUrl"].as_str().unwrap_or_default())
-                            }))
-                            .find(|o| !o.is_eq())
-                            .unwrap_or_else(|| compare_json(&a[key], &b[key]))
-                    } else {
-                        compare_json(&a[key], &b[key])
-                    };
-                    primary.then_with(|| ta.cmp(tb))
-                });
-                values.extend(ordered.into_iter().map(|(v, _)| v));
+                            .collect::<Result<Vec<_>, String>>()?;
+                        tied.sort_by(|(a, _), (b, _)| a.cmp(b));
+                        for (slot, (_, value)) in values[start..end].iter_mut().zip(tied) {
+                            *slot = value;
+                        }
+                    }
+                    start = end;
+                }
             }
         }
         _ => {}

@@ -54,6 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Audit `Record::new` rejects actions starting with `vigil.audit.` with `InvalidEntry`, reserving that prefix for internal records ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
+- Log scope order on attribute ties now follows the documented total order ([#7](https://github.com/vig-os/vigil/issues/7)).
+
 - Deny missing public documentation and missing error/panic sections across stable and unstable APIs with all features in flake and CI checks ([#44](https://github.com/vig-os/vigil/issues/44)).
 - Apply ADR-0006 decision 3 time-first JSON key order to logs ([#64](https://github.com/vig-os/vigil/issues/64)).
 - Drop log records whose body or attribute AnyValues nest deeper than 16 array/map edges and count them as lost log records; these records were previously exported ([#64](https://github.com/vig-os/vigil/issues/64)).
