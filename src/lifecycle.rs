@@ -834,7 +834,14 @@ mod tests {
             assert_eq!(error.lost(Signal::Metrics), 0);
             assert_eq!(error.lost(Signal::Logs), 0);
             assert!(!error.to_string().contains("log records"));
-            assert_eq!(error.to_string(), format!("{:?}", error.kind()));
+            assert_eq!(
+                error.to_string(),
+                if failed {
+                    "Failed: metric export failed"
+                } else {
+                    "DataLost: metric data points dropped"
+                }
+            );
             assert!(losses.finish(Ok(())).is_ok());
         }
         losses.metric_data_points(true);

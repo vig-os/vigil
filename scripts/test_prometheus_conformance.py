@@ -68,6 +68,8 @@ class QueryTests(unittest.TestCase):
 
     def test_client_http_errors_fail_immediately(self):
         for code in (400, 401, 404, 429):
+            error = urllib.error.HTTPError("url", code, "bad query", {}, io.BytesIO())
+            self.addCleanup(error.close)
             with (
                 self.subTest(code=code),
                 patch.object(oracle.time, "monotonic", side_effect=[0, 0, 1]),
@@ -75,9 +77,7 @@ class QueryTests(unittest.TestCase):
                 patch.object(
                     oracle.urllib.request,
                     "urlopen",
-                    side_effect=urllib.error.HTTPError(
-                        "url", code, "bad query", {}, io.BytesIO()
-                    ),
+                    side_effect=error,
                 ) as request,
                 self.assertRaisesRegex(AssertionError, "app_x.*bad query"),
             ):
