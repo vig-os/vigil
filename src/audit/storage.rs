@@ -49,6 +49,8 @@ pub(crate) struct State {
     newline: bool,
     gap: Option<blake3::Hasher>,
     pending_resume: bool,
+    // A broken hash link in the pending run, cleared by its closing resume.
+    run_loss: bool,
     checkpoint_predecessor: Option<Head>,
     checkpoint_previous: [u8; 32],
 }
@@ -93,6 +95,12 @@ pub(crate) struct TrailReader {
 }
 impl TrailReader {
     /// Reads the marker, settles staging and scans in one acquisition.
+    /// Damaged sealed runs require the matching checkpoint/resume and cumulative
+    /// fold of ADR-0005 amendment 6: an explicit writer/verifier exception.
+    /// A forged archived checkpoint/resume pair can pass without signature trust;
+    /// verification must detect BadSignature/NoReceipt. Empty segments can be
+    /// inserted into a run, and record-free evidence removed, without changing
+    /// the fold because file= is informational.
     pub(crate) fn open_marked(
         path: &Path,
         expected: Option<Head>,
@@ -113,6 +121,13 @@ impl TrailReader {
     }
     /// Scans an existing trail after B2b's staging settlement. `trail` comes
     /// from the checked marker. No signature trust is inferred from disk.
+    /// ADR-0005 amendment 6 deliberately permits damaged sealed runs that the
+    /// verifier reports, only when a matching immediate resume and the cumulative
+    /// MMR fold close the run. State is never reset at a damaged boundary.
+    /// A forged archived checkpoint/resume pair can still pass this reader;
+    /// verification reports BadSignature/NoReceipt. Inserting empty segments into
+    /// a run, or removing record-free segments or unparsable bytes, leaves the
+    /// fold unchanged (file= is informational).
     pub(crate) fn open(
         path: &Path,
         trail: [u8; 16],
@@ -218,15 +233,14 @@ pub(crate) fn existing(dir: &File, name: &Path, writable: bool) -> Result<File, 
 fn initial(dir: &File, trail: [u8; 16], expected: Option<Head>) -> Result<Cache, AuditError> {
     let mut chain = None;
     let mut found = false;
+    let mut run = false;
     let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
     for name in &names {
         let file = existing(dir, name, false)?;
-        chain = Some(scan(
-            &file, trail, chain, true, expected, &mut found, false,
-        )?);
+        chain = history_segment(&file, trail, chain, true, expected, &mut found, &mut run)?;
     }
     let file = existing(dir, Path::new("audit.jsonl"), true)?;
-    let state = scan(&file, trail, chain, true, expected, &mut found, false)?;
+    let state = scan_closing(&file, trail, chain, expected, &mut found, run)?;
     if expected.is_some() && !found {
         return Err(AuditError::new(
             AuditErrorKind::HeadMismatch,
@@ -238,6 +252,262 @@ fn initial(dir: &File, trail: [u8; 16], expected: Option<Head>) -> Result<Cache,
         state,
         sealed_before: names.last().cloned(),
     })
+}
+// Normal segments keep the single-pass strict path. Only damaged history, or
+// history already inside a run, needs the amendment-6 exception. No records are
+// buffered, and the cumulative MMR and cached head are never replaced by a later
+// checkpoint's claimed peaks.
+#[allow(clippy::too_many_arguments)]
+/// Folds a sealed predecessor without resetting state at damaged run boundaries.
+/// The caller must validate a successor with `scan_staged` or `scan_closing`.
+pub(crate) fn history_segment(
+    file: &File,
+    trail: [u8; 16],
+    mut state: Option<State>,
+    opening: bool,
+    expected: Option<Head>,
+    found: &mut bool,
+    run: &mut bool,
+) -> Result<Option<State>, AuditError> {
+    // Decision 8 still applies when a malformed suffix makes the successor
+    // enter the run fallback: a linking opening cannot defer its declaration.
+    let unsealed_boundary = opening && state.as_ref().is_some_and(|s| !sealed(s));
+    match scan_inner(
+        file,
+        trail,
+        state.clone(),
+        opening,
+        expected,
+        found,
+        false,
+        *run,
+    ) {
+        Ok(next) => {
+            *run = false;
+            return Ok(Some(next));
+        }
+        Err(error) if error.kind() == AuditErrorKind::CorruptTrail => {}
+        Err(error) => return Err(error),
+    }
+    let inherited = *run || unsealed_boundary;
+    *run = inherited;
+    let mut damaged = false;
+    let mut first = opening;
+    let mut count = 0;
+    let mut closing = false;
+    let mut must_close = false;
+    let mut prefix = false;
+    let mut invalid_line = false;
+    let mut gap = None::<blake3::Hasher>;
+    let mut file = file.try_clone().map_err(io_error)?;
+    let mut offset = if opening {
+        0
+    } else {
+        state.as_ref().map_or(0, |s| s.offset)
+    };
+    file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+    let mut reader = BufReader::new(file);
+    if !opening
+        && state
+            .as_ref()
+            .is_some_and(|s| !s.newline && s.gap.is_none())
+    {
+        let mut byte = [0];
+        if reader.read(&mut byte).map_err(io_error)? == 1 {
+            if byte != *b"\n" {
+                return Err(corrupt("bytes glued to complete unterminated record"));
+            }
+            offset += 1;
+        }
+    }
+    loop {
+        let mut line = Vec::new();
+        let bytes = reader
+            .by_ref()
+            .take(MAX_READ_BYTES)
+            .read_until(b'\n', &mut line)
+            .map_err(io_error)?;
+        if bytes == 0 {
+            break;
+        }
+        #[cfg(test)]
+        SCANNED.with(|n| n.set(n.get() + bytes));
+        offset += bytes as u64;
+        let newline = line.ends_with(b"\n");
+        let payload = line.strip_suffix(b"\n").unwrap_or(&line);
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(corrupt("audit line exceeds byte cap"));
+        }
+        let records = match Record::parse_line(payload) {
+            Ok(records) => records,
+            Err(error) if error.finding_kind() == Some(super::FindingKind::Unparsable) => {
+                // A fragment-only segment and an Unparsable crash outcome are
+                // retained evidence. Ordinary repair attestations still apply
+                // to fragments between complete records in the same segment.
+                if fragment(payload) {
+                    if !first {
+                        gap.get_or_insert_with(|| {
+                            let mut hash = blake3::Hasher::new();
+                            hash.update(b"vigil.audit.v1.repaired\0");
+                            hash
+                        })
+                        .update(&line);
+                    }
+                } else {
+                    damaged = true;
+                    invalid_line = true;
+                }
+                if count == 0 {
+                    prefix = true;
+                }
+                if count == 1 {
+                    closing = false;
+                }
+                if let Some(s) = &mut state {
+                    s.newline = newline;
+                }
+                continue;
+            }
+            Err(_) => return Err(corrupt("invalid audit record in sealed run")),
+        };
+        if records.len() != 1 {
+            return Err(corrupt("multiple records in native audit line"));
+        }
+        let record = &records[0];
+        if record.context.trail != trail {
+            return Err(corrupt("trail identity differs from marker"));
+        }
+        if invalid_line {
+            return Err(corrupt("unparsable line before complete record"));
+        }
+        if !(first || closing && count == 1)
+            && state.as_ref().is_some_and(|s| s.head == Head::of(record))
+        {
+            if let Some(hash) = gap.take()
+                && record.context.repaired != Some(*hash.finalize().as_bytes())
+            {
+                return Err(corrupt("missing or mismatched repair attestation"));
+            }
+            continue;
+        }
+        if state
+            .as_ref()
+            .is_some_and(|s| record.context.seq <= s.head.seq)
+        {
+            return Err(corrupt(
+                "record sequence did not increase inside sealed run",
+            ));
+        }
+        let broken = first
+            && state
+                .as_ref()
+                .is_some_and(|s| record.context.previous != s.head.hash);
+        if first && (!matches!(record.kind, Kind::Checkpoint(_)) || broken) {
+            damaged = true;
+        }
+        // The first present complete record is the base, never the first
+        // checkpoint found later in a headless segment.
+        if state.is_none() && !matches!(record.kind, Kind::Checkpoint(_)) {
+            return Err(corrupt("missing initial checkpoint"));
+        }
+        let outside_run = inherited && !*run;
+        if !first
+            && !outside_run
+            && state
+                .as_ref()
+                .is_some_and(|s| record.context.seq != s.head.seq + 1)
+        {
+            return Err(corrupt("sequence gap inside sealed run segment"));
+        }
+        if let Some(hash) = gap.take()
+            && record.context.repaired != Some(*hash.finalize().as_bytes())
+        {
+            return Err(corrupt("missing or mismatched repair attestation"));
+        }
+        if first {
+            // A segment may close one run and, through damage later in the
+            // same file, start another. Compare this checkpoint before treating
+            // the remaining in-run checkpoints solely as leaves.
+            let mut trial = state.clone();
+            closing = inherited
+                && !prefix
+                && !damaged
+                && apply(record, &mut trial, state.is_none()).is_ok();
+            if inherited && matches!(record.kind, Kind::Checkpoint(_)) && !broken && !closing {
+                return Err(corrupt("first successor does not close sealed run"));
+            }
+            must_close = closing;
+        }
+        let is_resume = matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume");
+        if count == 1 && closing {
+            // A complete second record resolves the EOF obligation; its kind
+            // and declaration are checked independently before closing the run.
+            must_close = false;
+            if !is_resume {
+                return Err(corrupt("first successor lacks immediate resume"));
+            }
+            *run = false;
+        }
+        let before_loss = !(broken || state.as_ref().is_some_and(|s| s.run_loss));
+        apply_checked(
+            record,
+            &mut state,
+            false,
+            broken,
+            outside_run || before_loss,
+        )?;
+        let s = state.as_mut().ok_or_else(|| corrupt("missing head"))?;
+        if count == 1 && closing {
+            s.run_loss = false;
+        }
+        if expected == Some(s.head) {
+            *found = true;
+        }
+        s.offset = offset;
+        s.newline = newline;
+        first = false;
+        count += 1;
+    }
+    if must_close && *run {
+        return Err(corrupt("first successor lacks resume"));
+    }
+    if count == 0 {
+        damaged = true;
+    }
+    if !damaged && !*run {
+        return Err(corrupt("invalid undamaged segment"));
+    }
+    if damaged {
+        *run = true;
+    }
+    if let Some(s) = &mut state {
+        if s.pending_resume {
+            return Err(corrupt("resume checkpoint lacks its declaration"));
+        }
+        s.length = offset;
+        s.gap = gap;
+    }
+    Ok(state)
+}
+/// Validates a staging successor, requiring a genesis link without a predecessor
+/// and an immediate resume when the predecessor history ends inside a run.
+pub(crate) fn scan_staged(
+    file: &File,
+    trail: [u8; 16],
+    state: Option<State>,
+    run: bool,
+) -> Result<State, AuditError> {
+    scan_inner(file, trail, state, true, None, &mut false, true, run)
+}
+fn scan_closing(
+    file: &File,
+    trail: [u8; 16],
+    state: Option<State>,
+    expected: Option<Head>,
+    found: &mut bool,
+    run: bool,
+) -> Result<State, AuditError> {
+    scan_inner(file, trail, state, true, expected, found, false, run)
 }
 fn sealed(state: &State) -> bool {
     // A complete JSON checkpoint without LF is still a record (ADR-0005 d5).
@@ -273,14 +543,15 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
     if old.len() < cache.state.length {
         return Err(corrupt("old live descriptor was truncated"));
     }
-    let mut state = scan(
+    let mut run = false;
+    let mut state = history_segment(
         &cache.file,
         trail,
         Some(cache.state.clone()),
         false,
         None,
         &mut found,
-        false,
+        &mut run,
     )?;
     // Locate the old descriptor by metadata, never by rereading historical
     // contents. If archived, the previous sealed name remains a lower bound.
@@ -301,10 +572,10 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
             continue;
         }
         let file = existing(dir, name, false)?;
-        state = scan(&file, trail, Some(state), true, None, &mut found, false)?;
+        state = history_segment(&file, trail, state, true, None, &mut found, &mut run)?;
     }
     let file = existing(dir, Path::new("audit.jsonl"), true)?;
-    let state = scan(&file, trail, Some(state), true, None, &mut found, false)?;
+    let state = scan_closing(&file, trail, state, None, &mut found, run)?;
     *cache = Cache {
         file,
         state,
@@ -321,12 +592,27 @@ const MAX_READ_BYTES: u64 = MAX_PAYLOAD_BYTES as u64 + 2; // LF plus one excess 
 pub(crate) fn scan(
     file: &File,
     trail: [u8; 16],
-    mut state: Option<State>,
+    state: Option<State>,
     opening: bool,
     expected: Option<Head>,
     found: &mut bool,
     genesis: bool,
 ) -> Result<State, AuditError> {
+    scan_inner(file, trail, state, opening, expected, found, genesis, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_inner(
+    file: &File,
+    trail: [u8; 16],
+    mut state: Option<State>,
+    opening: bool,
+    expected: Option<Head>,
+    found: &mut bool,
+    genesis: bool,
+    run: bool,
+) -> Result<State, AuditError> {
+    let genesis = genesis || (run && state.is_none());
     let mut file = file.try_clone().map_err(io_error)?;
     let start = if opening {
         0
@@ -341,7 +627,7 @@ pub(crate) fn scan(
     // 406/411/770 allow its trailing fragment and require writer/verifier parity.
     // Defer an unclosed predecessor's boundary until the successor's immediate
     // resume validates head/hash/lost_through below; file= is informational (525).
-    let mut boundary_resume = opening && state.as_ref().is_some_and(|s| !sealed(s));
+    let mut boundary_resume = opening && (run || state.as_ref().is_some_and(|s| !sealed(s)));
     let mut gap = None::<blake3::Hasher>;
     if !opening
         && let Some(s) = &state
@@ -446,6 +732,19 @@ pub(crate) fn scan(
     Ok(state)
 }
 fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<(), AuditError> {
+    apply_checked(record, state, genesis, false, true)?;
+    if let Some(s) = state {
+        s.run_loss = false;
+    }
+    Ok(())
+}
+fn apply_checked(
+    record: &Record,
+    state: &mut Option<State>,
+    genesis: bool,
+    broken_boundary: bool,
+    compare_mmr: bool,
+) -> Result<(), AuditError> {
     let head = Head::of(record);
     let root_link =
         state.is_none() && record.context.previous == Record::genesis(&record.context.trail);
@@ -461,6 +760,9 @@ fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<()
         if (genesis || head.seq == 0) && !root_link {
             return Err(corrupt("initial checkpoint does not link genesis"));
         }
+        if root_link && head.seq > 0 && cp.size != 1 {
+            return Err(corrupt("genesis resume must carry one creation leaf"));
+        }
         Mmr::from_peaks(cp.size, cp.peaks.clone()).map_err(|_| corrupt("invalid opening peaks"))?
     };
     let prior = state.as_ref().map(|s| s.head);
@@ -468,7 +770,7 @@ fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<()
         if head == s.head {
             return Ok(());
         } // Collector-style identical duplicates add no leaf.
-        if head.seq <= s.head.seq || record.context.previous != s.head.hash {
+        if head.seq <= s.head.seq || (!broken_boundary && record.context.previous != s.head.hash) {
             return Err(corrupt(
                 "record rolled back, changed or broke its hash link",
             ));
@@ -478,7 +780,7 @@ fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<()
         {
             return Err(corrupt("sequence gap lacks a resume declaration"));
         }
-        if head.seq != s.head.seq + 1 {
+        if !broken_boundary && head.seq != s.head.seq + 1 {
             if !matches!(record.kind, Kind::Checkpoint(_)) {
                 return Err(corrupt("sequence gap without checkpoint"));
             }
@@ -487,7 +789,9 @@ fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<()
     }
     match &record.kind {
         Kind::Checkpoint(cp) => {
-            if cp.size != mmr.size() || cp.root != mmr.root() || cp.peaks != mmr.peaks() {
+            if compare_mmr
+                && (cp.size != mmr.size() || cp.root != mmr.root() || cp.peaks != mmr.peaks())
+            {
                 return Err(corrupt("checkpoint MMR differs from preceding records"));
             }
         }
@@ -556,6 +860,7 @@ fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<()
         newline: true,
         gap: None,
         pending_resume: pending,
+        run_loss: broken_boundary || state.as_ref().is_some_and(|s| s.run_loss),
         checkpoint_predecessor: prior,
         checkpoint_previous: record.context.previous,
     });
