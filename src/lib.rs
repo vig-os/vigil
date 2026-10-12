@@ -60,13 +60,18 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 // state, even after a scoped default ends. Keep these tests in fresh children.
 #[cfg(test)]
 fn subscriber_test_child(name: &str) -> bool {
-    const CHILD: &str = "VIGIL_SUBSCRIBER_TEST_CHILD";
-    if std::env::var(CHILD).as_deref() == Ok(name) {
-        return true;
+    test_child(name, "VIGIL_SUBSCRIBER_TEST_CHILD").is_none()
+}
+
+// Share execution and verification so an incorrect --exact name cannot pass silently.
+#[cfg(test)]
+fn test_child(name: &str, child_env: &str) -> Option<std::process::Output> {
+    if std::env::var(child_env).as_deref() == Ok(name) {
+        return None;
     }
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])
-        .env(CHILD, name)
+        .env(child_env, name)
         .output()
         .unwrap();
     assert!(
@@ -76,11 +81,21 @@ fn subscriber_test_child(name: &str) -> bool {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    false
+    Some(output)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn child_runner_rejects_a_missing_test() {
+        assert!(
+            std::panic::catch_unwind(|| {
+                super::test_child("tests::missing_test", "VIGIL_MISSING_TEST_CHILD");
+            })
+            .is_err()
+        );
+    }
+
     #[test]
     fn version_is_the_package_version() {
         assert_eq!(super::VERSION, env!("CARGO_PKG_VERSION"));

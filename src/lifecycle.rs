@@ -85,8 +85,10 @@ impl FlushError {
     /// A failed durable log line counts its records even if another copy
     /// reached a remote receiver. Traces currently return zero; their
     /// implementation lands in #8. Metrics count measurements
-    /// that never reached the SDK, excluding data-point export failures and
-    /// measurements aggregated before a later name conflict (ADR-0003 d23).
+    /// that never reached the SDK, including records made before initialization.
+    /// Records made while metrics are off or failed are not counted, nor are
+    /// data-point export failures or measurements aggregated before a later name
+    /// conflict (ADR-0003 d23).
     /// Records rejected after shutdown begins are not counted.
     pub fn lost(&self, signal: Signal) -> u64 {
         match signal {
