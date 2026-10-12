@@ -163,6 +163,7 @@ jobs:
         run: |
           nix develop -c python3 -m unittest discover -s scripts
           nix develop -c python3 scripts/conformance.py
+          nix develop -c python3 scripts/prometheus_conformance.py
 
   supply-chain:
     if: ${{ !inputs.label-only }}

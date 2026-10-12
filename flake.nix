@@ -48,6 +48,7 @@
           pkgs.cargo-semver-checks
           pkgs.cargo-public-api
           pkgs.opentelemetry-collector-contrib
+          pkgs.prometheus
           pkgs.python3
         ];
 
