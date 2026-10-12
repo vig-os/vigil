@@ -58,6 +58,14 @@ fn pair(a: Declaration, b: Declaration, conflict: bool) {
     assert_eq!(handle.is_none(), conflict);
     assert_eq!(first.load(Ordering::Acquire), conflict);
     assert_eq!(second.load(Ordering::Acquire), conflict);
+    if a == b {
+        assert_eq!(
+            registry.0.lock().unwrap().names[&a.name.to_ascii_lowercase()]
+                .declarations
+                .len(),
+            1
+        );
+    }
     if conflict {
         // Two record calls, one on each already bound poison flag.
         for flag in [&first, &second] {
@@ -102,10 +110,48 @@ fn pair(a: Declaration, b: Declaration, conflict: bool) {
     assert_eq!(request.resource_metrics.is_empty(), conflict);
     assert!(losses.finish(Ok(())).is_ok());
 }
+fn pair_test(name: &str, a: Declaration, b: Declaration, conflict: bool, info: usize) {
+    if let Some(out) = crate::test_child(
+        &format!("metric_identity::tests::{name}"),
+        "VIGIL_IDENTITY_CHILD",
+    ) {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<_> = stderr
+            .lines()
+            .filter(|l| l.starts_with("vigil: conflicting metric instruments:"))
+            .collect();
+        assert_eq!(lines.len(), usize::from(conflict), "{stderr}");
+        assert_eq!(
+            stderr
+                .matches("Prometheus needs otlp.promote_scope_metadata: true")
+                .count(),
+            info,
+            "{stderr}"
+        );
+        if conflict {
+            let mut declarations = vec![a, b];
+            declarations.sort_by(Declaration::compare);
+            assert_eq!(
+                lines[0],
+                format!(
+                    "vigil: conflicting metric instruments: {declarations:?}; conflicting names dropped"
+                )
+            );
+        }
+        if info != 0 {
+            assert!(stderr.contains("crate-a@1 and crate-b@1"), "{stderr}");
+        }
+        if !conflict && info == 0 {
+            assert!(stderr.is_empty(), "{stderr}");
+        }
+    } else {
+        pair(a, b, conflict);
+    }
+}
 macro_rules! cases {
     ($($forward:ident, $reverse:ident: $a:expr, $b:expr, $conflict:literal, $info:literal;)+) => {$(
-        #[test] fn $forward() { if child(stringify!($forward), usize::from($conflict), $info) { pair($a, $b, $conflict); } }
-        #[test] fn $reverse() { if child(stringify!($reverse), usize::from($conflict), $info) { pair($b, $a, $conflict); } }
+        #[test] fn $forward() { pair_test(stringify!($forward), $a, $b, $conflict, $info); }
+        #[test] fn $reverse() { pair_test(stringify!($reverse), $b, $a, $conflict, $info); }
     )+};
 }
 cases! {
@@ -297,6 +343,140 @@ fn poisoning_without_records_is_reported_once() {
     assert_eq!(
         error.to_string(),
         "DataLost: metric names poisoned by conflicting declarations"
+    );
+    assert!(losses.finish(Ok(())).is_ok());
+}
+
+fn multi(name: &str, order: [usize; 3], abc: bool, diagnostics: usize, drops: u64) {
+    let ds = if abc {
+        [
+            declaration("crate-a", "app.x", Kind::Counter, "", "d1", None),
+            declaration("crate-b", "app.x", Kind::Counter, "", "d2", None),
+            declaration("crate-b", "app.x", Kind::Counter, "", "d3", None),
+        ]
+    } else {
+        [
+            counter("crate-a", "app.x", "ms"),
+            counter("crate-a", "app.x", "s"),
+            counter("crate-a", "app.x.seconds", ""),
+        ]
+    };
+    if let Some(out) = crate::test_child(
+        &format!("metric_identity::tests::{name}"),
+        "VIGIL_IDENTITY_CHILD",
+    ) {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<_> = stderr
+            .lines()
+            .filter(|l| l.starts_with("vigil: conflicting metric instruments:"))
+            .collect();
+        assert_eq!(lines.len(), diagnostics, "{stderr}");
+        let groups = if abc {
+            vec![vec![1, 2]]
+        } else {
+            match order {
+                [0, 1, 2] | [1, 0, 2] => vec![vec![0, 1], vec![1, 2]],
+                [0, 2, 1] | [2, 0, 1] => vec![vec![0, 1, 2]],
+                _ => vec![vec![1, 2]],
+            }
+        };
+        for (line, group) in lines.iter().zip(groups) {
+            let mut expected: Vec<_> = group.into_iter().map(|i| ds[i].clone()).collect();
+            expected.sort_by(Declaration::compare);
+            assert_eq!(
+                *line,
+                format!(
+                    "vigil: conflicting metric instruments: {expected:?}; conflicting names dropped"
+                )
+            );
+        }
+        return;
+    }
+    let registry = Registry::default();
+    let losses = Losses::default();
+    let mut flags = Vec::new();
+    for i in order {
+        let (flag, _) = registry.bind(ds[i].clone(), &losses, || ());
+        if flag.load(Ordering::Acquire) {
+            losses.measurements_dropped(1);
+        }
+        flags.push(flag);
+    }
+    for flag in flags {
+        assert!(flag.load(Ordering::Acquire));
+        losses.measurements_dropped(1);
+    }
+    let state = registry.0.lock().unwrap();
+    assert!(
+        state
+            .names
+            .values()
+            .all(|n| n.poisoned.load(Ordering::Acquire))
+    );
+    assert_eq!(state.names.len(), if abc { 1 } else { 2 });
+    drop(state);
+    let error = losses.finish(Ok(())).unwrap_err();
+    assert_eq!(error.kind(), FlushErrorKind::DataLost);
+    assert_eq!(error.lost(Signal::Metrics), drops);
+    assert!(
+        error
+            .to_string()
+            .contains("metric names poisoned by conflicting declarations")
+    );
+    assert!(losses.finish(Ok(())).is_ok());
+}
+macro_rules! multi_cases {
+    ($($name:ident: $order:expr,$abc:literal,$diag:literal,$drops:literal;)+) => {$(
+        #[test] fn $name() { multi(stringify!($name),$order,$abc,$diag,$drops); }
+    )+};
+}
+multi_cases! {
+    d123: [0,1,2],false,2,5;
+    d213: [1,0,2],false,2,5;
+    d132: [0,2,1],false,1,4;
+    d231: [1,2,0],false,1,5;
+    d312: [2,0,1],false,1,4;
+    d321: [2,1,0],false,1,5;
+    abc: [0,1,2],true,1,4;
+    bac: [1,0,2],true,1,4;
+    acb: [0,2,1],true,1,4;
+    bca: [1,2,0],true,1,5;
+    cab: [2,0,1],true,1,4;
+    cba: [2,1,0],true,1,5;
+}
+#[test]
+fn d0123_already_poisoned_is_indexed() {
+    if !child("d0123_already_poisoned_is_indexed", 2, 0) {
+        return;
+    }
+    let registry = Registry::default();
+    let losses = Losses::default();
+    for d in [
+        counter("crate-a", "app.x", "By"),
+        counter("crate-a", "app.x", "ms"),
+        counter("crate-a", "app.x", "s"),
+        counter("crate-a", "app.x.seconds", ""),
+    ] {
+        let (flag, _) = registry.bind(d, &losses, || ());
+        if flag.load(Ordering::Acquire) {
+            losses.measurements_dropped(1);
+        }
+    }
+    let state = registry.0.lock().unwrap();
+    assert!(
+        state.names["app.x.seconds"]
+            .poisoned
+            .load(Ordering::Acquire)
+    );
+    assert_eq!(state.names["app.x"].declarations.len(), 3);
+    drop(state);
+    let error = losses.finish(Ok(())).unwrap_err();
+    assert_eq!(error.kind(), FlushErrorKind::DataLost);
+    assert_eq!(error.lost(Signal::Metrics), 3);
+    assert!(
+        error
+            .to_string()
+            .contains("metric names poisoned by conflicting declarations")
     );
     assert!(losses.finish(Ok(())).is_ok());
 }
