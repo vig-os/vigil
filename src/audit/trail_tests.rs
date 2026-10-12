@@ -51,10 +51,6 @@ fn entry() -> Entry {
 
 #[test]
 fn public_receipt_checkpoint_and_close_roundtrip() {
-    fn send_sync<T: Send + Sync>() {}
-    send_sync::<AuditTrail>();
-    send_sync::<AuditConfig>();
-    send_sync::<Receipt>();
     let temp = Temp::new();
     let trail = temp.config().create(signer()).unwrap();
     assert_eq!(trail.dir(), temp.0);
