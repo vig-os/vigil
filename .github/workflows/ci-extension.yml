@@ -94,8 +94,6 @@ jobs:
         run: nix develop -c python3 scripts/check_public_api.py
       - name: Unstable API compilation
         run: nix develop -c env RUSTFLAGS="--cfg vigil_unstable" cargo check --locked --all-features
-      - name: Unstable clippy
-        run: nix develop -c env RUSTFLAGS="--cfg vigil_unstable" cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Unstable exporter and sink tests
         run: |
           nix develop -c env RUSTFLAGS="--cfg vigil_unstable" cargo test --locked --lib --bins --tests --examples --all-features

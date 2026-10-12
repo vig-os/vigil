@@ -92,6 +92,58 @@
             name: value: nixpkgs.lib.nameValuePair "audit-${name}" value
           ) audit.checks;
 
+        # ADR-0004 covers every combination of user features. `default` is
+        # Cargo's feature selector; test-preserve-order is CI-only consumer
+        # unification coverage and remains covered by the all-features checks.
+        cargoManifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+        userFeatures = builtins.filter (name: name != "default" && name != "test-preserve-order") (
+          builtins.attrNames cargoManifest.features
+        );
+        # #41's push feature will double today's 4 sets to 8. Above 16,
+        # require a ruling rather than silently sampling the stable surface.
+        featureSets =
+          assert pkgs.lib.assertMsg (
+            builtins.length userFeatures <= 4
+          ) "Clippy feature powerset would exceed 16 sets; request a ruling before adding more features";
+          builtins.foldl' (sets: feature: sets ++ map (set: set ++ [ feature ]) sets) [ [ ] ] userFeatures;
+        featureClippyChecks = builtins.listToAttrs (
+          pkgs.lib.concatMap (
+            features:
+            let
+              suffix = if features == [ ] then "no-default" else pkgs.lib.concatStringsSep "-" features;
+              featureArgs =
+                "--no-default-features"
+                + pkgs.lib.optionalString (features != [ ]) (
+                  " --features " + pkgs.lib.concatStringsSep "," features
+                );
+              # Reuse the all-features dependency artifacts. Cargo rebuilds
+              # only where feature selection or RUSTFLAGS changes fingerprints.
+              clippyFor =
+                unstable:
+                audit.craneLib.cargoClippy (
+                  audit.commonArgs
+                  // {
+                    inherit (audit) cargoArtifacts;
+                    cargoExtraArgs = featureArgs;
+                    cargoClippyExtraArgs = "--all-targets -- -D warnings";
+                  }
+                  // pkgs.lib.optionalAttrs unstable {
+                    RUSTFLAGS = (audit.commonArgs.RUSTFLAGS or "") + " --cfg vigil_unstable";
+                  }
+                );
+            in
+            map
+              (unstable: {
+                name = "clippy-${suffix}" + pkgs.lib.optionalString unstable "-unstable";
+                value = clippyFor unstable;
+              })
+              [
+                false
+                true
+              ]
+          ) featureSets
+        );
+
         # Independent of rust-toolchain.toml: ADR-0004 decision 11.
         fenix = vigos.inputs.fenix.packages.${system};
         msrvVersion = "1.95.0";
@@ -297,29 +349,32 @@
 
         };
 
-        checks = rustChecks // {
-          # Docs.rs exposes this surface too. Enforce the Cargo documentation
-          # lints for all features with vigil_unstable, as CI already does.
-          unstable-clippy = audit.checks.clippy.overrideAttrs (old: {
-            RUSTFLAGS = (old.RUSTFLAGS or "") + " --cfg vigil_unstable";
-          });
-          changelog =
-            pkgs.runCommand "changelog-check"
-              {
-                nativeBuildInputs = [
-                  pkgs.python3
-                  pkgs.git
-                ];
-              }
-              ''
-                export HOME="$TMPDIR"
-                cd ${self}
-                python3 scripts/check_changelog.py
-                python3 -m unittest discover -s scripts -p test_check_changelog.py -v
-                python3 -m unittest discover -s scripts -p test_check_rust_version.py -v
-                touch "$out"
-              '';
-        };
+        checks =
+          rustChecks
+          // featureClippyChecks
+          // {
+            # Docs.rs exposes this surface too. Enforce the Cargo documentation
+            # lints for all features with vigil_unstable, as CI already does.
+            unstable-clippy = audit.checks.clippy.overrideAttrs (old: {
+              RUSTFLAGS = (old.RUSTFLAGS or "") + " --cfg vigil_unstable";
+            });
+            changelog =
+              pkgs.runCommand "changelog-check"
+                {
+                  nativeBuildInputs = [
+                    pkgs.python3
+                    pkgs.git
+                  ];
+                }
+                ''
+                  export HOME="$TMPDIR"
+                  cd ${self}
+                  python3 scripts/check_changelog.py
+                  python3 -m unittest discover -s scripts -p test_check_changelog.py -v
+                  python3 -m unittest discover -s scripts -p test_check_rust_version.py -v
+                  touch "$out"
+                '';
+          };
         packages = rust.packages // {
           vigil = rust.packages.default;
         };
