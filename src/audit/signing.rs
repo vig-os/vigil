@@ -50,6 +50,8 @@ impl KeyFileSigner {
     /// Loads a regular seed file owned by the effective user with no group or
     /// other permission bits (ADR-0005 decision 9, amendment 7).
     /// Symlinks are followed; metadata checks use the opened descriptor.
+    /// Surrounding ASCII whitespace is allowed. Non-regular files are refused
+    /// either at open with an I/O error or after open as "not a regular file".
     ///
     /// **Use the secret seed file, never a public key or `.pub` file.** A public
     /// key silently derives a different signing key: compare [`Signer::public_key`]
@@ -117,8 +119,9 @@ pub(crate) fn check_key_metadata(
 ) -> Result<(), SignerError> {
     if mode & 0o077 != 0 {
         return Err(SignerError::new(format!(
-            "key file has group or other permission bits: {} ({mode:o})",
-            path.display()
+            "key file has group or other permission bits: {} ({:o})",
+            path.display(),
+            mode & 0o7777
         )));
     }
     if uid != euid {
@@ -131,7 +134,10 @@ pub(crate) fn check_key_metadata(
 }
 
 pub(crate) fn parse_hex_seed(text: &str) -> Result<ed25519_dalek::SigningKey, SignerError> {
-    let text = text.trim().as_bytes();
+    let text = text.trim_ascii().as_bytes();
+    if !text.is_ascii() {
+        return Err(SignerError::new("seed contains non-hex characters"));
+    }
     if text.len() != 64 {
         return Err(SignerError::new(
             "seed must contain exactly 64 hex characters",

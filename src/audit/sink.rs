@@ -150,7 +150,7 @@ pub(super) fn line(record: &Record) -> Result<Vec<u8>, AuditError> {
 }
 pub(crate) fn sync_io(file: &File, site: &'static str) -> std::io::Result<()> {
     #[cfg(test)]
-    hooks::event(site)?;
+    hooks::sync_event(file, site)?;
     if site.ends_with("dir") || site == "marker" {
         file.sync_all()?;
     } else {
@@ -737,6 +737,7 @@ mod hooks {
         pub(super) static SHORT: Cell<Option<usize>> = const { Cell::new(None) };
         pub(super) static FAIL: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
         pub(super) static EVENTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+        pub(super) static SYNC_EVENTS: RefCell<Vec<(&'static str, u64, u64)>> = const { RefCell::new(Vec::new()) };
     }
     pub(super) fn stderr(message: &str) {
         STDERR.with(|lines| lines.borrow_mut().push(message.to_owned()));
@@ -758,6 +759,16 @@ mod hooks {
                 observe(site);
             }
         });
+    }
+    pub(super) fn sync_event(file: &std::fs::File, site: &'static str) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = file.metadata()?;
+        SYNC_EVENTS.with(|events| {
+            events
+                .borrow_mut()
+                .push((site, metadata.dev(), metadata.ino()))
+        });
+        event(site)
     }
     pub(super) fn event(site: &'static str) -> io::Result<()> {
         OBSERVE.with(|observe| {

@@ -13,6 +13,7 @@ impl Temp {
         hooks::SHORT.with(|s| s.set(None));
         hooks::HALF.with(|s| s.set(false));
         hooks::EVENTS.with(|e| e.borrow_mut().clear());
+        hooks::SYNC_EVENTS.with(|e| e.borrow_mut().clear());
         let path = std::env::temp_dir().join(format!(
             "vigil-sink-{}-{}",
             std::process::id(),
@@ -1942,11 +1943,10 @@ fn key_load_checks_descriptor() {
     let path = t.0.join("key.seed");
     crate::audit::keygen(&path).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-    let mode = fs::metadata(&path).unwrap().permissions().mode();
     assert_eq!(
         KeyFileSigner::load(&path).unwrap_err().to_string(),
         format!(
-            "key file has group or other permission bits: {} ({mode:o})",
+            "key file has group or other permission bits: {} (640)",
             path.display()
         )
     );
@@ -2044,6 +2044,10 @@ fn keygen_fresh_round_trip_and_never_overwrites() {
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
     );
+    assert_eq!(
+        fs::metadata(&pub_path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
     assert_eq!(public, format!("{}\n", hex(&key)).as_bytes());
     assert!(!t.0.join("key.pub").exists());
     let signer = KeyFileSigner::load(&path).unwrap();
@@ -2096,6 +2100,21 @@ fn keygen_sync_order_and_cleanup() {
             ["keygen-seed", "keygen-pub", "keygen-dir"]
         )
     });
+    use std::os::unix::fs::MetadataExt as _;
+    let identity = |site, path: &std::path::Path| {
+        let metadata = fs::metadata(path).unwrap();
+        (site, metadata.dev(), metadata.ino())
+    };
+    hooks::SYNC_EVENTS.with(|events| {
+        assert_eq!(
+            *events.borrow(),
+            [
+                identity("keygen-seed", &path),
+                identity("keygen-pub", &t.0.join("key.seed.pub")),
+                identity("keygen-dir", &t.0),
+            ]
+        )
+    });
     for site in ["keygen-seed", "keygen-pub", "keygen-dir"] {
         let path = t.0.join(site);
         hooks::FAIL.with(|fail| *fail.borrow_mut() = vec![site]);
@@ -2125,5 +2144,43 @@ fn keygen_bare_relative_name() {
             .status()
             .unwrap()
             .success()
+    );
+}
+
+#[test]
+fn keygen_uses_entropy() {
+    let first = Temp::new();
+    let second = Temp::new();
+    let first_path = first.0.join("key.seed");
+    let second_path = second.0.join("key.seed");
+    let first_key = crate::audit::keygen(&first_path).unwrap();
+    let second_key = crate::audit::keygen(&second_path).unwrap();
+    assert_ne!(first_key, second_key);
+    assert_ne!(
+        fs::read(first_path).unwrap(),
+        fs::read(second_path).unwrap()
+    );
+}
+
+#[test]
+fn key_load_refuses_socket() {
+    let t = Temp::new();
+    let path = t.0.join("socket");
+    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    assert!(KeyFileSigner::load(&path).is_err());
+}
+
+#[test]
+fn key_load_ascii_whitespace_only() {
+    let t = Temp::new();
+    let path = t.0.join("key.seed");
+    let key = crate::audit::keygen(&path).unwrap();
+    let seed = fs::read_to_string(&path).unwrap();
+    fs::write(&path, format!(" \t\r\n{}\r\n\t ", seed.trim_ascii())).unwrap();
+    assert_eq!(KeyFileSigner::load(&path).unwrap().public_key(), key);
+    fs::write(&path, format!("\u{00a0}{}\u{00a0}", seed.trim_ascii())).unwrap();
+    assert_eq!(
+        KeyFileSigner::load(&path).unwrap_err().to_string(),
+        "seed contains non-hex characters"
     );
 }
