@@ -1423,6 +1423,221 @@ mod runs {
             corrupt_open(&d.0);
         }
     }
+    fn successor_obligation_probe(kind: u8) {
+        let d = Temp::new();
+        let first = base(&d);
+        put(&d, 0, &[&first], &[]);
+        let kept = headless(&first, 3);
+        put(&d, 1, &[&kept], &[]);
+        let mut fold = seeded_pair(&first, &kept);
+        let wrong_fold = seeded(&first);
+        let cp = signed(
+            if kind == 1 { 7 } else { 4 },
+            kept.hash(),
+            if kind == 1 { &wrong_fold } else { &fold },
+        );
+        let next = if kind == 1 {
+            declaration(&cp, 3, kept.hash(), 6, None)
+        } else {
+            entry(&cp)
+        };
+        if kind == 0 {
+            // Falsifier: the first successor is only cp@4; a later live pair
+            // cannot discharge its missing declaration.
+            put(&d, 2, &[&cp], &[]);
+        } else {
+            put(&d, 2, &[&cp, &next], b"junk\n");
+        }
+        fold.push(cp.hash()).unwrap();
+        let last = if kind == 0 {
+            &cp
+        } else {
+            fold.push(next.hash()).unwrap();
+            &next
+        };
+        close_run(&d, last, &fold);
+        corrupt_open(&d.0);
+    }
+    #[test]
+    fn successor_checkpoint_alone_cannot_defer_resume() {
+        successor_obligation_probe(0);
+    }
+    #[test]
+    fn successor_wrong_fold_with_suffix_cannot_defer_resume() {
+        successor_obligation_probe(1);
+    }
+    #[test]
+    fn successor_wrong_action_with_suffix_cannot_defer_resume() {
+        successor_obligation_probe(2);
+    }
+
+    fn unsealed_successor_probe(path: u8) {
+        use crate::audit::sink::{Config, Sink};
+        use std::sync::Arc;
+        for suffix in [b"".as_slice(), b"junk\n".as_slice()] {
+            for resumed in [false, true] {
+                let d = Temp::new();
+                let first = base(&d);
+                let e1 = entry(&first);
+                write_records(&d.0, &[&first, &e1]);
+                let cached = (path == 1).then(|| open(&d.0));
+                // Keep the cached descriptor, matching actual rotation/resume.
+                fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+                let mut fold = seeded_pair(&first, &e1);
+                let cp2 = signed(2, e1.hash(), &fold);
+                let e3 = if resumed {
+                    declaration(&cp2, 1, e1.hash(), 1, None)
+                } else {
+                    entry(&cp2)
+                };
+                put(&d, 1, &[&cp2, &e3], suffix);
+                fold.push(cp2.hash()).unwrap();
+                fold.push(e3.hash()).unwrap();
+                let (_, resume) = close_run(&d, &e3, &fold);
+                if path == 2 {
+                    fs::write(
+                        d.0.join("audit.trail"),
+                        format!("{}\n", crate::audit::hex(&TRAIL)),
+                    )
+                    .unwrap();
+                    fs::rename(d.0.join("audit.jsonl"), d.0.join(".audit-resume.jsonl")).unwrap();
+                    let result = Sink::open(
+                        &d.0,
+                        Arc::new(KeySeed::parse(&"27".repeat(32)).unwrap()),
+                        Config::default(),
+                        None,
+                    );
+                    if resumed {
+                        let sink = result.unwrap();
+                        assert_eq!(head(&open(&d.0)), Head::of(&resume));
+                        sink.close().unwrap();
+                    } else {
+                        assert_eq!(result.err().unwrap().kind(), AuditErrorKind::CorruptTrail);
+                    }
+                } else if let Some(reader) = cached {
+                    let result = reader.with_current(|_| Ok(()), |_, _, s| Ok(s.head));
+                    if resumed {
+                        assert_eq!(result.unwrap(), Head::of(&resume));
+                    } else {
+                        assert_eq!(result.unwrap_err().kind(), AuditErrorKind::CorruptTrail);
+                    }
+                } else if resumed {
+                    assert_eq!(head(&open(&d.0)), Head::of(&resume));
+                } else {
+                    corrupt_open(&d.0);
+                }
+            }
+        }
+    }
+    #[test]
+    fn unsealed_predecessor_requires_resume_even_with_junk_on_open() {
+        unsealed_successor_probe(0);
+    }
+    #[test]
+    fn unsealed_predecessor_requires_resume_even_with_junk_on_refresh() {
+        unsealed_successor_probe(1);
+    }
+    #[test]
+    fn unsealed_predecessor_requires_resume_even_with_junk_on_settlement() {
+        unsealed_successor_probe(2);
+    }
+    fn before_loss_probe(path: u8, headless: bool) {
+        use crate::audit::sink::{Config, Sink};
+        use std::sync::Arc;
+        for junk in [false, true] {
+            for wrong in [false, true] {
+                if headless && wrong {
+                    continue;
+                }
+                let d = Temp::new();
+                let first = base(&d);
+                let cached = (path == 1).then(|| open(&d.0));
+                fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+                let mut fold = seeded(&first);
+                let last;
+                if headless {
+                    let missing = entry(&first);
+                    let kept = entry(&missing);
+                    let next = entry(&kept);
+                    let mut honest = seeded_pair(&first, &missing);
+                    honest.push(kept.hash()).unwrap();
+                    honest.push(next.hash()).unwrap();
+                    last = signed(4, next.hash(), &honest);
+                    put(&d, 1, &[&kept], &[]);
+                    // This segment's first hash link is intact: the loss flag
+                    // must survive from the preceding headless segment.
+                    put(&d, 2, &[&next, &last], if junk { b"junk\n" } else { b"" });
+                    fold.push(kept.hash()).unwrap();
+                    fold.push(next.hash()).unwrap();
+                    fold.push(last.hash()).unwrap();
+                } else {
+                    let wrong_fold = seeded(&entry(&first));
+                    let cp1 = signed(1, first.hash(), if wrong { &wrong_fold } else { &fold });
+                    last = entry(&cp1);
+                    put(&d, 1, &[&cp1, &last], if junk { b"junk\n" } else { b"" });
+                    fold.push(cp1.hash()).unwrap();
+                    fold.push(last.hash()).unwrap();
+                }
+                let (_, resume) = close_run(&d, &last, &fold);
+                if path == 2 {
+                    fs::write(
+                        d.0.join("audit.trail"),
+                        format!("{}\n", crate::audit::hex(&TRAIL)),
+                    )
+                    .unwrap();
+                    fs::rename(d.0.join("audit.jsonl"), d.0.join(".audit-resume.jsonl")).unwrap();
+                    let result = Sink::open(
+                        &d.0,
+                        Arc::new(KeySeed::parse(&"27".repeat(32)).unwrap()),
+                        Config::default(),
+                        None,
+                    );
+                    if wrong {
+                        assert_eq!(result.err().unwrap().kind(), AuditErrorKind::CorruptTrail);
+                    } else {
+                        let sink = result.unwrap();
+                        assert_eq!(head(&open(&d.0)), Head::of(&resume));
+                        sink.close().unwrap();
+                    }
+                } else if let Some(reader) = cached {
+                    let result = reader.with_current(|_| Ok(()), |_, _, s| Ok(s.head));
+                    if wrong {
+                        assert_eq!(result.unwrap_err().kind(), AuditErrorKind::CorruptTrail);
+                    } else {
+                        assert_eq!(result.unwrap(), Head::of(&resume));
+                    }
+                } else if wrong {
+                    corrupt_open(&d.0);
+                } else {
+                    assert_eq!(head(&open(&d.0)), Head::of(&resume));
+                }
+            }
+        }
+    }
+    #[test]
+    fn before_loss_checkpoint_mmr_is_checked_on_open() {
+        before_loss_probe(0, false);
+    }
+    #[test]
+    fn before_loss_checkpoint_mmr_is_checked_on_refresh() {
+        before_loss_probe(1, false);
+    }
+    #[test]
+    fn before_loss_checkpoint_mmr_is_checked_on_settlement() {
+        before_loss_probe(2, false);
+    }
+    #[test]
+    fn after_loss_periodic_checkpoint_is_only_a_leaf_on_open() {
+        before_loss_probe(0, true);
+    }
+    #[test]
+    fn after_loss_periodic_checkpoint_is_only_a_leaf_on_refresh() {
+        before_loss_probe(1, true);
+    }
+    #[test]
+    fn after_loss_periodic_checkpoint_is_only_a_leaf_on_settlement() {
+        before_loss_probe(2, true);
+    }
     #[test]
     fn archived_forged_pair_is_documented_reader_residual() {
         let d = Temp::new();

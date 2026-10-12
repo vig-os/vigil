@@ -49,6 +49,8 @@ pub(crate) struct State {
     newline: bool,
     gap: Option<blake3::Hasher>,
     pending_resume: bool,
+    // A broken hash link in the pending run, cleared by its closing resume.
+    run_loss: bool,
     checkpoint_predecessor: Option<Head>,
     checkpoint_previous: [u8; 32],
 }
@@ -96,8 +98,9 @@ impl TrailReader {
     /// Damaged sealed runs require the matching checkpoint/resume and cumulative
     /// fold of ADR-0005 amendment 6: an explicit writer/verifier exception.
     /// A forged archived checkpoint/resume pair can pass without signature trust;
-    /// verification must detect BadSignature/NoReceipt. Record-free evidence can
-    /// be inserted or removed without changing the fold because file= is informational.
+    /// verification must detect BadSignature/NoReceipt. Empty segments can be
+    /// inserted into a run, and record-free evidence removed, without changing
+    /// the fold because file= is informational.
     pub(crate) fn open_marked(
         path: &Path,
         expected: Option<Head>,
@@ -266,6 +269,9 @@ pub(crate) fn history_segment(
     found: &mut bool,
     run: &mut bool,
 ) -> Result<Option<State>, AuditError> {
+    // Decision 8 still applies when a malformed suffix makes the successor
+    // enter the run fallback: a linking opening cannot defer its declaration.
+    let unsealed_boundary = opening && state.as_ref().is_some_and(|s| !sealed(s));
     match scan_inner(
         file,
         trail,
@@ -283,7 +289,8 @@ pub(crate) fn history_segment(
         Err(error) if error.kind() == AuditErrorKind::CorruptTrail => {}
         Err(error) => return Err(error),
     }
-    let inherited = *run;
+    let inherited = *run || unsealed_boundary;
+    *run = inherited;
     let mut damaged = false;
     let mut first = opening;
     let mut count = 0;
@@ -422,7 +429,6 @@ pub(crate) fn history_segment(
             // same file, start another. Compare this checkpoint before treating
             // the remaining in-run checkpoints solely as leaves.
             let mut trial = state.clone();
-            must_close = inherited && matches!(record.kind, Kind::Checkpoint(_)) && !broken;
             closing = inherited
                 && !prefix
                 && !damaged
@@ -430,17 +436,30 @@ pub(crate) fn history_segment(
             if inherited && matches!(record.kind, Kind::Checkpoint(_)) && !broken && !closing {
                 return Err(corrupt("first successor does not close sealed run"));
             }
+            must_close = closing;
         }
         let is_resume = matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume");
-        if count == 1 && closing && !is_resume {
-            return Err(corrupt("first successor lacks immediate resume"));
-        }
-        let base = state.is_none();
-        apply_checked(record, &mut state, false, broken, base || outside_run)?;
-        if count == 1 && closing && is_resume {
+        if count == 1 && closing {
+            // A complete second record resolves the EOF obligation; its kind
+            // and declaration are checked independently before closing the run.
+            must_close = false;
+            if !is_resume {
+                return Err(corrupt("first successor lacks immediate resume"));
+            }
             *run = false;
         }
+        let before_loss = !(broken || state.as_ref().is_some_and(|s| s.run_loss));
+        apply_checked(
+            record,
+            &mut state,
+            false,
+            broken,
+            outside_run || before_loss,
+        )?;
         let s = state.as_mut().ok_or_else(|| corrupt("missing head"))?;
+        if count == 1 && closing {
+            s.run_loss = false;
+        }
         if expected == Some(s.head) {
             *found = true;
         }
@@ -713,7 +732,11 @@ fn scan_inner(
     Ok(state)
 }
 fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<(), AuditError> {
-    apply_checked(record, state, genesis, false, true)
+    apply_checked(record, state, genesis, false, true)?;
+    if let Some(s) = state {
+        s.run_loss = false;
+    }
+    Ok(())
 }
 fn apply_checked(
     record: &Record,
@@ -837,6 +860,7 @@ fn apply_checked(
         newline: true,
         gap: None,
         pending_resume: pending,
+        run_loss: broken_boundary || state.as_ref().is_some_and(|s| s.run_loss),
         checkpoint_predecessor: prior,
         checkpoint_previous: record.context.previous,
     });

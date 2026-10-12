@@ -11,7 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Audit `keygen` creates durable seed/public-key files without overwriting ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - Audit reader support for damaged segment runs sealed by resume, with a cumulative MMR fold and explicit boundary declarations ([#11](https://github.com/vig-os/vigil/issues/11), [#87](https://github.com/vig-os/vigil/issues/87)).
-
 - Public audit writer surface (`AuditConfig`, `AuditTrail`, `Receipt`) and optional log mirroring ([#11](https://github.com/vig-os/vigil/issues/11)).
 - `Config::metrics` and `Config::metrics_interval` configure the metrics pipeline and periodic collection ([#7](https://github.com/vig-os/vigil/issues/7)).
 - Audit writer crash evidence: sealing and creation matrices, concurrent SIGKILL repairs, clean-stop heads and generated truncation properties ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
