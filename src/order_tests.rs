@@ -238,3 +238,34 @@ fn structural_ties_retain_record_sequence_and_point_attribute_order() {
         assert_eq!(value["scopeMetrics"][0], first);
     });
 }
+
+#[test]
+fn structural_ties_compare_global_oldest_timestamp_before_traversal_order() {
+    use serde_json::json;
+
+    let scope = |first, second| {
+        json!({
+            "scope": {"name": "same"},
+            "metrics": [
+                {"name": "a", "gauge": {"dataPoints": [{"timeUnixNano": first, "asInt": "1"}]}},
+                {"name": "b", "gauge": {"dataPoints": [{"timeUnixNano": second, "asInt": "1"}]}}
+            ]
+        })
+    };
+    let scopes = [scope("50", "60"), scope("100", "1")];
+    permutations(&scopes, |scopes| {
+        let mut value = json!({"scopeMetrics": scopes});
+        crate::envelope::normalize(&mut value, "", crate::ordered_json::LOGS).unwrap();
+        let first_point_times: Vec<_> = value["scopeMetrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|scope| {
+                scope["metrics"][0]["gauge"]["dataPoints"][0]["timeUnixNano"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(first_point_times, ["100", "50"]);
+    });
+}
