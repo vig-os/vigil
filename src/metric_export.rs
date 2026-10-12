@@ -30,6 +30,7 @@ pub struct OtlpJsonMetricExporter<S: LineSink> {
     limit: usize,
     pub(crate) losses: Arc<Losses>,
     failures: Mutex<crate::init::Failures>,
+    registry: Option<Arc<crate::metric_identity::Registry>>,
 }
 impl<S: LineSink> OtlpJsonMetricExporter<S> {
     /// Write to `sink`, with a 1,000,000-byte payload limit.
@@ -39,10 +40,15 @@ impl<S: LineSink> OtlpJsonMetricExporter<S> {
             limit: 1_000_000,
             losses: Arc::new(Losses::default()),
             failures: Mutex::default(),
+            registry: None,
         }
     }
     pub(crate) fn with_losses(mut self, losses: Arc<Losses>) -> Self {
         self.losses = losses;
+        self
+    }
+    pub(crate) fn with_registry(mut self, registry: Arc<crate::metric_identity::Registry>) -> Self {
+        self.registry = Some(registry);
         self
     }
     /// Set the payload limit, clamped to 1..=1,048,575 bytes, excluding newline.
@@ -56,7 +62,13 @@ impl<S: LineSink> OtlpJsonMetricExporter<S> {
         &self.sink
     }
     fn write(&self, metrics: &ResourceMetrics) -> (OTelSdkResult, usize) {
-        let request = ExportMetricsServiceRequest::from(metrics);
+        let mut request = ExportMetricsServiceRequest::from(metrics);
+        if let Some(registry) = &self.registry {
+            registry.filter(&mut request);
+            if request.resource_metrics.is_empty() {
+                return (Ok(()), 0);
+            }
+        }
         let mut lost = request
             .resource_metrics
             .iter()

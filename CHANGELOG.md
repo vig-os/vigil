@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Audit operator `rotate` and `checkpoint` require an exact expected head, with atomic new-key coverage and documented crash recovery ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
+- Metric identity registry poisons conflicting declarations and filters their exports; unstable `Config::install_opentelemetry_globals` installs the meter provider ([#7](https://github.com/vig-os/vigil/issues/7)).
+
 - Audit `keygen` creates durable seed/public-key files without overwriting ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - Audit reader support for damaged segment runs sealed by resume, with a cumulative MMR fold and explicit boundary declarations ([#11](https://github.com/vig-os/vigil/issues/11), [#87](https://github.com/vig-os/vigil/issues/87)).
 - Stable `vigil::metrics` facade with five static instruments, crate scopes, compile-time validation, late binding and recording-side measurement loss accounting ([#7](https://github.com/vig-os/vigil/issues/7)).

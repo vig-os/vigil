@@ -97,6 +97,8 @@ pub(crate) struct PublishedPipeline {
     #[cfg(feature = "metrics")]
     pub(crate) metrics: Option<SdkMeterProvider>,
     #[cfg(feature = "metrics")]
+    pub(crate) registry: Arc<crate::metric_identity::Registry>,
+    #[cfg(feature = "metrics")]
     pub(crate) losses: Arc<Losses>,
     #[cfg(feature = "metrics")]
     pub(crate) stopped: Arc<AtomicBool>,
@@ -126,6 +128,8 @@ impl Reservation {
         let published = PublishedPipeline {
             #[cfg(feature = "metrics")]
             metrics: _guard.metrics.clone(),
+            #[cfg(feature = "metrics")]
+            registry: _guard.registry.clone(),
             #[cfg(feature = "metrics")]
             losses: _guard.losses.clone(),
             #[cfg(feature = "metrics")]
@@ -271,6 +275,8 @@ pub struct Guard {
     metrics: Option<SdkMeterProvider>,
     #[cfg(feature = "metrics")]
     metrics_flushing: Arc<MetricFlushes>,
+    #[cfg(feature = "metrics")]
+    registry: Arc<crate::metric_identity::Registry>,
     stopped: Arc<AtomicBool>,
     dir: Option<PathBuf>,
     losses: Arc<Losses>,
@@ -596,6 +602,8 @@ pub struct Config {
     filter_env: String,
     default_filter: String,
     console: Console,
+    #[cfg(vigil_unstable)]
+    install_globals: bool,
     #[cfg(feature = "metrics")]
     metrics: Option<bool>,
     #[cfg(feature = "metrics")]
@@ -617,11 +625,28 @@ impl Config {
             filter_env: "RUST_LOG".into(),
             default_filter: "info".into(),
             console: Console::Off,
+            #[cfg(vigil_unstable)]
+            install_globals: false,
             #[cfg(feature = "metrics")]
             metrics: None,
             #[cfg(feature = "metrics")]
             metrics_interval: None,
         }
+    }
+    /// Crates using `opentelemetry::global` must use vigil's OpenTelemetry minor
+    /// (`vigil::unstable::opentelemetry`), or silently record into a no-op provider.
+    ///
+    /// Installs vigil's meter provider as the OpenTelemetry global meter provider.
+    /// The tracer provider follows in #8. No effect when metrics are off or failed.
+    /// Global instruments cannot cause poisoning, but streams under names poisoned
+    /// by vigil handles are filtered too (ADR-0003 d21). Use `--cfg vigil_unstable`
+    /// and pin vigil with `~1.N`.
+    #[cfg(vigil_unstable)]
+    #[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
+    #[must_use]
+    pub fn install_opentelemetry_globals(mut self) -> Self {
+        self.install_globals = true;
+        self
     }
     /// Enable metrics (default true); overrides `VIGIL_METRICS` (`0` or `1`).
     /// Disabled metrics create no storage, provider or reader thread;
@@ -745,6 +770,8 @@ impl Config {
             ));
         }
         let reservation = Reservation::acquire()?;
+        #[cfg(vigil_unstable)]
+        let install_globals = self.install_globals;
         let (layer, guard) = self.build_layer::<Registry>()?;
         before_install(&guard);
         if let Err(source) =
@@ -757,6 +784,12 @@ impl Config {
                 source: Some(Box::new(source)),
             });
         }
+        #[cfg(all(vigil_unstable, feature = "metrics"))]
+        if install_globals {
+            install_meter_global(&guard);
+        }
+        #[cfg(all(vigil_unstable, not(feature = "metrics")))]
+        let _ = install_globals;
         reservation.commit(&guard);
         if tracing_log::LogTracer::init().is_err() {
             let _ = writeln!(
@@ -803,8 +836,16 @@ impl Config {
         S: tracing::Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
     {
         let reservation = Reservation::acquire()?;
+        #[cfg(vigil_unstable)]
+        let install_globals = self.install_globals;
         let result = self.build_layer()?;
         reservation.commit(&result.1);
+        #[cfg(all(vigil_unstable, feature = "metrics"))]
+        if install_globals {
+            install_meter_global(&result.1);
+        }
+        #[cfg(all(vigil_unstable, not(feature = "metrics")))]
+        let _ = install_globals;
         Ok(result)
     }
 
@@ -831,6 +872,8 @@ impl Config {
             }),
         };
         let losses = Arc::new(Losses::default());
+        #[cfg(feature = "metrics")]
+        let registry = Arc::new(crate::metric_identity::Registry::default());
         let stopped = Arc::new(AtomicBool::new(false));
         let active = stopped.clone();
         let shutdown_filter = tracing_subscriber::filter::dynamic_filter_fn(move |_, _| {
@@ -918,7 +961,7 @@ impl Config {
                             let file = Arc::new(file);
                             #[cfg(all(test, feature = "metrics"))]
                             { signal_files[1] = Arc::downgrade(&file); }
-                            Some(build_metrics(file, resource.clone(), interval, losses.clone()))
+                            Some(build_metrics(file, resource.clone(), interval, losses.clone(), registry.clone()))
                         },
                         Err(error) => {
                             let _ = writeln!(std::io::stderr(), "vigil: cannot open metrics storage at {}: {error}; disabling metrics", dir.display());
@@ -994,6 +1037,8 @@ impl Config {
             metrics,
             #[cfg(feature = "metrics")]
             metrics_flushing: Arc::new(MetricFlushes::default()),
+            #[cfg(feature = "metrics")]
+            registry,
             stopped,
             losses: losses.clone(),
             dir: log_dir,
@@ -1015,6 +1060,13 @@ impl Config {
         ))
     }
 }
+#[cfg(all(vigil_unstable, feature = "metrics"))]
+fn install_meter_global(guard: &Guard) {
+    if let Some(provider) = &guard.metrics {
+        opentelemetry::global::set_meter_provider(provider.clone());
+    }
+}
+
 #[cfg(feature = "metrics")]
 fn metrics_interval(explicit: Option<Duration>) -> Duration {
     explicit
@@ -1052,11 +1104,13 @@ fn build_metrics(
     resource: Resource,
     interval: Duration,
     losses: Arc<Losses>,
+    registry: Arc<crate::metric_identity::Registry>,
 ) -> SdkMeterProvider {
     let storage = Arc::new(MetricStorage(Mutex::new(Some(file))));
     let exporter = PipelineMetricExporter {
         inner: crate::metric_export::OtlpJsonMetricExporter::new(storage)
-            .with_losses(losses.clone()),
+            .with_losses(losses.clone())
+            .with_registry(registry),
     };
     SdkMeterProvider::builder()
         .with_resource(resource)
@@ -1462,6 +1516,8 @@ mod guard_tests {
             metrics: None,
             #[cfg(feature = "metrics")]
             metrics_flushing: Arc::new(MetricFlushes::default()),
+            #[cfg(feature = "metrics")]
+            registry: Arc::new(crate::metric_identity::Registry::default()),
             stopped: Arc::new(AtomicBool::new(false)),
             dir: None,
             #[cfg(all(test, feature = "metrics"))]

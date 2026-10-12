@@ -351,7 +351,8 @@ fn after_shutdown_never_counts_binds_or_calls_sdk() {
             .0
             .handle
             .set(Some(Bound {
-                handle: opentelemetry::metrics::Counter::new(calls.clone()),
+                handle: Some(opentelemetry::metrics::Counter::new(calls.clone())),
+                poisoned: Arc::new(AtomicBool::new(false)),
                 pipeline
             }))
             .is_ok()
@@ -540,4 +541,203 @@ fn drop_stops_bound_and_unbound_instruments() {
     assert_eq!(all.len(), 1);
     assert_eq!(all[0]["sum"]["dataPoints"][0]["asInt"], 1);
     fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn staged_poisoning_filters_cumulative_streams_without_data_point_losses() {
+    if let Some(output) =
+        child("staged_poisoning_filters_cumulative_streams_without_data_point_losses")
+    {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(stderr.matches("conflicting metric instruments:").count(), 1);
+        assert!(!stderr.contains("dropped data points"));
+        return;
+    }
+    static A: Counter = Counter::new(Scope::new("crate-a", "1"), "staged.x").with_unit("ms");
+    static B: Counter = Counter::new(Scope::new("crate-b", "1"), "staged.x").with_unit("s");
+    static OK: Counter = Counter::new(crate::scope!(), "staged.ok");
+    let path = dir("staged-poison");
+    let (_, guard) = Config::new("identity")
+        .dir(&path)
+        .metrics_interval(std::time::Duration::from_secs(3600))
+        .layer::<tracing_subscriber::Registry>()
+        .unwrap();
+    A.add(1, &[]);
+    OK.add(1, &[]);
+    guard.flush().unwrap();
+    assert!(metrics(&path).iter().any(|m| m["name"] == "staged.x"));
+    let before = fs::read_to_string(path.join("metrics.jsonl"))
+        .unwrap()
+        .len();
+    B.add(1, &[]);
+    A.add(1, &[]);
+    let error = guard.flush().unwrap_err();
+    assert_eq!(error.lost(Signal::Metrics), 2);
+    assert_eq!(error.kind(), FlushErrorKind::DataLost);
+    assert!(
+        error
+            .to_string()
+            .contains("metric names poisoned by conflicting declarations")
+    );
+    let text = fs::read_to_string(path.join("metrics.jsonl")).unwrap();
+    assert!(!text[before..].contains("staged.x"));
+    assert!(text[before..].contains("staged.ok"));
+    guard.flush().unwrap();
+    A.add(1, &[]);
+    let error = guard.flush().unwrap_err();
+    assert_eq!(error.lost(Signal::Metrics), 1);
+    assert!(!error.to_string().contains("metric names poisoned"));
+    guard.shutdown().unwrap();
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn poisoned_only_export_writes_no_line() {
+    if child("poisoned_only_export_writes_no_line").is_some() {
+        return;
+    }
+    static A: Counter = Counter::new(crate::scope!(), "empty.x").with_unit("ms");
+    static B: Counter = Counter::new(crate::scope!(), "empty.x").with_unit("s");
+    let path = dir("empty-poison");
+    let (_, guard) = Config::new("identity")
+        .dir(&path)
+        .metrics_interval(std::time::Duration::from_secs(3600))
+        .layer::<tracing_subscriber::Registry>()
+        .unwrap();
+    A.add(1, &[]);
+    B.add(1, &[]);
+    assert_eq!(guard.flush().unwrap_err().lost(Signal::Metrics), 1);
+    assert!(
+        fs::read_to_string(path.join("metrics.jsonl"))
+            .unwrap()
+            .is_empty()
+    );
+    guard.shutdown().unwrap();
+    fs::remove_dir_all(path).unwrap();
+}
+
+fn determinism_run(reverse: bool) {
+    let path = dir(if reverse {
+        "determinism-reverse"
+    } else {
+        "determinism-forward"
+    });
+    static A: Counter = Counter::new(Scope::new("crate-a", "1"), "conflict.x").with_unit("ms");
+    static B: Counter = Counter::new(Scope::new("crate-b", "1"), "conflict.x").with_unit("s");
+    static OK: Counter = Counter::new(crate::scope!(), "identity.ok");
+    let (_, guard) = Config::new("identity")
+        .dir(&path)
+        .metrics_interval(std::time::Duration::from_secs(3600))
+        .layer::<tracing_subscriber::Registry>()
+        .unwrap();
+    if reverse {
+        B.add(1, &[]);
+        A.add(1, &[]);
+    } else {
+        A.add(1, &[]);
+        B.add(1, &[]);
+    }
+    OK.add(7, &[]);
+    assert_eq!(guard.flush().unwrap_err().kind(), FlushErrorKind::DataLost);
+    let text = fs::read_to_string(path.join("metrics.jsonl")).unwrap();
+    assert!(!text.is_empty());
+    assert!(text.contains("identity.ok"));
+    assert!(!text.contains("conflict.x"));
+    fn strip(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(m) => {
+                m.retain(|k, _| k != "timeUnixNano" && !k.ends_with("TimeUnixNano"));
+                for v in m.values_mut() {
+                    strip(v);
+                }
+            }
+            serde_json::Value::Array(a) => {
+                a.retain(|v| !matches!(v["key"].as_str(), Some("service.instance.id")));
+                for v in a {
+                    strip(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut json: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    strip(&mut json);
+    println!("DETERMINISTIC:{}", serde_json::to_string(&json).unwrap());
+    guard.shutdown().unwrap();
+    fs::remove_dir_all(path).unwrap();
+}
+#[test]
+fn identity_determinism_forward() {
+    if child("identity_determinism_forward").is_some() {
+        return;
+    }
+    determinism_run(false);
+}
+#[test]
+fn identity_determinism_reverse() {
+    if child("identity_determinism_reverse").is_some() {
+        return;
+    }
+    determinism_run(true);
+}
+#[test]
+fn identity_determinism_compares_separate_processes() {
+    let forward = child("identity_determinism_forward").unwrap();
+    let reverse = child("identity_determinism_reverse").unwrap();
+    let line = |out: &Output| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("DETERMINISTIC:"))
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(line(&forward), line(&reverse));
+}
+
+#[cfg(vigil_unstable)]
+fn global_run(install: bool, poison: bool, init: bool) {
+    let path = dir("global");
+    let config = Config::new("global")
+        .dir(&path)
+        .metrics_interval(std::time::Duration::from_secs(3600));
+    let config = if install {
+        config.install_opentelemetry_globals()
+    } else {
+        config
+    };
+    let guard = if init {
+        config.init().unwrap()
+    } else {
+        config.layer::<tracing_subscriber::Registry>().unwrap().1
+    };
+    let counter = opentelemetry::global::meter("global")
+        .u64_counter("global.x")
+        .build();
+    counter.add(5, &[]);
+    if poison {
+        static A: Counter = Counter::new(crate::scope!(), "global.x").with_unit("ms");
+        static B: Counter = Counter::new(crate::scope!(), "global.x").with_unit("s");
+        A.add(1, &[]);
+        B.add(1, &[]);
+        assert_eq!(guard.flush().unwrap_err().kind(), FlushErrorKind::DataLost);
+        guard.flush().unwrap();
+    }
+    guard.shutdown().unwrap();
+    let text = fs::read_to_string(path.join("metrics.jsonl")).unwrap();
+    assert_eq!(text.contains("global.x"), install && !poison);
+    fs::remove_dir_all(path).unwrap();
+}
+#[cfg(vigil_unstable)]
+macro_rules! globals {
+    ($($name:ident: $install:literal,$poison:literal,$init:literal;)+) => {$(
+        #[test] fn $name() { if child(stringify!($name)).is_none() { global_run($install,$poison,$init); } }
+    )+};
+}
+#[cfg(vigil_unstable)]
+globals! {
+    global_installed_layer: true,false,false;
+    global_installed_init: true,false,true;
+    global_not_installed_layer: false,false,false;
+    global_not_installed_init: false,false,true;
+    global_poisoned: true,true,false;
 }
