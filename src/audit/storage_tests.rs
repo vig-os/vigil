@@ -811,9 +811,12 @@ fn archived_resume_rejects_head_sequence_above_opening_with_right_hash() {
 #[test]
 fn genesis_resume_requires_immediate_matching_declaration() {
     let d = Temp::new();
-    let first = fixture(&d.0);
+    fixture(&d.0);
     let genesis = Record::genesis(&TRAIL);
-    let opening = cp(5, genesis, &seeded(&first));
+    let mut fold = Mmr::new();
+    fold.push(genesis).unwrap();
+    let opening = cp(5, genesis, &fold);
+    // Leaf validation is exercised by genesis_resume_checks_fold_leaf_in_both_reader_paths.
     let resume = declaration(&opening, 0, genesis, 4, None);
     write_records(&d.0, &[&opening]);
     corrupt_open(&d.0);
@@ -953,9 +956,12 @@ mod runs {
     #[test]
     fn genesis_resume_after_fragment_only_first_segment_keeps_creation_leaf() {
         let d = Temp::new();
-        let creation = base(&d);
+        base(&d);
         put(&d, 0, &[], b"{\"torn\":");
-        let checkpoint = signed(5, Record::genesis(&TRAIL), &seeded(&creation));
+        let mut fold = Mmr::new();
+        fold.push(Record::genesis(&TRAIL)).unwrap();
+        let checkpoint = signed(5, Record::genesis(&TRAIL), &fold);
+        // Leaf validation is exercised by genesis_resume_checks_fold_leaf_in_both_reader_paths.
         let resume = declaration(&checkpoint, 0, Record::genesis(&TRAIL), 4, None);
         write_records(&d.0, &[&checkpoint, &resume]);
         assert_eq!(head(&open(&d.0)), Head::of(&resume));
@@ -1106,7 +1112,10 @@ mod runs {
         write_records(&d.0, &[&kept]);
         corrupt_open(&d.0);
         fs::rename(d.0.join("audit.jsonl"), d.0.join("incident.evidence")).unwrap();
-        let checkpoint = signed(5, Record::genesis(&TRAIL), &seeded(&creation));
+        let mut fold = Mmr::new();
+        fold.push(Record::genesis(&TRAIL)).unwrap();
+        let checkpoint = signed(5, Record::genesis(&TRAIL), &fold);
+        // Leaf validation is exercised by genesis_resume_checks_fold_leaf_in_both_reader_paths.
         let resume = declaration(&checkpoint, 0, Record::genesis(&TRAIL), 4, None);
         let staged = [line(&checkpoint), line(&resume)].concat();
         fs::write(d.0.join(".audit-resume.jsonl"), &staged).unwrap();
@@ -1666,4 +1675,43 @@ mod runs {
         // exempt from the fails-without-change requirement.
         assert_eq!(head(&open(&d.0)), Head::of(&resume));
     }
+}
+
+#[test]
+fn genesis_resume_checks_fold_leaf_in_both_reader_paths() {
+    for fragment in [false, true] {
+        for correct in [false, true] {
+            let d = Temp::new();
+            fixture(&d.0);
+            let genesis = Record::genesis(&TRAIL);
+            let mut fold = Mmr::new();
+            fold.push(if correct { genesis } else { [42; 32] }).unwrap();
+            let opening = cp(5, genesis, &fold);
+            let resume = declaration(&opening, 0, genesis, 4, None);
+            if fragment {
+                fs::write(
+                    d.0.join("audit-20000101T000000.000000000Z.jsonl"),
+                    b"{\"torn\":",
+                )
+                .unwrap();
+            }
+            write_records(&d.0, &[&opening, &resume]);
+            if correct {
+                assert_eq!(head(&open(&d.0)), Head::of(&resume));
+            } else {
+                corrupt_open(&d.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn resume_base_refuses_non_checkpoint_without_archived_predecessor() {
+    let d = Temp::new();
+    let creation = fixture(&d.0);
+    let kept = entry(&creation);
+    write_records(&d.0, &[&kept]);
+    let file = File::open(d.0.join("audit.jsonl")).unwrap();
+    let result = history_segment(&file, TRAIL, None, true, None, &mut None, &mut false);
+    assert!(matches!(result, Err(e) if e.kind() == AuditErrorKind::CorruptTrail));
 }

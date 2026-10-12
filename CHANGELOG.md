@@ -54,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- ADR-0005 amendment 9 part 1 ([#11](https://github.com/vig-os/vigil/issues/11); settle/reader rules for operator resume: R5'' promotion matches a validated `file=`, R6' genesis leaf is the genesis digest, R9 hard-link-first in settle; test-only fault-injection seam in `rotate::rename_with`).
 - Rename audit `KeySeed` to `KeyFileSigner`, loading only regular seed files with verified permissions and effective ownership ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - Provisional audit format primitives require `vigil_unstable` ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - `FlushError::Display` preserves source errors and describes losses per signal; `Guard` final summaries now cover metrics, with independent logs fallback, concurrent shutdown and bounded metrics flush ([#7](https://github.com/vig-os/vigil/issues/7)).

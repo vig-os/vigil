@@ -339,70 +339,169 @@ fn predecessor_run(dir: &File, trail: [u8; 16]) -> Result<(Option<State>, bool),
     }
     Ok((state, run))
 }
+fn staged_records(staged: &File) -> Result<Option<Vec<Record>>, AuditError> {
+    let mut bytes = Vec::new();
+    staged
+        .take(2_000_003)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    Ok(bytes.strip_suffix(b"\n").and_then(|payload| {
+        payload
+            .split(|b| *b == b'\n')
+            .map(|part| {
+                let mut records = Record::parse_line(part).ok()?;
+                if records.len() == 1 {
+                    records.pop()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }))
+}
+fn discard_staging(dir: &File, name: &str) -> Result<(), AuditError> {
+    #[cfg(test)]
+    hooks::event("unlink").map_err(io_error)?;
+    rfs::unlinkat(dir, name, AtFlags::empty()).map_err(io_error)
+}
+fn finish_settle(dir: &File, renamed: bool, poisoned: &AtomicBool) -> Result<(), AuditError> {
+    if renamed {
+        sync_renamed(
+            dir,
+            "settle-promote-dir",
+            ".audit-next.jsonl, .audit-resume.jsonl",
+            poisoned,
+        )
+    } else {
+        sync(dir, "settle-discard-dir", poisoned)
+    }
+}
+/// Validates and promotes (or discards) a resume, then makes all pending
+/// directory mutations durable once. `renamed` includes an earlier R9 unlink
+/// or sealing promotion, so a failed final fsync poisons those changes too.
+pub(crate) fn promote_resume(
+    staged: &File,
+    dir: &File,
+    predecessor: (Option<State>, bool),
+    trail: [u8; 16],
+    poisoned: &AtomicBool,
+    mut renamed: bool,
+) -> Result<(), AuditError> {
+    let (prior, run) = predecessor;
+    let records = staged_records(staged)?;
+    let file = records
+        .as_ref()
+        .filter(|records| records.len() == 2)
+        .filter(|records| matches!(records[0].kind, Kind::Checkpoint(_)))
+        .and_then(|records| match &records[1].kind {
+            Kind::Entry(entry) => entry
+                .details
+                .as_deref()?
+                .split_once(" file=")
+                .map(|(_, file)| file),
+            Kind::Checkpoint(_) => None,
+        });
+    let live = exists(dir, "audit.jsonl")?;
+    let names = rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
+    let valid_file = match file {
+        Some("-") => !live,
+        Some(name) if rotate::parse_segment(name, "audit").is_some() => {
+            let newest = names.last().map(|p| p.as_path());
+            let after_others = names
+                .iter()
+                .filter(|p| p.as_path() != Path::new(name))
+                .all(|p| {
+                    rotate::segment_key(p, "audit") < rotate::segment_key(Path::new(name), "audit")
+                });
+            after_others
+                && if live {
+                    !exists(dir, name)?
+                } else {
+                    newest == Some(Path::new(name))
+                }
+        }
+        _ => false,
+    };
+    let valid = valid_file && scan_staged(staged, trail, prior, run).is_ok();
+    if valid {
+        if live {
+            #[cfg(test)]
+            hooks::event("seal-rename").map_err(io_error)?;
+            let name = file.ok_or_else(|| corrupt("missing resume filename"))?;
+            rotate::rename_no_replace(dir, Path::new("audit.jsonl"), Path::new(name))
+                .map_err(io_error)?;
+        }
+        #[cfg(test)]
+        hooks::event("promote").map_err(io_error)?;
+        rotate::rename_no_replace(
+            dir,
+            Path::new(".audit-resume.jsonl"),
+            Path::new("audit.jsonl"),
+        )
+        .map_err(io_error)?;
+        renamed = true;
+        #[cfg(test)]
+        hooks::point("settle-after-promote");
+    } else {
+        discard_staging(dir, ".audit-resume.jsonl")?;
+    }
+    finish_settle(dir, renamed, poisoned)
+}
 fn settle(dir: &File, trail: [u8; 16], poisoned: &AtomicBool) -> Result<(), AuditError> {
+    let mut changed = false;
+    let mut renamed = false;
+    // Amendment 9 R9 is a defence enabling recovery. Honest sealing crashes
+    // retain the staging file made durable in step 2 before step 4's rename.
+    if exists(dir, "audit.jsonl")? && linked_live(dir)? {
+        #[cfg(test)]
+        hooks::event("settle-unlink-live").map_err(io_error)?;
+        rfs::unlinkat(dir, "audit.jsonl", AtFlags::empty()).map_err(io_error)?;
+        changed = true;
+        renamed = true;
+        #[cfg(test)]
+        hooks::point("settle-after-unlink");
+    }
     for (name, count) in [(".audit-next.jsonl", 1), (".audit-resume.jsonl", 2)] {
         if !exists(dir, name)? {
             continue;
         }
         let staged = existing(dir, Path::new(name), false)?;
-        let mut bytes = Vec::new();
-        (&staged)
-            .take(2_000_003)
-            .read_to_end(&mut bytes)
-            .map_err(io_error)?;
-        let records: Option<Vec<Record>> = bytes.strip_suffix(b"\n").and_then(|payload| {
-            payload
-                .split(|b| *b == b'\n')
-                .map(|part| {
-                    let mut records = Record::parse_line(part).ok()?;
-                    if records.len() == 1 {
-                        records.pop()
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        });
         let (prior, run) = predecessor_run(dir, trail)?;
+        if count == 2 {
+            return promote_resume(&staged, dir, (prior, run), trail, poisoned, renamed);
+        }
+        let records = staged_records(&staged)?;
         let valid = records.as_ref().is_some_and(|records| {
-            if records.len() != count {
-                return false;
-            }
-            let first = &records[0];
-            if !matches!(first.kind, Kind::Checkpoint(_)) {
-                return false;
-            }
-            let seq = prior.as_ref().map_or(0, |s| s.head.seq.saturating_add(1));
-            if count == 1 && first.context.seq != seq {
-                return false;
-            }
-            // Scan enforces predecessor/genesis links, forward sequence and immediate resume action.
-            scan_staged(&staged, trail, prior.clone(), run).is_ok()
+            records.len() == 1
+                && matches!(records[0].kind, Kind::Checkpoint(_))
+                && records[0].context.seq
+                    == prior.as_ref().map_or(0, |s| s.head.seq.saturating_add(1))
+                && scan_staged(&staged, trail, prior.clone(), run).is_ok()
         });
         if valid {
             if exists(dir, "audit.jsonl")? {
                 #[cfg(test)]
                 hooks::event("seal-rename").map_err(io_error)?;
-                if linked_live(dir)? {
-                    rfs::unlinkat(dir, "audit.jsonl", AtFlags::empty()).map_err(io_error)?;
-                } else {
-                    rotate::rotate(dir, "audit", Path::new("audit.jsonl")).map_err(io_error)?;
-                }
+                rotate::rotate(dir, "audit", Path::new("audit.jsonl")).map_err(io_error)?;
             }
             #[cfg(test)]
             hooks::event("promote").map_err(io_error)?;
             rotate::rename_no_replace(dir, Path::new(name), Path::new("audit.jsonl"))
                 .map_err(io_error)?;
-            sync_renamed(dir, "settle-promote-dir", name, poisoned)?;
-        } else {
+            renamed = true;
             #[cfg(test)]
-            hooks::event("unlink").map_err(io_error)?;
-            rfs::unlinkat(dir, name, AtFlags::empty()).map_err(io_error)?;
-            sync(dir, "settle-discard-dir", poisoned)?;
+            hooks::point("settle-after-promote");
+        } else {
+            discard_staging(dir, name)?;
         }
+        changed = true;
+    }
+    if changed {
+        finish_settle(dir, renamed, poisoned)?;
     }
     Ok(())
 }
+
 impl Sink {
     pub(super) fn service(&self) -> &str {
         &self.config.service

@@ -787,10 +787,16 @@ fn apply_checked(
         if (genesis || head.seq == 0) && !root_link {
             return Err(corrupt("initial checkpoint does not link genesis"));
         }
-        if root_link && head.seq > 0 && cp.size != 1 {
-            return Err(corrupt("genesis resume must carry one creation leaf"));
+        if root_link && head.seq > 0 {
+            // Amendment 9: the lost creation hash is unavailable. Both reader
+            // paths authenticate the computable genesis leaf through this fold.
+            let mut fold = Mmr::new();
+            fold.push(Record::genesis(&record.context.trail))?;
+            fold
+        } else {
+            Mmr::from_peaks(cp.size, cp.peaks.clone())
+                .map_err(|_| corrupt("invalid opening peaks"))?
         }
-        Mmr::from_peaks(cp.size, cp.peaks.clone()).map_err(|_| corrupt("invalid opening peaks"))?
     };
     let prior = state.as_ref().map(|s| s.head);
     if let Some(s) = state.as_ref() {
@@ -816,7 +822,7 @@ fn apply_checked(
     }
     match &record.kind {
         Kind::Checkpoint(cp) => {
-            if compare_mmr
+            if (compare_mmr || (root_link && head.seq > 0))
                 && (cp.size != mmr.size() || cp.root != mmr.root() || cp.peaks != mmr.peaks())
             {
                 return Err(corrupt("checkpoint MMR differs from preceding records"));
