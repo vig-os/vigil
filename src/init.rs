@@ -1430,6 +1430,48 @@ mod install_race_tests {
             .collect()
     }
 
+    #[cfg(all(vigil_unstable, feature = "metrics"))]
+    #[test]
+    fn losing_install_keeps_sentinel_meter_global() {
+        if !crate::subscriber_test_child(
+            "init::install_race_tests::losing_install_keeps_sentinel_meter_global",
+        ) {
+            return;
+        }
+        let sink = crate::sink::MemorySink::new();
+        let sentinel = SdkMeterProvider::builder()
+            .with_reader(
+                opentelemetry_sdk::metrics::PeriodicReader::builder(
+                    crate::metric_export::OtlpJsonMetricExporter::new(sink.clone()),
+                )
+                .with_interval(Duration::from_secs(3600))
+                .build(),
+            )
+            .build();
+        opentelemetry::global::set_meter_provider(sentinel.clone());
+        let dir = std::env::temp_dir().join(format!("vigil-sentinel-{}", std::process::id()));
+        let error = Config::new("race")
+            .dir(&dir)
+            .install_opentelemetry_globals()
+            .init_with(|_| {
+                tracing::subscriber::set_global_default(tracing_subscriber::registry()).unwrap();
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), InitErrorKind::ForeignSubscriber);
+        opentelemetry::global::meter("sentinel")
+            .u64_counter("sentinel.survives")
+            .build()
+            .add(7, &[]);
+        sentinel.force_flush().unwrap();
+        assert!(
+            sink.lines()
+                .iter()
+                .any(|line| line.contains("sentinel.survives"))
+        );
+        sentinel.shutdown().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn foreign_subscriber_winning_install_releases_reservation() {
         if !crate::subscriber_test_child(

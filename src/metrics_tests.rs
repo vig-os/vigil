@@ -616,6 +616,87 @@ fn poisoned_only_export_writes_no_line() {
     fs::remove_dir_all(path).unwrap();
 }
 
+/// Mask only timestamps, service.instance.id and process.pid for comparison.
+/// ADR-0003 d7 keeps process identity in production output; ruling 7b2b-d2
+/// excludes those process-specific fields from the determinism property.
+fn normalize_identity_comparison(text: &str) -> String {
+    // Retain object order and raw scalar spelling, so comparison still checks
+    // bytes rather than silently sorting fields through serde_json::Map.
+    struct Fields<'a>(Vec<(String, &'a serde_json::value::RawValue)>);
+    impl<'de> serde::Deserialize<'de> for Fields<'de> {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = Fields<'de>;
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("an OTLP object")
+                }
+                fn visit_map<M: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: M,
+                ) -> Result<Self::Value, M::Error> {
+                    let mut fields = Vec::new();
+                    while let Some(entry) = map.next_entry()? {
+                        fields.push(entry);
+                    }
+                    Ok(Fields(fields))
+                }
+            }
+            deserializer.deserialize_map(Visitor)
+        }
+    }
+    fn mask(raw: &serde_json::value::RawValue, resource: bool, attributes: bool) -> String {
+        let text = raw.get();
+        match text.as_bytes().first() {
+            Some(b'{') => {
+                let fields: Fields<'_> = serde_json::from_str(text).unwrap();
+                let fields: Vec<_> = fields
+                    .0
+                    .into_iter()
+                    .filter(|(key, _)| key != "timeUnixNano" && !key.ends_with("TimeUnixNano"))
+                    .map(|(key, value)| {
+                        let filtered =
+                            mask(value, key == "resource", resource && key == "attributes");
+                        format!("{}:{filtered}", serde_json::to_string(&key).unwrap())
+                    })
+                    .collect();
+                format!("{{{}}}", fields.join(","))
+            }
+            Some(b'[') => {
+                let values: Vec<&serde_json::value::RawValue> = serde_json::from_str(text).unwrap();
+                let values: Vec<_> = values
+                    .into_iter()
+                    .filter(|value| {
+                        if !attributes {
+                            return true;
+                        }
+                        let value: serde_json::Value = serde_json::from_str(value.get()).unwrap();
+                        !matches!(
+                            value["key"].as_str(),
+                            Some("service.instance.id" | "process.pid")
+                        )
+                    })
+                    .map(|v| mask(v, false, false))
+                    .collect();
+                format!("[{}]", values.join(","))
+            }
+            _ => text.to_owned(),
+        }
+    }
+    let mut normalized = text
+        .lines()
+        .map(|line| {
+            let raw = serde_json::from_str(line).unwrap();
+            mask(raw, false, false)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.ends_with('\n') {
+        normalized.push('\n');
+    }
+    normalized
+}
+
 fn determinism_run(reverse: bool) {
     let path = dir(if reverse {
         "determinism-reverse"
@@ -643,26 +724,10 @@ fn determinism_run(reverse: bool) {
     assert!(!text.is_empty());
     assert!(text.contains("identity.ok"));
     assert!(!text.contains("conflict.x"));
-    fn strip(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(m) => {
-                m.retain(|k, _| k != "timeUnixNano" && !k.ends_with("TimeUnixNano"));
-                for v in m.values_mut() {
-                    strip(v);
-                }
-            }
-            serde_json::Value::Array(a) => {
-                a.retain(|v| !matches!(v["key"].as_str(), Some("service.instance.id")));
-                for v in a {
-                    strip(v);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut json: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
-    strip(&mut json);
-    println!("DETERMINISTIC:{}", serde_json::to_string(&json).unwrap());
+    println!(
+        "DETERMINISTIC:{}",
+        serde_json::to_string(&normalize_identity_comparison(&text)).unwrap()
+    );
     guard.shutdown().unwrap();
     fs::remove_dir_all(path).unwrap();
 }
@@ -740,4 +805,44 @@ globals! {
     global_not_installed_layer: false,false,false;
     global_not_installed_init: false,false,true;
     global_poisoned: true,true,false;
+}
+
+#[test]
+fn determinism_mask_preserves_metric_identity_and_measurements() {
+    let input = serde_json::json!({
+        "resource": {"attributes": [
+            {"key":"service.instance.id", "value":{"stringValue":"id"}},
+            {"key":"process.pid", "value":{"intValue":"123"}},
+            {"key":"service.name", "value":{"stringValue":"service"}}
+        ]},
+        "name":"identity.ok", "description":"kept", "unit":"ms",
+        "timeUnixNano":"1", "startTimeUnixNano":"2",
+        "attributes":[{"key":"process.pid","value":{"intValue":"99"}}],
+        "asInt":7
+    });
+    let normalized = normalize_identity_comparison(&input.to_string());
+    let input: serde_json::Value = serde_json::from_str(&normalized).unwrap();
+    assert!(input.get("timeUnixNano").is_none());
+    assert!(input.get("startTimeUnixNano").is_none());
+    assert_eq!(input["resource"]["attributes"].as_array().unwrap().len(), 1);
+    assert_eq!(input["resource"]["attributes"][0]["key"], "service.name");
+    assert_eq!(input["name"], "identity.ok");
+    assert_eq!(input["asInt"], 7);
+    assert_eq!(input["description"], "kept");
+    assert_eq!(input["unit"], "ms");
+    assert_eq!(input["attributes"][0]["value"]["intValue"], "99");
+}
+
+#[test]
+fn determinism_mask_retains_field_order_and_scalar_spelling() {
+    let text = "{\"name\":\"identity.ok\",\"timeUnixNano\":\"1\",\"asDouble\":1.0}\n";
+    assert_eq!(
+        normalize_identity_comparison(text),
+        "{\"name\":\"identity.ok\",\"asDouble\":1.0}\n"
+    );
+    let reversed = "{\"asDouble\":1.0,\"name\":\"identity.ok\"}\n";
+    assert_ne!(
+        normalize_identity_comparison(text),
+        normalize_identity_comparison(reversed)
+    );
 }

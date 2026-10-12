@@ -21,6 +21,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("expected output directory")?,
     );
     #[cfg(feature = "metrics")]
+    if let Some(mode) = std::env::args().nth(2) {
+        return identity_fixture(&dir, mode == "identity-poisoned");
+    }
+    #[cfg(feature = "metrics")]
     metric_fixture(&dir)?;
     let file = Arc::new(RotatingFile::open(
         &dir,
@@ -128,4 +132,26 @@ fn metric_fixture(dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error
     assert!(lines.len() > 2, "metrics must split");
     std::fs::write(dir.join("metrics.jsonl"), lines.join("\n") + "\n")?;
     Ok(())
+}
+
+#[cfg(all(vigil_unstable, feature = "metrics"))]
+fn identity_fixture(dir: &std::path::Path, poison: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use vigil::metrics::Counter;
+    static A: Counter = Counter::new(vigil::scope!(), "conformance.conflict").with_unit("ms");
+    static B: Counter = Counter::new(vigil::scope!(), "conformance.conflict").with_unit("s");
+    static OK: Counter = Counter::new(vigil::scope!(), "conformance.kept");
+    let (_, guard) = vigil::Config::new("identity-conformance")
+        .dir(dir)
+        .metrics_interval(std::time::Duration::from_secs(3600))
+        .layer::<tracing_subscriber::Registry>()?;
+    A.add(1, &[]);
+    OK.add(7, &[]);
+    if poison {
+        B.add(1, &[]);
+    }
+    match guard.shutdown() {
+        Err(error) if poison && error.kind() == vigil::FlushErrorKind::DataLost => Ok(()),
+        Ok(()) if !poison => Ok(()),
+        result => Err(format!("unexpected identity shutdown: {result:?}").into()),
+    }
 }
