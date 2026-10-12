@@ -146,6 +146,37 @@ def main():
                 "CARGO_ENCODED_RUSTFLAGS": "--cfg\x1fvigil_unstable",
             },
         )
+        # Compare a normal two-instrument run with the same run poisoning one
+        # name before its first export. Only the poisoned file feeds the Collector.
+        identity_files = []
+        for mode in ("identity-baseline", "identity-poisoned"):
+            destination = directory / mode
+            subprocess.run(
+                [
+                    "cargo",
+                    "run",
+                    "--locked",
+                    "--example",
+                    "conformance",
+                    "--",
+                    str(destination),
+                    mode,
+                ],
+                check=True,
+                env=os.environ | {"CARGO_ENCODED_RUSTFLAGS": "--cfg\x1fvigil_unstable"},
+            )
+            identity_files.append((destination / "metrics.jsonl").read_text())
+        baseline, poisoned = identity_files
+        require(len(poisoned) < len(baseline), "poisoning must shorten metrics output")
+        require(
+            "conformance.conflict" in baseline, "baseline conflict instrument missing"
+        )
+        require(
+            "conformance.conflict" not in poisoned, "poisoned metric escaped the filter"
+        )
+        require("conformance.kept" in poisoned, "healthy metric was removed")
+        with (directory / "metrics.jsonl").open("a") as stream:
+            stream.write(poisoned)
         inputs = sorted(
             path
             for path in directory.glob("logs-*.jsonl")
@@ -296,10 +327,24 @@ service:
         actual_metrics = metric_points(
             json.loads(line) for line in json_lines(metric_output.read_text())
         )
-        require(sum(expected_metrics.values()) == 40, "missing metric fixture points")
+        require(sum(expected_metrics.values()) == 41, "missing metric fixture points")
         require(
             actual_metrics == expected_metrics,
             f"Metric differences: {expected_metrics - actual_metrics}; unexpected: {actual_metrics - expected_metrics}",
+        )
+        require(
+            any(
+                json.loads(key)[2]["name"] == "conformance.kept"
+                for key in actual_metrics
+            ),
+            "Collector lost the healthy metric from the poisoned run",
+        )
+        require(
+            all(
+                json.loads(key)[2]["name"] != "conformance.conflict"
+                for key in actual_metrics
+            ),
+            "Collector received a poisoned name",
         )
         actual = records(json.loads(line) for line in json_lines(output.read_text()))
         require(

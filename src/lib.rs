@@ -16,6 +16,9 @@ const _: () = {
 
 mod init;
 mod lifecycle;
+#[cfg(feature = "metrics")]
+#[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+pub mod metrics;
 pub use init::{Config, Console, Guard, InitError, InitErrorKind, init};
 pub use lifecycle::{FlushError, FlushErrorKind, Signal};
 
@@ -35,8 +38,8 @@ mod sink;
 ///
 /// Enable `--cfg vigil_unstable` in the application's build and pin `~1.N`.
 /// Libraries using these paths require their applications to enable the cfg.
-/// The tracing integration re-export follows with traces in #8; global provider
-/// installation remains deferred to #7/#8.
+/// Global-provider installation is available (meter only; the tracer in #8).
+/// The tracing integration re-export follows with traces in #8.
 #[cfg(vigil_unstable)]
 #[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
 pub mod unstable {
@@ -57,13 +60,18 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 // state, even after a scoped default ends. Keep these tests in fresh children.
 #[cfg(test)]
 fn subscriber_test_child(name: &str) -> bool {
-    const CHILD: &str = "VIGIL_SUBSCRIBER_TEST_CHILD";
-    if std::env::var(CHILD).as_deref() == Ok(name) {
-        return true;
+    test_child(name, "VIGIL_SUBSCRIBER_TEST_CHILD").is_none()
+}
+
+// Share execution and verification so an incorrect --exact name cannot pass silently.
+#[cfg(test)]
+fn test_child(name: &str, child_env: &str) -> Option<std::process::Output> {
+    if std::env::var(child_env).as_deref() == Ok(name) {
+        return None;
     }
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])
-        .env(CHILD, name)
+        .env(child_env, name)
         .output()
         .unwrap();
     assert!(
@@ -73,11 +81,21 @@ fn subscriber_test_child(name: &str) -> bool {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    false
+    Some(output)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn child_runner_rejects_a_missing_test() {
+        assert!(
+            std::panic::catch_unwind(|| {
+                super::test_child("tests::missing_test", "VIGIL_MISSING_TEST_CHILD");
+            })
+            .is_err()
+        );
+    }
+
     #[test]
     fn version_is_the_package_version() {
         assert_eq!(super::VERSION, env!("CARGO_PKG_VERSION"));
@@ -96,6 +114,8 @@ mod envelope;
 pub mod metric_export;
 #[cfg(all(feature = "metrics", not(vigil_unstable)))]
 mod metric_export;
+#[cfg(feature = "metrics")]
+mod metric_identity;
 
 #[cfg(test)]
 mod order_tests;

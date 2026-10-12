@@ -134,6 +134,7 @@ jobs:
         run: |
           nix develop -c cargo test --locked $CARGO_ARGS --test golden
           nix develop -c cargo test --locked $CARGO_ARGS --lib ordered
+          nix develop -c cargo test --locked $CARGO_ARGS --features metrics --lib metrics::tests::identity_determinism
       - name: Verify audit shuffle, hashes and committed corpus with preserve-order
         if: ${{ matrix.map == 'preserve-order' }}
         env:
