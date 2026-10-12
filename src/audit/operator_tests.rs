@@ -8,7 +8,7 @@ use std::{fs, sync::atomic::AtomicUsize};
 pub(super) struct SignOnly {
     key: Arc<dyn Signer>,
     pub(super) calls: AtomicUsize,
-    public: AtomicUsize,
+    pub(super) public: AtomicUsize,
     fail: bool,
 }
 impl SignOnly {
