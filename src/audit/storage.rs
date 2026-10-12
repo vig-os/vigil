@@ -592,18 +592,10 @@ pub(crate) fn resumes_after(
         return Ok(None);
     }
     let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
-    let mut boundary = cache.sealed_before.as_ref();
-    for name in &names {
-        let metadata = rfs::statat(dir, name, rfs::AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|e| io_error(e.into()))?;
-        if (metadata.st_dev as u64, metadata.st_ino as u64) == (old.dev(), old.ino()) {
-            boundary = Some(name);
-            break;
-        }
-    }
+    let boundary = boundary(dir, cache)?;
     let mut minimum = None;
     for name in &names {
-        if boundary.is_some_and(|b| {
+        if boundary.as_ref().is_some_and(|b| {
             crate::rotate::segment_key(name, "audit") <= crate::rotate::segment_key(b, "audit")
         }) {
             continue;
@@ -617,6 +609,16 @@ pub(crate) fn resumes_after(
         minimum = Some(minimum.map_or(bound, |prior| prior.min(bound)));
     }
     Ok(minimum)
+}
+
+fn resume_details(details: &str) -> Result<(&str, &str, &str), AuditError> {
+    let (named, file) = details
+        .split_once(" file=")
+        .ok_or_else(|| corrupt("invalid resume details"))?;
+    let (named, lost) = named
+        .split_once(" lost_through=")
+        .ok_or_else(|| corrupt("invalid resume loss bound"))?;
+    Ok((named, lost, file))
 }
 
 fn resume_header(file: &File, trail: [u8; 16]) -> Result<Option<u64>, AuditError> {
@@ -654,13 +656,27 @@ fn resume_header(file: &File, trail: [u8; 16]) -> Result<Option<u64>, AuditError
                 return Ok(entry
                     .details
                     .as_deref()
-                    .and_then(|details| details.split_once(" lost_through="))
-                    .and_then(|(_, tail)| tail.split_once(" file="))
-                    .and_then(|(bound, _)| bound.parse().ok()));
+                    .and_then(|details| resume_details(details).ok())
+                    .and_then(|(_, bound, _)| bound.parse().ok()));
             }
         }
     }
     Ok(None)
+}
+
+fn boundary(dir: &File, cache: &Cache) -> Result<Option<PathBuf>, AuditError> {
+    let old = cache.file.metadata().map_err(io_error)?;
+    let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
+    let mut boundary = cache.sealed_before.clone();
+    for name in &names {
+        let metadata = rfs::statat(dir, name, rfs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| io_error(e.into()))?;
+        if (metadata.st_dev as u64, metadata.st_ino as u64) == (old.dev(), old.ino()) {
+            boundary = Some(name.clone());
+            break;
+        }
+    }
+    Ok(boundary)
 }
 
 fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditError> {
@@ -706,15 +722,7 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
     // Locate the old descriptor by metadata, never by rereading historical
     // contents. If archived, the previous sealed name remains a lower bound.
     let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
-    let mut boundary = cache.sealed_before.clone();
-    for name in &names {
-        let metadata = rfs::statat(dir, name, rfs::AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|e| io_error(e.into()))?;
-        if (metadata.st_dev as u64, metadata.st_ino as u64) == (old.dev(), old.ino()) {
-            boundary = Some(name.clone());
-            break;
-        }
-    }
+    let boundary = boundary(dir, cache)?;
     for name in &names {
         if boundary.as_ref().is_some_and(|b| {
             crate::rotate::segment_key(name, "audit") <= crate::rotate::segment_key(b, "audit")
@@ -962,12 +970,7 @@ fn apply_checked(
                 .details
                 .as_deref()
                 .ok_or_else(|| corrupt("resume without details"))?;
-            let (named, file) = details
-                .split_once(" file=")
-                .ok_or_else(|| corrupt("invalid resume details"))?;
-            let (named, lost) = named
-                .split_once(" lost_through=")
-                .ok_or_else(|| corrupt("invalid resume loss bound"))?;
+            let (named, lost, file) = resume_details(details)?;
             let (seq_text, hash) = named
                 .strip_prefix("head=")
                 .and_then(|v| v.split_once(':'))

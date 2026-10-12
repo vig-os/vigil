@@ -1,5 +1,10 @@
 use super::*;
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::atomic::AtomicUsize};
+use std::{
+    fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::PathBuf,
+    sync::atomic::AtomicUsize,
+};
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 pub(super) struct Temp(pub(super) PathBuf);
 impl Temp {
@@ -2675,18 +2680,6 @@ fn truncated_resume(t: &Temp, lost: u64) -> (Sink, Arc<operators::SignOnly>, Rec
     let resume = install_resume(t, &writer, lost);
     (writer, key, resume)
 }
-fn disk_snapshot(t: &Temp) -> Vec<(PathBuf, Vec<u8>)> {
-    let mut files: Vec<_> = fs::read_dir(&t.0)
-        .unwrap()
-        .map(|item| {
-            let path = item.unwrap().path();
-            let bytes = fs::read(&path).unwrap();
-            (path, bytes)
-        })
-        .collect();
-    files.sort();
-    files
-}
 #[test]
 fn resume_boundary_equality_after_truncated_live() {
     let t = Temp::new();
@@ -2732,11 +2725,11 @@ fn assert_contradicted(sealed: bool, path: u8) {
         assert!(!records(&t).iter().any(|r| matches!(&r.kind,
             Kind::Entry(e) if e.action == "vigil.audit.resume")));
     }
-    let snapshot = disk_snapshot(&t);
+    let before = snapshot(&t);
     let signs = key.calls.load(Ordering::Relaxed);
     let publics = key.public.load(Ordering::Relaxed);
     bad(writer.record(&entry()), AuditErrorKind::HeadMismatch);
-    assert_eq!(disk_snapshot(&t), snapshot);
+    assert_eq!(snapshot(&t), before);
     assert_eq!(key.calls.load(Ordering::Relaxed), signs);
     assert_eq!(key.public.load(Ordering::Relaxed), publics);
     // Replace the contradicted disk layout by a clean creation file. The sticky
@@ -2754,7 +2747,7 @@ fn assert_contradicted(sealed: bool, path: u8) {
     // must refuse every path even with a freshly validated, writable cache.
     writer.reader = TrailReader::open(&t.0, writer.trail, None).unwrap();
     hooks::STDERR.with(|lines| lines.borrow_mut().clear());
-    let snapshot = disk_snapshot(&t);
+    let before = snapshot(&t);
     match path {
         0 => {
             bad(writer.record(&entry()), AuditErrorKind::HeadMismatch);
@@ -2769,7 +2762,7 @@ fn assert_contradicted(sealed: bool, path: u8) {
         }
         _ => drop(writer),
     }
-    assert_eq!(disk_snapshot(&t), snapshot);
+    assert_eq!(snapshot(&t), before);
     assert_eq!(key.calls.load(Ordering::Relaxed), signs);
     assert_eq!(key.public.load(Ordering::Relaxed), publics);
     hooks::STDERR.with(|lines| assert!(lines.borrow().is_empty()));
@@ -2798,10 +2791,10 @@ fn resume_discovery_uses_minimum_across_two_sealed_and_live() {
     // present record remains valid, while H's acknowledgement 3 exceeds L1=2.
     install_resume(&t, &writer, 7);
     install_resume(&t, &writer, 12);
-    let snapshot = disk_snapshot(&t);
+    let before = snapshot(&t);
     let signs = key.calls.load(Ordering::Relaxed);
     bad(writer.record(&entry()), AuditErrorKind::HeadMismatch);
-    assert_eq!(disk_snapshot(&t), snapshot);
+    assert_eq!(snapshot(&t), before);
     assert_eq!(key.calls.load(Ordering::Relaxed), signs);
 }
 #[test]
@@ -2888,12 +2881,91 @@ fn resume_discovery_requires_full_validation_before_writing() {
         "-",
     );
     fs::write(t.0.join("audit.jsonl"), forged).unwrap();
-    let snapshot = disk_snapshot(&t);
+    let before = snapshot(&t);
     let signs = key.calls.load(Ordering::Relaxed);
     let publics = key.public.load(Ordering::Relaxed);
     bad(writer.record(&entry()), AuditErrorKind::CorruptTrail);
-    assert_eq!(disk_snapshot(&t), snapshot);
+    assert_eq!(snapshot(&t), before);
     assert_eq!(key.calls.load(Ordering::Relaxed), signs);
     assert_eq!(key.public.load(Ordering::Relaxed), publics);
     writer.closed = true;
+}
+
+#[test]
+fn resume_honest_boundary_segment_is_excluded() {
+    let t = Temp::new();
+    let (mut original, _, _) = truncated_resume(&t, 3);
+    original.closed = true;
+    hooks::TIME.with(|time| time.set(Some(2_000_000_000)));
+    let writer = open(&t);
+    assert_eq!(writer.record(&entry()).unwrap().head.seq, 6);
+    let mut other = open(&t);
+    other.config.max_bytes = 1;
+    let rotated = other.record(&entry()).unwrap();
+    assert_eq!(
+        writer.record(&entry()).unwrap().head.seq,
+        rotated.head.seq + 1
+    );
+}
+
+#[test]
+fn resume_honest_archived_inode_uses_sealed_before() {
+    let t = Temp::new();
+    let (mut original, _, _) = truncated_resume(&t, 3);
+    original.closed = true;
+    hooks::TIME.with(|time| time.set(Some(2_000_000_000)));
+    let mut other = open(&t);
+    other.config.max_bytes = 1;
+    other.record(&entry()).unwrap(); // Seal the resume before H opens.
+    let writer = open(&t);
+    writer.record(&entry()).unwrap();
+    let inode = fs::metadata(t.0.join("audit.jsonl")).unwrap().ino();
+    let rotated = other.record(&entry()).unwrap();
+    let dir = File::open(&t.0).unwrap();
+    let names = rotate::rotated_names_at(&dir, "audit").unwrap();
+    let archived = names
+        .iter()
+        .find(|name| fs::metadata(t.0.join(name)).unwrap().ino() == inode)
+        .unwrap();
+    fs::rename(t.0.join(archived), t.0.join("archived.jsonl")).unwrap();
+    assert!(
+        rotate::rotated_names_at(&dir, "audit")
+            .unwrap()
+            .iter()
+            .all(|name| fs::metadata(t.0.join(name)).unwrap().ino() != inode)
+    );
+    assert_eq!(
+        writer.record(&entry()).unwrap().head.seq,
+        rotated.head.seq + 1
+    );
+}
+
+#[test]
+fn resume_honest_same_inode_two_handles_continue() {
+    let t = Temp::new();
+    let (mut original, _, _) = truncated_resume(&t, 3);
+    original.closed = true;
+    hooks::TIME.with(|time| time.set(Some(2_000_000_000)));
+    let writer = open(&t);
+    let other = open(&t);
+    for expected in 6..10 {
+        let handle = if expected % 2 == 0 { &writer } else { &other };
+        assert_eq!(handle.record(&entry()).unwrap().head.seq, expected);
+    }
+}
+
+#[test]
+fn resume_deleted_live_equal_acknowledgement_continues() {
+    let t = Temp::new();
+    let mut writer = create(&t);
+    writer.config.max_bytes = 1;
+    let acknowledged = writer.record(&entry()).unwrap().head.seq;
+    assert_eq!(acknowledged, 3);
+    writer.config.max_bytes = Config::default().max_bytes;
+    fs::remove_file(t.0.join("audit.jsonl")).unwrap();
+    let resume = install_resume(&t, &writer, acknowledged);
+    hooks::TIME.with(|time| time.set(Some(2_000_000_000)));
+    let receipt = writer.record(&entry()).unwrap();
+    assert_eq!(receipt.head.seq, acknowledged + 3);
+    assert_eq!(records(&t).last().unwrap().context.previous, resume.hash());
 }
