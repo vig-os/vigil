@@ -828,12 +828,11 @@ fn genesis_resume_requires_immediate_matching_declaration() {
 
 mod runs {
     use super::*;
-    use crate::audit::{KeySeed, Signer};
+    use crate::audit::{KeyFileSigner, Signer};
 
-    // KeySeed is the current B1 software signer; the planned KeyFileSigner
-    // wrapper is not present yet. All checkpoints here have real signatures.
+    // All checkpoints here have real signatures from the test-only constructor.
     fn signed(seq: u64, previous: [u8; 32], mmr: &Mmr) -> Record {
-        let key = KeySeed::parse(&"27".repeat(32)).unwrap();
+        let key = KeyFileSigner::from_hex(&"27".repeat(32)).unwrap();
         let fields = |sig| {
             CheckpointFields::new(
                 mmr.size(),
@@ -1113,7 +1112,7 @@ mod runs {
         fs::write(d.0.join(".audit-resume.jsonl"), &staged).unwrap();
         let sink = Sink::open(
             &d.0,
-            Arc::new(KeySeed::parse(&"27".repeat(32)).unwrap()),
+            Arc::new(KeyFileSigner::from_hex(&"27".repeat(32)).unwrap()),
             Config::default(),
             Some(Head::of(&resume)),
         )
@@ -1209,7 +1208,7 @@ mod runs {
             };
             let sink = Sink::open(
                 &d.0,
-                Arc::new(KeySeed::parse(&"27".repeat(32)).unwrap()),
+                Arc::new(KeyFileSigner::from_hex(&"27".repeat(32)).unwrap()),
                 Config::default(),
                 Some(Head::of(&expected)),
             )
@@ -1323,7 +1322,7 @@ mod runs {
         assert!(
             Sink::open(
                 &d.0,
-                Arc::new(KeySeed::parse(&"27".repeat(32)).unwrap()),
+                Arc::new(KeyFileSigner::from_hex(&"27".repeat(32)).unwrap()),
                 Config::default(),
                 None
             )
@@ -1503,7 +1502,7 @@ mod runs {
                     fs::rename(d.0.join("audit.jsonl"), d.0.join(".audit-resume.jsonl")).unwrap();
                     let result = Sink::open(
                         &d.0,
-                        Arc::new(KeySeed::parse(&"27".repeat(32)).unwrap()),
+                        Arc::new(KeyFileSigner::from_hex(&"27".repeat(32)).unwrap()),
                         Config::default(),
                         None,
                     );
@@ -1588,7 +1587,7 @@ mod runs {
                     fs::rename(d.0.join("audit.jsonl"), d.0.join(".audit-resume.jsonl")).unwrap();
                     let result = Sink::open(
                         &d.0,
-                        Arc::new(KeySeed::parse(&"27".repeat(32)).unwrap()),
+                        Arc::new(KeyFileSigner::from_hex(&"27".repeat(32)).unwrap()),
                         Config::default(),
                         None,
                     );
@@ -1652,7 +1651,9 @@ mod runs {
                 cp.size,
                 cp.root,
                 cp.peaks.clone(),
-                KeySeed::parse(&"27".repeat(32)).unwrap().public_key(),
+                KeyFileSigner::from_hex(&"27".repeat(32))
+                    .unwrap()
+                    .public_key(),
                 [0; 64],
             )
             .unwrap(),
