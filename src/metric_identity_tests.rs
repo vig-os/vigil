@@ -15,7 +15,7 @@ fn declaration(
         kind,
         unit,
         description,
-        boundaries,
+        boundaries: boundaries.map(canonical_boundaries),
     }
 }
 fn counter(scope: &'static str, name: &'static str, unit: &'static str) -> Declaration {
@@ -479,4 +479,71 @@ fn d0123_already_poisoned_is_indexed() {
             .contains("metric names poisoned by conflicting declarations")
     );
     assert!(losses.finish(Ok(())).is_ok());
+}
+
+#[test]
+fn description_conflict_clause_is_redundant_for_every_kind() {
+    for kind in [
+        Kind::Counter,
+        Kind::CounterF64,
+        Kind::UpDownCounter,
+        Kind::Gauge,
+        Kind::Histogram,
+    ] {
+        for a_unit in ["ms", "s"] {
+            for b_unit in ["ms", "s"] {
+                for a_bounds in [
+                    None,
+                    Some(&[][..]),
+                    Some(&[1.0, 2.0][..]),
+                    Some(&[1.0, 3.0][..]),
+                ] {
+                    for b_bounds in [
+                        None,
+                        Some(&[][..]),
+                        Some(&[1.0, 2.0][..]),
+                        Some(&[1.0, 3.0][..]),
+                    ] {
+                        let a =
+                            declaration("crate-a", "same.name", kind, a_unit, "first", a_bounds);
+                        let b =
+                            declaration("crate-a", "same.name", kind, b_unit, "second", b_bounds);
+                        let a_series = series_names(a.name, a.kind, a.unit);
+                        let b_series = series_names(b.name, b.kind, b.unit);
+                        let overlap = a_series.iter().any(|name| b_series.contains(name));
+                        assert!(a.conflicts(&b, overlap), "{a:?} {b:?}");
+                        // Only compatible pairs can reach the description clause:
+                        // equal name/kind/unit always translates to overlapping series.
+                        assert!(overlap || !a.compatible(&b), "{a:?} {b:?}");
+                        assert_eq!(a.conflicts(&b, overlap), overlap || !a.compatible(&b));
+                        assert_eq!(b.conflicts(&a, overlap), overlap || !b.compatible(&a));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn canonical_boundary_equality_and_order_agree() {
+    let a = declaration(
+        "crate-a",
+        "zero.h",
+        Kind::Histogram,
+        "",
+        "",
+        Some(&[-0.0, 1.0]),
+    );
+    let b = declaration(
+        "crate-a",
+        "zero.h",
+        Kind::Histogram,
+        "",
+        "",
+        Some(&[0.0, 1.0]),
+    );
+    assert_eq!(a, b);
+    assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
+    assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Equal));
+    assert_eq!(a.boundaries.unwrap()[0].to_bits(), 0.0_f64.to_bits());
 }

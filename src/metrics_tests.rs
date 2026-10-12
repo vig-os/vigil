@@ -846,3 +846,65 @@ fn determinism_mask_retains_field_order_and_scalar_spelling() {
         normalize_identity_comparison(reversed)
     );
 }
+
+fn signed_zero_run(reverse: bool) {
+    let path = dir("signed-zero");
+    static NEGATIVE: Histogram =
+        Histogram::new(Scope::new("crate-a", "1"), "zero.h").with_boundaries(&[-0.0, 1.0]);
+    static POSITIVE: Histogram =
+        Histogram::new(Scope::new("crate-a", "1"), "zero.h").with_boundaries(&[0.0, 1.0]);
+    let (_, guard) = Config::new("signed-zero")
+        .dir(&path)
+        .metrics_interval(std::time::Duration::from_secs(3600))
+        .layer::<tracing_subscriber::Registry>()
+        .unwrap();
+    if reverse {
+        POSITIVE.record(0.5, &[]);
+        NEGATIVE.record(0.5, &[]);
+    } else {
+        NEGATIVE.record(0.5, &[]);
+        POSITIVE.record(0.5, &[]);
+    }
+    guard.flush().unwrap();
+    let exported = metrics(&path);
+    assert_eq!(exported.len(), 1);
+    let point = &exported[0]["histogram"]["dataPoints"][0];
+    assert_eq!(point["count"], "2");
+    assert_eq!(
+        point["explicitBounds"][0].as_f64().unwrap().to_bits(),
+        0.0_f64.to_bits()
+    );
+    let text = fs::read_to_string(path.join("metrics.jsonl")).unwrap();
+    println!(
+        "SIGNED_ZERO:{}",
+        serde_json::to_string(&normalize_identity_comparison(&text)).unwrap()
+    );
+    guard.shutdown().unwrap();
+    fs::remove_dir_all(path).unwrap();
+}
+#[test]
+fn identity_determinism_zero_forward() {
+    if child("identity_determinism_zero_forward").is_none() {
+        signed_zero_run(false);
+    }
+}
+#[test]
+fn identity_determinism_zero_reverse() {
+    if child("identity_determinism_zero_reverse").is_none() {
+        signed_zero_run(true);
+    }
+}
+#[test]
+fn identity_determinism_zero_compares_separate_processes() {
+    let forward = child("identity_determinism_zero_forward").unwrap();
+    let reverse = child("identity_determinism_zero_reverse").unwrap();
+    let line = |out: &Output| {
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("conflicting metric instruments"));
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("SIGNED_ZERO:"))
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(line(&forward), line(&reverse));
+}
