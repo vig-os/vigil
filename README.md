@@ -198,7 +198,7 @@ See [ADR-0004 decision 11](docs/adr/0004-public-api-and-stability.md#11-msrv-pol
 One crate, two layers:
 
 - **Telemetry core** (every project). Your code uses [`tracing`](https://docs.rs/tracing) as usual; vigil bridges it into OpenTelemetry and writes **OTLP/JSON Lines** files that conform to the [OTel file-exporter spec](https://opentelemetry.io/docs/specs/otel/protocol/file-exporter/): one `LogsData` / `MetricsData` / `TracesData` per line, one signal per file, in the [OTLP/JSON encoding](https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding) (64-bit ints as decimal strings, hex trace and span ids, integer enums, lowerCamelCase keys). Files rotate by size with age-based retention, and the rotation is safe when many processes write the same file. Loki (logs) and Prometheus (metrics) ingest OTLP natively.
-- **`audit` feature** (opt-in). A separate, **lossless** audit trail of user actions on a device (who did what, when, and why) in the spirit of 21 CFR Part 11 §11.10(e). Records are still OTLP log records, hash-chained, with Merkle roots per segment and **ed25519-signed checkpoints**. They're built on [`tessera-core`](https://github.com/vig-os/tessera) primitives, so data provenance and audit provenance share one proof system.
+- **`audit` feature** (opt-in). A separate, **lossless** audit trail of user actions on a device (who did what, when, and why) in the spirit of 21 CFR Part 11 §11.10(e). Records are still OTLP log records, hash-chained, committed by one Merkle mountain range (MMR) over the whole trail and covered by **ed25519-signed checkpoints**. The MMR is built the way [`tessera-core`](https://github.com/vig-os/tessera) builds its own (same leaves, nodes and roots), so tessera-core can check vigil's roots and proofs; vigil does not depend on tessera-core ([ADR-0005](docs/adr/0005-audit-trail.md) decisions 7 and 15).
 
 ```rust,no_run
 let guard = vigil::Config::new("my-service")
@@ -518,9 +518,12 @@ Pin the id in the verifier's trust file, which is kept outside the trail directo
 marker lives in the writable directory and is never a trust input. A trail re-created
 after deletion has a new id, even with the same key, and fails verification
 (`TrailMismatch`) until an operator pins the new id on purpose. If `create` fails after
-writing the marker, `open` reports `CorruptTrail` and `create` reports `TrailExists`: no
-record was acknowledged, so remove the directory, run `create` again and pin the newly
-drawn id.
+writing the marker but before completing staging, `open` reports `CorruptTrail` and
+`create` reports `TrailExists`: no record was acknowledged, so remove the directory, run
+`create` again and pin the newly drawn id. If it fails after its final renames, the
+trail is complete but `audit.poison` exists and `open` reports `Poisoned`; take the id
+from the marker, or remove the directory and run `create` again, and pin the id you
+keep (see the `audit.poison` procedure below).
 
 ### Key custody
 
@@ -610,7 +613,7 @@ writer processes:
    may run after the bound. Store the close checkpoints. A writer that returned no close
    checkpoint (killed, dropped, `close` failed, or a poisoned handle) may have left
    records above everything held: start the application once more with `expect_head`
-   from the highest held receipt and `close` that handle.
+   from the highest held receipt or checkpoint and `close` that handle.
 2. **Verify the trail (#13)** against the anchors and the receipts, including the close
    checkpoints, and never with live-trail reconciliation. A record that a `close` signed
    but the application never stored is `NoReceipt` here, before the new key covers it; a
@@ -665,11 +668,17 @@ crash never needs `resume`. An operator decides, with
   next `record` returns `InvalidConfig`. Higher than needed costs only a wider gap, so add
   a margin when in doubt. Lower than a held `seq` fails closed: that receipt or anchor is
   `ReceiptMismatch` or `AnchorMismatch` for good.
-- **Restore archived segments before resuming (R10).** A genesis restart cannot keep the
-  archive's MMR link, and without the predecessor `resume` refuses with `CorruptTrail`.
+- **Restore archived segments before resuming (R10).** vigil cannot detect the
+  missing archive. If every segment was archived away and the live file is lost, only
+  the marker remains, and `resume` accepts the genesis head `(0, genesis digest)` and
+  succeeds, which restarts the MMR and breaks its link to the archive. Restoring the
+  archived segments first is the operator's duty; the verifier's detection of a
+  genesis-linked resume next to archived segments is #13.
 - **On success,** store the returned receipt outside the trail directory before
-  continuing, and anchor the opening checkpoint at `lost_through + 1` (the command-line
-  tool will print its line, #13). The verifier reports the `Resumed` warning until a
+  continuing, and anchor the opening checkpoint at `lost_through + 1`. Today no library call
+  returns that checkpoint (`AuditConfig::resume` returns the trail and the receipt only;
+  [#138](https://github.com/vig-os/vigil/issues/138) tracks the gap), so do not anchor a
+  line read from the trail directory as if it were trusted. The verifier reports the `Resumed` warning until a
   reviewer accepts it (#13; see the review criteria below).
 - **On `Io`, or a call that never returned,** the resume may still have taken effect. If
   `audit.poison` exists, run its clearing procedure first (below). Then `open` settles the
@@ -691,8 +700,9 @@ crash never needs `resume`. An operator decides, with
 Restates [decision 6, amendment 3][d6] and the rustdoc of `AuditErrorKind::Poisoned`
 (`src/audit/mod.rs`). A failed fsync is never retried. When a failure cannot be undone,
 the writer creates `audit.poison` in the trail directory, and `open`, `record`,
-`checkpoint`, `close` and `resume` fail with `Poisoned` while it exists. A poisoned handle
-writes nothing; reopen the trail with `expect_head` from the highest held receipt. To
+`checkpoint`, `close`, `resume`, `AuditConfig::rotate` and `AuditConfig::checkpoint` fail
+with `Poisoned` while it exists, and `Drop` writes nothing and reports once on stderr. A
+poisoned handle writes nothing; reopen the trail with `expect_head` from the highest held receipt. To
 clear the file:
 
 1. Restart the machine, or unmount and remount the filesystem, so that the page cache is
@@ -700,8 +710,8 @@ clear the file:
 2. Verify the trail (#13). It now reads what the disk holds.
 3. Remove `audit.poison`, and nothing else: leave staging files for normal settlement.
 
-The file itself is not fsynced. If a power loss drops it, the restart replaces steps 2
-and 3, and they are silently skipped; run the verification anyway. Verifying before the
+The file itself is not fsynced. If a power loss drops it, the restart is step 1 and
+steps 2 and 3 are silently skipped; run the verification anyway. Verifying before the
 restart reads the page-cache view, which looks the same whether or not the kernel dropped
 the bytes.
 
