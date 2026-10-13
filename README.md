@@ -590,10 +590,10 @@ Restates [decision 5, "Receipt reconciliation"][d5] and [decision 9, step 1][d9]
   the trail directory, before the audited action completes. The receipts file is one
   `<seq> <blake3:hex>` line per record (`Receipt::hash_string` spells the hash); no action
   name is exempt, so a forged `vigil.audit.*` record is `NoReceipt` like any other.
-- **Store every `close` and `resume` checkpoint.** `AuditTrail::close` consumes the handle and returns
-  the `Checkpoint` it signed; `resume` returns its signed opening `Checkpoint`. Keep
-  each checkpoint’s `line` with the receipts. A `Drop` checkpoint is
-  not returned and cannot serve.
+- **Store every `close` and `resume` checkpoint.** `AuditTrail::close` consumes the
+  handle and returns the `Checkpoint` it signed; `resume` returns its signed opening
+  `Checkpoint`. Keep each checkpoint's `line` with the receipts. A `Drop` checkpoint
+  is not returned and cannot serve.
 - **The expected head** after every writer has stopped is the highest `seq` among all
   receipts and close checkpoints the application holds, across all its processes. After a
   `resume` nothing changes: every `seq` the resumed trail writes lies above `lost_through`.
