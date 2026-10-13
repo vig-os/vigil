@@ -26,6 +26,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     #[cfg(feature = "metrics")]
     metric_fixture(&dir)?;
+    #[cfg(feature = "traces")]
+    span_fixture(&dir)?;
     let file = Arc::new(RotatingFile::open(
         &dir,
         "logs",
@@ -154,4 +156,29 @@ fn identity_fixture(dir: &std::path::Path, poison: bool) -> Result<(), Box<dyn s
         Ok(()) if !poison => Ok(()),
         result => Err(format!("unexpected identity shutdown: {result:?}").into()),
     }
+}
+
+#[cfg(all(vigil_unstable, feature = "traces"))]
+#[path = "../tests/common/spans.rs"]
+mod spans;
+
+#[cfg(all(vigil_unstable, feature = "traces"))]
+fn span_fixture(dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    use opentelemetry_sdk::trace::SpanExporter;
+    let mut exporter =
+        vigil::span_export::OtlpJsonSpanExporter::new(MemorySink::new()).with_max_line_bytes(800);
+    exporter.set_resource(&common::resource(vec![KeyValue::new(
+        "service.name",
+        "vigil-traces",
+    )]));
+    let mut batch = spans::batch();
+    batch[1]
+        .attributes
+        .extend((0..100).map(|i| KeyValue::new(format!("key-{i}"), i64::from(i))));
+    spans::ready(exporter.export(batch))?;
+    std::fs::write(
+        dir.join("traces.jsonl"),
+        exporter.sink().lines().join("\n") + "\n",
+    )?;
+    Ok(())
 }

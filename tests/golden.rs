@@ -101,3 +101,22 @@ fn instance_identity_is_the_only_golden_content_change() {
     }
     assert_eq!(before, after);
 }
+
+#[cfg(feature = "traces")]
+#[path = "common/spans.rs"]
+mod spans;
+
+#[cfg(feature = "traces")]
+#[test]
+fn traces_golden_bytes_are_pinned() {
+    use opentelemetry_sdk::trace::SpanExporter;
+    let exporter = vigil::span_export::OtlpJsonSpanExporter::new(MemorySink::new());
+    spans::ready(exporter.export(spans::batch())).unwrap();
+    let actual: String = exporter
+        .sink()
+        .lines()
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_golden("traces-golden.jsonl", &actual);
+}

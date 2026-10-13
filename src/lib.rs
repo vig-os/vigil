@@ -119,3 +119,10 @@ mod metric_identity;
 
 #[cfg(test)]
 mod order_tests;
+
+#[cfg(all(feature = "traces", vigil_unstable))]
+#[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
+pub mod span_export;
+#[cfg(all(feature = "traces", not(vigil_unstable)))]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into init by 8c (#8)"))]
+mod span_export;

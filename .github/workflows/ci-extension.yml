@@ -111,9 +111,9 @@ jobs:
       matrix:
         include:
           - map: default
-            cargo-args: --no-default-features
+            cargo-args: --no-default-features --features traces
           - map: preserve-order
-            cargo-args: --no-default-features --features audit,test-preserve-order
+            cargo-args: --no-default-features --features audit,traces,test-preserve-order
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -127,7 +127,7 @@ jobs:
           cachix-cache: ${{ vars.CACHIX_CACHE }}
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
           dev-profile-path: ${{ inputs.dev-profile-path }}
-      - name: Verify golden bytes and deterministic ordering
+      - name: Verify golden bytes and deterministic ordering (including traces)
         env:
           RUSTFLAGS: --cfg vigil_unstable
           CARGO_ARGS: ${{ matrix.cargo-args }}
