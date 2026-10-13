@@ -18,7 +18,7 @@ name = "vigil"
 [features]
 default = ["metrics", "traces"]
 metrics = ["opentelemetry_sdk/metrics", "opentelemetry_sdk/experimental_metrics_custom_reader", "opentelemetry-proto/metrics"]
-traces = ["opentelemetry_sdk/trace", "opentelemetry-proto/trace"]
+traces = ["opentelemetry_sdk/trace", "opentelemetry-proto/trace", "dep:tracing-opentelemetry"]
 # CI-only consumer feature-unification regression coverage.
 test-preserve-order = ["serde_json/preserve_order"]
 audit = ["dep:blake3", "dep:ed25519-dalek", "dep:zeroize", "dep:base64", "rustix/process"]
@@ -36,6 +36,7 @@ serde = "1"
 serde_json = { version = "1", features = ["raw_value"] }
 rustix = { version = "1.1.5", features = ["fs", "system"] }
 opentelemetry-appender-tracing = "0.33"
+tracing-opentelemetry = { version = "0.34", default-features = false, optional = true }
 tracing = "0.1"
 tracing-core = "0.1"
 tracing-subscriber = { version = "0.3", features = ["registry", "env-filter", "fmt"] }

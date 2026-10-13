@@ -59,10 +59,6 @@ impl<S: LineSink> OtlpJsonSpanExporter<S> {
         &self.sink
     }
     /// Consume the number of spans lost since the previous call.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by trace_pipeline once 8c wires it (#8)")
-    )]
     pub(crate) fn take_dropped_spans(&self) -> usize {
         self.dropped.swap(0, Ordering::Relaxed)
     }

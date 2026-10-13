@@ -38,10 +38,10 @@ pub enum Signal {
 pub(crate) enum QueueSignal {
     Logs,
     #[cfg_attr(
-        not(test),
+        all(not(test), not(feature = "traces")),
         expect(
             dead_code,
-            reason = "constructed only by the trace pipeline, wired into init by 8c (#8)"
+            reason = "constructed only when the traces feature builds the trace pipeline"
         )
     )]
     Traces,
@@ -563,7 +563,6 @@ impl LogProcessor for ReportingProcessor {
 
 /// Counts completed span submissions and preserves typed processor timeouts.
 #[cfg(feature = "traces")]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into init by 8c (#8)"))]
 #[derive(Debug)]
 pub(crate) struct ReportingSpanProcessor<P: opentelemetry_sdk::trace::SpanProcessor> {
     pub(crate) inner: P,
