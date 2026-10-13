@@ -79,3 +79,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(vigil_unstable)'] }
 all-features = true
 rustdoc-args = ["--cfg", "docsrs", "--cfg", "vigil_unstable"]
 rustc-args = ["--cfg", "vigil_unstable"]
+
+[[bin]]
+name = "vigil-audit"
+path = "src/bin/vigil-audit/main.rs"
+required-features = ["audit"]

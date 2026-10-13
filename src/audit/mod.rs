@@ -13,6 +13,7 @@
 //! Format primitives require `--cfg vigil_unstable` and are provisional. Pin
 //! vigil with `~1.N` when opting in; they may change in a minor release.
 
+mod checkpoints;
 mod config;
 mod format;
 mod mmr;
@@ -21,6 +22,7 @@ mod sink;
 #[cfg_attr(not(test), allow(dead_code))] // Verifier wiring follows in #13.
 pub(crate) mod storage;
 mod trail;
+pub use checkpoints::checkpoints;
 pub use config::AuditConfig;
 pub use format::{Checkpoint, Entry, Value};
 pub use signing::{KeyFileSigner, Signer, SignerError, keygen};

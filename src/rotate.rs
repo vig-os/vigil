@@ -934,7 +934,7 @@ fn snapshot_state(dir: &Path, signal: &str) -> io::Result<SnapshotState> {
 
 // Never impede writers: under continuous rotation, return the eighth copy
 // through the caller's best-effort fallback rather than retrying indefinitely.
-fn retry_snapshot<T>(
+pub(crate) fn retry_snapshot<T>(
     dir: &Path,
     signal: &str,
     mut copy: impl FnMut(&[PathBuf]) -> io::Result<T>,
