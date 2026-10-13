@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 ///
 /// Dropping a healthy handle attempts a checkpoint, best effort, without
 /// panicking. Use [`Self::close`] to obtain a signed clean-stop head.
+/// If a boundary segment is lost and the clock went backwards, a later resume
+/// may sort below the handle's boundary: writes fail `CorruptTrail` without
+/// mutation. Reopen the trail to continue (ADR-0005 amendment 9, B3d2-d9).
 #[must_use]
 pub struct AuditTrail {
     sink: sink::Sink,

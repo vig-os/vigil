@@ -270,7 +270,7 @@ fn validation_happens_before_any_disk_access() {
         assert_eq!(error.kind(), AuditErrorKind::InvalidConfig);
         assert_eq!(
             error.to_string(),
-            "InvalidConfig: rotate/checkpoint take an explicit expected head; builder expect_head is invalid"
+            "InvalidConfig: operator calls take an explicit head; builder expect_head is invalid"
         );
     }
     assert_eq!(fs::read_dir(&t.0).unwrap().count(), 0);

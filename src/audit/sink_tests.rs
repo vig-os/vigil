@@ -1103,7 +1103,7 @@ fn resume_without_predecessor_discards_nonzero_genesis_head() {
 fn fail(sites: &[&'static str]) {
     hooks::FAIL.with(|f| *f.borrow_mut() = sites.to_vec());
 }
-fn snapshot(t: &Temp) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+pub(super) fn snapshot(t: &Temp) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     fs::read_dir(&t.0)
         .unwrap()
         .map(|e| {
@@ -2968,4 +2968,51 @@ fn resume_deleted_live_equal_acknowledgement_continues() {
     let receipt = writer.record(&entry()).unwrap();
     assert_eq!(receipt.head.seq, acknowledged + 3);
     assert_eq!(records(&t).last().unwrap().context.previous, resume.hash());
+}
+
+#[test]
+fn resume_lost_future_boundary_fails_closed() {
+    let t = Temp::new();
+    let mut setup = create(&t);
+    setup.config.max_bytes = 1;
+    setup.record(&entry()).unwrap();
+    setup.record(&entry()).unwrap();
+    setup.closed = true;
+    let dir = File::open(&t.0).unwrap();
+    let names = rotate::rotated_names_at(&dir, "audit").unwrap();
+    assert_eq!(names.len(), 2);
+    // Model two normal rotations, the latter while the wall clock is ahead.
+    fs::rename(
+        t.0.join(&names[0]),
+        t.0.join("audit-20000101T000000.000000000Z.jsonl"),
+    )
+    .unwrap();
+    let future = "audit-20990101T000000.000000000Z.jsonl";
+    fs::rename(t.0.join(&names[1]), t.0.join(future)).unwrap();
+    let mut writer = open(&t);
+    writer.closed = true;
+    let held = writer.record(&entry()).unwrap().head.seq;
+    // Structural tail loss; retain the earlier segment as the resume base.
+    fs::remove_file(t.0.join(future)).unwrap();
+    fs::remove_file(t.0.join("audit.jsonl")).unwrap();
+    install_resume(&t, &writer, held);
+    // The clock is back to the present. The resume is sealed below H's lost
+    // retained name boundary, then an ordinary opening replaces its header.
+    let mut other = open(&t);
+    other.closed = true;
+    other.config.max_bytes = 1;
+    let newest = other.record(&entry()).unwrap().head.seq;
+    Sink::open(&t.0, signer(), Config::default(), None)
+        .unwrap()
+        .closed = true;
+    let before = snapshot(&t);
+    bad(writer.record(&entry()), AuditErrorKind::CorruptTrail);
+    bad(writer.checkpoint(), AuditErrorKind::CorruptTrail);
+    bad(writer.close(), AuditErrorKind::CorruptTrail);
+    assert_eq!(snapshot(&t), before);
+    assert!(!t.0.join(".audit-next.jsonl").exists());
+    assert!(!t.0.join(".audit-resume.jsonl").exists());
+    let mut fresh = open(&t);
+    fresh.closed = true;
+    assert_eq!(fresh.record(&entry()).unwrap().head.seq, newest + 1);
 }

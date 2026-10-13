@@ -642,6 +642,18 @@ pub(crate) fn next_segment_name(signal: &str, now: &str, newest: Option<&str>) -
     }
 }
 
+/// Pick the sealing name before staging, while holding the directory lock.
+#[cfg(feature = "audit")]
+pub(crate) fn next_segment_name_now(dir: &File, signal: &str) -> io::Result<String> {
+    let now = stamp(SystemTime::now());
+    let names = rotated_names_at(dir, signal)?;
+    Ok(next_segment_name(
+        signal,
+        &now,
+        names.last().and_then(|p| p.to_str()),
+    ))
+}
+
 /// Rotate relative to the locked directory, atomically and without replacing
 /// an existing segment. Fall back only when the no-replace operation is absent.
 pub(crate) fn rotate(dir: &File, signal: &str, live_name: &Path) -> io::Result<()> {
