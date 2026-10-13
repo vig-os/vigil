@@ -7,7 +7,7 @@ use std::fmt;
 
 // Preserve serde's error category at the seam for B2's torn-prefix recovery.
 // Warning/strict policy belongs to #68, not the complete-record decoder.
-fn decode_complete_json(bytes: &[u8]) -> Result<Json, serde_json::Error> {
+pub(crate) fn decode_complete_json(bytes: &[u8]) -> Result<Json, serde_json::Error> {
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
     let value = Unique::deserialize(&mut decoder)?.0;
     decoder.end()?;
@@ -289,9 +289,9 @@ impl Record {
     /// policy and receipt reconciliation across resume follow the accepted
     /// amendment 2 (#68/#70) and belong to trail verification (#13). Context AnyValue nesting is limited to 16 container edges; JSON also has a 128-level parser guard.
     /// Only canonical camelCase message keys and decimal-string int64 fields
-    /// are accepted. Raw bytes below 0x20 are InvalidField; escaped controls and DEL are content.
+    /// are accepted. Raw bytes below 0x20 are Unparsable; escaped controls and DEL are content.
     /// JSON payloads over 1,000,000 bytes, excluding one optional final LF, fail
-    /// with TooLarge/InvalidField before parsing. No input is normalized.
+    /// with TooLarge/Unparsable before parsing. No input is normalized.
     ///
     /// # Errors
     ///
@@ -299,15 +299,14 @@ impl Record {
     /// Invalid framing, JSON, context, record fields or hashes return
     /// [`AuditErrorKind::CorruptTrail`] with a typed verifier finding.
     pub fn parse_line(bytes: &[u8]) -> Result<Vec<Self>, AuditError> {
-        let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-        payload(bytes)?;
-        let json = decode_complete_json(bytes).map_err(|e| {
-            finding(if e.is_data() {
-                FindingKind::InvalidField
-            } else {
-                FindingKind::Unparsable
-            })
-        })?;
+        match super::super::lines::classify(bytes) {
+            super::super::lines::Line::Record(records) => records,
+            super::super::lines::Line::Unparsable(error) => Err(error),
+            super::super::lines::Line::Fragment => Err(finding(FindingKind::Unparsable)),
+        }
+    }
+    /// Validates the record fields of an already decoded JSON object.
+    pub(crate) fn from_json(json: Json) -> Result<Vec<Self>, AuditError> {
         contexts(&json)?;
         message(&json, &["resourceLogs"])?;
         let mut records = Vec::new();

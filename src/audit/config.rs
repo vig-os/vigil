@@ -237,7 +237,8 @@ impl AuditConfig {
     /// if none remains. Headless, empty and rolled-back live files are sealed
     /// unchanged; a deleted live file needs no sealing. `lost_through` is "the
     /// highest `seq` the deployment holds any evidence of outside the trail
-    /// directory", including all processes' receipts, close checkpoints and pins.
+    /// directory", including receipts and close checkpoints of every process, anchors,
+    /// and revocation pins.
     /// It must be at least the head and at most `i64::MAX - 2`
     /// (sequence numbers are OTLP int64).
     /// At that bound resume succeeds, but the next `record` returns

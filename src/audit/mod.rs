@@ -15,6 +15,7 @@
 
 mod config;
 mod format;
+mod lines;
 mod mmr;
 mod signing;
 mod sink;
@@ -86,7 +87,8 @@ pub enum AuditErrorKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FindingKind {
-    /// Bytes are not one complete JSON value (including blank input).
+    /// Payload does not decode to a JSON object, including raw controls,
+    /// oversized payloads, invalid JSON, non-objects and blank input.
     Unparsable,
     /// The declared audit version is unsupported.
     UnknownVersion,
