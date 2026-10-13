@@ -799,7 +799,7 @@ README deployment duties belong to B3e, including amendment 10's separate `accep
   vigil-audit keygen <keyfile>
   ```
 
-  **The binary uses only the public API** (amendment 12, Proposed, ruling 13-d1 OQ11): `vigil-audit checkpoints` calls `checkpoints(dir)` (decision 13), and the receipts and review files are parsed in the binary, whose builder calls (`waive`, `receipts_from`, `accept`, `accept_run`) enforce the duplicate and kind rules below; an `InvalidConfig` from them is exit 2.
+  **The binary uses only the public API** (amendment 12, Accepted for checkpoint listing, [PR #147](https://github.com/vig-os/vigil/pull/147), ruling 13-d1 OQ11): `vigil-audit checkpoints` calls `checkpoints(dir)` (decision 13), and the receipts and review files are parsed in the binary, whose builder calls (`waive`, `receipts_from`, `accept`, `accept_run`) enforce the duplicate and kind rules below; an `InvalidConfig` from them is exit 2.
 
 - **Receipts file** (`--receipts`, amended, #66). UTF-8 lines; blank lines and lines starting with `#` are ignored:
   - `<seq> <blake3:hex>`: a receipt, a record's or a checkpoint's (decision 5);
@@ -1045,7 +1045,7 @@ Only vigil's own types and std appear. Hashes and keys are byte arrays, not `bla
 | `verify(dir, &TrustPolicy) -> Result<Report, AuditError>`, `Verifier` (`new(TrustPolicy)` by value; `anchor`, `start_from`, `receipts`; the fallible `trail`, `end_before`, `receipts_live`, `max_age`, `waive`, `receipts_from`, `accept` and `accept_run`, each `Result<Self, AuditError>` with `InvalidConfig`; `verify_dir` and `verify_files`, each `Result<Report, AuditError>`) (amended: `accept` by #68; amendment 12, Proposed, rulings 13-d1 OQ2 and 13-d2 D) | The verify contract (decision 11). `Err` is only `Io` (cannot read, the `io::Error` as source) or `InvalidConfig`; tampering is a finding. |
 | `Report` (`trail`, `records`, `first_seq`, `last_seq`, `covered_through`, `findings`, `is_valid`, `is_strict_valid`, `first_broken_link`) (amendment 12, Proposed, rulings 13-d1 OQ6 and 13-d2 C) | The verify result. `is_strict_valid` keeps the `--strict` predicate in the library; `first_seq` backs the JSON and text output (decision 11). |
 | `Finding` (`kind`, `severity`, `file`, `line`, `seq`, `detail`, `accepted_kind`, `run_digest`), `FindingKind` and `Severity` (both `#[non_exhaustive]`, `Copy + Eq + Debug`) (amendment 12, Proposed, ruling 13-d1 OQ6) | One finding. `accepted_kind` and `run_digest` carry what the review file and the JSON output need (decision 11). |
-| `checkpoints(dir: &Path) -> io::Result<Vec<Checkpoint>>` (amendment 12, Proposed, ruling 13-d1 OQ11) | The checkpoints of a trail directory in vigil's segment order, so `vigil-audit checkpoints` uses only the public API (decision 10). |
+| `checkpoints(dir: &Path) -> io::Result<Vec<Checkpoint>>` (amendment 12, Accepted, [PR #147](https://github.com/vig-os/vigil/pull/147), ruling 13-d1 OQ11) | The checkpoints of a trail directory in vigil's segment order, so `vigil-audit checkpoints` uses only the public API (decision 10). |
 | `AuditError`, `AuditErrorKind` (`Io`, `Poisoned`, `TooLarge`, `InvalidEntry`, `CorruptTrail`, `HeadMismatch`, `MissingTrail`, `TrailExists`, `Signer`, `InvalidConfig`), `#[non_exhaustive]`, `Copy + Eq + Debug` like ADR-0004's kinds | Matchable failures (ADR-0004 decision 3 shape). |
 
 ### 14. Dependencies (feature `audit` only)
@@ -1263,7 +1263,7 @@ Source: architect rulings 13-d1 (the #13 plan's open questions OQ1 to OQ15; the 
 | [19.4](#194-json-and-text-output-oq7) | the JSON schema and the text header | C1 | Proposed |
 | [19.5](#195-what-is-unparsable-oq9-b) | one classification of `Unparsable` for the reader and the verifier | 13-R ([#143](https://github.com/vig-os/vigil/issues/143)) | Proposed |
 | [19.6](#196-a-genesis-resume-and-r10-oq10-a) | genesis-resume gap `0..=lost_through`; R10 is `ChainBroken` | V3 and the R10 slice | Proposed |
-| [19.7](#197-the-checkpoints-function-oq11) | public `checkpoints(dir)` | C2 | Proposed |
+| [19.7](#197-the-checkpoints-function-oq11) | public `checkpoints(dir)` | C2 | Accepted ([PR #147](https://github.com/vig-os/vigil/pull/147)) |
 
 #### 19.1 The TrustPolicy builder (OQ1)
 
@@ -1335,9 +1335,24 @@ Source: architect rulings 13-d1 (the #13 plan's open questions OQ1 to OQ15; the 
 
 #### 19.7 The checkpoints function (OQ11)
 
+**Status: Accepted**, implemented by [PR #147](https://github.com/vig-os/vigil/pull/147) (#13 C2).
+
 - **Rule.** `pub fn checkpoints(dir: &Path) -> io::Result<Vec<Checkpoint>>` returns the checkpoints in vigil's segment order, so `vigil-audit checkpoints <dir>` uses only the public API. Receipts and review files are parsed in the binary; the library builder methods enforce the duplicate and kind rules.
 - **Why.** The binary can use only the public API, and the segment order and the segment parser are crate-private.
 - **Lands in** C2 (which also owns the binary skeleton).
+- **Snapshot semantics (13-d3 item 5).** No lock is taken. The ADR-0002 decision 12 snapshot retry checks segment names and the live inode before and after reading, up to eight attempts. Exhaustion returns `io::Error`; the live tail is never silently dropped. Unparsable lines and ordinary records are ignored. Parsed checkpoints are structurally and hash checked, but neither signatures nor chain history are verified.
+
+**C2 operator output and lifecycle note** (architect ruling 13-d3, item 2 clarified by 13C2-d1; [PR #147](https://github.com/vig-os/vigil/pull/147)):
+
+- Receipt lines are `<seq> blake3:<64 lowercase hex>`; checkpoint lines are the original JSON payload. Lines are emitted in sequence order, only after the library call producing them returns.
+- `keygen` writes the key file and `<keyfile>.pub`, and prints the public key.
+- `create` prints the 32-hex trail id, then its close checkpoint.
+- `resume` prints the opening checkpoint at L+1, the resume receipt at L+2 and its close checkpoint at L+3.
+- `rotate` prints its receipt, then its checkpoint. `checkpoint` prints its checkpoint receipt, then its checkpoint line. `checkpoints` prints all parseable checkpoints in segment order, including `audit.jsonl`.
+- `create` uses its `--service` value for `service.name`; `rotate`, `checkpoint` and `resume` use the constant `vigil-audit`. The human is named by `--actor`.
+- Commands obtaining a handle (`create` and `resume`) explicitly call `close()` before exit. Successful output is retained when a later close fails. Item 1 governs **every** exit code, including close failures: success 0; `Io`/`InvalidConfig` and usage errors 2; every other `AuditError` and `SignerError` 1. Audit diagnostics are `error: <Kind>: <detail>`; signer diagnostics are `error: Signer: <detail>`.
+- If stdout fails after a successful operation, all successful output lines are repeated on stderr and exit is 2. The six operator commands exist in C2; `verify` remains #13 C1 and is rejected as unknown until that slice lands.
+
 
 #### 19.8 The sentences this amendment changes
 
