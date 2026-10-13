@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Operator `resume` (`AuditConfig::resume`) with a receipt and signer-retaining writer handle ([#11](https://github.com/vig-os/vigil/issues/11)).
+
 - ADR-0005 amendment 10: prefix deletion, archiving and run review. `open` is structural and `verify` decides; the archive procedure copies from the verified snapshot, verifies in place per batch and checks each batch's end on a schedule (`--end-before`); a run's `SegmentStructure` names every loss point's missing `seq` range, and an `accept-run` review line accepts exactly one run's findings by a ranges digest. Docs only; #13 implements it ([#107](https://github.com/vig-os/vigil/issues/107)).
 - Prometheus conformance script, shared translation fixture and README Prometheus subsection ([#7](https://github.com/vig-os/vigil/issues/7)).
 - Audit operator `rotate` and `checkpoint` require an exact expected head, with atomic new-key coverage and documented crash recovery ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
@@ -55,6 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Docs: ADR-0003 amendments for traces (decision 15 drops the span sink's pending state, decision 16 respects an upstream's sample-out, decision 23 counts span overflow per flush) and ADR-0004 decision 7's `traces` crate count ([#8](https://github.com/vig-os/vigil/issues/8)).
+- ADR-0005 amendment 9 Accepted: operator resume surface and inline path; `promote_resume` returns `ResumeOutcome`; document the lost-boundary clock-rollback limit ([#11](https://github.com/vig-os/vigil/issues/11)).
+
 - Audit writers discover crossed `vigil.audit.resume` loss bounds before cache validation, rebuild through open, and track their highest acknowledged `seq` to fail closed stickily on a contradictory resume (R7'', ADR-0005 amendment 9, Proposed; [#11](https://github.com/vig-os/vigil/issues/11)).
 - Clarify the error diagnostic stability promise and strengthen Prometheus harness retry, deadline and attempt-log coverage; complete mapping documentation ([#128](https://github.com/vig-os/vigil/issues/128)).
 - ADR-0005 amendment 9 part 1 ([#11](https://github.com/vig-os/vigil/issues/11); settle/reader rules for operator resume: R5'' promotion matches a validated `file=`, R6' genesis leaf is the genesis digest, R9 hard-link-first in settle; test-only fault-injection seam in `rotate::rename_with`).

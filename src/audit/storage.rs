@@ -591,15 +591,9 @@ pub(crate) fn resumes_after(
     if (old.dev(), old.ino()) == (current.dev(), current.ino()) {
         return Ok(None);
     }
-    let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
-    let boundary = boundary(dir, cache)?;
+    let (names, _) = segments_after(dir, cache)?;
     let mut minimum = None;
     for name in &names {
-        if boundary.as_ref().is_some_and(|b| {
-            crate::rotate::segment_key(name, "audit") <= crate::rotate::segment_key(b, "audit")
-        }) {
-            continue;
-        }
         let file = existing(dir, name, false)?;
         if let Some(bound) = resume_header(&file, trail)? {
             minimum = Some(minimum.map_or(bound, |prior: u64| prior.min(bound)));
@@ -664,7 +658,10 @@ fn resume_header(file: &File, trail: [u8; 16]) -> Result<Option<u64>, AuditError
     Ok(None)
 }
 
-fn boundary(dir: &File, cache: &Cache) -> Result<Option<PathBuf>, AuditError> {
+fn segments_after(
+    dir: &File,
+    cache: &Cache,
+) -> Result<(Vec<PathBuf>, Option<PathBuf>), AuditError> {
     let old = cache.file.metadata().map_err(io_error)?;
     let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
     let mut boundary = cache.sealed_before.clone();
@@ -676,7 +673,19 @@ fn boundary(dir: &File, cache: &Cache) -> Result<Option<PathBuf>, AuditError> {
             break;
         }
     }
-    Ok(boundary)
+    let newest = names.last().cloned();
+    Ok((
+        names
+            .into_iter()
+            .filter(|name| {
+                boundary.as_ref().is_none_or(|b| {
+                    crate::rotate::segment_key(name, "audit")
+                        > crate::rotate::segment_key(b, "audit")
+                })
+            })
+            .collect(),
+        newest,
+    ))
 }
 
 fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditError> {
@@ -721,14 +730,8 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
     )?;
     // Locate the old descriptor by metadata, never by rereading historical
     // contents. If archived, the previous sealed name remains a lower bound.
-    let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
-    let boundary = boundary(dir, cache)?;
+    let (names, newest) = segments_after(dir, cache)?;
     for name in &names {
-        if boundary.as_ref().is_some_and(|b| {
-            crate::rotate::segment_key(name, "audit") <= crate::rotate::segment_key(b, "audit")
-        }) {
-            continue;
-        }
         let file = existing(dir, name, false)?;
         state = history_segment(&file, trail, state, true, None, &mut found, &mut run)?;
     }
@@ -737,7 +740,7 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
     *cache = Cache {
         file,
         state,
-        sealed_before: names.last().cloned(),
+        sealed_before: newest,
     };
     Ok(())
 }

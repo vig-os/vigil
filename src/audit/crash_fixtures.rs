@@ -79,15 +79,22 @@ impl Process {
             .unwrap()
             .write_all(b"close\n")
             .unwrap();
+        self.finish();
+    }
+    /// Wait for a child that needs no instruction, verifying its test ran.
+    pub(crate) fn finish(&mut self) {
         let mut line = String::new();
+        let mut passed = false;
         while self.output.read_line(&mut line).unwrap() != 0 {
             if let Some(rest) = line.strip_prefix("RECEIPT ") {
                 let (seq, hash) = rest.trim().split_once(' ').unwrap();
                 self.receipts.push((seq.parse().unwrap(), hash.into()));
             }
+            passed |= line.contains("1 passed;");
             line.clear();
         }
         assert!(self.child.wait().unwrap().success());
+        assert!(passed, "child must execute exactly one passing test");
     }
 }
 impl Drop for Process {

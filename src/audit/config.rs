@@ -5,7 +5,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 /// Reviewed audit policy, independent of telemetry and `VIGIL_*` variables.
 ///
-/// Builders defer validation until create, open, rotate or checkpoint. The
+/// Builders defer validation until create, open, rotate, checkpoint or resume. The
 /// default directory is `$XDG_STATE_HOME/<service>/audit`, falling back to
 /// `$HOME/.local/state/<service>/audit`; relative environment paths are ignored.
 #[derive(Debug, Clone)]
@@ -95,7 +95,7 @@ impl AuditConfig {
         if self.expected.is_some() {
             return Err(AuditError::new(
                 AuditErrorKind::InvalidConfig,
-                "rotate/checkpoint take an explicit expected head; builder expect_head is invalid",
+                "operator calls take an explicit head; builder expect_head is invalid",
             ));
         }
         self.validate(false)
@@ -227,6 +227,93 @@ impl AuditConfig {
             sink::OperatorOp::Checkpoint,
         )?;
         super::trail::checkpoint(written.checkpoint)
+    }
+    /// Resumes structural loss under ADR-0005 decision 8, "An operator decides",
+    /// and amendment 9. Restore archived segments before resuming: a genesis
+    /// restart cannot retain their MMR link. Amendment 6's base must be a
+    /// checkpoint; otherwise restore the archived predecessor first.
+    ///
+    /// `head` must equal the last complete record found, or `(0, genesis digest)`
+    /// if none remains. Headless, empty and rolled-back live files are sealed
+    /// unchanged; a deleted live file needs no sealing. `lost_through` is "the
+    /// highest `seq` the deployment holds any evidence of outside the trail
+    /// directory", including all processes' receipts, close checkpoints and pins.
+    /// It must be at least the head and at most `u64::MAX - 2`.
+    ///
+    /// The opening checkpoint is at `lost_through + 1`; the unsigned resume
+    /// entry follows at `lost_through + 2`, with the trail id as object and
+    /// `audit.details` exactly `head=<seq>:blake3:<hex> lost_through=<seq> file=<name|->`.
+    /// "Both lines go into `.audit-resume.jsonl` in one write and one fsync"
+    /// before promotion under one lock. With no predecessor, the shared fold
+    /// uses the genesis digest as its single leaf (amendment 9 part 1).
+    /// The signer signs the opening and becomes the returned handle's signer,
+    /// including its best-effort Drop checkpoint. Store the returned receipt
+    /// outside the directory before continuing.
+    ///
+    /// # Crash recovery
+    /// "A `resume` that returned `Io` may still take effect, whatever step failed"
+    /// (decision 6, amendment 3 rule 2). Clear poison by restarting the machine
+    /// or remounting the filesystem, verifying, then removing `audit.poison`.
+    /// After restart, open settles staging; read the resume entry from the trail.
+    /// For `Io` or a call that never returned, waive only that entry at
+    /// `lost_through + 2`, directly after its opening checkpoint. Its full hashed
+    /// content must match the recorded call arguments and its time the call
+    /// window (decision 5, amendment 8, rulings B3c-d1/d2). Use the fixed reason
+    /// `operator resume started <UTC>: returned Io: <error>` or
+    /// `operator resume started <UTC>: did not return (<killed|host stopped> at <UTC>)`.
+    /// Review `Resumed` separately; amendment 10's `accept-run` pins the run's
+    /// `SegmentStructure` loss ranges and does not imply `accept Resumed`.
+    ///
+    /// # Errors
+    /// Returns `InvalidConfig` for invalid policy, builder `expect_head` or loss
+    /// bounds; `InvalidEntry` for empty/NUL actor or reason; `TooLarge` for an
+    /// oversized record; `HeadMismatch` for a different found head; `MissingTrail`
+    /// for a missing marker (a missing directory is created first); `CorruptTrail`
+    /// for a noncanonical marker or rejected predecessor fold; `Poisoned` when
+    /// the poison barrier exists; `Signer` for signing failure; and `Io` for
+    /// storage failures or an invariant failure after promotion. Refusals create
+    /// no handle and therefore never checkpoint on Drop.
+    pub fn resume(
+        self,
+        signer: Arc<dyn Signer>,
+        head: (u64, [u8; 32]),
+        lost_through: u64,
+        actor: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<(AuditTrail, Receipt), AuditError> {
+        let dir = self.validate_operator()?;
+        if lost_through < head.0 || lost_through > u64::MAX - 2 {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                "invalid resume loss bound",
+            ));
+        }
+        let (actor, reason) = (actor.into(), reason.into());
+        sink::validate_actor_reason(&actor, &reason)?;
+        let (sink, record) = sink::Sink::resume(
+            &dir,
+            signer,
+            self.config,
+            Head {
+                seq: head.0,
+                hash: head.1,
+            },
+            lost_through,
+            actor,
+            reason,
+        )?;
+        let receipt = Receipt {
+            trail: record.context.trail,
+            seq: record.context.seq,
+            hash: record.hash(),
+            unsigned_records: 0,
+        };
+        if self.mirror
+            && let super::format::Kind::Entry(entry) = &record.kind
+        {
+            super::trail::mirror(entry, &receipt);
+        }
+        Ok((AuditTrail::new(sink, dir, self.mirror), receipt))
     }
     /// Opens an existing trail without writing or signing new trail content.
     /// Interrupted staging is settled and the chain is scanned.

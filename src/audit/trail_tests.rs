@@ -290,9 +290,10 @@ fn operator_mirror_is_after_unlock() {
                 "scheduled",
             )
             .unwrap();
-        temp.config()
+        let next = temp
+            .config()
             .mirror_to_logs(true)
-            .checkpoint(key, (c.seq(), c.hash()))
+            .checkpoint(key.clone(), (c.seq(), c.hash()))
             .unwrap();
         let captured = events.lock().unwrap();
         assert_eq!(captured.len(), 1);
@@ -303,6 +304,23 @@ fn operator_mirror_is_after_unlock() {
         assert_eq!(captured[0]["action"], "\"vigil.audit.key_rotated\"");
         assert_eq!(captured[0]["seq"], r.seq().to_string());
         assert_eq!(captured[0]["hash"].trim_matches('"'), r.hash_string());
+        drop(captured);
+        let (_trail, resume) = temp
+            .config()
+            .mirror_to_logs(true)
+            .resume(
+                key,
+                (next.seq(), next.hash()),
+                next.seq(),
+                "operator",
+                "reviewed",
+            )
+            .unwrap();
+        let captured = events.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[1]["action"], "\"vigil.audit.resume\"");
+        assert_eq!(captured[1]["seq"], resume.seq().to_string());
+        assert_eq!(captured[1]["hash"].trim_matches('"'), resume.hash_string());
     });
 }
 

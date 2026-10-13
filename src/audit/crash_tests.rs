@@ -14,6 +14,88 @@ fn child_role() {
     hooks::TIME.with(|v| v.set(Some(1_000_000_000)));
     let path = PathBuf::from(path);
     let role = std::env::var("VIGIL_CRASH_ROLE").unwrap();
+    if let Some(operation) = role.strip_prefix("resume-race-") {
+        let dir = File::open(&path).unwrap();
+        let trail = marker(&dir).unwrap();
+        let h = predecessor_run(&dir, trail).unwrap().0.unwrap().head;
+        let key = super::operators::SignOnly::new("22", false);
+        let contender = operation == "contender";
+        let once = std::cell::Cell::new(false);
+        hooks::OBSERVE.with(|v| {
+            *v.borrow_mut() = Some(Box::new(move |site| {
+                if site
+                    == if contender {
+                        "resume-before-lock"
+                    } else {
+                        "clock"
+                    }
+                    && !once.replace(true)
+                {
+                    println!("READY");
+                    std::io::stdout().flush().unwrap();
+                    if !contender {
+                        std::io::stdin().read_line(&mut String::new()).unwrap();
+                    }
+                }
+            }))
+        });
+        if contender {
+            bad(
+                AuditConfig::new("vigil").dir(&path).resume(
+                    key.clone(),
+                    (h.seq, h.hash),
+                    20,
+                    "a",
+                    "r",
+                ),
+                AuditErrorKind::HeadMismatch,
+            );
+            assert_eq!(key.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(key.public.load(Ordering::Relaxed), 0);
+        } else if operation == "resume" {
+            let (mut sink, _) = Sink::resume(
+                &path,
+                key.clone(),
+                Config::default(),
+                h,
+                20,
+                "a".into(),
+                "r".into(),
+            )
+            .unwrap();
+            sink.closed = true;
+            assert_eq!(key.calls.load(Ordering::Relaxed), 1);
+        } else {
+            let op = if operation == "checkpoint" {
+                OperatorOp::Checkpoint
+            } else {
+                OperatorOp::Rotate {
+                    bound: h,
+                    actor: "a".into(),
+                    reason: "r".into(),
+                }
+            };
+            Sink::open(&path, key.clone(), Config::default(), None)
+                .unwrap()
+                .operator_write(h, op)
+                .unwrap();
+            assert_eq!(key.calls.load(Ordering::Relaxed), 1);
+        }
+        hooks::OBSERVE.with(|v| *v.borrow_mut() = None);
+        return;
+    }
+    if role == "resume" {
+        let dir = File::open(&path).unwrap();
+        let trail = marker(&dir).unwrap();
+        let prior = predecessor_run(&dir, trail).unwrap().0;
+        let head = prior.map_or((0, Record::genesis(&trail)), |s| (s.head.seq, s.head.hash));
+        install_park(std::env::var("VIGIL_CRASH_SITE").unwrap());
+        let _result = AuditConfig::new("vigil")
+            .dir(&path)
+            .resume(signer(), head, 20, "operator", "reviewed")
+            .unwrap();
+        panic!("resume did not crash");
+    }
     if role == "stderr" {
         let key = Arc::new(Failing::new());
         let s = Sink::open(

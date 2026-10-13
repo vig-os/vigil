@@ -225,5 +225,11 @@
       "vigil::metrics::Value::from": "fn",
       "vigil::scope": "macro"
     }
+  },
+  {
+    "justification": "ADR-0005 decisions 8 and 13 (operator resume surface row): pre-1.0 additive AuditConfig::resume; no AuditErrorKind changes",
+    "items": {
+      "vigil::audit::AuditConfig::resume": "fn"
+    }
   }
 ]
