@@ -101,7 +101,7 @@
         userFeatures = builtins.filter (name: name != "default" && name != "test-preserve-order") (
           builtins.attrNames cargoManifest.features
         );
-        # #41's push feature will double today's 4 sets to 8. Above 16,
+        # #41's push feature will double today's 8 sets to 16. Above 16,
         # require a ruling rather than silently sampling the stable surface.
         featureSets =
           assert pkgs.lib.assertMsg (

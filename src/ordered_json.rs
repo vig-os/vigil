@@ -35,6 +35,13 @@ pub(crate) const METRICS: Rules = &[
     ("dataPoints", &["timeUnixNano"]),
 ];
 
+#[cfg(feature = "traces")]
+pub(crate) const TRACES: Rules = &[
+    ("resourceSpans", &["scopeSpans"]),
+    ("scopeSpans", &["spans"]),
+    ("spans", &["spanId", "endTimeUnixNano"]),
+];
+
 pub(crate) fn encode(value: &Value, context: &str, rules: Rules) -> Result<String, String> {
     serde_json::to_string(&Ordered {
         value,

@@ -306,7 +306,7 @@ fn ordered_record(value: &Json) -> Result<String, String> {
     crate::ordered_json::encode(value, "logRecords", crate::ordered_json::LOGS)
 }
 
-fn markers(original_size: usize, dropped: bool) -> Vec<Json> {
+pub(crate) fn markers(original_size: usize, dropped: bool) -> Vec<Json> {
     let mut attributes = vec![
         serde_json::json!({"key":"vigil.original_size","value":{"intValue":original_size.to_string()}}),
         serde_json::json!({"key":"vigil.truncated","value":{"boolValue":true}}),
@@ -419,7 +419,7 @@ pub(crate) fn fit_record(
     Ok((text, true))
 }
 
-fn sort_json_attributes(value: &mut Json) {
+pub(crate) fn sort_json_attributes(value: &mut Json) {
     match value {
         Json::Object(values) => {
             for (key, value) in values {
@@ -437,13 +437,17 @@ fn sort_json_attributes(value: &mut Json) {
     }
 }
 
-struct StringCandidate {
-    pointer: String,
-    bytes: usize,
-    base64: bool,
+pub(crate) struct StringCandidate {
+    pub(crate) pointer: String,
+    pub(crate) bytes: usize,
+    pub(crate) base64: bool,
 }
 
-fn string_candidates(value: &Json, path: &mut Vec<String>, result: &mut Vec<StringCandidate>) {
+pub(crate) fn string_candidates(
+    value: &Json,
+    path: &mut Vec<String>,
+    result: &mut Vec<StringCandidate>,
+) {
     match value {
         Json::Array(values) => {
             for (index, value) in values.iter().enumerate() {
@@ -487,11 +491,11 @@ fn escaped_bytes(c: char) -> usize {
     }
 }
 
-fn string_bytes(text: &str) -> usize {
+pub(crate) fn string_bytes(text: &str) -> usize {
     text.chars().map(escaped_bytes).sum()
 }
 
-fn cut_string(text: &mut String, overflow: usize, base64: bool) {
+pub(crate) fn cut_string(text: &mut String, overflow: usize, base64: bool) {
     let mut removed = 0;
     let mut end = text.len();
     for (index, c) in text.char_indices().rev() {

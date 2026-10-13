@@ -15,10 +15,15 @@ pub enum Envelope {
     /// Metrics, split into data points and dropped if still oversized.
     #[cfg(feature = "metrics")]
     Metrics,
+    /// Spans, with shortening and diagnostic stubs.
+    #[cfg(feature = "traces")]
+    Traces,
 }
 impl Envelope {
     fn fields(self) -> [&'static str; 3] {
         match self {
+            #[cfg(feature = "traces")]
+            Self::Traces => ["resourceSpans", "scopeSpans", "spans"],
             Self::Logs => ["resourceLogs", "scopeLogs", "logRecords"],
             #[cfg(feature = "metrics")]
             Self::Metrics => ["resourceMetrics", "scopeMetrics", "metrics"],
@@ -27,6 +32,8 @@ impl Envelope {
     pub(crate) fn rules(self) -> Rules {
         match self {
             Self::Logs => ordered_json::LOGS,
+            #[cfg(feature = "traces")]
+            Self::Traces => ordered_json::TRACES,
             #[cfg(feature = "metrics")]
             Self::Metrics => ordered_json::METRICS,
         }
@@ -40,6 +47,16 @@ impl Envelope {
                     stubs: usize::from(stub),
                 }]
             }),
+            #[cfg(feature = "traces")]
+            Self::Traces => {
+                crate::span_export::fit_span(item, overhead, limit).map(|(text, stub)| {
+                    vec![BoundedLine {
+                        text,
+                        records: 1,
+                        stubs: usize::from(stub),
+                    }]
+                })
+            }
             #[cfg(feature = "metrics")]
             Self::Metrics => crate::metric_export::fit_metric(item, overhead, limit),
         }
@@ -51,9 +68,9 @@ impl Envelope {
 pub struct BoundedLine {
     /// JSON payload, excluding the newline.
     pub(crate) text: String,
-    /// Log records or metric data points present in the line.
+    /// Log records, spans or metric data points present in the line.
     pub(crate) records: usize,
-    /// Diagnostic log stubs included in the record count.
+    /// Diagnostic log/span stubs included in the record count.
     pub(crate) stubs: usize,
 }
 impl BoundedLine {
@@ -61,11 +78,11 @@ impl BoundedLine {
     pub fn text(&self) -> &str {
         &self.text
     }
-    /// Log records or metric data points present in the payload.
+    /// Log records, spans or metric data points present in the payload.
     pub fn records(&self) -> usize {
         self.records
     }
-    /// Diagnostic log stubs included in the record count.
+    /// Diagnostic log/span stubs included in the record count.
     pub fn stubs(&self) -> usize {
         self.stubs
     }
@@ -73,7 +90,7 @@ impl BoundedLine {
 /// Bound an already sanitized and deterministically ordered OTLP projection.
 ///
 /// # Errors
-/// Returns an encoding error or an error when a log diagnostic cannot fit.
+/// Returns an encoding error or an error when a log/span diagnostic cannot fit.
 #[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
 pub fn bounded_lines(
     request: &Json,
@@ -90,6 +107,8 @@ pub fn bounded_lines(
         .flat_map(|s| s[items].as_array().into_iter().flatten())
         .map(|_item| match envelope {
             Envelope::Logs => 1,
+            #[cfg(feature = "traces")]
+            Envelope::Traces => 1,
             #[cfg(feature = "metrics")]
             Envelope::Metrics => crate::metric_export::point_count(_item),
         })
@@ -332,8 +351,8 @@ fn compare_any_value(a: &Json, b: &Json) -> std::cmp::Ordering {
 
 fn compare_element(a: &Json, b: &Json, context: &str) -> std::cmp::Ordering {
     let key = match context {
-        "scopeLogs" | "scopeMetrics" => "scope",
-        "resourceLogs" | "resourceMetrics" => "resource",
+        "scopeLogs" | "scopeMetrics" | "scopeSpans" => "scope",
+        "resourceLogs" | "resourceMetrics" | "resourceSpans" => "resource",
         _ => "",
     };
     if context == "metrics" {
@@ -414,7 +433,8 @@ fn field_order(key: &str) -> (usize, &str) {
         "unit" => 2,
         "attributes" => 3,
         "key" => 4,
-        "metrics" | "logRecords" | "scopeMetrics" | "scopeLogs" | "dataPoints" => 5,
+        "spans" | "scopeSpans" | "metrics" | "logRecords" | "scopeMetrics" | "scopeLogs"
+        | "dataPoints" => 5,
         _ => 6,
     };
     (rank, key)
@@ -552,7 +572,12 @@ fn structural_key(
             }
             if matches!(
                 context,
-                "scopeLogs" | "scopeMetrics" | "resourceLogs" | "resourceMetrics"
+                "scopeLogs"
+                    | "scopeMetrics"
+                    | "scopeSpans"
+                    | "resourceLogs"
+                    | "resourceMetrics"
+                    | "resourceSpans"
             ) {
                 let metadata = if context.starts_with("scope") {
                     "scope"
@@ -599,7 +624,9 @@ pub(crate) fn normalize(value: &mut Json, context: &str, _rules: Rules) -> Resul
             for (key, value) in fields {
                 if matches!(
                     key.as_str(),
-                    "resourceLogs"
+                    "resourceSpans"
+                        | "scopeSpans"
+                        | "resourceLogs"
                         | "resourceMetrics"
                         | "scopeLogs"
                         | "scopeMetrics"
@@ -626,7 +653,9 @@ pub(crate) fn normalize(value: &mut Json, context: &str, _rules: Rules) -> Resul
             }
             if matches!(
                 context,
-                "resourceLogs"
+                "resourceSpans"
+                    | "scopeSpans"
+                    | "resourceLogs"
                     | "resourceMetrics"
                     | "scopeLogs"
                     | "scopeMetrics"

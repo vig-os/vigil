@@ -106,6 +106,22 @@ def metric_points(messages):
     return result
 
 
+def span_records(messages):
+    """Compare span metadata and values independently of line boundaries."""
+    result = collections.Counter()
+    for message in messages:
+        for resource in message["resourceSpans"]:
+            for scope in resource.get("scopeSpans", []):
+                for span in scope.get("spans", []):
+                    identity = [
+                        {k: v for k, v in resource.items() if k != "scopeSpans"},
+                        {k: v for k, v in scope.items() if k != "spans"},
+                        span,
+                    ]
+                    result[json.dumps(normalize(identity), sort_keys=True)] += 1
+    return result
+
+
 def json_lines(text):
     """JSON Lines delimiters are LF, not Unicode NEL/line/paragraph separators."""
     return [line for line in text.split("\n") if line]
@@ -268,6 +284,7 @@ def main():
         require(len(resources) >= 2, "fixture must contain at least two resources")
         output = directory / "output.jsonl"
         metric_output = directory / "metrics-output.jsonl"
+        span_output = directory / "traces-output.jsonl"
         config = directory / "collector.yaml"
         config.write_text(f"""receivers:
   otlpjsonfile:
@@ -278,13 +295,22 @@ def main():
     include: [{json.dumps(str(directory / "metrics.jsonl"))}]
     start_at: beginning
     include_file_name: false
+  otlpjsonfile/traces:
+    include: [{json.dumps(str(directory / "traces.jsonl"))}]
+    start_at: beginning
+    include_file_name: false
 exporters:
+  file/traces:
+    path: {json.dumps(str(span_output))}
   file/metrics:
     path: {json.dumps(str(metric_output))}
   file:
     path: {json.dumps(str(output))}
 service:
   pipelines:
+    traces:
+      receivers: [otlpjsonfile/traces]
+      exporters: [file/traces]
     metrics:
       receivers: [otlpjsonfile/metrics]
       exporters: [file/metrics]
@@ -346,15 +372,30 @@ service:
             ),
             "Collector received a poisoned name",
         )
+        expected_spans = span_records(
+            json.loads(line)
+            for line in json_lines((directory / "traces.jsonl").read_text())
+        )
+        actual_spans = span_records(
+            json.loads(line) for line in json_lines(span_output.read_text())
+        )
+        require(sum(expected_spans.values()) == 4, "missing span fixture records")
+        require(
+            actual_spans == expected_spans,
+            f"Span differences: {expected_spans - actual_spans}; unexpected: {actual_spans - expected_spans}",
+        )
+        require(any('"NaN"' in key for key in expected_spans), "missing NaN span")
+        require(
+            any("vigil.dropped" in key for key in expected_spans), "missing span stub"
+        )
         actual = records(json.loads(line) for line in json_lines(output.read_text()))
         require(
             actual == expected,
             f"Lost/changed: {expected - actual}\nUnexpected: {actual - expected}",
         )
         print(
-            f"Conformant: {sum(actual.values())} records including {len(writer_lines)} generated writer cases across {len(list(directory.glob('logs*.jsonl')))} input files; valid EOF delivered, garbage EOF dropped"
+            f"Conformant: {sum(actual.values())} records including {len(writer_lines)} generated writer cases across {len(list(directory.glob('logs*.jsonl')))} input files; {sum(actual_spans.values())} spans and {sum(actual_metrics.values())} metric points; valid EOF delivered, garbage EOF dropped"
         )
-    # TODO: extend reference-reader conformance to traces (#8).
 
 
 if __name__ == "__main__":
