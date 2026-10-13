@@ -5,9 +5,10 @@
 //! the trail directory. Operator rotation and checkpoints require the exact
 //! expected head (the highest held receipt or checkpoint). [`AuditConfig::resume`]
 //! differs: it takes the exact head found on disk after the loss, or
-//! `(0, genesis digest)`, plus `lost_through` from the highest held receipt, and
-//! builder `expect_head` is `InvalidConfig` for it. Offline verification follows
-//! in #13.
+//! `(0, genesis digest)`, plus `lost_through`, the highest `seq` the deployment
+//! holds any evidence of outside the trail directory (all processes' receipts,
+//! close checkpoints, anchors and pins). Builder `expect_head` is `InvalidConfig`
+//! for it. Offline verification follows in #13.
 //!
 //! Format primitives require `--cfg vigil_unstable` and are provisional. Pin
 //! vigil with `~1.N` when opting in; they may change in a minor release.
@@ -66,8 +67,9 @@ pub enum AuditErrorKind {
     /// Existing trail bytes violate the format or chain.
     CorruptTrail,
     /// The application's expected head is absent or different. Operator rotate
-    /// and checkpoint require the exact expected head, matching both sequence and
-    /// hash; resume returns it when the given head differs from the head found on disk.
+    /// and checkpoint require the expected head to equal the head on disk,
+    /// matching both sequence and hash; resume returns it when the given head
+    /// differs from the head found on disk.
     HeadMismatch,
     /// The trail marker is missing.
     MissingTrail,
