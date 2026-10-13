@@ -146,6 +146,15 @@ let dir = guard.dir();                     // Some(state dir) unless logs fell b
 
 ### 3. Errors are for the caller's mistakes; the environment degrades
 
+The programmatic surface of every public error type is promised: the type,
+`kind()` and its `#[non_exhaustive]` kind enum, `lost()` where provided, and
+`source()` chaining. This covers `InitError`, `FlushError`, the planned
+`PropagationError`, `AuditError` and `SignerError` (which has no kind or loss accessor).
+Per **architect ruling 113-d1**, `Display` and `Debug` text are human-readable
+diagnostics and are not part of the 1.0 stability promise. They may change in
+any release, including a patch; every change must be listed in the CHANGELOG.
+Programs must not parse this text.
+
 The rule: `InitError` is returned only for a mistake the caller can fix in code. Anything the environment causes (unwritable storage, a bad environment variable, a subscriber that cannot be reconfigured) degrades with one stderr warning and still returns a `Guard`, because telemetry must never stop the application (as `init` already does for storage, #5).
 
 - **`InitError`** is a struct with `kind(&self) -> InitErrorKind`, `Display`, `Error` (with `source()` where there is one), `Send + Sync + 'static`. **`InitErrorKind`** is `#[non_exhaustive]`, `Copy + Eq + Debug`, with:

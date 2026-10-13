@@ -10,6 +10,9 @@ vigil publishes no 0.x: the first release is 1.0.0, so what follows is the 1.0
 promise. Logs and metrics are implemented today; the rest of the promised surface is still
 being built, and the pre-1.0 `dev` branch may change it.
 
+- **Not covered.** Error `Display` and `Debug` text may change even in a patch,
+  with a CHANGELOG entry. Programs must not parse it; see
+  [ADR-0004 decision 3](docs/adr/0004-public-api-and-stability.md#3-errors-are-for-the-callers-mistakes-the-environment-degrades).
 - **Semver.** The stable API is every public item built without `--cfg vigil_unstable`,
   with any combination of Cargo features, and it names only vigil's own types, `std`
   and the `tracing` family. OpenTelemetry types never appear in it, so an
@@ -103,7 +106,8 @@ Prometheus maps OTLP metrics using its default translation (ADR-0003 d12):
 | Runs of characters other than ASCII letters, digits and `:`, including `.` and `_` | One `_` between name tokens; `:` is preserved |
 | Unit | Fixed unit words and per-unit suffixes as detailed below; no repeated suffix token |
 | Monotonic counter | `_total`; inner `total` words are dropped (`app.total.x` → `app_x_total`) |
-| Gauge with unit `1` | `_ratio` (`app.x` → `app_x_ratio`) |
+| Gauge with unit `1` | Drop inner `ratio` words and append `_ratio` (`app.ratio.x` → `app_x_ratio`) |
+| Name starting with a digit | Prefix `_` (`1x` → `_1x`; translator only, the facade rejects these names) |
 | Up-down counter with unit `1` | No suffix (`app.x` → `app_x`) |
 | Monotonic counter with unit `1` | `_total` only (`app.x` → `app_x_total`) |
 | Histogram | `_bucket`, `_sum`, `_count` after the unit suffix |

@@ -39,6 +39,7 @@ use crate::{
 /// A mistake the caller can correct in code. Environmental failures degrade
 /// to stderr. Concrete error sources are not part of the stability promise;
 /// downcasting them is unsupported.
+/// The `Display` text is for people; it is not part of the stability promise. Match on `kind()`.
 #[derive(Debug)]
 pub struct InitError {
     kind: InitErrorKind,
