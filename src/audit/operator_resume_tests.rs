@@ -1,7 +1,7 @@
 //! Operator resume API, durability and receipt handoff (B3d2b2).
 use super::crash_fixtures::content;
 use super::operators::SignOnly;
-use super::tests::{Temp, bad, bytes, create, entry, records, signer};
+use super::tests::{Temp, bad, bytes, create, entry, records, signer, snapshot};
 use super::*;
 use std::fs;
 
@@ -212,15 +212,34 @@ fn head_refusals_are_exact_in_every_live_branch() {
     }
 }
 #[test]
+fn resume_loss_bound_precedes_head_and_poison_checks() {
+    for poisoned in [false, true] {
+        let t = Temp::new();
+        let actual = genesis_layout(&t, false);
+        let h = if poisoned {
+            fs::write(t.0.join("audit.poison"), b"planted poison").unwrap();
+            actual
+        } else {
+            (0, [7; 32])
+        };
+        let before = snapshot(&t);
+        let key = SignOnly::new("22", false);
+        bad(
+            config(&t).resume(key.clone(), h, i64::MAX as u64 - 1, "a", "r"),
+            AuditErrorKind::InvalidConfig,
+        );
+        assert_eq!(snapshot(&t), before);
+        assert_eq!(key.calls.load(Ordering::Relaxed), 0);
+    }
+}
+#[test]
 fn validation_and_base_refusal_never_touch_signer() {
     let t = Temp::new();
     let key = SignOnly::new("22", false);
-    for (h, lost) in [((2, [0; 32]), 1), ((0, [0; 32]), u64::MAX - 1)] {
-        bad(
-            config(&t).resume(key.clone(), h, lost, "a", "r"),
-            AuditErrorKind::InvalidConfig,
-        );
-    }
+    bad(
+        config(&t).resume(key.clone(), (2, [0; 32]), 1, "a", "r"),
+        AuditErrorKind::InvalidConfig,
+    );
     for (a, r) in [("", "r"), ("a", ""), ("a\0", "r"), ("a", "r\0")] {
         bad(
             config(&t).resume(key.clone(), (0, [0; 32]), 0, a, r),

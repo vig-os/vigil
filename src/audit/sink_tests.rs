@@ -1103,7 +1103,7 @@ fn resume_without_predecessor_discards_nonzero_genesis_head() {
 fn fail(sites: &[&'static str]) {
     hooks::FAIL.with(|f| *f.borrow_mut() = sites.to_vec());
 }
-fn snapshot(t: &Temp) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+pub(super) fn snapshot(t: &Temp) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     fs::read_dir(&t.0)
         .unwrap()
         .map(|e| {
