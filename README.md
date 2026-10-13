@@ -590,9 +590,10 @@ Restates [decision 5, "Receipt reconciliation"][d5] and [decision 9, step 1][d9]
   the trail directory, before the audited action completes. The receipts file is one
   `<seq> <blake3:hex>` line per record (`Receipt::hash_string` spells the hash); no action
   name is exempt, so a forged `vigil.audit.*` record is `NoReceipt` like any other.
-- **Store every `close` checkpoint.** `AuditTrail::close` consumes the handle and returns
-  the `Checkpoint` it signed; keep its `line` with the receipts. A `Drop` checkpoint is
-  not returned and cannot serve.
+- **Store every `close` and `resume` checkpoint.** `AuditTrail::close` consumes the
+  handle and returns the `Checkpoint` it signed; `resume` returns its signed opening
+  `Checkpoint`. Keep each checkpoint's `line` with the receipts. A `Drop` checkpoint
+  is not returned and cannot serve.
 - **The expected head** after every writer has stopped is the highest `seq` among all
   receipts and close checkpoints the application holds, across all its processes. After a
   `resume` nothing changes: every `seq` the resumed trail writes lies above `lost_through`.
@@ -651,7 +652,8 @@ Restates [decision 8, "An operator decides"][d8], [amendment 9, part 2][a9] and
 `HeadMismatch` (a rollback). vigil never guesses which case is innocent, and an honest
 crash never needs `resume`. An operator decides, with
 `AuditConfig::resume(signer, head, lost_through, actor, reason)`, which returns the
-`AuditTrail` and the `Receipt` of its `vigil.audit.resume` record. The builder's
+`AuditTrail`, the `Receipt` of its `vigil.audit.resume` record and the signed opening
+`Checkpoint`. The builder's
 `expect_head` is `InvalidConfig` here.
 
 - **The live file's state decides what is sealed.** A *headless* live file (present, but
@@ -676,10 +678,9 @@ crash never needs `resume`. An operator decides, with
   archived segments first is the operator's duty; the verifier's detection of a
   genesis-linked resume next to archived segments is #13.
 - **On success,** store the returned receipt outside the trail directory before
-  continuing, and anchor the opening checkpoint at `lost_through + 1`. Today no library call
-  returns that checkpoint (`AuditConfig::resume` returns the trail and the receipt only;
-  [#138](https://github.com/vig-os/vigil/issues/138) tracks the gap), so do not anchor a
-  line read from the trail directory as if it were trusted. The verifier reports the `Resumed` warning until a
+  continuing, and anchor the `Checkpoint` that `resume` returns at `lost_through + 1`.
+  Do not anchor a line read from the trail directory as if it were trusted.
+  The verifier reports the `Resumed` warning until a
   reviewer accepts it (#13; see the review criteria below).
 - **On `Io`, or a call that never returned,** the resume may still have taken effect. If
   `audit.poison` exists, run its clearing procedure first (below). Then `open` settles the

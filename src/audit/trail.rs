@@ -92,6 +92,9 @@ impl AuditTrail {
     }
 }
 pub(super) fn checkpoint(record: Record) -> Result<Checkpoint, AuditError> {
+    #[cfg(test)]
+    sink::hooks::event("checkpoint-convert")
+        .map_err(|e| AuditError::new(AuditErrorKind::CorruptTrail, e.to_string()))?;
     let bytes = sink::line(&record)?;
     let line = std::str::from_utf8(&bytes)
         .map_err(|e| AuditError::new(AuditErrorKind::CorruptTrail, e.to_string()))?;

@@ -11,7 +11,7 @@ fn config(t: &Temp) -> AuditConfig {
 fn head(r: &Record) -> (u64, [u8; 32]) {
     (r.context.seq, r.hash())
 }
-fn invoke(t: &Temp, h: (u64, [u8; 32]), lost: u64) -> (AuditTrail, Receipt) {
+fn invoke(t: &Temp, h: (u64, [u8; 32]), lost: u64) -> (AuditTrail, Receipt, Checkpoint) {
     config(t)
         .resume(signer(), h, lost, "operator", "reviewed")
         .unwrap()
@@ -27,6 +27,58 @@ fn genesis_layout(t: &Temp, empty: bool) -> (u64, [u8; 32]) {
     }
     h
 }
+#[test]
+fn returned_opening_checkpoint_matches_disk_and_signature() {
+    let t = Temp::new();
+    let h = genesis_layout(&t, true);
+    let key = signer();
+    let (_trail, receipt, opening) = config(&t)
+        .resume(key.clone(), h, 5, "operator", "reviewed")
+        .unwrap();
+    let rs = records(&t);
+    let record = &rs[0];
+    assert_eq!(opening.seq(), 6);
+    assert_eq!(opening.seq(), record.context.seq);
+    assert_eq!(opening.hash(), record.hash());
+    assert_eq!(
+        opening.line(),
+        String::from_utf8(line(record).unwrap())
+            .unwrap()
+            .trim_end_matches('\n')
+    );
+    // Extract the signature field (tag 0x24) from the canonical TLV encoding.
+    let canonical = record.canonical();
+    let mut fields = canonical.as_slice();
+    let signature = loop {
+        let tag = fields[0];
+        let len = u32::from_be_bytes(fields[1..5].try_into().unwrap()) as usize;
+        if tag == 0x24 {
+            break <[u8; 64]>::try_from(&fields[5..5 + len]).unwrap();
+        }
+        fields = &fields[5 + len..];
+    };
+    crate::audit::verify_signature(
+        &key.public_key(),
+        &record.signing_message().unwrap(),
+        &signature,
+    )
+    .unwrap();
+    assert_eq!(receipt.seq(), rs[1].context.seq);
+}
+
+#[test]
+fn returned_resume_receipt_links_to_returned_opening_checkpoint() {
+    let t = Temp::new();
+    let h = genesis_layout(&t, true);
+    let (_trail, receipt, opening) = config(&t)
+        .resume(signer(), h, 5, "operator", "reviewed")
+        .unwrap();
+    let rs = records(&t);
+    let record = rs.iter().find(|r| r.context.seq == receipt.seq()).unwrap();
+    assert_eq!(record.hash(), receipt.hash());
+    assert_eq!(record.context.previous, opening.hash());
+}
+
 #[test]
 fn live_states_details_single_write_receipt_and_round_trip() {
     for state in 0..6 {
@@ -70,7 +122,7 @@ fn live_states_details_single_write_receipt_and_round_trip() {
         let key = SignOnly::new("22", false);
         hooks::EVENTS.with(|e| e.borrow_mut().clear());
         let lost = if state == 5 { h.0 } else { 5 };
-        let (trail, receipt) = config(&t)
+        let (trail, receipt, _) = config(&t)
             .resume(key.clone(), h, lost, "operator", "reviewed")
             .unwrap();
         let events = hooks::EVENTS.with(|e| e.borrow().clone());
@@ -129,9 +181,9 @@ fn live_states_details_single_write_receipt_and_round_trip() {
 fn empty_sealed_then_lost_accepts_genesis_and_shared_leaf() {
     let t = Temp::new();
     let h = genesis_layout(&t, true);
-    let (first, _) = invoke(&t, h, 5);
+    let (first, _, _) = invoke(&t, h, 5);
     fs::remove_file(t.0.join("audit.jsonl")).unwrap();
-    let (_second, receipt) = invoke(&t, h, 8);
+    let (_second, receipt, _) = invoke(&t, h, 8);
     let rs = records(&t);
     let Kind::Checkpoint(cp) = &rs[0].kind else {
         panic!()
@@ -273,10 +325,10 @@ fn returned_receipt_raises_acknowledgement_before_handoff() {
     let mut setup = create(&t);
     setup.closed = true;
     let h = head(&records(&t)[0]);
-    let (first, receipt) = invoke(&t, h, 5);
+    let (first, receipt, _) = invoke(&t, h, 5);
     assert_eq!(receipt.seq(), 7);
     fs::remove_file(t.0.join("audit.jsonl")).unwrap();
-    let (_second, _) = invoke(&t, h, 6);
+    let (_second, _, _) = invoke(&t, h, 6);
     let before = content(&t.0);
     bad(first.record(&entry()), AuditErrorKind::HeadMismatch);
     bad(first.checkpoint(), AuditErrorKind::HeadMismatch);
@@ -382,7 +434,7 @@ fn pending_next_is_settled_before_head_check() {
     )
     .unwrap();
     fs::write(t.0.join(".audit-next.jsonl"), line(&cp).unwrap()).unwrap();
-    let (_trail, receipt) = invoke(&t, head(&cp), 5);
+    let (_trail, receipt, _) = invoke(&t, head(&cp), 5);
     assert_eq!(receipt.seq(), 7);
     assert!(!t.0.join(".audit-next.jsonl").exists());
 }
@@ -414,7 +466,7 @@ fn changed_directory_after_staging_discards_without_receipt() {
 fn inline_every_short_write_prefix_rolls_back_pair() {
     let source = Temp::new();
     let h = genesis_layout(&source, true);
-    let (_trail, _) = invoke(&source, h, 5);
+    let (_trail, _, _) = invoke(&source, h, 5);
     let length = bytes(&source).len();
     for prefix in 0..length {
         let t = Temp::new();
@@ -508,6 +560,18 @@ fn two_process_resume_waits_for_rotate_checkpoint_and_resume() {
         assert!(!t.0.join(".audit-resume.jsonl").exists());
         let _fresh = config(&t).open(signer()).unwrap();
     }
+}
+
+#[test]
+fn checkpoint_conversion_failure_precedes_staging_and_promotion() {
+    let t = Temp::new();
+    let h = genesis_layout(&t, true);
+    let before = content(&t.0);
+    // Model a failure of the shared checkpoint constructor's validation.
+    hooks::FAIL.with(|v| *v.borrow_mut() = vec!["checkpoint-convert"]);
+    let error = config(&t).resume(signer(), h, 5, "a", "r").unwrap_err();
+    assert_eq!(error.kind(), AuditErrorKind::CorruptTrail);
+    assert_eq!(content(&t.0), before);
 }
 
 #[test]
@@ -622,7 +686,7 @@ fn resume_int64_and_size_refusals_sign_nothing() {
     assert_eq!(key.calls.load(Ordering::Relaxed), 0);
     assert_eq!(content(&t.0), before);
     // Only action reserves the prefix; actor and reason may carry it as text.
-    let (_trail, _) = config(&t)
+    let (_trail, _, _) = config(&t)
         .resume(key.clone(), h, 5, "vigil.audit.actor", "vigil.audit.reason")
         .unwrap();
     assert_eq!(key.calls.load(Ordering::Relaxed), 1);
@@ -632,7 +696,7 @@ fn resume_int64_and_size_refusals_sign_nothing() {
 fn resume_at_int64_top_refuses_next_record() {
     let t = Temp::new();
     let h = genesis_layout(&t, false);
-    let (trail, receipt) = invoke(&t, h, i64::MAX as u64 - 2);
+    let (trail, receipt, _) = invoke(&t, h, i64::MAX as u64 - 2);
     assert_eq!(receipt.seq(), i64::MAX as u64);
     let before = content(&t.0);
     let error = trail.record(&entry()).unwrap_err();
