@@ -400,12 +400,12 @@ impl Guard {
         #[cfg(feature = "metrics")]
         let metrics = self.metrics.take();
         let forward = tracing::dispatcher::get_default(Clone::clone);
-        let capture = || ShutdownCapture {
-            event: "BatchLogProcessor.LogsDropped",
-            field: "dropped_logs_count",
-            signal: crate::Signal::Logs,
-            forward: forward.clone(),
-            losses: self.losses.clone(),
+        let capture = || {
+            ShutdownCapture::new(
+                crate::lifecycle::QueueSignal::Logs,
+                forward.clone(),
+                self.losses.clone(),
+            )
         };
         let started = Instant::now();
         let logs_shutdown = || {
@@ -467,7 +467,9 @@ impl Guard {
     }
 
     fn summaries(&self, error: Option<&FlushError>, dropping: bool) {
-        let (logs, failed) = self.losses.pending_stderr(crate::Signal::Logs);
+        let (logs, failed) = self
+            .losses
+            .pending_stderr(crate::lifecycle::QueueSignal::Logs);
         let kind = error
             .and_then(|error| error.signal_kind(Signal::Logs))
             .unwrap_or(if failed {
@@ -1336,12 +1338,17 @@ struct ReportingExporter {
 }
 impl LogExporter for ReportingExporter {
     async fn export(&self, batch: LogBatch<'_>) -> opentelemetry_sdk::error::OTelSdkResult {
-        self.losses
-            .reached(crate::Signal::Logs, batch.iter().count() as u64);
+        self.losses.reached(
+            crate::lifecycle::QueueSignal::Logs,
+            batch.iter().count() as u64,
+        );
         let result = self.inner.export(batch).await;
         let lost = self.inner.take_dropped_records();
-        self.losses
-            .record(crate::Signal::Logs, lost as u64, result.is_err());
+        self.losses.record(
+            crate::lifecycle::QueueSignal::Logs,
+            lost as u64,
+            result.is_err(),
+        );
         let reported = self
             .failures
             .lock()
@@ -1353,7 +1360,8 @@ impl LogExporter for ReportingExporter {
                 &result,
                 self.losses.shutting_down.load(Ordering::Acquire),
             );
-        self.losses.reported(crate::Signal::Logs, reported);
+        self.losses
+            .reported(crate::lifecycle::QueueSignal::Logs, reported);
         Ok(())
     }
     fn set_resource(&mut self, resource: &Resource) {
@@ -1409,7 +1417,9 @@ mod dropped_stub_tests {
                 Poll::Ready(Ok(()))
             ));
             assert_eq!(
-                exporter.losses.pending_stderr(crate::Signal::Logs),
+                exporter
+                    .losses
+                    .pending_stderr(crate::lifecycle::QueueSignal::Logs),
                 (count - 1, false)
             );
         }
@@ -1417,7 +1427,9 @@ mod dropped_stub_tests {
             .shutdown_with_timeout(Duration::from_secs(1))
             .unwrap();
         assert_eq!(
-            exporter.losses.pending_stderr(crate::Signal::Logs),
+            exporter
+                .losses
+                .pending_stderr(crate::lifecycle::QueueSignal::Logs),
             (1, false)
         );
         let loss = exporter.losses.finish(Ok(())).unwrap_err();
@@ -2012,13 +2024,17 @@ mod metrics_lifecycle_tests {
         }
         let dir = directory("flush-silent");
         let guard = Config::new("silent").dir(&dir).init().unwrap();
-        guard.losses.record(crate::Signal::Logs, 2, true);
+        guard
+            .losses
+            .record(crate::lifecycle::QueueSignal::Logs, 2, true);
         guard.losses.metric_data_points(true);
         guard.losses.metric_pending(3, 0);
         let error = guard.flush().unwrap_err();
         assert_eq!(error.kind(), FlushErrorKind::Failed);
         assert_eq!(error.lost(Signal::Logs), 2);
-        guard.losses.reported(crate::Signal::Logs, 2);
+        guard
+            .losses
+            .reported(crate::lifecycle::QueueSignal::Logs, 2);
         guard.losses.metric_pending(0, 3);
         guard.shutdown().unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -2351,7 +2367,9 @@ mod metrics_lifecycle_tests {
                 guard.losses.metric_pending(3, 0);
             }
             if mode == "drop-both" || mode == "explicit-logs" {
-                guard.losses.record(crate::Signal::Logs, 2, false);
+                guard
+                    .losses
+                    .record(crate::lifecycle::QueueSignal::Logs, 2, false);
             }
             if mode == "metric-failed" {
                 guard.losses.outcome(

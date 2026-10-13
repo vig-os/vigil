@@ -1,6 +1,9 @@
 //! Trace export loss reporting; provider construction follows in 8c (#8).
 use crate::{
-    Signal, init::Failures, lifecycle::Losses, sink::LineSink, span_export::OtlpJsonSpanExporter,
+    init::Failures,
+    lifecycle::{Losses, QueueSignal},
+    sink::LineSink,
+    span_export::OtlpJsonSpanExporter,
 };
 use opentelemetry_sdk::{
     Resource,
@@ -22,11 +25,11 @@ pub(crate) struct ReportingSpanExporter<S: LineSink> {
 }
 impl<S: LineSink + 'static> SpanExporter for ReportingSpanExporter<S> {
     async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-        self.losses.reached(Signal::Traces, batch.len() as u64);
+        self.losses.reached(QueueSignal::Traces, batch.len() as u64);
         let result = self.inner.export(batch).await;
         let lost = self.inner.take_dropped_spans();
         self.losses
-            .record(Signal::Traces, lost as u64, result.is_err());
+            .record(QueueSignal::Traces, lost as u64, result.is_err());
         let reported = self
             .failures
             .lock()
@@ -38,7 +41,7 @@ impl<S: LineSink + 'static> SpanExporter for ReportingSpanExporter<S> {
                 &result,
                 self.losses.shutting_down.load(Ordering::Acquire),
             );
-        self.losses.reported(Signal::Traces, reported);
+        self.losses.reported(QueueSignal::Traces, reported);
         Ok(())
     }
     fn set_resource(&mut self, resource: &Resource) {
@@ -55,6 +58,7 @@ impl<S: LineSink + 'static> SpanExporter for ReportingSpanExporter<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Signal;
     use crate::span_export::fixtures;
     use crate::{lifecycle::FlushErrorKind, sink::MemorySink};
 
@@ -64,6 +68,69 @@ mod tests {
             failures: Mutex::new(Failures::default()),
             losses: Arc::new(Losses::default()),
         }
+    }
+
+    #[test]
+    fn real_trace_stack_flushes_without_losses() {
+        use crate::{lifecycle::ReportingSpanProcessor, sink::AppendFile};
+        use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+        use opentelemetry_sdk::trace::{BatchSpanProcessor, SdkTracerProvider};
+        // The owned directory is unique to this test process and removed below.
+        let dir =
+            std::env::temp_dir().join(format!("vigil-real-trace-stack-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("traces.jsonl");
+        let exporter = exporter(AppendFile::open(&path).unwrap(), 10000);
+        let losses = exporter.losses.clone();
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(ReportingSpanProcessor {
+                inner: BatchSpanProcessor::builder(exporter).build(),
+                losses: losses.clone(),
+            })
+            .build();
+        let tracer = provider.tracer("real-stack");
+        for name in ["first", "second", "third"] {
+            drop(tracer.start(name));
+        }
+        let result = crate::lifecycle::flush(|| provider.force_flush());
+        result.as_ref().unwrap();
+        let outcome = losses.finish_signals(Ok(()), Ok(()), result);
+        let lost = outcome
+            .as_ref()
+            .err()
+            .map_or(0, |error| error.lost(Signal::Traces));
+        assert_eq!(lost, 0);
+        outcome.unwrap();
+        let lines = std::fs::read_to_string(&path).unwrap();
+        let names: Vec<_> = lines
+            .lines()
+            .flat_map(|line| {
+                let json: serde_json::Value = serde_json::from_str(line).unwrap();
+                json["resourceSpans"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|resource| {
+                        resource["scopeSpans"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .flat_map(|scope| {
+                                scope["spans"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|span| span["name"].as_str().unwrap().to_owned())
+                            })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(names, ["first", "second", "third"]);
+        losses
+            .finish_signals(Ok(()), Ok(()), provider.shutdown())
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
