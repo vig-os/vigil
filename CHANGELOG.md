@@ -56,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Docs: the README "Audit format (opt-in)" now lists the operator duties of ADR-0005 §18.4 (what `accept-run` does not accept, the archive procedure and schedule, Collector copies, `open` is not a verifier, `--strict`) and an operator checklist; the README conformance paragraph covers the span round trip; the ADR §18.6 table cites decision 2 steps by name, not line ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - Docs: the README "Audit format (opt-in)" section now carries the deployment text for the audit trail (filesystems, trail id, key custody, trust file, receipts, rotation, resume, `audit.poison`, review criteria and known limits); ADR-0005 §18.3 residual 7 now says "the start from the anchor-store entry" ([#126](https://github.com/vig-os/vigil/issues/126)). No code change ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).
 - Docs: ADR-0003 amendments for traces (decision 15 drops the span sink's pending state, decision 16 respects an upstream's sample-out, decision 23 counts span overflow per flush) and ADR-0004 decision 7's `traces` crate count ([#8](https://github.com/vig-os/vigil/issues/8)).
 - ADR-0005 amendment 9 Accepted: operator resume surface and inline path; document the lost-boundary clock-rollback limit ([#11](https://github.com/vig-os/vigil/issues/11)).
