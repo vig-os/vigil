@@ -66,12 +66,22 @@ fn subscriber_test_child(name: &str) -> bool {
 // Share execution and verification so an incorrect --exact name cannot pass silently.
 #[cfg(test)]
 fn test_child(name: &str, child_env: &str) -> Option<std::process::Output> {
+    test_child_with_env(name, child_env, &[])
+}
+
+#[cfg(test)]
+fn test_child_with_env(
+    name: &str,
+    child_env: &str,
+    env: &[(&str, &str)],
+) -> Option<std::process::Output> {
     if std::env::var(child_env).as_deref() == Ok(name) {
         return None;
     }
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])
         .env(child_env, name)
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     assert!(
