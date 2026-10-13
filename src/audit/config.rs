@@ -238,7 +238,10 @@ impl AuditConfig {
     /// unchanged; a deleted live file needs no sealing. `lost_through` is "the
     /// highest `seq` the deployment holds any evidence of outside the trail
     /// directory", including all processes' receipts, close checkpoints and pins.
-    /// It must be at least the head and at most `u64::MAX - 2`.
+    /// It must be at least the head and at most `i64::MAX - 2`
+    /// (sequence numbers are OTLP int64).
+    /// At that bound resume succeeds, but the next `record` returns
+    /// `InvalidConfig` ("sequence exceeds OTLP int64").
     ///
     /// The opening checkpoint is at `lost_through + 1`; the unsigned resume
     /// entry follows at `lost_through + 2`, with the trail id as object and
@@ -282,7 +285,7 @@ impl AuditConfig {
         reason: impl Into<String>,
     ) -> Result<(AuditTrail, Receipt), AuditError> {
         let dir = self.validate_operator()?;
-        if lost_through < head.0 || lost_through > u64::MAX - 2 {
+        if lost_through < head.0 || lost_through > i64::MAX as u64 - 2 {
             return Err(AuditError::new(
                 AuditErrorKind::InvalidConfig,
                 "invalid resume loss bound",

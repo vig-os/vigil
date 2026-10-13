@@ -147,8 +147,8 @@ fn empty_sealed_then_lost_accepts_genesis_and_shared_leaf() {
 }
 #[test]
 fn head_refusals_are_exact_in_every_live_branch() {
-    for state in 0..5 {
-        for mismatch in 0..3 {
+    for state in 0..7 {
+        for mismatch in 0..4 {
             let t = Temp::new();
             let mut setup = create(&t);
             setup.closed = true;
@@ -173,15 +173,31 @@ fn head_refusals_are_exact_in_every_live_branch() {
                     fs::remove_file(t.0.join("audit.jsonl")).unwrap();
                     h = (0, Record::genesis(&setup.trail));
                 }
-                _ => {
+                4 => {
                     fs::write(t.0.join("audit.jsonl"), []).unwrap();
                     h = (0, Record::genesis(&setup.trail));
+                }
+                _ => {
+                    // Deleted and empty live files can still have a sealed predecessor.
+                    fs::write(
+                        t.0.join("audit-20000101T000000.000000000Z.jsonl"),
+                        line(&rs[0]).unwrap(),
+                    )
+                    .unwrap();
+                    if state == 5 {
+                        fs::remove_file(t.0.join("audit.jsonl")).unwrap();
+                    } else {
+                        fs::write(t.0.join("audit.jsonl"), []).unwrap();
+                    }
+                    h = head(&rs[0]);
                 }
             }
             h = match mismatch {
                 0 => (h.0, [9; 32]),
                 1 => (h.0.saturating_add(1), h.1),
-                _ => (0, [8; 32]),
+                2 => (0, [8; 32]),
+                _ if state <= 2 || state >= 5 => (0, Record::genesis(&setup.trail)),
+                _ => continue,
             };
             let before = content(&t.0);
             let key = SignOnly::new("22", false);
@@ -523,5 +539,85 @@ fn marker_errors_and_signer_failure_return_no_handle() {
         AuditErrorKind::Signer,
     );
     assert_eq!(key.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(content(&t.0), before);
+}
+
+#[test]
+fn restored_live_after_staging_discards_without_receipt() {
+    let t = Temp::new();
+    let mut setup = create(&t);
+    setup.closed = true;
+    setup.record(&entry()).unwrap();
+    let original = bytes(&t);
+    let h = (0, Record::genesis(&setup.trail));
+    fs::remove_file(t.0.join("audit.jsonl")).unwrap();
+    let path = t.0.clone();
+    let restored = original.clone();
+    hooks::OBSERVE.with(|v| {
+        *v.borrow_mut() = Some(Box::new(move |site| {
+            if site == "staging-dir" {
+                fs::write(path.join("audit.jsonl"), &restored).unwrap();
+            }
+        }));
+    });
+    let result = config(&t).resume(signer(), h, 5, "a", "r");
+    hooks::OBSERVE.with(|v| *v.borrow_mut() = None);
+    bad(result, AuditErrorKind::Io);
+    assert_eq!(bytes(&t), original);
+    assert_eq!(
+        records(&t)
+            .iter()
+            .map(|r| r.context.seq)
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert!(!t.0.join(".audit-resume.jsonl").exists());
+}
+
+#[test]
+fn resume_int64_and_size_refusals_sign_nothing() {
+    let t = Temp::new();
+    let h = genesis_layout(&t, false);
+    let key = SignOnly::new("22", false);
+    let before = content(&t.0);
+    for lost in [i64::MAX as u64 - 1, u64::MAX] {
+        bad(
+            config(&t).resume(key.clone(), h, lost, "a", "r"),
+            AuditErrorKind::InvalidConfig,
+        );
+        assert_eq!(key.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(content(&t.0), before);
+    }
+    bad(
+        config(&t).resume(key.clone(), h, 5, "a", "r".repeat(1_100_000)),
+        AuditErrorKind::TooLarge,
+    );
+    assert_eq!(key.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(content(&t.0), before);
+    bad(
+        AuditConfig::new("s".repeat(1_100_000))
+            .dir(&t.0)
+            .resume(key.clone(), h, 5, "a", "r"),
+        AuditErrorKind::InvalidConfig,
+    );
+    assert_eq!(key.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(content(&t.0), before);
+    // Only action reserves the prefix; actor and reason may carry it as text.
+    let (_trail, _) = config(&t)
+        .resume(key.clone(), h, 5, "vigil.audit.actor", "vigil.audit.reason")
+        .unwrap();
+    assert_eq!(key.calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn resume_at_int64_top_refuses_next_record() {
+    let t = Temp::new();
+    let h = genesis_layout(&t, false);
+    let (trail, receipt) = invoke(&t, h, i64::MAX as u64 - 2);
+    assert_eq!(receipt.seq(), i64::MAX as u64);
+    let before = content(&t.0);
+    let error = trail.record(&entry()).unwrap_err();
+    assert_eq!(error.kind(), AuditErrorKind::InvalidConfig);
+    assert!(error.to_string().contains("sequence exceeds OTLP int64"));
     assert_eq!(content(&t.0), before);
 }

@@ -678,10 +678,16 @@ impl Sink {
             if prior.is_none() {
                 mmr.push(head.hash)?;
             }
-            let opening = Self::signed(
-                &*signer,
-                RecordContext::new(trail, lost + 1, clock()?, &config.service, head.hash),
-                &mmr,
+            let context = RecordContext::new(trail, lost + 1, clock()?, &config.service, head.hash);
+            let opening = Record::checkpoint(
+                context.clone(),
+                CheckpointFields::new(
+                    mmr.size(),
+                    mmr.root(),
+                    mmr.peaks().to_vec(),
+                    [0; 32],
+                    [0; 64],
+                )?,
             )?;
             let entry = Entry::new(actor, ReservedAction::Resume.name(), hex(&trail))
                 .reason(reason)
@@ -690,10 +696,17 @@ impl Sink {
                     head.seq,
                     digest_string(&head.hash)
                 ));
-            let record = ReservedAction::Resume.record(
+            let mut record = ReservedAction::Resume.record(
                 RecordContext::new(trail, lost + 2, clock()?, &config.service, opening.hash()),
                 entry,
             )?;
+            // B3d2-d10: validate both encoded records before signing. Keys,
+            // signatures and chain hashes have fixed-width hex encodings, so
+            // replacing the zero placeholders cannot change either line size.
+            line(&opening)?;
+            line(&record)?;
+            let opening = Self::signed(&*signer, context, &mmr)?;
+            record.context.previous = opening.hash();
             let bytes = [line(&opening)?, line(&record)?].concat();
             Self::stage(dir, ".audit-resume.jsonl", &bytes, &poisoned)?;
             let staged = existing(dir, Path::new(".audit-resume.jsonl"), false)?;
