@@ -482,15 +482,34 @@ fn description_conflict_clause_is_redundant_for_every_kind() {
 
 #[test]
 fn canonical_boundary_equality_and_order_agree() {
-    let a = declaration(
-        "crate-a",
-        "zero.h",
-        Kind::Histogram,
-        "",
-        "",
-        Some(&[-0.0, 1.0]),
-    );
-    let b = declaration(
+    if crate::test_child(
+        "metric_identity::tests::canonical_boundary_equality_and_order_agree",
+        "VIGIL_IDENTITY_CHILD",
+    )
+    .is_some()
+    {
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("vigil-identity-zero-{}", std::process::id()));
+    let (_, guard) = crate::Config::new("signed-zero")
+        .dir(&path)
+        .metrics_interval(std::time::Duration::from_secs(3600))
+        .layer::<tracing_subscriber::Registry>()
+        .unwrap();
+    let registry = &crate::init::published_pipeline().unwrap().registry;
+    let construct = |boundaries: &'static [f64]| {
+        crate::metrics::Histogram::new(crate::metrics::Scope::new("crate-a", "1"), "zero.h")
+            .with_boundaries(boundaries)
+            .record(0.5, &[]);
+        // Keep each production declaration before registry deduplication can
+        // hide its representation; reset both name and series indexes.
+        let mut state = std::mem::take(&mut *registry.0.lock().unwrap());
+        state.names.remove("zero.h").unwrap().declarations.remove(0)
+    };
+    let a = construct(&[-0.0, 1.0]);
+    let b = construct(&[0.0, 1.0]);
+    let c = construct(&[0.0, 2.0]);
+    let canonical = declaration(
         "crate-a",
         "zero.h",
         Kind::Histogram,
@@ -498,8 +517,19 @@ fn canonical_boundary_equality_and_order_agree() {
         "",
         Some(&[0.0, 1.0]),
     );
+    for value in [&a, &b] {
+        assert_eq!(value, &canonical);
+        assert_eq!(value.cmp(&canonical), std::cmp::Ordering::Equal);
+        assert_eq!(
+            value.boundaries.as_ref().unwrap()[0].to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(value.cmp(&c), std::cmp::Ordering::Less);
+        assert_eq!(c.cmp(value), std::cmp::Ordering::Greater);
+    }
     assert_eq!(a, b);
     assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
     assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Equal));
-    assert_eq!(a.boundaries.unwrap()[0].to_bits(), 0.0_f64.to_bits());
+    guard.shutdown().unwrap();
+    std::fs::remove_dir_all(path).unwrap();
 }
