@@ -803,7 +803,7 @@ sealed segment may be moved, except that a run sealed by `resume` is archived to
 with everything before it: the start is then the resume's opening checkpoint, never a
 record inside the run. The live file and the trail marker must stay. **Batch *n*** is the
 set of segments moved by the *n*-th archiving. The **start of batch *n*** is the opening
-checkpoint of the oldest segment that stays after it, and the first record of batch *n*+1.
+checkpoint of the oldest segment that stays after it, and the first record of batch *n*+1 (or of the trail directory).
 
 Every `vigil-audit` command below is #13 and not yet available. The commands are
 copied from the ADR.
@@ -834,8 +834,8 @@ copied from the ADR.
 7. **Check the end of every batch on a schedule,** not only on restore or move:
    `vigil-audit verify [--start-from <batch-start anchor entry of batch n−1>]
    --end-before <archive record of batch n> --end-anchor <batch-start anchor entry of
-   batch n> <archive dir n>`, with the trust file, the anchors, the receipts and the
-   review file. A mismatch (`AnchorMismatch`), a missing entry or an end checkpoint that is
+   batch n> <archive dir n>`, with the trust file, the anchors (the starts of batches
+   *n*−1 and *n* among them), the receipts and the review file. A mismatch (`AnchorMismatch`), a missing entry or an end checkpoint that is
    not that entry (`UnanchoredEnd`) is an error, never a warning.
 
 The rules that make the steps hold:
@@ -869,13 +869,13 @@ structural check, as [Receipts and the expected head](#receipts-and-the-expected
 [Known limits](#known-limits) say: it settles interrupted staging and scans the chain, and
 it infers no signature trust from the disk. A process restarted on a trail whose prefix
 was deleted opens it and writes, as it would after archiving. So **run `verify` (#13)
-routinely on the live trail**, with the start from the anchor-store entry and the archive
-steps above: a restarting writer does not see a prefix deletion.
+routinely on the live trail**: with the start from the anchor-store entry once something
+has been archived (the first record must be that start), with no start before the first
+archiving (`seq 0` must be present), and with the archive steps above. A restarting writer does not see a prefix deletion.
 
 ### `--strict`
 
-Restates [decision 11][d11]. `--strict` is a flag of the `vigil-audit verify` command
-(#13). It turns every warning that no `accept` line has accepted into a failure, and it is
+Restates [decision 5][d5]. `--strict` is a flag of the `vigil-audit verify` command (#13). It turns every warning that no `accept` line has accepted into a failure, and it is
 the mode for regulated review.
 
 ### Operator duties
@@ -891,7 +891,7 @@ operator. Each entry links to the subsection that describes it.
 - [ ] **Decide on `resume` after structural loss** ([Operator resume](#operator-resume)).
 - [ ] **Run on storage that honours flushes** ([Supported filesystems and
   durability](#supported-filesystems-and-durability)).
-- [ ] **Review `accept Resumed` and `accept-run` against the deployment's evidence**
+- [ ] **Review `accept Resumed` and `accept-run` (#13) against the deployment's evidence**
   ([Review criteria](#review-criteria)).
 - [ ] **Know what `accept-run` does not accept** and what it means for archiving ([What
   `accept-run` does not accept](#what-accept-run-does-not-accept)).
@@ -899,7 +899,7 @@ operator. Each entry links to the subsection that describes it.
   sealed segments](#archiving-sealed-segments)).
 - [ ] **Ship the archive record and its anchor with Collector copies** ([Archiving sealed
   segments](#archiving-sealed-segments)).
-- [ ] **Run `verify` routinely on the live trail; `open` is not a verifier** ([`open` is not
+- [ ] **Run `verify` (#13) routinely on the live trail; `open` is not a verifier** ([`open` is not
   a verifier](#open-is-not-a-verifier)).
 
 ### Known limits
