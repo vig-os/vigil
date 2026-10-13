@@ -41,7 +41,7 @@ pub(crate) enum QueueSignal {
         not(test),
         expect(
             dead_code,
-            reason = "unused without traces; production trace queue wiring follows in 8c (#8)"
+            reason = "constructed only by the trace pipeline, wired into init by 8c (#8)"
         )
     )]
     Traces,

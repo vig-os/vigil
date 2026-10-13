@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn reported_span_losses_leave_pending_logs_unchanged() {
         let exporter = exporter(MemorySink::new(), 800);
-        exporter.losses.record(QueueSignal::Logs, 2, false);
+        exporter.losses.record(QueueSignal::Logs, 2, true);
         let mut span = fixtures::span("stub", 1);
         span.attributes.extend(
             (0..100).map(|i| opentelemetry::KeyValue::new(format!("key-{i}"), i64::from(i))),
@@ -171,10 +171,7 @@ mod tests {
             exporter.losses.pending_stderr(QueueSignal::Traces),
             (0, false)
         );
-        assert_eq!(
-            exporter.losses.pending_stderr(QueueSignal::Logs),
-            (2, false)
-        );
+        assert_eq!(exporter.losses.pending_stderr(QueueSignal::Logs), (2, true));
         let error = exporter.losses.finish(Ok(())).unwrap_err();
         assert_eq!(error.lost(Signal::Traces), 1);
         assert_eq!(error.lost(Signal::Logs), 2);
