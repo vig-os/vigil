@@ -321,10 +321,6 @@ fn linked_live(dir: &File) -> Result<bool, AuditError> {
     let live = existing(dir, Path::new("audit.jsonl"), false)?;
     rotate::has_segment_link(dir, "audit", &rfs::fstat(&live).map_err(io_error)?).map_err(io_error)
 }
-#[cfg(test)]
-fn predecessor(dir: &File, trail: [u8; 16]) -> Result<Option<State>, AuditError> {
-    predecessor_run(dir, trail).map(|(state, _)| state)
-}
 fn predecessor_run(dir: &File, trail: [u8; 16]) -> Result<(Option<State>, bool), AuditError> {
     let mut state = None;
     let mut run = false;

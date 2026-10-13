@@ -317,7 +317,6 @@ fn initial_record(
 // history already inside a run, needs the amendment-6 exception. No records are
 // buffered, and the cumulative MMR and cached head are never replaced by a later
 // checkpoint's claimed peaks.
-#[allow(clippy::too_many_arguments)]
 /// Folds a sealed predecessor without resetting state at damaged run boundaries.
 /// The caller must validate a successor with `scan_staged` or `scan_closing`.
 pub(crate) fn history_segment(
@@ -336,11 +335,13 @@ pub(crate) fn history_segment(
         file,
         trail,
         state.clone(),
-        opening,
         expected,
         found,
-        false,
-        *run,
+        SegmentContext {
+            opening,
+            genesis: false,
+            run: *run,
+        },
     ) {
         Ok(next) => {
             *run = false;
@@ -557,7 +558,18 @@ pub(crate) fn scan_staged(
     state: Option<State>,
     run: bool,
 ) -> Result<State, AuditError> {
-    scan_inner(file, trail, state, true, None, &mut None, true, run)
+    scan_inner(
+        file,
+        trail,
+        state,
+        None,
+        &mut None,
+        SegmentContext {
+            opening: true,
+            genesis: true,
+            run,
+        },
+    )
 }
 fn scan_closing(
     file: &File,
@@ -567,7 +579,18 @@ fn scan_closing(
     found: &mut Option<Record>,
     run: bool,
 ) -> Result<State, AuditError> {
-    scan_inner(file, trail, state, true, expected, found, false, run)
+    scan_inner(
+        file,
+        trail,
+        state,
+        expected,
+        found,
+        SegmentContext {
+            opening: true,
+            genesis: false,
+            run,
+        },
+    )
 }
 fn sealed(state: &State) -> bool {
     // A complete JSON checkpoint without LF is still a record (ADR-0005 d5).
@@ -759,20 +782,43 @@ pub(crate) fn scan(
     found: &mut Option<Record>,
     genesis: bool,
 ) -> Result<State, AuditError> {
-    scan_inner(file, trail, state, opening, expected, found, genesis, false)
+    scan_inner(
+        file,
+        trail,
+        state,
+        expected,
+        found,
+        SegmentContext {
+            opening,
+            genesis,
+            run: false,
+        },
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Boundary policy for scanning one segment under ADR-0005 amendment 6.
+struct SegmentContext {
+    /// Whether scanning starts at the segment's opening checkpoint.
+    opening: bool,
+    /// Whether an absent predecessor requires a genesis link.
+    genesis: bool,
+    /// Whether predecessor history ends inside a run requiring immediate resume.
+    run: bool,
+}
+
 fn scan_inner(
     file: &File,
     trail: [u8; 16],
     mut state: Option<State>,
-    opening: bool,
     expected: Option<Head>,
     found: &mut Option<Record>,
-    genesis: bool,
-    run: bool,
+    context: SegmentContext,
 ) -> Result<State, AuditError> {
+    let SegmentContext {
+        opening,
+        genesis,
+        run,
+    } = context;
     let genesis = genesis || (run && state.is_none());
     let mut file = file.try_clone().map_err(io_error)?;
     let start = if opening {
