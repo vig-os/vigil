@@ -430,7 +430,8 @@ line splitting and poisoned-name filtering. Run
 `nix develop -c python3 scripts/prometheus_conformance.py` for the
 [Prometheus oracle](scripts/prometheus_conformance.py), including cross-scope
 sharing, collision poisoning and every valid shared translation fixture row.
-Traces (#8) remain a planned extension.
+Spans from the unstable span exporter make the same round trip through the Collector;
+the `init` traces bridge is #8.
 
 ## Semver
 
@@ -773,6 +774,134 @@ is never a crash effect. The reviewer checks each range against the deployment's
 evidence and records the reviewer and the reason. That evidence is the receipts, close
 checkpoints, anchors, the application's request log and the incident report.
 
+### What `accept-run` does not accept
+
+Restates [decision 18.2][d182] and [residual 4 of decision 18.3][d183]. An `accept-run`
+line (#13) accepts exactly one run's listed findings, as its digest pins them (see
+[Review criteria](#review-criteria), which also says that a plain `accept` never accepts
+an error). It never accepts:
+
+- **A missing prefix.** A cut that removes the beginning of the trail is `SeqGap` from
+  `seq 0` (or `StartMismatch`), not a loss point inside a run.
+- **Anchors and revocation pins inside a named range** while the run's closing opening
+  checkpoint is unanchored. They are accepted only when that checkpoint is anchored in the
+  verification and the digest matches.
+- **Every receipt outside the ranges.**
+- **`MmrMismatch`** of the run's closing opening checkpoint.
+
+For archiving this means: a run whose closing opening checkpoint is unanchored, with an
+anchored checkpoint or pin inside a named range, cannot be archived by the procedure
+below until that checkpoint is anchored in the verification, or the trail is restored
+from an intact copy.
+
+### Archiving sealed segments
+
+Restates the Archiving bullet and Procedure of [decision 2][d2], and README duties 3 and 4
+of [decision 18.4][d184]. Archiving moves sealed segments to WORM or off-host storage. It
+is an operator action outside vigil, which never deletes or rewrites an audit file. Any
+sealed segment may be moved, except that a run sealed by `resume` is archived together
+with everything before it: the start is then the resume's opening checkpoint, never a
+record inside the run. The live file and the trail marker must stay. **Batch *n*** is the
+set of segments moved by the *n*-th archiving. The **start of batch *n*** is the opening
+checkpoint of the oldest segment that stays after it, and the first record of batch *n*+1 (or of the trail directory).
+
+Every `vigil-audit` command below is #13 and not yet available. The commands are
+copied from the ADR.
+
+1. **Snapshot and verify.** Take a snapshot (a copy of the trail files) and verify it
+   with the anchors, the receipts and the review file: `vigil-audit verify <snapshot>`
+   for batch 1, and `vigil-audit verify --start-from <batch-start anchor entry of batch
+   n−1> <snapshot>` for batch *n* ≥ 2. The criterion: no error finding and no warning
+   that a reviewer has not accepted.
+2. **Choose the start:** the opening checkpoint of the oldest segment that stays (a file
+   operation: nothing runs).
+3. **Record and anchor the start.** Copy its line from the snapshot step 1 verified
+   (`vigil-audit checkpoints <snapshot>`), never from a later read of the trail directory,
+   into the archive record and into the anchor store, where it is the **batch-start anchor
+   entry** of this batch. When the start is a resume's opening checkpoint, the archive
+   record also holds the line of the `vigil.audit.resume` record that follows it.
+4. **Copy** the older segments from the snapshot that step 1 verified, never from the
+   trail directory, to the archive destination (a file operation).
+5. **Remove** the older segments from the trail directory (a file operation). **Keep the
+   snapshot until step 6 has passed**: a copy that fails there is repeated from it.
+6. **Verify in place,** at the archive's destination, with the anchors, the receipts and
+   the review file, against step 1's criterion:
+   - batch 1: `vigil-audit verify <archive dir> <trail dir>`, with no start;
+   - batch *n* ≥ 2: `vigil-audit verify --start-from <batch-start anchor entry of batch
+     n−1> <archive dir n> <trail dir>`;
+   - then the trail directory alone: `vigil-audit verify --start-from <batch-start anchor
+     entry of this batch> <trail dir>`.
+7. **Check the end of every batch on a schedule,** not only on restore or move:
+   `vigil-audit verify [--start-from <batch-start anchor entry of batch n−1>]
+   --end-before <archive record of batch n> --end-anchor <batch-start anchor entry of
+   batch n> <archive dir n>`, with the trust file, the anchors (the starts of batches
+   *n*−1 and *n* among them), the receipts and the review file. A mismatch (`AnchorMismatch`), a missing entry or an end checkpoint that is
+   not that entry (`UnanchoredEnd`) is an error, never a warning.
+
+The rules that make the steps hold:
+
+- **Keep each archive record outside the trail directory, beside its archive,** and put its
+  start line in the anchor store. Whoever can delete inside the archive can rewrite the
+  record next to it; only the anchor-store entry is the trusted end.
+- **`--start-from` and `--end-anchor` come from the anchor store's batch-start entries,
+  `--end-before` from the archive record** (which must byte-equal its entry), never from
+  the trail directory. A start read from the disk is likely to be "anchored" too, and an
+  attacker who deleted kept segments would then make the anchors and receipts of the
+  deleted records `OutOfRange`.
+- **The schedule is the detection window** ([residual 1][d183]). A deletion or tail cut of
+  an archive between two step-7 runs is found by the next run, so the interval is how long
+  it can go unseen. Choose it from the deployment's evidence requirements.
+- **The schedule must cover every anchored start** ([residual 10][d183]): step 7 runs
+  only for the batches it is given. The inventory is the set of anchored starts.
+- **The full verification** is batch 1's form of step 6 over every batch directory and the
+  trail directory. Run it whenever archives are restored or moved again.
+- **The anchor store must sit where the attacker cannot write** (WORM, another host):
+  step 7 relies on its integrity ([residual 11][d183], [decision 10][d10]).
+
+**Collector copies must also ship the archive record** and its anchor. A copy that
+starts after `seq 0` without them (`verify_files`, #13) cannot be told from a deleted
+prefix: `SeqGap` ([residual 8][d183]).
+
+### `open` is not a verifier
+
+Restates [decision 18.1][d181] and README duty 5 of [decision 18.4][d184]. `open` is a
+structural check, as [Receipts and the expected head](#receipts-and-the-expected-head) and
+[Known limits](#known-limits) say: it settles interrupted staging and scans the chain, and
+it infers no signature trust from the disk. A process restarted on a trail whose prefix
+was deleted opens it and writes, as it would after archiving. So **run `verify` (#13)
+routinely on the live trail**: with the start from the anchor-store entry once something
+has been archived (the first record must be that start), with no start before the first
+archiving (`seq 0` must be present), and with the archive steps above. A restarting writer does not see a prefix deletion.
+
+### `--strict`
+
+Restates [decision 5][d5]. `--strict` is a flag of the `vigil-audit verify` command (#13). It turns every warning that no `accept` line has accepted into a failure, and it is
+the mode for regulated review.
+
+### Operator duties
+
+[Decision 18.4][d184] and the [Consequences][cons] of the ADR assign these duties to the
+operator. Each entry links to the subsection that describes it.
+
+- [ ] **Pin each trail id and keep the trust file outside the trail directory** ([Trail
+  directory and trail id](#trail-directory-and-trail-id), [Trust file layout and the
+  one-file rule](#trust-file-layout-and-the-one-file-rule)).
+- [ ] **Stop every writer before rotating a key** ([Operator rotation and
+  checkpoint](#operator-rotation-and-checkpoint)).
+- [ ] **Decide on `resume` after structural loss** ([Operator resume](#operator-resume)).
+- [ ] **Run on storage that honours flushes** ([Supported filesystems and
+  durability](#supported-filesystems-and-durability)).
+- [ ] **Review `accept Resumed` and `accept-run` (#13) against the deployment's evidence**
+  ([Review criteria](#review-criteria)).
+- [ ] **Know what `accept-run` does not accept** and what it means for archiving ([What
+  `accept-run` does not accept](#what-accept-run-does-not-accept)).
+- [ ] **Archive by the procedure, with the schedule and the full verification** ([Archiving
+  sealed segments](#archiving-sealed-segments)).
+- [ ] **Ship the archive record and its anchor with Collector copies** ([Archiving sealed
+  segments](#archiving-sealed-segments)).
+- [ ] **Run `verify` (#13) routinely on the live trail; `open` is not a verifier** ([`open` is not
+  a verifier](#open-is-not-a-verifier)).
+
 ### Known limits
 
 - With no earlier segments present (an archived prefix), the reader accepts a lone
@@ -796,6 +925,7 @@ Use digests rather than personal data in entries, retaining the referenced value
 application's own store.
 
 [d1]: docs/adr/0005-audit-trail.md#1-scope-a-separate-synchronous-fail-closed-api-behind-feature-audit
+[d2]: docs/adr/0005-audit-trail.md#2-files-adr-0002s-machinery-in-a-directory-of-its-own
 [d5]: docs/adr/0005-audit-trail.md#5-hash-chain
 [d6]: docs/adr/0005-audit-trail.md#6-the-lossless-sink-fsync-per-record-fail-closed-no-queue
 [d8]: docs/adr/0005-audit-trail.md#8-signed-checkpoints-cadence-and-segment-sealing
@@ -806,8 +936,11 @@ application's own store.
 [d12]: docs/adr/0005-audit-trail.md#12-format-freeze-and-the-promise-that-old-trails-still-verify
 [d13]: docs/adr/0005-audit-trail.md#13-public-surface-feature-audit-under-adr-0004s-rules
 [d181]: docs/adr/0005-audit-trail.md#181-open-is-structural-verify-decides
+[d182]: docs/adr/0005-audit-trail.md#182-why-accept-run-does-not-reopen-p1
 [d183]: docs/adr/0005-audit-trail.md#183-residuals-and-who-catches-each
 [d184]: docs/adr/0005-audit-trail.md#184-readme-duties-copied-by-b3e
+[d10]: docs/adr/0005-audit-trail.md#10-anchoring-optional
+[cons]: docs/adr/0005-audit-trail.md#consequences
 
 ## Performance
 
