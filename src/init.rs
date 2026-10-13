@@ -328,10 +328,9 @@ impl Guard {
         let metrics = self.start_metrics_flush();
         #[cfg(all(test, feature = "metrics"))]
         self.losses.observe_flush_order();
-        let logs = self
-            .provider
-            .as_ref()
-            .map_or(Ok(()), crate::lifecycle::flush);
+        let logs = self.provider.as_ref().map_or(Ok(()), |provider| {
+            crate::lifecycle::flush(|| provider.force_flush())
+        });
         self.losses.outcome(Signal::Logs, &logs);
         #[cfg(feature = "metrics")]
         let metrics = metrics.map_or(Ok(()), |target| {
@@ -340,7 +339,7 @@ impl Guard {
         #[cfg(not(feature = "metrics"))]
         let metrics = Ok(());
         let _ = deadline;
-        self.losses.finish_signals(logs, metrics)
+        self.losses.finish_signals(logs, metrics, Ok(()))
     }
 
     #[cfg(feature = "metrics")]
@@ -401,9 +400,12 @@ impl Guard {
         #[cfg(feature = "metrics")]
         let metrics = self.metrics.take();
         let forward = tracing::dispatcher::get_default(Clone::clone);
-        let capture = || ShutdownCapture {
-            forward: forward.clone(),
-            losses: self.losses.clone(),
+        let capture = || {
+            ShutdownCapture::new(
+                crate::lifecycle::QueueSignal::Logs,
+                forward.clone(),
+                self.losses.clone(),
+            )
         };
         let started = Instant::now();
         let logs_shutdown = || {
@@ -461,11 +463,13 @@ impl Guard {
         });
         #[cfg(not(feature = "metrics"))]
         let _ = metrics_builder;
-        self.losses.finish_signals(result.0, result.1)
+        self.losses.finish_signals(result.0, result.1, Ok(()))
     }
 
     fn summaries(&self, error: Option<&FlushError>, dropping: bool) {
-        let (logs, failed) = self.losses.pending_stderr();
+        let (logs, failed) = self
+            .losses
+            .pending_stderr(crate::lifecycle::QueueSignal::Logs);
         let kind = error
             .and_then(|error| error.signal_kind(Signal::Logs))
             .unwrap_or(if failed {
@@ -1334,10 +1338,17 @@ struct ReportingExporter {
 }
 impl LogExporter for ReportingExporter {
     async fn export(&self, batch: LogBatch<'_>) -> opentelemetry_sdk::error::OTelSdkResult {
-        self.losses.reached(batch.iter().count() as u64);
+        self.losses.reached(
+            crate::lifecycle::QueueSignal::Logs,
+            batch.iter().count() as u64,
+        );
         let result = self.inner.export(batch).await;
         let lost = self.inner.take_dropped_records();
-        self.losses.record(lost as u64, result.is_err());
+        self.losses.record(
+            crate::lifecycle::QueueSignal::Logs,
+            lost as u64,
+            result.is_err(),
+        );
         let reported = self
             .failures
             .lock()
@@ -1349,7 +1360,8 @@ impl LogExporter for ReportingExporter {
                 &result,
                 self.losses.shutting_down.load(Ordering::Acquire),
             );
-        self.losses.reported(reported);
+        self.losses
+            .reported(crate::lifecycle::QueueSignal::Logs, reported);
         Ok(())
     }
     fn set_resource(&mut self, resource: &Resource) {
@@ -1404,12 +1416,22 @@ mod dropped_stub_tests {
                 std::future::Future::poll(export.as_mut(), &mut Context::from_waker(Waker::noop())),
                 Poll::Ready(Ok(()))
             ));
-            assert_eq!(exporter.losses.pending_stderr(), (count - 1, false));
+            assert_eq!(
+                exporter
+                    .losses
+                    .pending_stderr(crate::lifecycle::QueueSignal::Logs),
+                (count - 1, false)
+            );
         }
         exporter
             .shutdown_with_timeout(Duration::from_secs(1))
             .unwrap();
-        assert_eq!(exporter.losses.pending_stderr(), (1, false));
+        assert_eq!(
+            exporter
+                .losses
+                .pending_stderr(crate::lifecycle::QueueSignal::Logs),
+            (1, false)
+        );
         let loss = exporter.losses.finish(Ok(())).unwrap_err();
         assert_eq!(loss.kind(), crate::FlushErrorKind::DataLost);
         assert_eq!(loss.lost(crate::Signal::Logs), 2);
@@ -2002,13 +2024,17 @@ mod metrics_lifecycle_tests {
         }
         let dir = directory("flush-silent");
         let guard = Config::new("silent").dir(&dir).init().unwrap();
-        guard.losses.record(2, true);
+        guard
+            .losses
+            .record(crate::lifecycle::QueueSignal::Logs, 2, true);
         guard.losses.metric_data_points(true);
         guard.losses.metric_pending(3, 0);
         let error = guard.flush().unwrap_err();
         assert_eq!(error.kind(), FlushErrorKind::Failed);
         assert_eq!(error.lost(Signal::Logs), 2);
-        guard.losses.reported(2);
+        guard
+            .losses
+            .reported(crate::lifecycle::QueueSignal::Logs, 2);
         guard.losses.metric_pending(0, 3);
         guard.shutdown().unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -2341,7 +2367,9 @@ mod metrics_lifecycle_tests {
                 guard.losses.metric_pending(3, 0);
             }
             if mode == "drop-both" || mode == "explicit-logs" {
-                guard.losses.record(2, false);
+                guard
+                    .losses
+                    .record(crate::lifecycle::QueueSignal::Logs, 2, false);
             }
             if mode == "metric-failed" {
                 guard.losses.outcome(

@@ -126,3 +126,10 @@ pub mod span_export;
 #[cfg(all(feature = "traces", not(vigil_unstable)))]
 #[cfg_attr(not(test), expect(dead_code, reason = "wired into init by 8c (#8)"))]
 mod span_export;
+
+#[cfg(feature = "traces")]
+mod trace_pipeline;
+
+#[cfg(all(test, feature = "traces"))]
+#[path = "../tests/common/temp.rs"]
+mod test_temp;

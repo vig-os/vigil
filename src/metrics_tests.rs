@@ -459,7 +459,7 @@ fn explicit_shutdown_does_not_print_measurements() {
 #[test]
 fn mixed_losses_display_in_signal_order() {
     let losses = Losses::default();
-    losses.record(3, false);
+    losses.record(crate::lifecycle::QueueSignal::Logs, 3, false);
     losses.measurements_dropped(2);
     losses.metric_data_points(false);
     let error = losses.finish(Ok(())).unwrap_err();

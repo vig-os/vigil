@@ -28,6 +28,8 @@ use std::{
 /// Oversized spans are shortened or replaced with identity-preserving stubs.
 /// The `vigil.truncated`, `vigil.dropped` and `vigil.original_size` attribute
 /// names are reserved on spans; shortening replaces caller-supplied values.
+/// Known limit: an SDK scope with a NaN-valued attribute never equals itself,
+/// so each span has its own `scopeSpans` entry. Output remains deterministic.
 /// Use `--cfg vigil_unstable` and pin vigil with `~1.N`.
 #[derive(Debug)]
 #[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
@@ -57,7 +59,10 @@ impl<S: LineSink> OtlpJsonSpanExporter<S> {
         &self.sink
     }
     /// Consume the number of spans lost since the previous call.
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by 8b (#8)"))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by trace_pipeline once 8c wires it (#8)")
+    )]
     pub(crate) fn take_dropped_spans(&self) -> usize {
         self.dropped.swap(0, Ordering::Relaxed)
     }
@@ -258,7 +263,7 @@ pub(crate) fn fit_span(
 
 #[cfg(test)]
 #[path = "../tests/common/spans.rs"]
-mod fixtures;
+pub(crate) mod fixtures;
 
 #[cfg(test)]
 mod tests {
@@ -393,7 +398,9 @@ mod tests {
         };
         // SDK scope identity distinguishes an absent version from an explicit
         // empty version, although both project to identical OTLP metadata.
-        // Thus even group_spans_by_resource_and_scope can produce tied scopes.
+        // These SDK scopes pin metadata ties, not the field_order arms.
+        // The hand-built proto differs in droppedAttributesCount and
+        // exercises those arms.
         let mut a = fixtures::span("same", 1);
         a.name = "a".into();
         let mut b = fixtures::span("same", 2);
@@ -440,6 +447,29 @@ mod tests {
         assert_eq!(project(reversed).unwrap(), json);
     }
     #[test]
+    fn ordered_nan_scope_keeps_separate_deterministic_entries() {
+        let scope = opentelemetry::InstrumentationScope::builder("nan")
+            .with_attributes([opentelemetry::KeyValue::new("value", f64::NAN)])
+            .build();
+        let mut a = fixtures::span("nan", 1);
+        a.instrumentation_scope = scope.clone();
+        let mut b = fixtures::span("nan", 2);
+        b.instrumentation_scope = scope;
+        let batch = vec![a, b];
+        let (result, lines, lost) = output(batch.clone(), 10000);
+        result.unwrap();
+        assert_eq!(lost, 0);
+        let json: Json = serde_json::from_str(&lines[0]).unwrap();
+        let scopes = json["resourceSpans"][0]["scopeSpans"].as_array().unwrap();
+        assert_eq!(scopes.len(), 2);
+        assert!(
+            scopes
+                .iter()
+                .all(|s| s["spans"].as_array().unwrap().len() == 1)
+        );
+        assert_eq!(output(batch, 10000).1, lines);
+    }
+    #[test]
     fn empty_batch_writes_nothing() {
         let (result, lines, lost) = output(Vec::new(), 1);
         result.unwrap();
@@ -451,7 +481,7 @@ mod tests {
         assert_eq!(lost, 0);
     }
     #[test]
-    fn shortened_attributes_include_sorted_markers() {
+    fn ordered_shortened_attributes_include_sorted_markers() {
         let mut span = fixtures::span("a", 2);
         span.attributes
             .push(opentelemetry::KeyValue::new("payload", "x".repeat(10000)));
