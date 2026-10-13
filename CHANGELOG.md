@@ -10,8 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Operator `resume` (`AuditConfig::resume`) with a receipt and signer-retaining writer handle ([#11](https://github.com/vig-os/vigil/issues/11)).
-- Default `traces` feature and unstable `span_export::OtlpJsonSpanExporter` (#8, slice 8a).
-
+- Default `traces` feature and unstable `span_export::OtlpJsonSpanExporter` ([#8](https://github.com/vig-os/vigil/issues/8)).
 - ADR-0005 amendment 10: prefix deletion, archiving and run review. `open` is structural and `verify` decides; the archive procedure copies from the verified snapshot, verifies in place per batch and checks each batch's end on a schedule (`--end-before`); a run's `SegmentStructure` names every loss point's missing `seq` range, and an `accept-run` review line accepts exactly one run's findings by a ranges digest. Docs only; #13 implements it ([#107](https://github.com/vig-os/vigil/issues/107)).
 - Prometheus conformance script, shared translation fixture and README Prometheus subsection ([#7](https://github.com/vig-os/vigil/issues/7)).
 - Audit operator `rotate` and `checkpoint` require an exact expected head, with atomic new-key coverage and documented crash recovery ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12)).

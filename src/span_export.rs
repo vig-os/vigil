@@ -26,6 +26,8 @@ use std::{
 
 /// **Unstable:** writes spans as bounded OTLP/JSON lines.
 /// Oversized spans are shortened or replaced with identity-preserving stubs.
+/// The `vigil.truncated`, `vigil.dropped` and `vigil.original_size` attribute
+/// names are reserved on spans; shortening replaces caller-supplied values.
 /// Use `--cfg vigil_unstable` and pin vigil with `~1.N`.
 #[derive(Debug)]
 #[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
@@ -60,6 +62,9 @@ impl<S: LineSink> OtlpJsonSpanExporter<S> {
         self.dropped.swap(0, Ordering::Relaxed)
     }
     fn write(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+        if batch.is_empty() {
+            return Ok(());
+        }
         let mut lost = batch.len();
         let result = (|| {
             let request = ExportTraceServiceRequest {
@@ -283,7 +288,27 @@ mod tests {
     }
     #[test]
     fn ordered_spans_sort_scopes_and_attributes_keep_batch_order() {
-        let (_, expected, _) = output(fixtures::batch(), 10000);
+        let batch_with_children = || {
+            let mut batch = fixtures::batch();
+            let span = &mut batch[0];
+            let attributes = vec![
+                opentelemetry::KeyValue::new("z", "last"),
+                opentelemetry::KeyValue::new("a", "first"),
+            ];
+            span.events.events.push(opentelemetry::trace::Event::new(
+                "event",
+                span.start_time,
+                attributes.clone(),
+                0,
+            ));
+            span.links.links.push(opentelemetry::trace::Link::new(
+                span.span_context.clone(),
+                attributes,
+                0,
+            ));
+            batch
+        };
+        let (_, expected, _) = output(batch_with_children(), 10000);
         let json: Json = serde_json::from_str(&expected[0]).unwrap();
         let scopes = json["resourceSpans"][0]["scopeSpans"].as_array().unwrap();
         assert_eq!(scopes[0]["scope"]["name"], "a");
@@ -291,11 +316,17 @@ mod tests {
         assert_eq!(scopes[0]["spans"][0]["name"], "span-3");
         assert_eq!(scopes[0]["spans"][1]["name"], "span-1");
         for _ in 0..128 {
-            let mut batch = fixtures::batch();
+            let mut batch = batch_with_children();
             batch.swap(0, 1);
             batch.swap(2, 3);
             for span in &mut batch {
                 span.attributes.reverse();
+                for event in &mut span.events.events {
+                    event.attributes.reverse();
+                }
+                for link in &mut span.links.links {
+                    link.attributes.reverse();
+                }
             }
             assert_eq!(output(batch, 10000).1, expected);
         }
@@ -311,7 +342,12 @@ mod tests {
         let prefix = "{\"resourceSpans\":[{\"scopeSpans\":[{\"spans\":[{\"spanId\":";
         for line in &lines {
             assert!(line.starts_with(prefix));
-            assert!(prefix.len() + 18 < 128);
+            let json: Json = serde_json::from_str(line).unwrap();
+            let id = json["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["spanId"]
+                .as_str()
+                .unwrap();
+            let written_id = format!("\"spanId\":\"{id}\"");
+            assert!(line.find(&written_id).unwrap() + written_id.len() <= 128);
             assert!(line.contains("\"doubleValue\":\"NaN\""));
             assert!(line.contains("\"doubleValue\":\"Infinity\""));
             assert!(line.contains("\"doubleValue\":\"-Infinity\""));
@@ -321,6 +357,154 @@ mod tests {
         assert_eq!(spans[0]["traceId"], "00000000000000000000000000abcdef");
         assert_eq!(spans[0]["kind"], 2);
         assert_eq!(spans[0]["status"]["code"], 2);
+    }
+    #[test]
+    fn ordered_trace_children_precede_remaining_envelope_metadata() {
+        use opentelemetry_proto::tonic::{
+            common::v1::InstrumentationScope,
+            resource::v1::Resource as ProtoResource,
+            trace::v1::{ResourceSpans, ScopeSpans, Span},
+        };
+        // Valid OTLP messages at the shared envelope seam may carry dropped
+        // attribute counts. These are remaining metadata, not primary keys;
+        // child structure must decide ties before these counts (ADR-0001 d5).
+        let resource = |name: &str, dropped| ResourceSpans {
+            resource: Some(ProtoResource {
+                dropped_attributes_count: dropped,
+                ..Default::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope {
+                    name: "same".into(),
+                    dropped_attributes_count: dropped,
+                    ..Default::default()
+                }),
+                spans: vec![Span {
+                    name: name.into(),
+                    trace_id: vec![1; 16],
+                    span_id: vec![1; 8],
+                    start_time_unix_nano: 1,
+                    end_time_unix_nano: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // SDK scope identity distinguishes an absent version from an explicit
+        // empty version, although both project to identical OTLP metadata.
+        // Thus even group_spans_by_resource_and_scope can produce tied scopes.
+        let mut a = fixtures::span("same", 1);
+        a.name = "a".into();
+        let mut b = fixtures::span("same", 2);
+        b.name = "b".into();
+        b.instrumentation_scope = opentelemetry::InstrumentationScope::builder("same")
+            .with_version("")
+            .build();
+        assert_ne!(a.instrumentation_scope, b.instrumentation_scope);
+        let (result, lines, lost) = output(vec![b.clone(), a.clone()], 10000);
+        result.unwrap();
+        assert_eq!(lost, 0);
+        let json: Json = serde_json::from_str(&lines[0]).unwrap();
+        let scopes = json["resourceSpans"][0]["scopeSpans"].as_array().unwrap();
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes[0]["scope"], scopes[1]["scope"]);
+        assert_eq!(scopes[0]["spans"][0]["name"], "a");
+        assert_eq!(scopes[1]["spans"][0]["name"], "b");
+        assert_eq!(output(vec![a, b], 10000).1, lines);
+        // ResourceSpans: scopeSpans must precede resource metadata.
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![resource("b", 1), resource("a", 2)],
+        };
+        let json = project(request.clone()).unwrap();
+        assert_eq!(
+            json["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
+            "a"
+        );
+        let mut reversed = request;
+        reversed.resource_spans.reverse();
+        assert_eq!(project(reversed).unwrap(), json);
+        // ScopeSpans: spans must precede scope metadata.
+        let mut first = resource("b", 1);
+        first.scope_spans.extend(resource("a", 2).scope_spans);
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![first],
+        };
+        let json = project(request.clone()).unwrap();
+        assert_eq!(
+            json["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
+            "a"
+        );
+        let mut reversed = request;
+        reversed.resource_spans[0].scope_spans.reverse();
+        assert_eq!(project(reversed).unwrap(), json);
+    }
+    #[test]
+    fn empty_batch_writes_nothing() {
+        let (result, lines, lost) = output(Vec::new(), 1);
+        result.unwrap();
+        assert!(lines.is_empty());
+        assert_eq!(lost, 0);
+        let (result, lines, lost) = output(Vec::new(), 10000);
+        result.unwrap();
+        assert!(lines.is_empty());
+        assert_eq!(lost, 0);
+    }
+    #[test]
+    fn shortened_attributes_include_sorted_markers() {
+        let mut span = fixtures::span("a", 2);
+        span.attributes
+            .push(opentelemetry::KeyValue::new("payload", "x".repeat(10000)));
+        let (result, lines, lost) = output(vec![span], 1000);
+        result.unwrap();
+        assert_eq!(lost, 0);
+        assert_eq!(lines.len(), 1);
+        let spans = records(&lines);
+        let keys: Vec<_> = spans[0]["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "a",
+                "payload",
+                "vigil.original_size",
+                "vigil.truncated",
+                "z"
+            ]
+        );
+    }
+    #[test]
+    fn shortening_replaces_reserved_markers() {
+        let mut span = fixtures::span("a", 2);
+        span.attributes.extend([
+            opentelemetry::KeyValue::new("payload", "x".repeat(10000)),
+            opentelemetry::KeyValue::new("vigil.truncated", false),
+            opentelemetry::KeyValue::new("vigil.dropped", true),
+            opentelemetry::KeyValue::new("vigil.original_size", -1_i64),
+        ]);
+        let original_size = output(vec![span.clone()], 100000).1[0].len();
+        let (result, lines, lost) = output(vec![span], 1000);
+        result.unwrap();
+        assert_eq!(lost, 0);
+        let spans = records(&lines);
+        let attributes = spans[0]["attributes"].as_array().unwrap();
+        let named = |name| {
+            attributes
+                .iter()
+                .filter(|a| a["key"] == name)
+                .collect::<Vec<_>>()
+        };
+        let truncated = named("vigil.truncated");
+        assert_eq!(truncated.len(), 1);
+        assert_eq!(truncated[0]["value"]["boolValue"], true);
+        let original = named("vigil.original_size");
+        assert_eq!(original.len(), 1);
+        assert_eq!(original[0]["value"]["intValue"], original_size.to_string());
+        assert!(named("vigil.dropped").is_empty());
     }
     #[test]
     fn split_spans_repeat_metadata() {
