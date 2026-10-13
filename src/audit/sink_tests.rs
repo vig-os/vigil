@@ -362,8 +362,9 @@ fn complete_line_without_lf_is_not_a_gap() {
     fs::write(t.0.join("audit.jsonl"), &before).unwrap();
     // Fresh reader: the first handle correctly refuses a shortening below cached length.
     let mut reopened = open(&t);
-    let state = predecessor(&File::open(&t.0).unwrap(), reopened.trail)
+    let state = predecessor_run(&File::open(&t.0).unwrap(), reopened.trail)
         .unwrap()
+        .0
         .unwrap();
     let next = Record::new(reopened.context(&state, 1_000_000_000).unwrap(), entry()).unwrap();
     reopened.config.max_bytes = before.len() as u64 + line(&next).unwrap().len() as u64;
@@ -421,8 +422,9 @@ fn fsync_failure_sites_poison_handle_and_rollback() {
                 b"{".to_vec()
             } else {
                 s.checkpoint().unwrap();
-                let state = predecessor(&File::open(&t.0).unwrap(), s.trail)
+                let state = predecessor_run(&File::open(&t.0).unwrap(), s.trail)
                     .unwrap()
+                    .0
                     .unwrap();
                 line(&s.checkpoint_record(&state, 1_000_000_000).unwrap()).unwrap()
             };
@@ -482,8 +484,9 @@ fn resume_staging_every_prefix_with_and_without_gap() {
         let mut s = create(&t);
         s.closed = true;
         let live = bytes(&t);
-        let state = predecessor(&File::open(&t.0).unwrap(), s.trail)
+        let state = predecessor_run(&File::open(&t.0).unwrap(), s.trail)
             .unwrap()
+            .0
             .unwrap();
         let staged = resume_bytes(
             &s,
@@ -518,7 +521,7 @@ fn sealing_staging_rules_and_interrupted_creation() {
         let mut s = create(&t);
         s.closed = true;
         let dir = File::open(&t.0).unwrap();
-        let state = predecessor(&dir, s.trail).unwrap().unwrap();
+        let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
         let closing = s.checkpoint_record(&state, 2_000_000_000).unwrap();
         let mut mmr = state.mmr.clone();
         mmr.push(closing.hash()).unwrap();
@@ -662,8 +665,9 @@ fn reading_writer_accepts_absent_fragment_and_refuses_changed_or_inserted_fragme
         let t = Temp::new();
         let s = create(&t);
         let initial = bytes(&t);
-        let state = predecessor(&File::open(&t.0).unwrap(), s.trail)
+        let state = predecessor_run(&File::open(&t.0).unwrap(), s.trail)
             .unwrap()
+            .0
             .unwrap();
         let gap = b"{\"resourceLogs\":\n";
         let mut h = blake3::Hasher::new();
@@ -836,7 +840,7 @@ fn resume_promotes_over_live_opening_checkpoint() {
     assert!(matches!(records(&t)[0].kind, Kind::Checkpoint(_)));
     assert_eq!(records(&t)[0].context.seq, 2);
     let dir = File::open(&t.0).unwrap();
-    let state = predecessor(&dir, s.trail).unwrap().unwrap();
+    let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
     let live = bytes(&t);
     let staged = resume_bytes(
         &s,
@@ -862,7 +866,7 @@ fn assert_resume_discard(rule: u8, seal_before_settle: bool) {
     let mut s = create(&t);
     s.closed = true;
     let dir = File::open(&t.0).unwrap();
-    let state = predecessor(&dir, s.trail).unwrap().unwrap();
+    let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
     // A declared gap permits a below-head checkpoint with a locally valid MMR count.
     let initial = resume_bytes(
         &s,
@@ -876,7 +880,7 @@ fn assert_resume_discard(rule: u8, seal_before_settle: bool) {
     let mut reopened = open(&t);
     reopened.closed = true;
     assert_resume_filename(&t);
-    let state = predecessor(&dir, s.trail).unwrap().unwrap();
+    let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
     let seq = state.head.seq + u64::from(rule != 2);
     let previous = if rule == 0 { [42; 32] } else { state.head.hash };
     let action = if rule == 1 {
@@ -934,7 +938,7 @@ fn record_at_rotation_limit_stays_in_live_file() {
     let t = Temp::new();
     let mut s = create(&t);
     let dir = File::open(&t.0).unwrap();
-    let state = predecessor(&dir, s.trail).unwrap().unwrap();
+    let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
     let record = Record::new(s.context(&state, 1_000_000_000).unwrap(), entry()).unwrap();
     let expected = [bytes(&t), line(&record).unwrap()].concat();
     s.config.max_bytes = expected.len() as u64;
@@ -949,8 +953,9 @@ fn resume_without_predecessor_discards_non_genesis_link() {
     let t = Temp::new();
     let mut s = create(&t);
     s.closed = true;
-    let mut state = predecessor(&File::open(&t.0).unwrap(), s.trail)
+    let mut state = predecessor_run(&File::open(&t.0).unwrap(), s.trail)
         .unwrap()
+        .0
         .unwrap();
     state.head.hash = [42; 32];
     let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume", "-");
@@ -967,8 +972,9 @@ fn resume_without_predecessor_promotes_genesis_link() {
     let t = Temp::new();
     let mut s = create(&t);
     s.closed = true;
-    let mut state = predecessor(&File::open(&t.0).unwrap(), s.trail)
+    let mut state = predecessor_run(&File::open(&t.0).unwrap(), s.trail)
         .unwrap()
+        .0
         .unwrap();
     state.head.hash = Record::genesis(&s.trail);
     state.mmr = Mmr::new();
@@ -1007,7 +1013,7 @@ fn resume_settlement_promotes_over_archived_live_prefix() {
     s.record(&entry()).unwrap();
     s.closed = true;
     let dir = File::open(&t.0).unwrap();
-    let state = predecessor(&dir, s.trail).unwrap().unwrap();
+    let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
     let live = bytes(&t);
     assert!(records(&t)[0].context.seq > 0);
     assert_ne!(records(&t)[0].context.previous, Record::genesis(&s.trail));
@@ -1041,7 +1047,7 @@ fn sealing_settlement_promotes_after_archived_prefix_without_live() {
     s.record(&entry()).unwrap();
     s.closed = true;
     let dir = File::open(&t.0).unwrap();
-    let state = predecessor(&dir, s.trail).unwrap().unwrap();
+    let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
     let closing = s.checkpoint_record(&state, 2_000_000_000).unwrap();
     let mut mmr = state.mmr.clone();
     mmr.push(closing.hash()).unwrap();
@@ -1085,8 +1091,9 @@ fn resume_without_predecessor_discards_nonzero_genesis_head() {
     let t = Temp::new();
     let mut s = create(&t);
     s.closed = true;
-    let mut state = predecessor(&File::open(&t.0).unwrap(), s.trail)
+    let mut state = predecessor_run(&File::open(&t.0).unwrap(), s.trail)
         .unwrap()
+        .0
         .unwrap();
     state.head.hash = Record::genesis(&s.trail);
     state.head.seq = 3;
@@ -1122,8 +1129,9 @@ fn assert_inert(s: &Sink, t: &Temp) {
     assert_eq!(snapshot(t), before);
 }
 fn promotable(s: &Sink, t: &Temp, resume: bool) -> Vec<u8> {
-    let state = predecessor(&File::open(&t.0).unwrap(), s.trail)
+    let state = predecessor_run(&File::open(&t.0).unwrap(), s.trail)
         .unwrap()
+        .0
         .unwrap();
     if resume {
         resume_bytes(
@@ -2308,7 +2316,7 @@ fn resume_promotion_uses_record_filename_and_one_final_sync() {
     s.signer = operators::SignOnly::new("11", false);
     s.closed = true;
     let dir = File::open(&t.0).unwrap();
-    let state = predecessor(&dir, s.trail).unwrap().unwrap();
+    let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
     let name = "audit-20990101T000000.000000000Z.jsonl";
     let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume", name);
     let live = bytes(&t);
@@ -2376,7 +2384,7 @@ fn resume_invalid_filename_on_never_rotated_trail_is_discarded() {
         s.closed = true;
         let dir = File::open(&t.0).unwrap();
         assert!(rotate::rotated_names_at(&dir, "audit").unwrap().is_empty());
-        let state = predecessor(&dir, s.trail).unwrap().unwrap();
+        let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
         let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume", file);
         let before = bytes(&t);
         fs::write(t.0.join(".audit-resume.jsonl"), staged).unwrap();
@@ -2403,7 +2411,7 @@ fn resume_filename_validation_and_directory_states() {
         s.record(&entry()).unwrap();
         s.closed = true;
         let dir = File::open(&t.0).unwrap();
-        let state = predecessor(&dir, s.trail).unwrap().unwrap();
+        let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
         let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume", file);
         let before = bytes(&t);
         fs::write(t.0.join(".audit-resume.jsonl"), staged).unwrap();
@@ -2423,7 +2431,7 @@ fn resume_filename_validation_and_directory_states() {
             }
         }
         let dir = File::open(&t.0).unwrap();
-        let original_state = predecessor(&dir, s.trail).unwrap().unwrap();
+        let original_state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
         let names = rotate::rotated_names_at(&dir, "audit").unwrap();
         let name = if mode == 2 || mode == 3 {
             names[0].to_str().unwrap()
@@ -2438,7 +2446,7 @@ fn resume_filename_validation_and_directory_states() {
         let mut state = if mode == 1 || mode == 4 {
             original_state
         } else {
-            predecessor(&dir, s.trail).unwrap().unwrap()
+            predecessor_run(&dir, s.trail).unwrap().0.unwrap()
         };
         if mode == 1 || mode == 4 {
             state.head.hash = Record::genesis(&s.trail);
@@ -2538,7 +2546,7 @@ fn resume_hard_link_is_unlinked_before_directory_validation() {
     let mut s = create(&t);
     s.closed = true;
     let dir = File::open(&t.0).unwrap();
-    let state = predecessor(&dir, s.trail).unwrap().unwrap();
+    let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
     let name = next_resume_file(&t);
     fs::hard_link(t.0.join("audit.jsonl"), t.0.join(&name)).unwrap();
     let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume", &name);
@@ -2560,7 +2568,7 @@ fn genesis_resume_staging_checks_the_shared_fold() {
         let mut s = create(&t);
         s.closed = true;
         let dir = File::open(&t.0).unwrap();
-        let mut state = predecessor(&dir, s.trail).unwrap().unwrap();
+        let mut state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
         state.head.hash = Record::genesis(&s.trail);
         state.mmr = Mmr::new();
         state
@@ -2656,7 +2664,7 @@ fn settle_batches_both_staging_discards_after_hard_link() {
 // and its Drop writes lost_through + 3, one above the resume record itself.
 fn install_resume(t: &Temp, writer: &Sink, lost: u64) -> Record {
     let dir = File::open(&t.0).unwrap();
-    let state = predecessor(&dir, writer.trail).unwrap().unwrap();
+    let state = predecessor_run(&dir, writer.trail).unwrap().0.unwrap();
     let staged = resume_bytes(
         writer,
         &state,
