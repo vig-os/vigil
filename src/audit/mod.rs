@@ -3,7 +3,12 @@
 //! Call [`AuditConfig::create`] once at deployment, then [`AuditConfig::open`]
 //! with the highest held receipt as the expected head. Store receipts outside
 //! the trail directory. Operator rotation and checkpoints require the exact
-//! expected head; resume follows in #11 B3d and offline verification in #13.
+//! expected head (the highest held receipt or checkpoint). [`AuditConfig::resume`]
+//! differs: it takes the exact head found on disk after the loss, or
+//! `(0, genesis digest)`, plus `lost_through`, the highest `seq` the deployment
+//! holds any evidence of outside the trail directory (all processes' receipts,
+//! close checkpoints, anchors and pins). Builder `expect_head` is `InvalidConfig`
+//! for it. Offline verification follows in #13.
 //!
 //! Format primitives require `--cfg vigil_unstable` and are provisional. Pin
 //! vigil with `~1.N` when opting in; they may change in a minor release.
@@ -48,7 +53,7 @@ pub enum AuditErrorKind {
     /// A previous durability failure makes further writes unsafe.
     ///
     /// To clear `audit.poison`, first restart the machine or unmount and remount
-    /// the filesystem to discard the page cache, then run `vigil-audit verify`,
+    /// the filesystem to discard the page cache, then verify the trail offline (the `vigil-audit verify` command, #13),
     /// and only after verification passes remove `audit.poison`. Leave staging
     /// files for normal settlement. The poison file is not fsynced: a power loss
     /// may drop it, silently skipping verification and removal after restart;
@@ -62,7 +67,9 @@ pub enum AuditErrorKind {
     /// Existing trail bytes violate the format or chain.
     CorruptTrail,
     /// The application's expected head is absent or different. Operator rotate
-    /// and checkpoint require the exact disk head, matching both sequence and hash.
+    /// and checkpoint require the expected head to equal the head on disk,
+    /// matching both sequence and hash; resume returns it when the given head
+    /// differs from the head found on disk.
     HeadMismatch,
     /// The trail marker is missing.
     MissingTrail,
