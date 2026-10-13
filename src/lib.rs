@@ -129,3 +129,7 @@ mod span_export;
 
 #[cfg(feature = "traces")]
 mod trace_pipeline;
+
+#[cfg(all(test, feature = "traces"))]
+#[path = "../tests/common/temp.rs"]
+mod test_temp;

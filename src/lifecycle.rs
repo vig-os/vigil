@@ -37,11 +37,18 @@ pub enum Signal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueueSignal {
     Logs,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "unused without traces; production trace queue wiring follows in 8c (#8)"
+        )
+    )]
     Traces,
 }
 impl QueueSignal {
-    /// Queue order and storage cardinality, independent of enabled exporters.
-    const ALL: [Self; 2] = [Self::Logs, Self::Traces];
+    /// Number of SDK queues: logs and traces; metrics have no queue.
+    const COUNT: usize = 2;
 }
 
 /// Flush/shutdown outcome, ordered by precedence: timeout, failure, data loss.
@@ -235,7 +242,7 @@ struct QueueCounts {
 #[derive(Debug, Default)]
 struct State {
     period: Period,
-    queues: [QueueCounts; QueueSignal::ALL.len()],
+    queues: [QueueCounts; QueueSignal::COUNT],
     #[cfg(feature = "metrics")]
     pending_measurements: u64,
     #[cfg(feature = "metrics")]

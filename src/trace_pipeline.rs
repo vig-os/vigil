@@ -75,11 +75,8 @@ mod tests {
         use crate::{lifecycle::ReportingSpanProcessor, sink::AppendFile};
         use opentelemetry::trace::{Tracer as _, TracerProvider as _};
         use opentelemetry_sdk::trace::{BatchSpanProcessor, SdkTracerProvider};
-        // The owned directory is unique to this test process and removed below.
-        let dir =
-            std::env::temp_dir().join(format!("vigil-real-trace-stack-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("traces.jsonl");
+        let dir = crate::test_temp::TempDir::new();
+        let path = dir.0.join("traces.jsonl");
         let exporter = exporter(AppendFile::open(&path).unwrap(), 10000);
         let losses = exporter.losses.clone();
         let provider = SdkTracerProvider::builder()
@@ -130,7 +127,6 @@ mod tests {
         losses
             .finish_signals(Ok(()), Ok(()), provider.shutdown())
             .unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -160,6 +156,28 @@ mod tests {
         let error = exporter.losses.finish(Ok(())).unwrap_err();
         assert_eq!(error.lost(Signal::Traces), 1);
         assert_eq!(error.kind(), FlushErrorKind::DataLost);
+    }
+
+    #[test]
+    fn reported_span_losses_leave_pending_logs_unchanged() {
+        let exporter = exporter(MemorySink::new(), 800);
+        exporter.losses.record(QueueSignal::Logs, 2, false);
+        let mut span = fixtures::span("stub", 1);
+        span.attributes.extend(
+            (0..100).map(|i| opentelemetry::KeyValue::new(format!("key-{i}"), i64::from(i))),
+        );
+        fixtures::ready(exporter.export(vec![span])).unwrap();
+        assert_eq!(
+            exporter.losses.pending_stderr(QueueSignal::Traces),
+            (0, false)
+        );
+        assert_eq!(
+            exporter.losses.pending_stderr(QueueSignal::Logs),
+            (2, false)
+        );
+        let error = exporter.losses.finish(Ok(())).unwrap_err();
+        assert_eq!(error.lost(Signal::Traces), 1);
+        assert_eq!(error.lost(Signal::Logs), 2);
     }
 
     #[test]
