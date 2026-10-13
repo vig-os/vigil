@@ -46,9 +46,17 @@ fn returned_opening_checkpoint_matches_disk_and_signature() {
             .unwrap()
             .trim_end_matches('\n')
     );
-    // Signature is the final field (tag 0x24) in the canonical record.
+    // Extract the signature field (tag 0x24) from the canonical TLV encoding.
     let canonical = record.canonical();
-    let signature: [u8; 64] = canonical[canonical.len() - 64..].try_into().unwrap();
+    let mut fields = canonical.as_slice();
+    let signature = loop {
+        let tag = fields[0];
+        let len = u32::from_be_bytes(fields[1..5].try_into().unwrap()) as usize;
+        if tag == 0x24 {
+            break <[u8; 64]>::try_from(&fields[5..5 + len]).unwrap();
+        }
+        fields = &fields[5 + len..];
+    };
     crate::audit::verify_signature(
         &key.public_key(),
         &record.signing_message().unwrap(),
