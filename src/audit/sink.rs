@@ -1,4 +1,4 @@
-//! Internal durable writer; the public trail surface follows in #11 B3.
+//! Internal durable writer behind the public `AuditTrail` and `AuditConfig`.
 use super::{
     format::{Kind, request},
     storage::{Head, State, TrailReader, existing, history_segment, scan_staged},
