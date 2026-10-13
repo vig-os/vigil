@@ -264,7 +264,7 @@ impl MetricFlushes {
     }
 }
 
-/// Owns the batch processor. Keep this alive until logging is finished.
+/// Owns the signal providers. Keep this alive until telemetry is finished.
 /// Drop waits up to five seconds, including time blocked on the directory lock.
 /// On timeout it warns on stderr; remaining records may be lost. The SDK worker
 /// may continue in the background until the lock is released.
@@ -320,8 +320,8 @@ impl Guard {
     ///
     /// # Errors
     /// Returns timeout, SDK/sink failure or data loss since the previous flush.
-    /// Logs falling back to stderr contribute no error; metrics still report
-    /// their outcome.
+    /// Logs falling back to stderr contribute no error; metrics and traces still
+    /// report their outcomes.
     /// Queue overflow is counted independently of SDK diagnostics and filters.
     /// Concurrent arrivals can make this a lower bound; see [`FlushError::lost`].
     /// More than 64 concurrent requests can saturate the logs SDK control channel
@@ -334,19 +334,19 @@ impl Guard {
         self.losses.observe_flush_order();
         let (logs, traces) = std::thread::scope(|_scope| {
             #[cfg(feature = "traces")]
-            let traces = _scope.spawn(|| {
-                self.traces.as_ref().map_or(Ok(()), |provider| {
-                    crate::lifecycle::flush(|| provider.force_flush())
-                })
+            let traces = self.traces.as_ref().map(|provider| {
+                _scope.spawn(move || crate::lifecycle::flush(|| provider.force_flush()))
             });
             let logs = self.provider.as_ref().map_or(Ok(()), |provider| {
                 crate::lifecycle::flush(|| provider.force_flush())
             });
             #[cfg(feature = "traces")]
-            let traces = traces.join().unwrap_or_else(|_| {
-                Err(OTelSdkError::InternalFailure(
-                    "span flush thread panicked".into(),
-                ))
+            let traces = traces.map_or(Ok(()), |thread| {
+                thread.join().unwrap_or_else(|_| {
+                    Err(OTelSdkError::InternalFailure(
+                        "span flush thread panicked".into(),
+                    ))
+                })
             });
             #[cfg(not(feature = "traces"))]
             let traces = Ok(());
@@ -378,8 +378,8 @@ impl Guard {
     }
 
     /// Flush and stop the pipeline with a five-second timeout. Drop then does
-    /// nothing. Logs falling back to stderr contribute no error; metrics
-    /// still report their outcome. The process slot remains occupied.
+    /// nothing. Logs falling back to stderr contribute no error; metrics and traces
+    /// still report their outcomes. The process slot remains occupied.
     ///
     /// # Errors
     /// Returns timeout, SDK/sink failure or data loss. See `FlushError::lost`.
@@ -479,7 +479,9 @@ impl Guard {
             #[cfg(feature = "metrics")]
             let metrics_thread = metrics_builder.spawn_scoped(scope, metrics_shutdown);
             #[cfg(feature = "traces")]
-            let traces_thread = traces_builder.spawn_scoped(scope, traces_shutdown);
+            let traces_thread = traces
+                .as_ref()
+                .map(|_| traces_builder.spawn_scoped(scope, traces_shutdown));
             let logs = match logs_thread {
                 Ok(thread) => thread.join().unwrap_or_else(|_| {
                     Err(OTelSdkError::InternalFailure(
@@ -506,12 +508,13 @@ impl Guard {
             self.losses.outcome(Signal::Logs, &logs);
             #[cfg(feature = "traces")]
             let traces = match traces_thread {
-                Ok(thread) => thread.join().unwrap_or_else(|_| {
+                Some(Ok(thread)) => thread.join().unwrap_or_else(|_| {
                     Err(OTelSdkError::InternalFailure(
                         "span shutdown thread panicked".into(),
                     ))
                 }),
-                Err(_) => traces_shutdown(),
+                Some(Err(_)) => traces_shutdown(),
+                None => Ok(()),
             };
             #[cfg(not(feature = "traces"))]
             let traces = Ok(());
@@ -3548,6 +3551,28 @@ mod traces_wiring_tests {
             false,
             true,
         );
+    }
+    #[test]
+    fn flush_reports_real_export_span_loss() {
+        if let Some(output) = child("flush_reports_real_export_span_loss", &[]) {
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(stderr.matches("runtime span export failed").count(), 1);
+            assert_eq!(stderr.matches("; dropped spans: 1").count(), 1);
+            assert!(!stderr.contains("span shutdown"));
+            return;
+        }
+        let dir = crate::test_temp::TempDir::new();
+        let guard = Config::new("export-loss").dir(&dir.0).init().unwrap();
+        let name = "x".repeat(1_100_000);
+        drop(tracing::info_span!("oversized", otel.name = name));
+        let error = guard.flush().unwrap_err();
+        assert_eq!(error.lost(Signal::Traces), 1);
+        assert_eq!(
+            error.signal_kind(Signal::Traces),
+            Some(FlushErrorKind::Failed)
+        );
+        assert_eq!(error.lost(Signal::Logs), 0);
+        guard.shutdown().unwrap();
     }
     #[test]
     fn trace_shutdown_spawn_failure_runs_inline() {
