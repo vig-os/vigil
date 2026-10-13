@@ -3,7 +3,7 @@ use opentelemetry::InstrumentationScope;
 use opentelemetry_sdk::{
     Resource,
     error::{OTelSdkError, OTelSdkResult},
-    logs::{BatchLogProcessor, LogProcessor, SdkLogRecord, SdkLoggerProvider},
+    logs::{BatchLogProcessor, LogProcessor, SdkLogRecord},
 };
 use std::{
     cell::Cell,
@@ -48,17 +48,20 @@ pub enum FlushErrorKind {
 /// A flush/shutdown error with per-signal lower bounds on loss.
 /// Concrete error sources are not stable; downcasting is unsupported.
 /// `Error::source()` returns the logs source when present, otherwise the
-/// metrics source. Display keeps each source on its own signal's part.
+/// metrics source, then the traces source. Display keeps each source on its own signal's part.
+/// Metrics retain label precedence: Timeout/Failed replaces the data-points-dropped
+/// label; measurement counts and conflicting-name diagnostics remain visible.
 /// The `Display` text is for people; it is not part of the stability promise. Match on `kind()`.
 #[derive(Debug)]
 pub struct FlushError {
     kind: FlushErrorKind,
-    signal_kinds: [Option<FlushErrorKind>; 2],
+    signal_kinds: [Option<FlushErrorKind>; 3],
     logs: u64,
+    spans: u64,
     measurements: u64,
     data_points_lost: bool,
     metric_names_poisoned: bool,
-    sources: [Option<OTelSdkError>; 2],
+    sources: [Option<OTelSdkError>; 3],
 }
 impl FlushError {
     /// The highest-priority outcome: Timeout, then Failed, then DataLost.
@@ -66,8 +69,9 @@ impl FlushError {
         self.kind
     }
 
+    /// The outcome belonging to this signal alone.
     pub(crate) fn signal_kind(&self, signal: Signal) -> Option<FlushErrorKind> {
-        self.signal_kinds[if signal == Signal::Metrics { 1 } else { 0 }]
+        self.signal_kinds[signal as usize]
     }
 
     /// A lower bound on lost data, in the signal's own unit.
@@ -85,8 +89,8 @@ impl FlushError {
     /// or worker disconnection can be lost without being counted.
     ///
     /// A failed durable log line counts its records even if another copy
-    /// reached a remote receiver. Traces currently return zero; their
-    /// implementation lands in #8. Metrics count measurements
+    /// reached a remote receiver. A failed span line counts its spans.
+    /// Metrics count measurements
     /// that never reached the SDK, including records made before initialization.
     /// Records made while metrics are off or failed are not counted, nor are
     /// data-point export failures or measurements aggregated before a later name
@@ -96,7 +100,7 @@ impl FlushError {
         match signal {
             Signal::Logs => self.logs,
             Signal::Metrics => self.measurements,
-            Signal::Traces => 0,
+            Signal::Traces => self.spans,
         }
     }
 }
@@ -104,22 +108,14 @@ impl fmt::Display for FlushError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self.kind)?;
         let mut separator = ": ";
-        let logs_part = self.logs != 0 || self.signal_kinds[0].is_some();
-        if logs_part {
-            write!(f, "{separator}")?;
-            separator = "; ";
-            if self.logs != 0 {
-                write!(f, "at least {} log records lost", self.logs)?;
-            } else {
-                f.write_str(match self.signal_kinds[0] {
-                    Some(FlushErrorKind::Timeout) => "log export timed out",
-                    _ => "log export failed",
-                })?;
-            }
-            if let Some(source) = &self.sources[0] {
-                write!(f, ": {source}")?;
-            }
-        }
+        self.display_queue(
+            f,
+            Signal::Logs,
+            self.logs,
+            "log records",
+            "log",
+            &mut separator,
+        )?;
         if self.measurements != 0 {
             write!(
                 f,
@@ -146,6 +142,43 @@ impl fmt::Display for FlushError {
             if let Some(source) = &self.sources[1] {
                 write!(f, ": {source}")?;
             }
+            separator = "; ";
+        }
+        self.display_queue(
+            f,
+            Signal::Traces,
+            self.spans,
+            "spans",
+            "span",
+            &mut separator,
+        )?;
+        Ok(())
+    }
+}
+impl FlushError {
+    /// Render a queue signal's count followed by its own outcome and source.
+    fn display_queue(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        signal: Signal,
+        count: u64,
+        unit: &str,
+        name: &str,
+        separator: &mut &str,
+    ) -> fmt::Result {
+        if count != 0 {
+            write!(f, "{separator}at least {count} {unit} lost")?;
+            *separator = "; ";
+        }
+        let label = match self.signal_kind(signal) {
+            Some(FlushErrorKind::Timeout) => "timed out",
+            Some(FlushErrorKind::Failed) => "failed",
+            _ => return Ok(()),
+        };
+        write!(f, "{separator}{name} export {label}")?;
+        *separator = "; ";
+        if let Some(source) = &self.sources[signal as usize] {
+            write!(f, ": {source}")?;
         }
         Ok(())
     }
@@ -155,13 +188,16 @@ impl std::error::Error for FlushError {
         self.sources[0]
             .as_ref()
             .or(self.sources[1].as_ref())
+            .or(self.sources[2].as_ref())
             .map(|source| source as _)
     }
 }
 
+/// Losses and outcomes since the last completed reporting period.
 #[derive(Debug, Default)]
 struct Period {
     logs: u64,
+    spans: u64,
     measurements: u64,
     metrics_failed: bool,
     metrics_data_lost: bool,
@@ -169,19 +205,27 @@ struct Period {
     failed: bool,
     timeout: bool,
     metrics_timeout: bool,
+    traces_failed: bool,
+    traces_timeout: bool,
 }
 
+/// Queue watermarks and diagnostics shared by logs and traces.
 #[derive(Debug, Default)]
-struct State {
-    period: Period,
+struct QueueCounts {
     accepted: u64,
     reached: u64,
     overflow_reported: u64,
     sdk_overflow: u64,
     pending_stderr: u64,
+    pending_failed: bool,
+}
+/// Per-signal queue totals and the current reporting period.
+#[derive(Debug, Default)]
+struct State {
+    period: Period,
+    queues: [QueueCounts; 3],
     #[cfg(feature = "metrics")]
     pending_measurements: u64,
-    pending_failed: bool,
     #[cfg(feature = "metrics")]
     pending_points: u64,
     #[cfg(feature = "metrics")]
@@ -221,12 +265,23 @@ impl Losses {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-    pub(crate) fn record(&self, logs: u64, failed: bool) {
+    /// Account for a failed export or diagnostic stub in the signal's unit.
+    pub(crate) fn record(&self, signal: Signal, count: u64, failed: bool) {
         let mut state = self.state();
-        state.period.logs = state.period.logs.saturating_add(logs);
-        state.period.failed |= failed;
-        state.pending_failed |= failed;
-        state.pending_stderr = state.pending_stderr.saturating_add(logs);
+        match signal {
+            Signal::Logs => {
+                state.period.logs = state.period.logs.saturating_add(count);
+                state.period.failed |= failed;
+            }
+            Signal::Traces => {
+                state.period.spans = state.period.spans.saturating_add(count);
+                state.period.traces_failed |= failed;
+            }
+            Signal::Metrics => unreachable!("metrics use measurement accounting"),
+        }
+        let queue = &mut state.queues[signal as usize];
+        queue.pending_failed |= failed;
+        queue.pending_stderr = queue.pending_stderr.saturating_add(count);
     }
     #[cfg(feature = "metrics")]
     pub(crate) fn metric_name_poisoned(&self) {
@@ -270,6 +325,7 @@ impl Losses {
         let state = self.state();
         (state.pending_points, state.pending_metrics_failed)
     }
+    /// Retain a provider outcome under its own signal.
     pub(crate) fn outcome(&self, signal: Signal, result: &OTelSdkResult) {
         let mut state = self.state();
         let timeout = matches!(result, Err(OTelSdkError::Timeout(_)));
@@ -278,54 +334,80 @@ impl Losses {
                 state.period.metrics_timeout |= timeout;
                 state.period.metrics_failed |= result.is_err() && !timeout;
             }
-            _ => {
+            Signal::Traces => {
+                state.period.traces_timeout |= timeout;
+                state.period.traces_failed |= result.is_err() && !timeout;
+            }
+            Signal::Logs => {
                 state.period.timeout |= timeout;
                 state.period.failed |= result.is_err() && !timeout;
             }
         }
     }
-    pub(crate) fn reached(&self, logs: u64) {
+    /// Count records or spans handed to the exporter.
+    pub(crate) fn reached(&self, signal: Signal, logs: u64) {
         let mut state = self.state();
-        state.reached = state.reached.saturating_add(logs);
+        state.queues[signal as usize].reached =
+            state.queues[signal as usize].reached.saturating_add(logs);
     }
-    pub(crate) fn reported(&self, logs: u64) {
+    /// Remove losses already included in a runtime stderr report.
+    pub(crate) fn reported(&self, signal: Signal, logs: u64) {
         let mut state = self.state();
-        state.pending_stderr = state.pending_stderr.saturating_sub(logs);
-        state.pending_failed = false;
+        state.queues[signal as usize].pending_stderr = state.queues[signal as usize]
+            .pending_stderr
+            .saturating_sub(logs);
+        state.queues[signal as usize].pending_failed = false;
     }
-    pub(crate) fn pending_stderr(&self) -> (u64, bool) {
+    /// Losses and failure status still awaiting a stderr report.
+    pub(crate) fn pending_stderr(&self, signal: Signal) -> (u64, bool) {
         let state = self.state();
-        (state.pending_stderr, state.pending_failed)
+        (
+            state.queues[signal as usize].pending_stderr,
+            state.queues[signal as usize].pending_failed,
+        )
     }
-    fn overflow_total(&self, total: u64) {
+    /// Reconcile the SDK's lifetime queue-overflow count at shutdown.
+    fn overflow_total(&self, signal: Signal, total: u64) {
         let mut state = self.state();
-        state.sdk_overflow = total;
-        Self::overflow(&mut state, total);
+        state.queues[signal as usize].sdk_overflow = total;
+        Self::overflow(&mut state, signal, total);
     }
-    fn overflow(state: &mut State, total: u64) {
-        let lost = total.saturating_sub(state.overflow_reported);
-        state.overflow_reported = state.overflow_reported.max(total);
-        state.period.logs = state.period.logs.saturating_add(lost);
-        state.pending_stderr = state.pending_stderr.saturating_add(lost);
+    /// Add only the overflow not accounted for by an earlier drain.
+    fn overflow(state: &mut State, signal: Signal, total: u64) {
+        let lost = total.saturating_sub(state.queues[signal as usize].overflow_reported);
+        state.queues[signal as usize].overflow_reported =
+            state.queues[signal as usize].overflow_reported.max(total);
+        match signal {
+            Signal::Logs => state.period.logs = state.period.logs.saturating_add(lost),
+            Signal::Traces => state.period.spans = state.period.spans.saturating_add(lost),
+            Signal::Metrics => unreachable!("metrics have no queue"),
+        }
+        state.queues[signal as usize].pending_stderr = state.queues[signal as usize]
+            .pending_stderr
+            .saturating_add(lost);
     }
-    fn drained(&self, accepted: u64, result: &OTelSdkResult) {
+    /// Count the accepted/exported difference only after a successful drain.
+    fn drained(&self, signal: Signal, accepted: u64, result: &OTelSdkResult) {
         if result.is_ok() {
             let mut state = self.state();
             // Everything accepted before the request has drained. Later
             // arrivals may have reached the exporter too: subtracting them
             // deliberately undercounts rather than counting queued records.
-            let total = accepted.saturating_sub(state.reached);
-            Self::overflow(&mut state, total);
+            let total = accepted.saturating_sub(state.queues[signal as usize].reached);
+            Self::overflow(&mut state, signal, total);
         }
     }
     #[cfg(test)]
+    /// Finish a logs-only test period.
     pub(crate) fn finish(&self, result: OTelSdkResult) -> Result<(), FlushError> {
-        self.finish_signals(result, Ok(()))
+        self.finish_signals(result, Ok(()), Ok(()))
     }
+    /// Consume a period, retaining each caller's three provider outcomes.
     pub(crate) fn finish_signals(
         &self,
         result: OTelSdkResult,
         metrics: OTelSdkResult,
+        traces: OTelSdkResult,
     ) -> Result<(), FlushError> {
         #[cfg(feature = "metrics")]
         crate::metrics::drain_before_init(self, false);
@@ -334,14 +416,19 @@ impl Losses {
         // flush consumed the period's shared counts and exporter flags.
         period.metrics_timeout |= matches!(metrics, Err(OTelSdkError::Timeout(_)));
         period.metrics_failed |= metrics.is_err() && !period.metrics_timeout;
-        let kind = if period.timeout
+        period.traces_timeout |= matches!(traces, Err(OTelSdkError::Timeout(_)));
+        period.traces_failed |= traces.is_err() && !period.traces_timeout;
+        let kind = if period.traces_timeout
+            || period.timeout
             || period.metrics_timeout
             || matches!(result, Err(OTelSdkError::Timeout(_)))
         {
             FlushErrorKind::Timeout
-        } else if period.failed || period.metrics_failed || result.is_err() {
+        } else if period.traces_failed || period.failed || period.metrics_failed || result.is_err()
+        {
             FlushErrorKind::Failed
-        } else if period.logs != 0
+        } else if period.spans != 0
+            || period.logs != 0
             || period.measurements != 0
             || period.metrics_data_lost
             || period.metric_names_poisoned
@@ -376,18 +463,25 @@ impl Losses {
                         || period.measurements != 0
                         || period.metric_names_poisoned,
                 ),
+                signal_kind(
+                    period.traces_timeout,
+                    period.traces_failed,
+                    period.spans != 0,
+                ),
             ],
+            spans: period.spans,
             logs: period.logs,
             measurements: period.measurements,
             data_points_lost: period.metrics_data_lost,
             metric_names_poisoned: period.metric_names_poisoned,
-            sources: [result.err(), metrics.err()],
+            sources: [result.err(), metrics.err(), traces.err()],
         })
     }
 
-    fn observe(&self, result: OTelSdkResult) -> OTelSdkResult {
+    /// Preserve a signal's typed shutdown timeout before SDK stringification.
+    fn observe(&self, signal: Signal, result: OTelSdkResult) -> OTelSdkResult {
         if matches!(result, Err(OTelSdkError::Timeout(_))) {
-            self.state().period.timeout = true;
+            self.outcome(signal, &result);
         }
         result
     }
@@ -399,10 +493,11 @@ thread_local! {
     static FLUSH_TIMEOUT: Cell<Option<Duration>> = const { Cell::new(None) };
 }
 
-pub(crate) fn flush(provider: &SdkLoggerProvider) -> OTelSdkResult {
+/// Run either provider's flush, recovering its caller-local typed timeout.
+pub(crate) fn flush(flush: impl FnOnce() -> OTelSdkResult) -> OTelSdkResult {
     FLUSH_TIMEOUT.with(|timeout| {
         timeout.set(None);
-        let result = provider.force_flush();
+        let result = flush();
         match timeout.take() {
             Some(duration) => Err(OTelSdkError::Timeout(duration)),
             None => result,
@@ -410,7 +505,7 @@ pub(crate) fn flush(provider: &SdkLoggerProvider) -> OTelSdkResult {
     })
 }
 
-// Preserve typed processor timeouts before the provider stringifies them.
+/// Preserve typed log processor timeouts before the provider stringifies them.
 #[derive(Debug)]
 pub(crate) struct ReportingProcessor {
     pub(crate) inner: BatchLogProcessor,
@@ -422,23 +517,68 @@ impl LogProcessor for ReportingProcessor {
         // mistaken for overflow at a concurrent flush's watermark.
         self.inner.emit(data, scope);
         let mut state = self.losses.state();
-        state.accepted = state.accepted.saturating_add(1);
+        state.queues[Signal::Logs as usize].accepted = state.queues[Signal::Logs as usize]
+            .accepted
+            .saturating_add(1);
     }
     fn force_flush(&self) -> OTelSdkResult {
-        let accepted = self.losses.state().accepted;
+        let accepted = self.losses.state().queues[Signal::Logs as usize].accepted;
         let result = self.inner.force_flush();
-        self.losses.drained(accepted, &result);
+        self.losses.drained(Signal::Logs, accepted, &result);
         if let Err(OTelSdkError::Timeout(duration)) = &result {
             FLUSH_TIMEOUT.with(|timeout| timeout.set(Some(*duration)));
         }
         result
     }
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
-        let accepted = self.losses.state().accepted;
+        let accepted = self.losses.state().queues[Signal::Logs as usize].accepted;
         let result = self
             .losses
-            .observe(self.inner.shutdown_with_timeout(timeout));
-        self.losses.drained(accepted, &result);
+            .observe(Signal::Logs, self.inner.shutdown_with_timeout(timeout));
+        self.losses.drained(Signal::Logs, accepted, &result);
+        result
+    }
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
+    }
+}
+
+/// Counts completed span submissions and preserves typed processor timeouts.
+#[cfg(feature = "traces")]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into init by 8c (#8)"))]
+#[derive(Debug)]
+pub(crate) struct ReportingSpanProcessor<P: opentelemetry_sdk::trace::SpanProcessor> {
+    pub(crate) inner: P,
+    pub(crate) losses: Arc<Losses>,
+}
+#[cfg(feature = "traces")]
+impl<P: opentelemetry_sdk::trace::SpanProcessor> opentelemetry_sdk::trace::SpanProcessor
+    for ReportingSpanProcessor<P>
+{
+    fn on_start(&self, span: &mut opentelemetry_sdk::trace::Span, cx: &opentelemetry::Context) {
+        self.inner.on_start(span, cx);
+    }
+    fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
+        self.inner.on_end(span);
+        let mut state = self.losses.state();
+        let queue = &mut state.queues[Signal::Traces as usize];
+        queue.accepted = queue.accepted.saturating_add(1);
+    }
+    fn force_flush(&self) -> OTelSdkResult {
+        let accepted = self.losses.state().queues[Signal::Traces as usize].accepted;
+        let result = self.inner.force_flush();
+        self.losses.drained(Signal::Traces, accepted, &result);
+        if let Err(OTelSdkError::Timeout(duration)) = &result {
+            FLUSH_TIMEOUT.with(|timeout| timeout.set(Some(*duration)));
+        }
+        result
+    }
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        let accepted = self.losses.state().queues[Signal::Traces as usize].accepted;
+        let result = self
+            .losses
+            .observe(Signal::Traces, self.inner.shutdown_with_timeout(timeout));
+        self.losses.drained(Signal::Traces, accepted, &result);
         result
     }
     fn set_resource(&mut self, resource: &Resource) {
@@ -464,11 +604,15 @@ impl<S: Subscriber> Layer<S> for AfterShutdown {
     }
 }
 
-struct Count(u64);
+/// Extract the configured SDK overflow field from an event.
+struct Count {
+    value: u64,
+    field: &'static str,
+}
 impl Visit for Count {
     fn record_u64(&mut self, field: &Field, value: u64) {
-        if field.name() == "dropped_logs_count" {
-            self.0 = value;
+        if field.name() == self.field {
+            self.value = value;
         }
     }
     fn record_debug(&mut self, _: &Field, _: &dyn fmt::Debug) {}
@@ -476,24 +620,32 @@ impl Visit for Count {
 
 // Enabled independently of the consumer's filters. Every other callback is
 // delegated to the dispatcher captured on the calling thread before spawning.
+/// Capture one signal's SDK overflow event on the provider shutdown thread.
 pub(crate) struct ShutdownCapture {
+    pub(crate) event: &'static str,
+    pub(crate) field: &'static str,
+    pub(crate) signal: Signal,
     pub(crate) forward: Dispatch,
     pub(crate) losses: Arc<Losses>,
 }
 impl ShutdownCapture {
-    fn captures(meta: &Metadata<'_>) -> bool {
-        meta.target().starts_with("opentelemetry") && meta.name() == "BatchLogProcessor.LogsDropped"
+    /// Match only the configured SDK event, forwarding every other event.
+    fn captures(&self, meta: &Metadata<'_>) -> bool {
+        meta.target().starts_with("opentelemetry") && meta.name() == self.event
     }
 }
 impl Subscriber for ShutdownCapture {
     fn enabled(&self, meta: &Metadata<'_>) -> bool {
-        Self::captures(meta) || self.forward.enabled(meta)
+        self.captures(meta) || self.forward.enabled(meta)
     }
     fn event(&self, event: &Event<'_>) {
-        if Self::captures(event.metadata()) {
-            let mut count = Count(0);
+        if self.captures(event.metadata()) {
+            let mut count = Count {
+                value: 0,
+                field: self.field,
+            };
             event.record(&mut count);
-            self.losses.overflow_total(count.0);
+            self.losses.overflow_total(self.signal, count.value);
         } else {
             self.forward.event(event);
         }
@@ -528,15 +680,252 @@ impl Subscriber for ShutdownCapture {
 mod tests {
     use super::*;
 
+    #[test]
+    fn trace_outcome_is_isolated() {
+        let losses = Losses::default();
+        losses.outcome(Signal::Traces, &Err(OTelSdkError::Timeout(Duration::ZERO)));
+        let error = losses.finish_signals(Ok(()), Ok(()), Ok(())).unwrap_err();
+        assert_eq!(error.signal_kind(Signal::Logs), None);
+        assert_eq!(
+            error.signal_kind(Signal::Traces),
+            Some(FlushErrorKind::Timeout)
+        );
+        assert_eq!(error.to_string(), "Timeout: span export timed out");
+    }
+
+    #[test]
+    fn display_three_signals_and_counted_outcomes() {
+        for (timeout, label) in [(true, "timed out"), (false, "failed")] {
+            let losses = Losses::default();
+            losses.record(Signal::Logs, 2, false);
+            let result = if timeout {
+                Err(OTelSdkError::Timeout(Duration::ZERO))
+            } else {
+                Err(OTelSdkError::InternalFailure("logs".into()))
+            };
+            let source = result.as_ref().unwrap_err().to_string();
+            let error = losses.finish(result).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "{:?}: at least 2 log records lost; log export {label}: {source}",
+                    error.kind()
+                )
+            );
+        }
+        let losses = Losses::default();
+        losses.record(Signal::Traces, 4, true);
+        assert_eq!(
+            losses.finish(Ok(())).unwrap_err().to_string(),
+            "Failed: at least 4 spans lost; span export failed"
+        );
+        losses.record(Signal::Logs, 2, true);
+        losses.record(Signal::Traces, 3, false);
+        let metric = OTelSdkError::Timeout(Duration::ZERO);
+        let trace = OTelSdkError::InternalFailure("traces".into());
+        let expected = format!(
+            "Timeout: at least 2 log records lost; log export failed; metric export timed out: {metric}; at least 3 spans lost; span export failed: {trace}"
+        );
+        let error = losses
+            .finish_signals(Ok(()), Err(metric), Err(trace))
+            .unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(error.lost(Signal::Traces), 3);
+        for timeout in [false, true] {
+            let mut error = metric_only_error(if timeout {
+                FlushErrorKind::Timeout
+            } else {
+                FlushErrorKind::Failed
+            });
+            error.data_points_lost = true;
+            error.measurements = 5;
+            let label = if timeout { "timed out" } else { "failed" };
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "{:?}: at least 5 metric measurements lost; metric export {label}: Operation failed: metrics",
+                    error.kind()
+                )
+            );
+        }
+    }
+
+    #[cfg(feature = "traces")]
+    #[test]
+    fn trace_provider_keeps_typed_timeout() {
+        use opentelemetry_sdk::trace::{SdkTracerProvider, Span, SpanData, SpanProcessor};
+        #[derive(Debug)]
+        struct Timeout;
+        impl SpanProcessor for Timeout {
+            fn on_start(&self, _: &mut Span, _: &opentelemetry::Context) {}
+            fn on_end(&self, _: SpanData) {}
+            fn force_flush(&self) -> OTelSdkResult {
+                Err(OTelSdkError::Timeout(Duration::ZERO))
+            }
+            fn shutdown_with_timeout(&self, _: Duration) -> OTelSdkResult {
+                Ok(())
+            }
+        }
+        let losses = Arc::new(Losses::default());
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(ReportingSpanProcessor {
+                inner: Timeout,
+                losses: losses.clone(),
+            })
+            .build();
+        assert!(matches!(
+            provider.force_flush(),
+            Err(OTelSdkError::InternalFailure(_))
+        ));
+        let result = flush(|| provider.force_flush());
+        assert!(matches!(result, Err(OTelSdkError::Timeout(_))));
+        let error = losses.finish_signals(Ok(()), Ok(()), result).unwrap_err();
+        assert_eq!(
+            error.signal_kind(Signal::Traces),
+            Some(FlushErrorKind::Timeout)
+        );
+        assert_eq!(error.signal_kind(Signal::Logs), None);
+    }
+
+    #[cfg(feature = "traces")]
+    #[test]
+    fn trace_overflow_flush_and_shutdown_capture() {
+        if !crate::subscriber_test_child(
+            "lifecycle::tests::trace_overflow_flush_and_shutdown_capture",
+        ) {
+            return;
+        }
+        use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+        use opentelemetry_sdk::trace::{
+            BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider, SpanData, SpanExporter,
+        };
+        #[derive(Debug)]
+        struct SpanBlock(Block);
+        impl SpanExporter for SpanBlock {
+            async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+                self.0.losses.reached(Signal::Traces, batch.len() as u64);
+                if self.0.started.send(()).is_ok() {
+                    self.0.release.lock().unwrap().recv().unwrap();
+                }
+                Ok(())
+            }
+        }
+        struct TraceForward(Arc<AtomicU64>);
+        impl<S: Subscriber> Layer<S> for TraceForward {
+            fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+                if event.metadata().name() == "trace.shutdown.forwarded" {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let losses = Arc::new(Losses::default());
+        let forwarded = Arc::new(AtomicU64::new(0));
+        let _current = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(TraceForward(forwarded.clone())),
+        );
+        let (started, wait) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(0);
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(ReportingSpanProcessor {
+                losses: losses.clone(),
+                inner: BatchSpanProcessor::builder(SpanBlock(Block {
+                    started,
+                    release: Mutex::new(released),
+                    losses: losses.clone(),
+                }))
+                .with_batch_config(
+                    BatchConfigBuilder::default()
+                        .with_max_queue_size(1)
+                        .with_max_export_batch_size(1)
+                        .build(),
+                )
+                .build(),
+            })
+            .build();
+        let tracer = provider.tracer("overflow");
+        drop(tracer.start("first"));
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        for _ in 0..10 {
+            drop(tracer.start("queued"));
+        }
+        drop(wait);
+        release.send(()).unwrap();
+        let error = losses
+            .finish_signals(Ok(()), Ok(()), flush(|| provider.force_flush()))
+            .unwrap_err();
+        assert_eq!(error.kind(), FlushErrorKind::DataLost);
+        assert_eq!(error.lost(Signal::Traces), 9);
+        assert_eq!(error.lost(Signal::Logs), 0);
+        assert_eq!(
+            losses.state().queues[Signal::Traces as usize].sdk_overflow,
+            0
+        );
+        let capture = ShutdownCapture {
+            event: "BatchSpanProcessor.SpansDropped",
+            field: "dropped_span_count",
+            signal: Signal::Traces,
+            forward: tracing::dispatcher::get_default(Clone::clone),
+            losses: losses.clone(),
+        };
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    tracing::subscriber::with_default(capture, || {
+                        tracing::info!(name: "trace.shutdown.forwarded", "forward");
+                        provider.shutdown()
+                    })
+                })
+                .join()
+                .unwrap()
+                .unwrap()
+        });
+        assert!(losses.finish(Ok(())).is_ok());
+        assert_eq!(
+            losses.state().queues[Signal::Traces as usize].sdk_overflow,
+            9
+        );
+        assert_eq!(
+            losses.state().queues[Signal::Traces as usize].overflow_reported,
+            9
+        );
+        assert_eq!(forwarded.load(Ordering::Relaxed), 1);
+        // A zero-overflow provider must not emit SpansDropped at shutdown.
+        losses.state().queues[Signal::Traces as usize].sdk_overflow = 17;
+        let capture = ShutdownCapture {
+            event: "BatchSpanProcessor.SpansDropped",
+            field: "dropped_span_count",
+            signal: Signal::Traces,
+            forward: tracing::dispatcher::get_default(Clone::clone),
+            losses: losses.clone(),
+        };
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(SpanBlock(Block {
+                started: mpsc::sync_channel(1).0,
+                release: Mutex::new(mpsc::channel().1),
+                losses: losses.clone(),
+            }))
+            .build();
+        tracing::subscriber::with_default(capture, || provider.shutdown()).unwrap();
+        assert_eq!(
+            losses.state().queues[Signal::Traces as usize].sdk_overflow,
+            17
+        );
+    }
+
     fn metric_only_error(kind: FlushErrorKind) -> FlushError {
         FlushError {
             kind,
-            signal_kinds: [None, Some(kind)],
+            signal_kinds: [None, Some(kind), None],
             logs: 0,
+            spans: 0,
             measurements: 0,
             data_points_lost: false,
             metric_names_poisoned: false,
-            sources: [None, Some(OTelSdkError::InternalFailure("metrics".into()))],
+            sources: [
+                None,
+                Some(OTelSdkError::InternalFailure("metrics".into())),
+                None,
+            ],
         }
     }
 
@@ -635,7 +1024,7 @@ mod tests {
                 false,
                 Some("logs"),
                 None,
-                "Failed: at least 2 log records lost: logs",
+                "Failed: at least 2 log records lost; log export failed: logs",
             ),
             (
                 FlushErrorKind::DataLost,
@@ -713,14 +1102,16 @@ mod tests {
         {
             let error = FlushError {
                 kind,
-                signal_kinds: [logs_kind, metrics_kind],
+                signal_kinds: [logs_kind, metrics_kind, None],
                 logs,
+                spans: 0,
                 measurements,
                 data_points_lost,
                 metric_names_poisoned,
                 sources: [
                     logs_source.map(|s: &str| OTelSdkError::InternalFailure(s.into())),
                     metrics_source.map(|s: &str| OTelSdkError::InternalFailure(s.into())),
+                    None,
                 ],
             };
             assert_eq!(
@@ -751,7 +1142,8 @@ mod tests {
     }
     impl LogExporter for Block {
         async fn export(&self, batch: LogBatch<'_>) -> OTelSdkResult {
-            self.losses.reached(batch.iter().count() as u64);
+            self.losses
+                .reached(Signal::Logs, batch.iter().count() as u64);
             if self.started.send(()).is_ok() {
                 self.release.lock().unwrap().recv().unwrap();
             }
@@ -815,6 +1207,9 @@ mod tests {
         assert_eq!(error.lost(Signal::Logs), 9);
         assert!(losses.finish(provider.force_flush()).is_ok());
         let capture = ShutdownCapture {
+            event: "BatchLogProcessor.LogsDropped",
+            field: "dropped_logs_count",
+            signal: Signal::Logs,
             forward: tracing::dispatcher::get_default(Clone::clone),
             losses: losses.clone(),
         };
@@ -827,7 +1222,7 @@ mod tests {
         });
         assert!(losses.finish(Ok(())).is_ok());
         // Pins the SDK event name, field and shutdown thread capture.
-        assert_eq!(losses.state().sdk_overflow, 9);
+        assert_eq!(losses.state().queues[Signal::Logs as usize].sdk_overflow, 9);
         assert_eq!(forwarded.load(Ordering::Relaxed), 1);
     }
 
@@ -860,7 +1255,7 @@ mod tests {
             assert!(losses.finish(Ok(())).is_ok());
         }
         losses.metric_data_points(true);
-        losses.record(3, false);
+        losses.record(Signal::Logs, 3, false);
         let error = losses.finish(Ok(())).unwrap_err();
         assert_eq!(error.kind(), FlushErrorKind::Failed);
         assert!(error.to_string().contains("3 log records"));
@@ -879,7 +1274,7 @@ mod tests {
     #[test]
     fn each_signal_keeps_its_own_kind_and_concurrent_callers_keep_timeouts() {
         let losses = Losses::default();
-        losses.record(3, true);
+        losses.record(Signal::Logs, 3, true);
         losses.metric_data_points(false);
         let error = losses.finish(Ok(())).unwrap_err();
         assert_eq!(error.kind(), FlushErrorKind::Failed);
@@ -893,9 +1288,9 @@ mod tests {
         );
         assert_eq!(
             error.to_string(),
-            "Failed: at least 3 log records lost; metric data points dropped"
+            "Failed: at least 3 log records lost; log export failed; metric data points dropped"
         );
-        losses.record(2, false);
+        losses.record(Signal::Logs, 2, false);
         losses.metric_data_points(true);
         let error = losses.finish(Ok(())).unwrap_err();
         assert_eq!(
@@ -904,7 +1299,7 @@ mod tests {
         );
         for _ in 0..2 {
             let error = losses
-                .finish_signals(Ok(()), Err(OTelSdkError::Timeout(Duration::ZERO)))
+                .finish_signals(Ok(()), Err(OTelSdkError::Timeout(Duration::ZERO)), Ok(()))
                 .unwrap_err();
             assert_eq!(error.kind(), FlushErrorKind::Timeout);
             assert_eq!(
@@ -927,10 +1322,12 @@ mod tests {
     #[test]
     fn display_orders_log_losses_before_metric_timeout_or_failure() {
         let losses = Losses::default();
-        losses.record(2, false);
+        losses.record(Signal::Logs, 2, false);
         let metrics = OTelSdkError::Timeout(Duration::from_secs(1));
         let metrics_text = metrics.to_string();
-        let error = losses.finish_signals(Ok(()), Err(metrics)).unwrap_err();
+        let error = losses
+            .finish_signals(Ok(()), Err(metrics), Ok(()))
+            .unwrap_err();
         assert_eq!(
             error.to_string(),
             format!(
@@ -941,16 +1338,18 @@ mod tests {
             std::error::Error::source(&error).unwrap().to_string(),
             metrics_text
         );
-        losses.record(2, false);
+        losses.record(Signal::Logs, 2, false);
         let logs = OTelSdkError::InternalFailure("logs source".into());
         let metrics = OTelSdkError::InternalFailure("metrics source".into());
         let logs_text = logs.to_string();
         let metrics_text = metrics.to_string();
-        let error = losses.finish_signals(Err(logs), Err(metrics)).unwrap_err();
+        let error = losses
+            .finish_signals(Err(logs), Err(metrics), Ok(()))
+            .unwrap_err();
         assert_eq!(
             error.to_string(),
             format!(
-                "Failed: at least 2 log records lost: {logs_text}; metric export failed: {metrics_text}"
+                "Failed: at least 2 log records lost; log export failed: {logs_text}; metric export failed: {metrics_text}"
             )
         );
         assert_eq!(
@@ -962,20 +1361,20 @@ mod tests {
     #[test]
     fn outcome_precedence_counts_and_period_resets() {
         let losses = Losses::default();
-        losses.record(2, true);
-        let result = losses.observe(Err(OTelSdkError::Timeout(Duration::ZERO)));
+        losses.record(Signal::Logs, 2, true);
+        let result = losses.observe(Signal::Logs, Err(OTelSdkError::Timeout(Duration::ZERO)));
         let error = losses.finish(result).unwrap_err();
         assert_eq!(error.kind(), FlushErrorKind::Timeout);
         assert_eq!(error.lost(Signal::Logs), 2);
         assert!(std::error::Error::source(&error).is_some());
         assert!(losses.finish(Ok(())).is_ok());
-        losses.record(3, true);
+        losses.record(Signal::Logs, 3, true);
         let error = losses.finish(Ok(())).unwrap_err();
         assert_eq!(error.kind(), FlushErrorKind::Failed);
         assert_eq!(error.lost(Signal::Logs), 3);
         assert!(losses.finish(Ok(())).is_ok());
-        losses.record(u64::MAX, false);
-        losses.record(1, false);
+        losses.record(Signal::Logs, u64::MAX, false);
+        losses.record(Signal::Logs, 1, false);
         let error = losses.finish(Ok(())).unwrap_err();
         assert_eq!(error.kind(), FlushErrorKind::DataLost);
         assert_eq!(error.lost(Signal::Logs), u64::MAX);
