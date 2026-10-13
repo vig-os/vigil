@@ -369,6 +369,37 @@ mod tests {
     }
 
     #[test]
+    fn entering_span_activates_context() {
+        use opentelemetry::trace::TraceContextExt as _;
+        capture(
+            || {
+                assert!(
+                    !opentelemetry::Context::current()
+                        .span()
+                        .span_context()
+                        .is_valid()
+                );
+                let span = tracing::info_span!("context");
+                span.in_scope(|| {
+                    assert!(
+                        opentelemetry::Context::current()
+                            .span()
+                            .span_context()
+                            .is_valid()
+                    )
+                });
+                assert!(
+                    !opentelemetry::Context::current()
+                        .span()
+                        .span_context()
+                        .is_valid()
+                );
+            },
+            false,
+        );
+    }
+
+    #[test]
     fn all_local_spans_export_without_loss() {
         let spans = capture(
             || {
@@ -403,8 +434,25 @@ mod tests {
         let spans = capture(
             || {
                 for i in 0..2000 {
-                    tracing::info_span!("environment", index = i, extra = "kept")
-                        .in_scope(|| tracing::error!("failure"));
+                    use opentelemetry::trace::{
+                        SpanContext, SpanId, TraceFlags, TraceId, TraceState,
+                    };
+                    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+                    let span = tracing::info_span!("environment", index = i, extra = "kept");
+                    span.add_link_with_attributes(
+                        SpanContext::new(
+                            TraceId::from(1),
+                            SpanId::from(2),
+                            TraceFlags::SAMPLED,
+                            false,
+                            TraceState::default(),
+                        ),
+                        vec![
+                            opentelemetry::KeyValue::new("link.one", 1),
+                            opentelemetry::KeyValue::new("link.two", 2),
+                        ],
+                    );
+                    span.in_scope(|| tracing::error!("failure"));
                 }
             },
             false,
@@ -415,6 +463,9 @@ mod tests {
             assert!(attrs(&span).contains_key("extra"));
             assert!(span["events"].as_array().unwrap().is_empty());
             assert_eq!(span["droppedEventsCount"], 1);
+            assert_eq!(span["links"].as_array().unwrap().len(), 1);
+            assert_eq!(span["links"][0]["attributes"].as_array().unwrap().len(), 2);
+            assert_eq!(attrs(&span).len(), 8);
         }
     }
 
