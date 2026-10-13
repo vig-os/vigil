@@ -71,6 +71,15 @@ impl LineSink for TraceStorage {
     }
 }
 impl TraceStorage {
+    fn is_disabled(&self) -> bool {
+        matches!(
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            TraceStorageState::Disabled
+        )
+    }
     #[cfg_attr(not(test), expect(dead_code, reason = "wired into init in #8 8c-2"))]
     pub(crate) fn close(&self) {
         *self
@@ -89,10 +98,18 @@ pub(crate) fn build_tracer(
     losses: Arc<Losses>,
 ) -> opentelemetry_sdk::trace::SdkTracerProvider {
     use opentelemetry_sdk::trace::{BatchSpanProcessor, Sampler, SdkTracerProvider};
-    SdkTracerProvider::builder()
+    let builder = SdkTracerProvider::builder()
         .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
         .with_span_limits(span_limits())
-        .with_resource(resource)
+        .with_resource(resource);
+    // ADR-0003 d15: Disabled discards "without counting them as losses";
+    // d5: "without further reports or counts". Resolve this before installing
+    // either wrapper: no serializer, queue, accounting or shutdown capture
+    // exists for Disabled. The provider still supplies sampled span contexts.
+    if storage.is_disabled() {
+        return builder.build();
+    }
+    builder
         .with_span_processor(crate::lifecycle::ReportingSpanProcessor {
             inner: BatchSpanProcessor::builder(ReportingSpanExporter {
                 inner: OtlpJsonSpanExporter::new(storage),
@@ -304,6 +321,7 @@ mod tests {
                 tracing::debug_span!("excluded").in_scope(|| {});
                 tracing::info_span!("included").in_scope(|| {
                     tracing::info!("ordinary");
+                    tracing::warn!("warning");
                     tracing::error!("first");
                     tracing::error!("second");
                 });
@@ -467,6 +485,118 @@ mod tests {
             assert_eq!(span["links"][0]["attributes"].as_array().unwrap().len(), 2);
             assert_eq!(attrs(&span).len(), 8);
         }
+    }
+
+    #[test]
+    fn parent_based_respects_remote_sample_out() {
+        use opentelemetry::{
+            Context,
+            trace::{SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceId, TraceState},
+        };
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let spans = capture(
+            || {
+                let span = tracing::info_span!("sampled_out");
+                let parent = SpanContext::new(
+                    TraceId::from(1),
+                    SpanId::from(2),
+                    TraceFlags::default(),
+                    true,
+                    TraceState::default(),
+                );
+                span.set_parent(Context::new().with_remote_span_context(parent))
+                    .unwrap();
+                span.in_scope(|| {});
+                drop(span);
+                drop(tracing::info_span!("local_root"));
+            },
+            false,
+        );
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["name"], "local_root");
+    }
+
+    fn disabled_pipeline_probe(oversized: bool) {
+        use opentelemetry::trace::TraceContextExt as _;
+        let storage = Arc::new(TraceStorage(Mutex::new(TraceStorageState::Disabled)));
+        let losses = Arc::new(Losses::default());
+        let provider = build_tracer(
+            storage,
+            Resource::builder_empty().build(),
+            1,
+            losses.clone(),
+        );
+        let subscriber = tracing_subscriber::registry().with(
+            otel_layer(&provider)
+                .with_filter(tracing_subscriber::filter::filter_fn(spans_or_error)),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            if oversized {
+                let name = "x".repeat(1_100_000);
+                tracing::info_span!("oversized", otel.name = name).in_scope(|| {
+                    assert!(
+                        opentelemetry::Context::current()
+                            .span()
+                            .span_context()
+                            .is_valid()
+                    );
+                });
+            } else {
+                for i in 0..2000 {
+                    drop(tracing::info_span!("disabled_volume", index = i));
+                }
+            }
+        });
+        let flushed = losses.finish_signals(Ok(()), Ok(()), provider.force_flush());
+        assert_eq!(
+            flushed
+                .as_ref()
+                .err()
+                .map_or(0, |error| error.lost(Signal::Traces)),
+            0
+        );
+        flushed.unwrap();
+        let shutdown = losses.finish_signals(Ok(()), Ok(()), provider.shutdown());
+        assert_eq!(
+            shutdown
+                .as_ref()
+                .err()
+                .map_or(0, |error| error.lost(Signal::Traces)),
+            0
+        );
+        shutdown.unwrap();
+    }
+
+    #[test]
+    fn disabled_oversized_span_never_counts_or_reports() {
+        if let Some(output) = crate::test_child(
+            "trace_pipeline::tests::disabled_oversized_span_never_counts_or_reports",
+            "VIGIL_DISABLED_OVERSIZED_CHILD",
+        ) {
+            assert!(
+                output.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        disabled_pipeline_probe(true);
+    }
+
+    #[test]
+    fn disabled_queue_one_never_counts_or_reports() {
+        if let Some(output) = crate::test_child(
+            "trace_pipeline::tests::disabled_queue_one_never_counts_or_reports",
+            "VIGIL_DISABLED_QUEUE_CHILD",
+        ) {
+            assert!(
+                output.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        disabled_pipeline_probe(false);
     }
 
     #[test]
