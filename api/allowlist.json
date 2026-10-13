@@ -162,6 +162,12 @@
     }
   },
   {
+    "justification": "ADR-0003 decision 5 and ADR-0004 decision 6: trace signal builder switch",
+    "items": {
+      "vigil::Config::traces": "fn"
+    }
+  },
+  {
     "justification": "ADR-0005 decision 13, ADR-0004 d1",
     "items": {
       "vigil::audit::KeyFileSigner": "struct",

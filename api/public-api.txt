@@ -217,6 +217,7 @@ pub fn vigil::Config::new(service: impl core::convert::Into<alloc::string::Strin
 pub fn vigil::Config::queue_size(self, size: usize) -> Self
 pub fn vigil::Config::retention(self, retention: core::option::Option<core::time::Duration>) -> Self
 pub fn vigil::Config::revision(self, revision: impl core::convert::Into<alloc::string::String>) -> Self
+pub fn vigil::Config::traces(self, enabled: bool) -> Self
 pub fn vigil::Config::version(self, version: impl core::convert::Into<alloc::string::String>) -> Self
 pub struct vigil::FlushError
 impl vigil::FlushError
