@@ -5,8 +5,8 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value as Json};
 use std::fmt;
 
-// Preserve serde's error category at the seam for B2's torn-prefix recovery.
-// Warning/strict policy belongs to #68, not the complete-record decoder.
+// Decode object contents with duplicate-key and raw-read field validation.
+// Physical-line classification belongs to the shared `lines` module.
 pub(crate) fn decode_complete_json(bytes: &[u8]) -> Result<Json, serde_json::Error> {
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
     let value = Unique::deserialize(&mut decoder)?.0;

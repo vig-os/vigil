@@ -63,11 +63,19 @@ mod tests {
     }
     #[test]
     fn strict_prefixes_are_fragments() {
-        let line = GOLDEN.lines().next().unwrap().replace("actor", "acté😀r");
+        let parsed = Record::parse_line(GOLDEN.lines().next().unwrap().as_bytes()).unwrap();
+        let record = Record::new(
+            parsed[0].context.clone(),
+            super::super::Entry::new("acté😀r", "change", "object"),
+        )
+        .unwrap();
+        let bytes = super::super::sink::line(&record).unwrap();
+        let line = bytes.strip_suffix(b"\n").unwrap();
+        assert!(matches!(classify(line), Line::Record(Ok(_))));
         // Empty input is explicitly Unparsable; a full JSON object is a record.
         for cut in 1..line.len() {
             assert!(
-                matches!(classify(&line.as_bytes()[..cut]), Line::Fragment),
+                matches!(classify(&line[..cut]), Line::Fragment),
                 "cut {cut}"
             );
         }
