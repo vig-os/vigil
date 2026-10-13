@@ -35,7 +35,7 @@ pub fn vigil::audit::AuditConfig::max_bytes(self, bytes: u64) -> Self
 pub fn vigil::audit::AuditConfig::mirror_to_logs(self, on: bool) -> Self
 pub fn vigil::audit::AuditConfig::new(service: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn vigil::audit::AuditConfig::open(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>) -> core::result::Result<vigil::audit::AuditTrail, vigil::audit::AuditError>
-pub fn vigil::audit::AuditConfig::resume(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>, head: (u64, [u8; 32]), lost_through: u64, actor: impl core::convert::Into<alloc::string::String>, reason: impl core::convert::Into<alloc::string::String>) -> core::result::Result<(vigil::audit::AuditTrail, vigil::audit::Receipt), vigil::audit::AuditError>
+pub fn vigil::audit::AuditConfig::resume(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>, head: (u64, [u8; 32]), lost_through: u64, actor: impl core::convert::Into<alloc::string::String>, reason: impl core::convert::Into<alloc::string::String>) -> core::result::Result<(vigil::audit::AuditTrail, vigil::audit::Receipt, vigil::audit::Checkpoint), vigil::audit::AuditError>
 pub fn vigil::audit::AuditConfig::rotate(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>, bound: (u64, [u8; 32]), expect_head: (u64, [u8; 32]), actor: impl core::convert::Into<alloc::string::String>, reason: impl core::convert::Into<alloc::string::String>) -> core::result::Result<(vigil::audit::Receipt, vigil::audit::Checkpoint), vigil::audit::AuditError>
 pub struct vigil::audit::AuditError
 impl vigil::audit::AuditError

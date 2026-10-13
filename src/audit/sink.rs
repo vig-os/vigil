@@ -635,7 +635,7 @@ impl Sink {
         lost: u64,
         actor: String,
         reason: String,
-    ) -> Result<(Self, Record), AuditError> {
+    ) -> Result<(Self, Record, super::Checkpoint), AuditError> {
         let poisoned = AtomicBool::new(false);
         let mut written = None;
         let mut promoted = false;
@@ -708,6 +708,8 @@ impl Sink {
             let opening = Self::signed(&*signer, context, &mmr)?;
             record.context.previous = opening.hash();
             let bytes = [line(&opening)?, line(&record)?].concat();
+            // R16: construct the public checkpoint before any promotion can take effect.
+            let opening = super::trail::checkpoint(opening)?;
             Self::stage(dir, ".audit-resume.jsonl", &bytes, &poisoned)?;
             let staged = existing(dir, Path::new(".audit-resume.jsonl"), false)?;
             #[cfg(test)]
@@ -719,7 +721,7 @@ impl Sink {
                 return Err(io_error("resume staging discarded after validation"));
             }
             promoted = true;
-            written = Some(record);
+            written = Some((record, opening));
             Ok(trail)
         })
         .map_err(|cause| {
@@ -730,7 +732,8 @@ impl Sink {
                 cause
             }
         })?;
-        let record = written.ok_or_else(|| io_error("resume promoted without captured record"))?;
+        let (record, opening) =
+            written.ok_or_else(|| io_error("resume promoted without captured record"))?;
         let sink = Self {
             trail: record.context.trail,
             reader,
@@ -744,7 +747,7 @@ impl Sink {
             closed: false,
         };
         sink.acknowledge(record.context.seq);
-        Ok((sink, record))
+        Ok((sink, record, opening))
     }
     fn signed(
         signer: &dyn Signer,
@@ -1133,7 +1136,7 @@ impl Drop for Sink {
     }
 }
 #[cfg(test)]
-mod hooks {
+pub(super) mod hooks {
     use std::{
         cell::{Cell, RefCell},
         io,
@@ -1178,7 +1181,7 @@ mod hooks {
         });
         event(site)
     }
-    pub(super) fn event(site: &'static str) -> io::Result<()> {
+    pub(in crate::audit) fn event(site: &'static str) -> io::Result<()> {
         OBSERVE.with(|observe| {
             if let Some(observe) = observe.borrow().as_ref() {
                 observe(site);

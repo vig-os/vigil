@@ -227,7 +227,7 @@
     }
   },
   {
-    "justification": "ADR-0005 decisions 8 and 13 (operator resume surface row): pre-1.0 additive AuditConfig::resume; no AuditErrorKind changes",
+    "justification": "ADR-0005 decisions 8 and 13, amendment 11 (ruling 138-d1): pre-1.0 AuditConfig::resume returns the opening Checkpoint; no AuditErrorKind changes",
     "items": {
       "vigil::audit::AuditConfig::resume": "fn"
     }

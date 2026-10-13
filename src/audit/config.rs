@@ -250,8 +250,9 @@ impl AuditConfig {
     /// before promotion under one lock. With no predecessor, the shared fold
     /// uses the genesis digest as its single leaf (amendment 9 part 1).
     /// The signer signs the opening and becomes the returned handle's signer,
-    /// including its best-effort Drop checkpoint. Store the returned receipt
-    /// outside the directory before continuing.
+    /// including its best-effort Drop checkpoint. Returns the trail, the resume
+    /// receipt and the signed opening checkpoint, in that order. Store the receipt
+    /// outside the directory and anchor the returned checkpoint before continuing.
     ///
     /// # Crash recovery
     /// "A `resume` that returned `Io` may still take effect, whatever step failed"
@@ -283,7 +284,7 @@ impl AuditConfig {
         lost_through: u64,
         actor: impl Into<String>,
         reason: impl Into<String>,
-    ) -> Result<(AuditTrail, Receipt), AuditError> {
+    ) -> Result<(AuditTrail, Receipt, Checkpoint), AuditError> {
         let dir = self.validate_operator()?;
         if lost_through < head.0 || lost_through > i64::MAX as u64 - 2 {
             return Err(AuditError::new(
@@ -293,7 +294,7 @@ impl AuditConfig {
         }
         let (actor, reason) = (actor.into(), reason.into());
         sink::validate_actor_reason(&actor, &reason)?;
-        let (sink, record) = sink::Sink::resume(
+        let (sink, record, opening) = sink::Sink::resume(
             &dir,
             signer,
             self.config,
@@ -316,7 +317,7 @@ impl AuditConfig {
         {
             super::trail::mirror(entry, &receipt);
         }
-        Ok((AuditTrail::new(sink, dir, self.mirror), receipt))
+        Ok((AuditTrail::new(sink, dir, self.mirror), receipt, opening))
     }
     /// Opens an existing trail without writing or signing new trail content.
     /// Interrupted staging is settled and the chain is scanned.

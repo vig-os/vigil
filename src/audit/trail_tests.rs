@@ -305,7 +305,7 @@ fn operator_mirror_is_after_unlock() {
         assert_eq!(captured[0]["seq"], r.seq().to_string());
         assert_eq!(captured[0]["hash"].trim_matches('"'), r.hash_string());
         drop(captured);
-        let (_trail, resume) = temp
+        let (_trail, resume, _) = temp
             .config()
             .mirror_to_logs(true)
             .resume(

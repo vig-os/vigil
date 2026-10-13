@@ -53,7 +53,7 @@ fn child_role() {
             assert_eq!(key.calls.load(Ordering::Relaxed), 0);
             assert_eq!(key.public.load(Ordering::Relaxed), 0);
         } else if operation == "resume" {
-            let (mut sink, _) = Sink::resume(
+            let (mut sink, _, _) = Sink::resume(
                 &path,
                 key.clone(),
                 Config::default(),
