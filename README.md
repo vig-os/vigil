@@ -209,7 +209,7 @@ guard.shutdown()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Logs and metrics are available now, and the audit writer behind the `audit` feature ([Audit format](#audit-format-opt-in)); traces are planned (#8). Keep the guard
+Logs and metrics are available now, and the audit writer behind the `audit` feature ([Audit format](#audit-format-opt-in)); traces are in progress (#8: only the unstable span exporter has landed). Keep the guard
 alive until shutdown to flush queued logs. `let _ = vigil::init(..)` drops it immediately. The batch queue holds 65,536 records by default (512 per export, every second).
 Memory is bounded by queue size times record size; overflow drops records with
 a stderr warning. `VIGIL_QUEUE_SIZE` or `Config::queue_size` changes the bound
