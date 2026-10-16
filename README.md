@@ -4,11 +4,18 @@
 
 > **Pre-alpha.** The design is settled; the code is being built. Logs, metrics, traces and the audit writer (behind the `audit` feature) are implemented; the audit operator commands are implemented; the audit verifier (#13 C1) and trace propagation (#8 8e) are being built. Track progress in the milestones.
 
+**Pre-1.0 caveats.** Logs, metrics and traces export today, but open spans at
+shutdown (#8 8d), propagation (#8 8e), and the tracer globals opt-in (#8 8f)
+remain open. End root spans before shutdown. Review the [known issues](#known-issues)
+before adopting an early release.
+
 ## Stability
 
-vigil publishes no 0.x: the first release is 1.0.0, so what follows is the 1.0
-promise. Logs, metrics and traces are implemented today; the rest of the promised surface is still
-being built, and the pre-1.0 `dev` branch may change it.
+Early GitHub releases start with v0.1.0; crates.io publication comes later and
+remains the owner's decision. Before 1.0, a minor bump may break compatibility;
+a patch never does. Applications should pin `~0.N` (or `=0.N.M`). Every breaking
+change is labelled `semver:major` and recorded in the CHANGELOG. The stability
+promise below applies from 1.0.0. Version changes are managed by the release train (#151).
 
 - **Not covered.** Error `Display` and `Debug` text may change even in a patch,
   with a CHANGELOG entry. Programs must not parse it; see
@@ -57,12 +64,20 @@ being built, and the pre-1.0 `dev` branch may change it.
   change in a minor release with a changelog entry; and copies of files that a shipper
   has rewritten.
 
+## Known issues
+
+- [#150](https://github.com/vig-os/vigil/issues/150): metrics close can block behind the directory lock.
+- [#112](https://github.com/vig-os/vigil/issues/112): metrics shutdown has a five-second floor.
+- [#13](https://github.com/vig-os/vigil/issues/13): no offline audit verifier yet; `open` and operator commands do not verify a trail.
+- [#89](https://github.com/vig-os/vigil/issues/89): crash guarantees remain unproven.
+- [#46](https://github.com/vig-os/vigil/issues/46): no macOS CI test lane yet.
+
 ## Traces
 
 The default `traces` feature exports spans to `traces.jsonl` beside logs and
 metrics. Set `VIGIL_TRACES=0` or `Config::traces(false)` to disable it completely;
 `1` enables it and explicit builder values win. Unset or empty values enable
-traces; other values warn once and use the default.
+traces; other values warn and use the default.
 
 Enter the span for correlation: log records emitted while it is entered carry
 its trace and span IDs. An explicit event parent on an unentered span does not
@@ -86,6 +101,18 @@ sampler, span limits and batch settings. `OTEL_BSP_EXPORT_TIMEOUT` and
 `OTEL_BSP_MAX_CONCURRENT_EXPORTS` do not apply to the synchronous processor.
 
 ## Metrics
+
+`VIGIL_METRICS=0` disables metrics and `1` enables them (enabled by default).
+Unset or empty values use the default; any other value warns and uses the default.
+`Config::metrics(bool)` overrides the environment. These switches have the same
+grammar as `VIGIL_TRACES` and `Config::traces(bool)` above.
+
+`VIGIL_METRICS_INTERVAL` sets collection in whole seconds (default 60).
+It accepts an unsigned 64-bit integer of at least 1, using Rust's integer parsing
+(optional leading `+`, no whitespace). Unset or empty values use the default;
+invalid, zero, negative or overflowing values warn and use 60 seconds.
+`Config::metrics_interval(Duration)` overrides it and clamps durations below one
+second to one second. These options require the `metrics` feature.
 
 With the default `metrics` feature, declare instruments in statics using the
 scope of their declaring crate:
@@ -196,11 +223,12 @@ own SDK pipeline can opt in with `RUSTFLAGS="--cfg vigil_unstable" cargo build`,
 or set `[build] rustflags = ["--cfg", "vigil_unstable"]` in their own
 `.cargo/config.toml`. Use `vigil::unstable::{opentelemetry, opentelemetry_sdk}`
 for the exact versions linked by vigil. These APIs may change in any minor;
-applications should pin vigil with `~1.N`. A library using them forces its
+applications should pin vigil with `~0.N` (or `=0.N.M`) before 1.0, and `~1.N` from 1.0. A library using them forces its
 applications to enable the cfg, must document that requirement, and should avoid
 pinning `~1.N` itself because that constrains every dependent in the graph.
-Global-provider installation is available for the meter provider. The tracer
-provider and the tracing integration re-export follow in #8.
+Global-provider installation is available for the meter provider through
+`Config::install_opentelemetry_globals` (requires `--cfg vigil_unstable`). The tracer
+provider opt-in and the tracing integration re-export remain open in #8 8f.
 
 Cargo uses one rustflags source, in precedence order: `CARGO_ENCODED_RUSTFLAGS`,
 `RUSTFLAGS`, matching target rustflags (including `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`),
