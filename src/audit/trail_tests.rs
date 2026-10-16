@@ -502,3 +502,82 @@ fn public_debug_and_value_traits() {
     );
     trail.close().unwrap();
 }
+
+fn unparsable_tail_roundtrip(tail: &[u8]) {
+    use std::io::Write;
+    let temp = Temp::new();
+    let trail = temp.config().create(signer()).unwrap();
+    let receipt = trail.record(&entry()).unwrap();
+    // Reproduce a crash snapshot at genesis plus one entry.
+    let snapshot = fs::read(temp.0.join("audit.jsonl")).unwrap();
+    drop(trail);
+    fs::write(temp.0.join("audit.jsonl"), snapshot).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(temp.0.join("audit.jsonl"))
+        .unwrap()
+        .write_all(tail)
+        .unwrap();
+    assert_eq!(
+        temp.config().open(signer()).unwrap_err().kind(),
+        AuditErrorKind::CorruptTrail
+    );
+    let (trail, _, checkpoint) = temp
+        .config()
+        .resume(
+            signer(),
+            (receipt.seq(), receipt.hash()),
+            receipt.seq(),
+            "operator",
+            "reviewed crash",
+        )
+        .unwrap();
+    assert!(temp.records().iter().all(|r| r.context.repaired.is_none()));
+    assert!(
+        Record::parse_line(checkpoint.line().as_bytes()).unwrap()[0]
+            .context
+            .repaired
+            .is_none()
+    );
+    drop(trail);
+    drop(temp.config().open(signer()).unwrap());
+}
+#[test]
+fn classifier_tail_nul_fill() {
+    unparsable_tail_roundtrip(&[0; 4096]);
+}
+#[test]
+fn classifier_tail_nul_after_prefix() {
+    unparsable_tail_roundtrip(&[b"{\"resourceLogs\":[{\"res".as_slice(), &[0; 64]].concat());
+}
+#[test]
+fn classifier_tail_nul_with_lf() {
+    unparsable_tail_roundtrip(&[&[0; 8][..], b"\n"].concat());
+}
+#[test]
+fn classifier_tail_non_json() {
+    unparsable_tail_roundtrip(b"xyz\n");
+}
+#[test]
+fn classifier_tail_del() {
+    unparsable_tail_roundtrip(b"\x7f\n");
+}
+#[test]
+fn classifier_tail_over_cap_record_suffix() {
+    let record = include_str!("../../tests/fixtures/audit/codec.jsonl")
+        .lines()
+        .next()
+        .unwrap();
+    unparsable_tail_roundtrip(
+        &[
+            vec![b'x'; 1_000_002],
+            record.as_bytes().to_vec(),
+            b"\n".to_vec(),
+        ]
+        .concat(),
+    );
+}
+#[test]
+fn classifier_tail_over_cap_fragment_suffix() {
+    unparsable_tail_roundtrip(&[vec![b'x'; 1_000_002], b"{\"resourceLogs\":[".to_vec()].concat());
+}

@@ -90,6 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Audit tail classification** ([#143](https://github.com/vig-os/vigil/issues/143)): `resume` seals NUL-filled, control-byte and oversized tails. Reading raw controls, oversized payloads and JSON non-objects now reports `AuditError::finding_kind()` as `Unparsable` instead of record findings; writer validation is unchanged.
+
 - Audit rustdoc no longer says resume is pending or that `vigil-audit verify` exists; it marks the command as #13 and states which head resume takes ([#136](https://github.com/vig-os/vigil/issues/136)).
 - Give every `FlushError` signal part its own diagnostic label, including metrics-only failures and timeouts ([#113](https://github.com/vig-os/vigil/issues/113)).
 - Complete README Prometheus unit mapping and conformance diagnostics for bind retries and transient query failures ([#7](https://github.com/vig-os/vigil/issues/7)).

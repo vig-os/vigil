@@ -226,7 +226,8 @@ pub(super) fn valid_text(text: &str) -> Result<(), AuditError> {
     Ok(())
 }
 
-/// Checks line size and framing identically at both boundaries.
+/// Refuses payloads the writer cannot emit. Reading uses `lines::classify`
+/// with the same framing bounds and the ADR-0005 Unparsable finding.
 pub(super) fn payload(bytes: &[u8]) -> Result<(), AuditError> {
     if bytes.len() > MAX_PAYLOAD_BYTES {
         return Err(AuditError::decoding(
