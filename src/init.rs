@@ -13,9 +13,7 @@ use std::{
 use crate::{FlushErrorKind, Signal};
 use opentelemetry::{InstrumentationScope, KeyValue, logs::LoggerProvider};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_sdk::error::OTelSdkError;
-#[cfg(feature = "metrics")]
-use opentelemetry_sdk::error::OTelSdkResult;
+use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 #[cfg(feature = "metrics")]
 use opentelemetry_sdk::metrics::{PeriodicReader, PeriodicReaderBuilder, SdkMeterProvider};
 use opentelemetry_sdk::{
