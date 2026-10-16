@@ -58,10 +58,14 @@ fn consumer_release_notes() {
 
 #[test]
 fn package_allowlist() {
+    // Cargo normalizes the published manifest to a multiline array.
     let include = MANIFEST
-        .lines()
-        .find(|line| line.starts_with("include = "))
-        .unwrap();
+        .split_once("include = [")
+        .unwrap()
+        .1
+        .split_once(']')
+        .unwrap()
+        .0;
     for required in [
         "src/**",
         "Cargo.lock",
