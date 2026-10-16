@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 type Head = (u64, [u8; 32]);
 
 pub(super) enum Command {
+    Help(String),
     Keygen(PathBuf),
     Checkpoints(PathBuf),
     Create {
@@ -33,17 +34,78 @@ pub(super) enum Command {
     },
 }
 
+// ADR-0005 decision 11 is the source of these command arguments.
+const COMMANDS: &[(&str, &str, &str)] = &[
+    (
+        "checkpoints",
+        "<dir>",
+        "Print checkpoint lines in sequence order.",
+    ),
+    (
+        "checkpoint",
+        "--key <keyfile> --expect-head <seq>:<hash> <dir>",
+        "Sign a checkpoint at the expected head.",
+    ),
+    (
+        "rotate",
+        "--key <keyfile> --actor <who> --reason <why> --bound <seq>:<hash> --expect-head <seq>:<hash> <dir>",
+        "Record a key rotation and sign a checkpoint.",
+    ),
+    (
+        "create",
+        "--key <keyfile> --service <name> <dir>",
+        "Create a new audit trail.",
+    ),
+    (
+        "resume",
+        "--key <keyfile> --actor <who> --reason <why> --head <seq>:<hash> --lost-through <seq> <dir>",
+        "Resume a trail after operator-confirmed loss.",
+    ),
+    (
+        "keygen",
+        "<keyfile>",
+        "Generate a signing key and public key file.",
+    ),
+];
+
+pub(super) fn usage(full: bool) -> String {
+    let mut text = String::from("Usage:\n");
+    for (name, arguments, description) in COMMANDS {
+        text.push_str(&format!("  vigil-audit {name} {arguments}\n"));
+        if full {
+            text.push_str(&format!("    {description}\n"));
+        }
+    }
+    text.push_str("  verify: not yet available (#13)\n");
+    if full {
+        text.push_str("\nUse vigil-audit <command> --help for command help.\n\nExit codes:\n  0  Success\n  1  AuditError or SignerError (except Io/InvalidConfig)\n  2  Usage, Io or InvalidConfig error\n");
+    }
+    text
+}
+
 pub(super) fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
     let command = args.next().ok_or("missing command")?;
     let command = command.to_str().ok_or("invalid command")?;
-    let flags: &[&str] = match command {
-        "keygen" | "checkpoints" => &[],
-        "create" => &["--key", "--service"],
-        "checkpoint" => &["--key", "--expect-head"],
-        "rotate" => &["--key", "--actor", "--reason", "--bound", "--expect-head"],
-        "resume" => &["--key", "--actor", "--reason", "--head", "--lost-through"],
-        _ => return Err(format!("unknown command: {command}")),
-    };
+    let rest: Vec<_> = args.collect();
+    if matches!(command, "--help" | "-h" | "help") && rest.is_empty() {
+        return Ok(Command::Help(usage(true)));
+    }
+    let spec = COMMANDS
+        .iter()
+        .find(|spec| spec.0 == command)
+        .ok_or_else(|| format!("unknown command: {command}"))?;
+    if rest == [OsString::from("--help")] {
+        return Ok(Command::Help(format!(
+            "Usage: vigil-audit {} {}\n{}\n",
+            spec.0, spec.1, spec.2
+        )));
+    }
+    let flags: Vec<_> = spec
+        .1
+        .split_whitespace()
+        .filter(|arg| arg.starts_with("--"))
+        .collect();
+    let mut args = rest.into_iter();
     let mut options = BTreeMap::new();
     let mut dir = None;
     while let Some(arg) = args.next() {
@@ -57,7 +119,7 @@ pub(super) fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Command,
             return Err("unexpected positional argument".into());
         }
     }
-    for flag in flags {
+    for flag in &flags {
         if !options.contains_key(*flag) {
             return Err(format!("missing {flag}"));
         }
