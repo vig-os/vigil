@@ -1,5 +1,5 @@
 //! **Unstable:** bounded OTLP/JSON span export. Enable `--cfg vigil_unstable`
-//! and pin vigil with `~1.N`. Provider wiring follows in 8c (#8).
+//! and pin vigil with `~1.N`.
 use crate::{
     envelope::{self, Envelope},
     logs::{self, StringCandidate},
@@ -50,11 +50,13 @@ impl<S: LineSink> OtlpJsonSpanExporter<S> {
         }
     }
     /// Set the payload limit, clamped to 1..=1,048,575 bytes, excluding newline.
+    #[cfg(any(test, vigil_unstable))]
     pub fn with_max_line_bytes(mut self, limit: usize) -> Self {
         self.limit = limit.clamp(1, 1_048_575);
         self
     }
     /// The sink receiving complete lines.
+    #[cfg(any(test, vigil_unstable))]
     pub fn sink(&self) -> &S {
         &self.sink
     }

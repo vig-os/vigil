@@ -39,8 +39,7 @@ fn span_limits() -> opentelemetry_sdk::trace::SpanLimits {
 #[derive(Debug)]
 pub(crate) struct TraceStorage(pub(crate) Mutex<TraceStorageState>);
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into init in #8 8c-2"))]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum TraceStorageState {
     Ready(Arc<crate::rotate::RotatingFile>),
     Disabled,
@@ -48,22 +47,26 @@ pub(crate) enum TraceStorageState {
 }
 impl LineSink for TraceStorage {
     fn write_line(&self, line: &[u8]) -> std::io::Result<()> {
-        match &*self
+        // Release the state lock before I/O: close must never wait for a writer.
+        let state = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
+            .clone();
+        match state {
             TraceStorageState::Ready(file) => file.write_line(line),
             TraceStorageState::Disabled => Ok(()),
             TraceStorageState::Closed => Err(std::io::ErrorKind::BrokenPipe.into()),
         }
     }
     fn flush(&self) -> std::io::Result<()> {
-        match &*self
+        // Release the state lock before I/O: close must never wait for a writer.
+        let state = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
+            .clone();
+        match state {
             TraceStorageState::Ready(file) => file.flush(),
             TraceStorageState::Disabled => Ok(()),
             TraceStorageState::Closed => Err(std::io::ErrorKind::BrokenPipe.into()),
@@ -80,7 +83,6 @@ impl TraceStorage {
             TraceStorageState::Disabled
         )
     }
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired into init in #8 8c-2"))]
     pub(crate) fn close(&self) {
         *self
             .0
@@ -90,7 +92,6 @@ impl TraceStorage {
 }
 
 /// Build a provider only after storage has resolved to ready or disabled.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into init in #8 8c-2"))]
 pub(crate) fn build_tracer(
     storage: Arc<TraceStorage>,
     resource: Resource,
@@ -124,7 +125,6 @@ pub(crate) fn build_tracer(
 }
 
 /// Configure the layer for its concrete subscriber position.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into init in #8 8c-2"))]
 pub(crate) fn otel_layer<S>(
     provider: &opentelemetry_sdk::trace::SdkTracerProvider,
 ) -> tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>
@@ -143,7 +143,6 @@ where
 }
 
 /// Preserve error status while the zero-event limit removes duplicate events.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into init in #8 8c-2"))]
 pub(crate) fn spans_or_error(metadata: &tracing::Metadata<'_>) -> bool {
     metadata.is_span() || *metadata.level() == tracing::Level::ERROR
 }
@@ -615,6 +614,49 @@ mod tests {
         assert_eq!(
             storage.write_line(b"{}").unwrap_err().kind(),
             std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn close_does_not_wait_for_in_flight_directory_write_and_later_writes_count() {
+        use std::{sync::mpsc, time::Instant};
+        let dir = crate::test_temp::TempDir::new();
+        let file = Arc::new(
+            crate::rotate::RotatingFile::open(&dir.0, "traces", Default::default()).unwrap(),
+        );
+        let storage = Arc::new(TraceStorage(Mutex::new(TraceStorageState::Ready(
+            file.clone(),
+        ))));
+        let held = std::fs::File::open(&dir.0).unwrap();
+        held.lock().unwrap();
+        let writer_storage = storage.clone();
+        let writer = std::thread::spawn(move || writer_storage.write_line(b"{}"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // The writer clones the file before entering the blocked I/O operation.
+        while Arc::strong_count(&file) < 3 {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let (closed, observed) = mpsc::channel();
+        let close_storage = storage.clone();
+        let closer = std::thread::spawn(move || {
+            close_storage.close();
+            closed.send(()).unwrap();
+        });
+        let timely = observed.recv_timeout(Duration::from_millis(500)).is_ok();
+        held.unlock().unwrap();
+        writer.join().unwrap().unwrap();
+        closer.join().unwrap();
+        assert!(timely, "close waited for blocked directory write");
+        let exporter = exporter(storage, 10000);
+        fixtures::ready(exporter.export(fixtures::batch())).unwrap();
+        assert_eq!(
+            exporter
+                .losses
+                .finish(Ok(()))
+                .unwrap_err()
+                .lost(Signal::Traces),
+            4
         );
     }
 

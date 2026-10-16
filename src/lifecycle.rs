@@ -608,8 +608,26 @@ impl<P: opentelemetry_sdk::trace::SpanProcessor> opentelemetry_sdk::trace::SpanP
 pub(crate) struct AfterShutdown {
     pub(crate) stopped: Arc<AtomicBool>,
     pub(crate) warned: AtomicBool,
+    #[cfg(feature = "traces")]
+    pub(crate) span_warned: AtomicBool,
 }
 impl<S: Subscriber> Layer<S> for AfterShutdown {
+    #[cfg(feature = "traces")]
+    fn on_new_span(
+        &self,
+        _: &tracing::span::Attributes<'_>,
+        _: &tracing::span::Id,
+        _: Context<'_, S>,
+    ) {
+        if self.stopped.load(Ordering::Acquire) && !self.span_warned.swap(true, Ordering::Relaxed) {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "vigil: span after shutdown; further spans will be dropped silently"
+            );
+        }
+    }
+
     fn on_event(&self, _: &Event<'_>, _: Context<'_, S>) {
         if self.stopped.load(Ordering::Acquire) && !self.warned.swap(true, Ordering::Relaxed) {
             use std::io::Write;

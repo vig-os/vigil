@@ -13,9 +13,7 @@ use std::{
 use crate::{FlushErrorKind, Signal};
 use opentelemetry::{InstrumentationScope, KeyValue, logs::LoggerProvider};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_sdk::error::OTelSdkError;
-#[cfg(feature = "metrics")]
-use opentelemetry_sdk::error::OTelSdkResult;
+use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 #[cfg(feature = "metrics")]
 use opentelemetry_sdk::metrics::{PeriodicReader, PeriodicReaderBuilder, SdkMeterProvider};
 use opentelemetry_sdk::{
@@ -264,7 +262,7 @@ impl MetricFlushes {
     }
 }
 
-/// Owns the batch processor. Keep this alive until logging is finished.
+/// Owns the signal providers. Keep this alive until telemetry is finished.
 /// Drop waits up to five seconds, including time blocked on the directory lock.
 /// On timeout it warns on stderr; remaining records may be lost. The SDK worker
 /// may continue in the background until the lock is released.
@@ -272,6 +270,10 @@ impl MetricFlushes {
 #[derive(Debug)]
 pub struct Guard {
     provider: Option<SdkLoggerProvider>,
+    #[cfg(feature = "traces")]
+    traces: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    #[cfg(feature = "traces")]
+    trace_storage: Option<Arc<crate::trace_pipeline::TraceStorage>>,
     #[cfg(feature = "metrics")]
     metrics: Option<SdkMeterProvider>,
     #[cfg(feature = "metrics")]
@@ -281,12 +283,31 @@ pub struct Guard {
     stopped: Arc<AtomicBool>,
     dir: Option<PathBuf>,
     losses: Arc<Losses>,
-    #[cfg(all(test, feature = "metrics"))]
-    signal_files: [std::sync::Weak<RotatingFile>; 2],
+    #[cfg(all(test, any(feature = "metrics", feature = "traces")))]
+    signal_files: [std::sync::Weak<RotatingFile>; 3],
 }
+// Keep the scheduling seam shared with the deterministic concurrency proof.
+fn flush_logs_and_traces(
+    logs: impl FnOnce() -> OTelSdkResult,
+    traces: Option<impl FnOnce() -> OTelSdkResult + Send>,
+) -> (OTelSdkResult, OTelSdkResult) {
+    std::thread::scope(|scope| {
+        let traces = traces.map(|flush| scope.spawn(flush));
+        let logs = logs();
+        let traces = traces.map_or(Ok(()), |thread| {
+            thread.join().unwrap_or_else(|_| {
+                Err(OTelSdkError::InternalFailure(
+                    "span flush thread panicked".into(),
+                ))
+            })
+        });
+        (logs, traces)
+    })
+}
+
 impl Guard {
     /// The actual log directory, or `None` when logs fell back to stderr.
-    /// Metrics may still write `metrics.jsonl` there; `None` does not mean
+    /// Metrics and traces may still write `metrics.jsonl` and `traces.jsonl` there; `None` does not mean
     /// that no file is written.
     pub fn dir(&self) -> Option<&Path> {
         self.dir.as_deref()
@@ -316,8 +337,8 @@ impl Guard {
     ///
     /// # Errors
     /// Returns timeout, SDK/sink failure or data loss since the previous flush.
-    /// Logs falling back to stderr contribute no error; metrics still report
-    /// their outcome.
+    /// Logs falling back to stderr contribute no error; metrics and traces still
+    /// report their outcomes.
     /// Queue overflow is counted independently of SDK diagnostics and filters.
     /// Concurrent arrivals can make this a lower bound; see [`FlushError::lost`].
     /// More than 64 concurrent requests can saturate the logs SDK control channel
@@ -328,9 +349,21 @@ impl Guard {
         let metrics = self.start_metrics_flush();
         #[cfg(all(test, feature = "metrics"))]
         self.losses.observe_flush_order();
-        let logs = self.provider.as_ref().map_or(Ok(()), |provider| {
-            crate::lifecycle::flush(|| provider.force_flush())
-        });
+        #[cfg(feature = "traces")]
+        let traces = self
+            .traces
+            .as_ref()
+            .map(|provider| move || crate::lifecycle::flush(|| provider.force_flush()));
+        #[cfg(not(feature = "traces"))]
+        let traces: Option<fn() -> OTelSdkResult> = None;
+        let (logs, traces) = flush_logs_and_traces(
+            || {
+                self.provider.as_ref().map_or(Ok(()), |provider| {
+                    crate::lifecycle::flush(|| provider.force_flush())
+                })
+            },
+            traces,
+        );
         self.losses.outcome(Signal::Logs, &logs);
         #[cfg(feature = "metrics")]
         let metrics = metrics.map_or(Ok(()), |target| {
@@ -339,7 +372,7 @@ impl Guard {
         #[cfg(not(feature = "metrics"))]
         let metrics = Ok(());
         let _ = deadline;
-        self.losses.finish_signals(logs, metrics, Ok(()))
+        self.losses.finish_signals(logs, metrics, traces)
     }
 
     #[cfg(feature = "metrics")]
@@ -357,8 +390,8 @@ impl Guard {
     }
 
     /// Flush and stop the pipeline with a five-second timeout. Drop then does
-    /// nothing. Logs falling back to stderr contribute no error; metrics
-    /// still report their outcome. The process slot remains occupied.
+    /// nothing. Logs falling back to stderr contribute no error; metrics and traces
+    /// still report their outcomes. The process slot remains occupied.
     ///
     /// # Errors
     /// Returns timeout, SDK/sink failure or data loss. See `FlushError::lost`.
@@ -386,6 +419,7 @@ impl Guard {
             timeout,
             std::thread::Builder::new(),
             std::thread::Builder::new(),
+            std::thread::Builder::new(),
         )
     }
     fn stop_with_builder(
@@ -393,12 +427,15 @@ impl Guard {
         timeout: Duration,
         logs_builder: std::thread::Builder,
         metrics_builder: std::thread::Builder,
+        traces_builder: std::thread::Builder,
     ) -> Result<(), FlushError> {
         self.stopped.store(true, Ordering::Release);
         self.losses.shutting_down.store(true, Ordering::Release);
         let provider = self.provider.take();
         #[cfg(feature = "metrics")]
         let metrics = self.metrics.take();
+        #[cfg(feature = "traces")]
+        let traces = self.traces.take();
         let forward = tracing::dispatcher::get_default(Clone::clone);
         let capture = || {
             ShutdownCapture::new(
@@ -431,10 +468,32 @@ impl Guard {
             self.losses.outcome(Signal::Metrics, &result);
             result
         };
+        #[cfg(feature = "traces")]
+        let traces_shutdown = || {
+            let result = traces.as_ref().map_or(Ok(()), |provider| {
+                let capture = ShutdownCapture::new(
+                    crate::lifecycle::QueueSignal::Traces,
+                    forward.clone(),
+                    self.losses.clone(),
+                );
+                tracing::subscriber::with_default(capture, || {
+                    provider.shutdown_with_timeout(timeout.saturating_sub(started.elapsed()))
+                })
+            });
+            if let Some(storage) = &self.trace_storage {
+                storage.close();
+            }
+            self.losses.outcome(Signal::Traces, &result);
+            result
+        };
         let result = std::thread::scope(|scope| {
             let logs_thread = logs_builder.spawn_scoped(scope, logs_shutdown);
             #[cfg(feature = "metrics")]
             let metrics_thread = metrics_builder.spawn_scoped(scope, metrics_shutdown);
+            #[cfg(feature = "traces")]
+            let traces_thread = traces
+                .as_ref()
+                .map(|_| traces_builder.spawn_scoped(scope, traces_shutdown));
             let logs = match logs_thread {
                 Ok(thread) => thread.join().unwrap_or_else(|_| {
                     Err(OTelSdkError::InternalFailure(
@@ -459,11 +518,25 @@ impl Guard {
             #[cfg(not(feature = "metrics"))]
             let metrics = Ok(());
             self.losses.outcome(Signal::Logs, &logs);
-            (logs, metrics)
+            #[cfg(feature = "traces")]
+            let traces = match traces_thread {
+                Some(Ok(thread)) => thread.join().unwrap_or_else(|_| {
+                    Err(OTelSdkError::InternalFailure(
+                        "span shutdown thread panicked".into(),
+                    ))
+                }),
+                Some(Err(_)) => traces_shutdown(),
+                None => Ok(()),
+            };
+            #[cfg(not(feature = "traces"))]
+            let traces = Ok(());
+            (logs, metrics, traces)
         });
         #[cfg(not(feature = "metrics"))]
         let _ = metrics_builder;
-        self.losses.finish_signals(result.0, result.1, Ok(()))
+        #[cfg(not(feature = "traces"))]
+        let _ = traces_builder;
+        self.losses.finish_signals(result.0, result.1, result.2)
     }
 
     fn summaries(&self, error: Option<&FlushError>, dropping: bool) {
@@ -522,6 +595,27 @@ impl Guard {
                 let _ = writeln!(std::io::stderr());
             }
         }
+        #[cfg(feature = "traces")]
+        {
+            let (spans, failed) = self
+                .losses
+                .pending_stderr(crate::lifecycle::QueueSignal::Traces);
+            let kind = error
+                .and_then(|error| error.signal_kind(Signal::Traces))
+                .unwrap_or(if failed {
+                    FlushErrorKind::Failed
+                } else {
+                    FlushErrorKind::DataLost
+                });
+            if (dropping && (spans != 0 || kind != FlushErrorKind::DataLost))
+                || (!dropping && kind == FlushErrorKind::Timeout)
+            {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "vigil: span shutdown: {kind:?}; dropped spans: {spans}; remaining spans may be lost"
+                );
+            }
+        }
     }
 }
 impl Drop for Guard {
@@ -530,7 +624,11 @@ impl Drop for Guard {
         let metrics = self.metrics.is_some();
         #[cfg(not(feature = "metrics"))]
         let metrics = false;
-        if self.provider.is_none() && !metrics {
+        #[cfg(feature = "traces")]
+        let traces = self.traces.is_some();
+        #[cfg(not(feature = "traces"))]
+        let traces = false;
+        if self.provider.is_none() && !metrics && !traces {
             return;
         }
         let result = self.stop(Duration::from_secs(5));
@@ -575,8 +673,8 @@ impl Drop for Guard {
 /// it down, and call `Guard::flush` before reading only records with a field
 /// unique to the test. See [`Guard::flush`] for the shared-static example.
 ///
-/// Tracing spans alone do not populate OTLP trace/span IDs; distributed trace
-/// context integration is planned for the metrics and traces release.
+/// With traces enabled, enter a span to correlate log records with its trace/span IDs.
+/// An explicit event parent without entering that span does not activate correlation.
 ///
 /// # Errors
 /// Returns `AlreadyRunning`, `ForeignSubscriber`, `InvalidServiceName`
@@ -611,6 +709,8 @@ pub struct Config {
     install_globals: bool,
     #[cfg(feature = "metrics")]
     metrics: Option<bool>,
+    #[cfg(feature = "traces")]
+    traces: Option<bool>,
     #[cfg(feature = "metrics")]
     metrics_interval: Option<Duration>,
 }
@@ -634,6 +734,8 @@ impl Config {
             install_globals: false,
             #[cfg(feature = "metrics")]
             metrics: None,
+            #[cfg(feature = "traces")]
+            traces: None,
             #[cfg(feature = "metrics")]
             metrics_interval: None,
         }
@@ -642,7 +744,8 @@ impl Config {
     /// (`vigil::unstable::opentelemetry`), or silently record into a no-op provider.
     ///
     /// Installs vigil's meter provider as the OpenTelemetry global meter provider.
-    /// The tracer provider follows in #8. No effect when metrics are off or failed.
+    /// The tracer provider follows in #8 8f. No global propagator is installed.
+    /// No effect when metrics are off or failed.
     /// Global instruments cannot cause poisoning, but streams under names poisoned
     /// by vigil handles are filtered too (ADR-0003 d21). Use `--cfg vigil_unstable`
     /// and pin vigil with `~1.N`.
@@ -661,6 +764,15 @@ impl Config {
     #[must_use]
     pub fn metrics(mut self, enabled: bool) -> Self {
         self.metrics = Some(enabled);
+        self
+    }
+    /// Enable traces (default true); overrides `VIGIL_TRACES` (`0` or `1`).
+    /// Disabled traces create no storage, provider, worker thread or tracing layer.
+    #[cfg(feature = "traces")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "traces")))]
+    #[must_use]
+    pub fn traces(mut self, enabled: bool) -> Self {
+        self.traces = Some(enabled);
         self
     }
     /// Metrics collection interval (default 60 seconds); overrides
@@ -809,6 +921,7 @@ impl Config {
     /// the global subscriber or LogTracer. The consumer installs its Registry;
     /// `SubscriberInitExt::init()` also installs LogTracer.
     ///
+    /// Enter spans to correlate log records with their trace/span IDs when traces are enabled.
     /// Includes per-layer filtering, SDK diagnostics, recursion exclusion,
     /// post-shutdown filtering and the optional console. Other layers retain
     /// their own filters. Tests use nextest (one process per test), or share
@@ -887,6 +1000,8 @@ impl Config {
         let after_shutdown = AfterShutdown {
             stopped: stopped.clone(),
             warned: AtomicBool::new(false),
+            #[cfg(feature = "traces")]
+            span_warned: AtomicBool::new(false),
         }
         .with_filter(filter.clone())
         .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
@@ -952,10 +1067,12 @@ impl Config {
             }
             Resource::builder_empty().with_attributes(attrs).build()
         });
-        #[cfg(all(test, feature = "metrics"))]
-        let mut signal_files: [std::sync::Weak<RotatingFile>; 2] = Default::default();
+        #[cfg(all(test, any(feature = "metrics", feature = "traces")))]
+        let mut signal_files: [std::sync::Weak<RotatingFile>; 3] = Default::default();
         #[cfg(feature = "metrics")]
-        let metrics_enabled = self.metrics.unwrap_or_else(metrics_enabled);
+        let metrics_enabled = self
+            .metrics
+            .unwrap_or_else(|| signal_switch("VIGIL_METRICS"));
         #[cfg(feature = "metrics")]
         let metrics = if metrics_enabled {
             let interval = metrics_interval(self.metrics_interval);
@@ -978,6 +1095,60 @@ impl Config {
         } else {
             None
         };
+        #[cfg(feature = "traces")]
+        let traces_enabled = self.traces.unwrap_or_else(|| signal_switch("VIGIL_TRACES"));
+        #[cfg(feature = "traces")]
+        let trace_storage = traces_enabled.then(|| {
+            use crate::trace_pipeline::{TraceStorage, TraceStorageState};
+            let state = match (dir.as_ref(), resource.as_ref()) {
+                (Some(dir), Some(_)) => match RotatingFile::open(dir, "traces", rotation.clone()) {
+                    Ok(file) => {
+                        let file = Arc::new(file);
+                        #[cfg(test)]
+                        {
+                            signal_files[2] = Arc::downgrade(&file);
+                        }
+                        TraceStorageState::Ready(file)
+                    }
+                    Err(error) => {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "vigil: cannot open traces storage at {}: {error}; disabling traces",
+                            dir.display()
+                        );
+                        TraceStorageState::Disabled
+                    }
+                },
+                _ => TraceStorageState::Disabled,
+            };
+            Arc::new(TraceStorage(Mutex::new(state)))
+        });
+        #[cfg(feature = "traces")]
+        let traces = trace_storage.as_ref().map(|storage| {
+            crate::trace_pipeline::build_tracer(
+                storage.clone(),
+                resource
+                    .clone()
+                    .unwrap_or_else(|| Resource::builder_empty().build()),
+                queue_size,
+                losses.clone(),
+            )
+        });
+        #[cfg(feature = "traces")]
+        let otel = traces.as_ref().map(|provider| {
+            let active = stopped.clone();
+            crate::trace_pipeline::otel_layer(provider)
+                .with_filter(tracing_subscriber::filter::filter_fn(
+                    crate::trace_pipeline::spans_or_error,
+                ))
+                .with_filter(tracing_subscriber::filter::dynamic_filter_fn(
+                    move |_, _| !active.load(Ordering::Acquire),
+                ))
+                .with_filter(filter.clone())
+                .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                    !meta.target().starts_with("opentelemetry")
+                }))
+        });
         let file = dir.as_ref()
             .ok_or_else(|| std::io::Error::other(format!("neither XDG_STATE_HOME nor HOME provides an absolute path; rejected XDG_STATE_HOME={:?}, HOME={:?}", env::var_os("XDG_STATE_HOME"), env::var_os("HOME"))))
             .and_then(|dir| RotatingFile::open(dir, "logs", rotation))
@@ -985,10 +1156,16 @@ impl Config {
             .and_then(|file| id.map(|_| file));
         #[cfg(feature = "metrics")]
         let metrics_disabled = metrics_enabled && (resource.is_none() || dir.is_none());
+        #[cfg(not(feature = "metrics"))]
+        let metrics_disabled = false;
+        #[cfg(feature = "traces")]
+        let traces_disabled = traces_enabled && (resource.is_none() || dir.is_none());
+        #[cfg(not(feature = "traces"))]
+        let traces_disabled = false;
         let (destination, provider, log_dir): (PipelineLayer<S>, _, _) = match file {
             Ok(file) => {
                 let file = Arc::new(file);
-                #[cfg(all(test, feature = "metrics"))]
+                #[cfg(all(test, any(feature = "metrics", feature = "traces")))]
                 {
                     signal_files[0] = Arc::downgrade(&file);
                 }
@@ -1014,14 +1191,12 @@ impl Config {
                 (bridge.and_then(console).boxed(), Some(provider), dir)
             }
             Err(error) => {
-                #[cfg(feature = "metrics")]
-                let disabled = if metrics_disabled {
-                    " for logs; disabling metrics"
-                } else {
-                    ""
+                let disabled = match (metrics_disabled, traces_disabled) {
+                    (true, true) => " for logs; disabling metrics and traces",
+                    (true, false) => " for logs; disabling metrics",
+                    (false, true) => " for logs; disabling traces",
+                    (false, false) => "",
                 };
-                #[cfg(not(feature = "metrics"))]
-                let disabled = "";
                 let _ = writeln!(
                     std::io::stderr(),
                     "vigil: {error}; falling back to stderr{disabled}"
@@ -1038,6 +1213,10 @@ impl Config {
         };
         let guard = Guard {
             provider,
+            #[cfg(feature = "traces")]
+            traces,
+            #[cfg(feature = "traces")]
+            trace_storage,
             #[cfg(feature = "metrics")]
             metrics,
             #[cfg(feature = "metrics")]
@@ -1047,7 +1226,7 @@ impl Config {
             stopped,
             losses: losses.clone(),
             dir: log_dir,
-            #[cfg(all(test, feature = "metrics"))]
+            #[cfg(all(test, any(feature = "metrics", feature = "traces")))]
             signal_files,
         };
         let destination = destination
@@ -1056,13 +1235,10 @@ impl Config {
             .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
                 !meta.target().starts_with("opentelemetry")
             }));
-        Ok((
-            diagnostics()
-                .and_then(after_shutdown)
-                .and_then(destination)
-                .boxed(),
-            guard,
-        ))
+        let pipeline = diagnostics().and_then(after_shutdown);
+        #[cfg(feature = "traces")]
+        let pipeline = pipeline.and_then(otel);
+        Ok((pipeline.and_then(destination).boxed(), guard))
     }
 }
 #[cfg(all(vigil_unstable, feature = "metrics"))]
@@ -1079,16 +1255,16 @@ fn metrics_interval(explicit: Option<Duration>) -> Duration {
         .unwrap_or(Duration::from_secs(60))
 }
 
-#[cfg(feature = "metrics")]
-fn metrics_enabled() -> bool {
-    match env::var_os("VIGIL_METRICS").filter(|value| !value.is_empty()) {
+#[cfg(any(feature = "metrics", feature = "traces"))]
+fn signal_switch(var: &str) -> bool {
+    match env::var_os(var).filter(|value| !value.is_empty()) {
         None => true,
         Some(value) if value == "0" => false,
         Some(value) if value == "1" => true,
         Some(value) => {
             let _ = writeln!(
                 std::io::stderr(),
-                "vigil: invalid VIGIL_METRICS={value:?}; expected 0 or 1; using default"
+                "vigil: invalid {var}={value:?}; expected 0 or 1; using default"
             );
             true
         }
@@ -1577,6 +1753,10 @@ mod guard_tests {
         let retained = provider.clone();
         let mut guard = Guard {
             provider: Some(provider),
+            #[cfg(feature = "traces")]
+            traces: None,
+            #[cfg(feature = "traces")]
+            trace_storage: None,
             #[cfg(feature = "metrics")]
             metrics: None,
             #[cfg(feature = "metrics")]
@@ -1585,7 +1765,7 @@ mod guard_tests {
             registry: Arc::new(crate::metric_identity::Registry::default()),
             stopped: Arc::new(AtomicBool::new(false)),
             dir: None,
-            #[cfg(all(test, feature = "metrics"))]
+            #[cfg(all(test, any(feature = "metrics", feature = "traces")))]
             signal_files: Default::default(),
             losses: Arc::new(Losses::default()),
         };
@@ -1596,6 +1776,7 @@ mod guard_tests {
         guard
             .stop_with_builder(
                 Duration::from_millis(17),
+                std::thread::Builder::new().stack_size(usize::MAX / 2 + 1),
                 std::thread::Builder::new().stack_size(usize::MAX / 2 + 1),
                 std::thread::Builder::new().stack_size(usize::MAX / 2 + 1),
             )
@@ -1869,7 +2050,10 @@ mod metrics_lifecycle_tests {
         let guard = Config::new("layout").dir(&dir).init().unwrap();
         assert!(dir.join("logs.jsonl").is_file());
         assert!(dir.join("metrics.jsonl").is_file());
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            2 + usize::from(cfg!(feature = "traces"))
+        );
         drop(guard);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1913,7 +2097,10 @@ mod metrics_lifecycle_tests {
                     .is_none_or(|v| v.as_array().unwrap().is_empty())
             );
         }
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            2 + usize::from(cfg!(feature = "traces"))
+        );
         drop((logs, metrics));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -2525,6 +2712,7 @@ mod metrics_lifecycle_tests {
                 Duration::from_secs(1),
                 std::thread::Builder::new().stack_size(usize::MAX / 2 + 1),
                 std::thread::Builder::new().stack_size(usize::MAX / 2 + 1),
+                std::thread::Builder::new().stack_size(usize::MAX / 2 + 1),
             )
             .unwrap();
         assert!(start.elapsed() < Duration::from_secs(2));
@@ -2950,5 +3138,532 @@ mod facade_publication_tests {
             7
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "traces"))]
+mod traces_wiring_tests {
+    use super::*;
+    use opentelemetry::trace::{TraceContextExt as _, Tracer as _};
+    use serde_json::Value;
+    use std::fs;
+
+    fn child(name: &str, env: &[(&str, &str)]) -> Option<std::process::Output> {
+        crate::test_child_with_env(
+            &format!("init::traces_wiring_tests::{name}"),
+            "VIGIL_TRACES_WIRING_CHILD",
+            env,
+        )
+    }
+    fn records(dir: &Path, signal: &str, item: &str) -> Vec<Value> {
+        fs::read_to_string(dir.join(format!("{signal}.jsonl")))
+            .unwrap()
+            .lines()
+            .flat_map(|line| {
+                let value: Value = serde_json::from_str(line).unwrap();
+                value[format!("resource{item}")]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|resource| {
+                        resource[format!("scope{item}")]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .flat_map(|scope| {
+                                scope[if signal == "logs" {
+                                    "logRecords"
+                                } else {
+                                    "spans"
+                                }]
+                                .as_array()
+                                .unwrap()
+                                .clone()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+    fn correlation(layer: bool) {
+        let dir = crate::test_temp::TempDir::new();
+        let config = Config::new("correlation")
+            .dir(&dir.0)
+            .filter_env("VIGIL_TEST_UNUSED_FILTER");
+        let guard = if layer {
+            let (layer, guard) = config.layer::<Registry>().unwrap();
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
+                .unwrap();
+            guard
+        } else {
+            config.init().unwrap()
+        };
+        tracing::debug_span!("excluded").in_scope(|| tracing::debug!("excluded event"));
+        let span = tracing::info_span!("included");
+        span.in_scope(|| {
+            tracing::info!("ordinary");
+            tracing::error!("failure");
+        });
+        tracing::info!(parent: &span, "explicit parent");
+        drop(span);
+        drop(opentelemetry::global::tracer("x").start("global-absent"));
+        guard.shutdown().unwrap();
+        let spans = records(&dir.0, "traces", "Spans");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["name"], "included");
+        assert_eq!(spans[0]["status"]["code"], 2);
+        assert_eq!(spans[0]["droppedEventsCount"], 1);
+        assert!(spans[0]["events"].as_array().unwrap().is_empty());
+        let logs = records(&dir.0, "logs", "Logs");
+        assert_eq!(logs.len(), 3);
+        for log in &logs[..2] {
+            assert!(!log["traceId"].as_str().unwrap().is_empty());
+            assert_eq!(log["traceId"], spans[0]["traceId"]);
+            assert_eq!(log["spanId"], spans[0]["spanId"]);
+        }
+        assert_eq!(logs[2]["traceId"], "");
+        assert_eq!(logs[2]["spanId"], "");
+        assert_eq!(
+            fs::read_dir(&dir.0).unwrap().count(),
+            2 + usize::from(cfg!(feature = "metrics"))
+        );
+    }
+    #[test]
+    fn init_correlates_and_deduplicates() {
+        if child("init_correlates_and_deduplicates", &[]).is_some() {
+            return;
+        }
+        correlation(false);
+    }
+    #[test]
+    fn consumer_layer_correlates_and_deduplicates() {
+        if child("consumer_layer_correlates_and_deduplicates", &[]).is_some() {
+            return;
+        }
+        correlation(true);
+    }
+    fn disabled(builder: Option<bool>, expected: bool) {
+        let dir = crate::test_temp::TempDir::new();
+        let mut config = Config::new("switch").dir(&dir.0);
+        if let Some(value) = builder {
+            config = config.traces(value);
+        }
+        let guard = config.init().unwrap();
+        assert_eq!(guard.traces.is_some(), expected);
+        assert_eq!(guard.trace_storage.is_some(), expected);
+        assert_eq!(guard.signal_files[2].upgrade().is_some(), expected);
+        tracing::info_span!("switch").in_scope(|| {
+            assert_eq!(
+                opentelemetry::Context::current()
+                    .span()
+                    .span_context()
+                    .is_valid(),
+                expected
+            );
+        });
+        guard.flush().unwrap();
+        drop(guard);
+        assert_eq!(dir.0.join("traces.jsonl").exists(), expected);
+    }
+    #[test]
+    fn builder_disables_every_trace_component() {
+        if let Some(output) = child(
+            "builder_disables_every_trace_component",
+            &[("VIGIL_TRACES", "1")],
+        ) {
+            assert!(output.stderr.is_empty());
+            return;
+        }
+        disabled(Some(false), false);
+    }
+    #[test]
+    fn environment_disables_every_trace_component() {
+        if let Some(output) = child(
+            "environment_disables_every_trace_component",
+            &[("VIGIL_TRACES", "0")],
+        ) {
+            assert!(output.stderr.is_empty());
+            return;
+        }
+        disabled(None, false);
+    }
+    #[test]
+    fn explicit_builder_wins_over_environment() {
+        if child(
+            "explicit_builder_wins_over_environment",
+            &[("VIGIL_TRACES", "0")],
+        )
+        .is_some()
+        {
+            return;
+        }
+        disabled(Some(true), true);
+    }
+    #[test]
+    fn invalid_switch_warns_once() {
+        if let Some(output) = child("invalid_switch_warns_once", &[("VIGIL_TRACES", "x")]) {
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                "vigil: invalid VIGIL_TRACES=\"x\"; expected 0 or 1; using default\n"
+            );
+            return;
+        }
+        disabled(None, true);
+    }
+    #[test]
+    fn storage_failure_preserves_context_and_other_signals_without_loss() {
+        if let Some(output) = child(
+            "storage_failure_preserves_context_and_other_signals_without_loss",
+            &[],
+        ) {
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(stderr.lines().count(), 1);
+            assert!(stderr.contains("cannot open traces storage"));
+            return;
+        }
+        let dir = crate::test_temp::TempDir::new();
+        fs::create_dir(dir.0.join("traces.jsonl")).unwrap();
+        let guard = Config::new("failure").dir(&dir.0).init().unwrap();
+        tracing::info_span!("disabled-storage").in_scope(|| {
+            assert!(
+                opentelemetry::Context::current()
+                    .span()
+                    .span_context()
+                    .is_valid()
+            );
+            tracing::info!("still logged");
+        });
+        #[cfg(feature = "metrics")]
+        {
+            use opentelemetry::metrics::MeterProvider as _;
+            guard
+                .metrics
+                .as_ref()
+                .unwrap()
+                .meter("test")
+                .u64_counter("requests")
+                .build()
+                .add(1, &[]);
+        }
+        guard.flush().unwrap();
+        guard.shutdown().unwrap();
+        assert_eq!(records(&dir.0, "logs", "Logs").len(), 1);
+        #[cfg(feature = "metrics")]
+        assert!(
+            !fs::read_to_string(dir.0.join("metrics.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn all_levels_produce_zero_stdout_bytes() {
+        if let Some(output) = child("all_levels_produce_zero_stdout_bytes", &[]) {
+            // The child redirects stdout only around application execution;
+            // the shared helper separately verifies libtest ran this test.
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("application stdout"));
+            return;
+        }
+        let dir = crate::test_temp::TempDir::new();
+        let guard = Config::new("stdout")
+            .dir(&dir.0)
+            .default_filter("trace")
+            .init()
+            .unwrap();
+        let (reader, writer) = std::io::pipe().unwrap();
+        let saved = rustix::io::dup(std::io::stdout()).unwrap();
+        rustix::stdio::dup2_stdout(&writer).unwrap();
+        tracing::info_span!("stdout").in_scope(|| {
+            tracing::trace!("trace");
+            tracing::debug!("debug");
+            tracing::info!("info");
+            tracing::warn!("warn");
+            tracing::error!("error");
+        });
+        guard.shutdown().unwrap();
+        rustix::stdio::dup2_stdout(&saved).unwrap();
+        drop(writer);
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        reader.take(10000).read_to_end(&mut bytes).unwrap();
+        assert!(bytes.is_empty(), "application stdout: {bytes:?}");
+    }
+    #[test]
+    fn after_shutdown_warns_once_per_kind() {
+        if let Some(output) = child("after_shutdown_warns_once_per_kind", &[]) {
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                "vigil: span after shutdown; further spans will be dropped silently\nvigil: event after shutdown; further events will be dropped silently\n"
+            );
+            return;
+        }
+        let dir = crate::test_temp::TempDir::new();
+        let guard = Config::new("stopped").dir(&dir.0).init().unwrap();
+        guard.shutdown().unwrap();
+        for _ in 0..2 {
+            tracing::info_span!("late").in_scope(|| tracing::info!("late"));
+        }
+        assert!(records(&dir.0, "traces", "Spans").is_empty());
+    }
+    fn summary(name: &str, dropping: bool) {
+        if let Some(output) = child(name, &[]) {
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                if dropping {
+                    "vigil: span shutdown: DataLost; dropped spans: 3; remaining spans may be lost\n"
+                } else {
+                    ""
+                }
+            );
+            return;
+        }
+        let dir = crate::test_temp::TempDir::new();
+        let guard = Config::new("summary").dir(&dir.0).init().unwrap();
+        guard
+            .losses
+            .record(crate::lifecycle::QueueSignal::Traces, 3, false);
+        if dropping {
+            drop(guard);
+        } else {
+            assert_eq!(guard.shutdown().unwrap_err().lost(Signal::Traces), 3);
+        }
+    }
+    #[test]
+    fn drop_reports_unprinted_span_losses() {
+        summary("drop_reports_unprinted_span_losses", true);
+    }
+    #[test]
+    fn explicit_shutdown_returns_span_losses_without_printing() {
+        summary(
+            "explicit_shutdown_returns_span_losses_without_printing",
+            false,
+        );
+    }
+    #[test]
+    fn flush_returns_span_losses() {
+        if child("flush_returns_span_losses", &[]).is_some() {
+            return;
+        }
+        let dir = crate::test_temp::TempDir::new();
+        let guard = Config::new("loss").dir(&dir.0).init().unwrap();
+        guard
+            .losses
+            .record(crate::lifecycle::QueueSignal::Traces, 4, true);
+        assert_eq!(guard.flush().unwrap_err().lost(Signal::Traces), 4);
+        guard.shutdown().unwrap();
+    }
+    #[test]
+    fn directory_lock_child() {
+        let Ok(dir) = std::env::var("VIGIL_TRACE_LOCK_DIRECTORY") else {
+            return;
+        };
+        let held = std::fs::File::open(dir).unwrap();
+        held.lock().unwrap();
+        println!("ready");
+        std::io::stdout().flush().unwrap();
+        let mut release = String::new();
+        std::io::stdin().read_line(&mut release).unwrap();
+        assert_eq!(release, "release\n");
+        held.unlock().unwrap();
+    }
+    struct DirectoryBlock(std::process::Child);
+    impl DirectoryBlock {
+        fn new(dir: &Path) -> Self {
+            use std::io::BufRead as _;
+            let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "init::traces_wiring_tests::directory_lock_child",
+                    "--nocapture",
+                ])
+                .env("VIGIL_TRACE_LOCK_DIRECTORY", dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut ready = String::new();
+            let mut output = std::io::BufReader::new(process.stdout.take().unwrap());
+            loop {
+                ready.clear();
+                assert_ne!(output.read_line(&mut ready).unwrap(), 0);
+                if ready.ends_with("ready\n") {
+                    break;
+                }
+            }
+            process.stdout = Some(output.into_inner());
+            Self(process)
+        }
+    }
+    impl Drop for DirectoryBlock {
+        fn drop(&mut self) {
+            writeln!(self.0.stdin.take().unwrap(), "release").unwrap();
+            use std::io::Read as _;
+            let mut stdout = Vec::new();
+            self.0
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_end(&mut stdout)
+                .unwrap();
+            let output = std::process::Output {
+                status: self.0.wait().unwrap(),
+                stdout,
+                stderr: Vec::new(),
+            };
+            crate::assert_test_child("init::traces_wiring_tests::directory_lock_child", &output);
+        }
+    }
+    fn blocked_deadline(name: &str, flushing: bool, metrics: bool) {
+        if let Some(output) = child(name, &[]) {
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            if !flushing {
+                assert_eq!(stderr.matches("vigil: span shutdown: Timeout; dropped spans: 0; remaining spans may be lost").count(), 1);
+            }
+            return;
+        }
+        let dir = crate::test_temp::TempDir::new();
+        let config = Config::new("deadline").dir(&dir.0);
+        #[cfg(feature = "metrics")]
+        let config = config
+            .metrics(metrics)
+            .metrics_interval(Duration::from_secs(3600));
+        let guard = config.init().unwrap();
+        #[cfg(feature = "metrics")]
+        if metrics {
+            use opentelemetry::metrics::MeterProvider as _;
+            guard
+                .metrics
+                .as_ref()
+                .unwrap()
+                .meter("test")
+                .u64_counter("blocked")
+                .build()
+                .add(1, &[]);
+        }
+        let block = DirectoryBlock::new(&dir.0);
+        drop(tracing::info_span!("blocked"));
+        tracing::info!("blocked log");
+        let started = Instant::now();
+        let mut guard = Some(guard);
+        let error = if flushing {
+            guard.as_ref().unwrap().flush().unwrap_err()
+        } else {
+            guard
+                .take()
+                .unwrap()
+                .shutdown_with_timeout(Duration::from_secs(1))
+                .unwrap_err()
+        };
+        let elapsed = started.elapsed();
+        drop(block);
+        if let Some(guard) = guard {
+            guard.shutdown().unwrap();
+        }
+        assert_eq!(
+            error.signal_kind(Signal::Traces),
+            Some(FlushErrorKind::Timeout)
+        );
+        assert_eq!(
+            error.signal_kind(Signal::Logs),
+            Some(FlushErrorKind::Timeout)
+        );
+        let bound = if flushing || metrics {
+            Duration::from_millis(7500)
+        } else {
+            Duration::from_secs(2)
+        };
+        assert!(elapsed < bound, "{elapsed:?}");
+    }
+    #[test]
+    fn flush_runs_logs_and_traces_concurrently() {
+        let (logs_entered, observe_logs) = std::sync::mpsc::channel();
+        let (traces_entered, observe_traces) = std::sync::mpsc::channel();
+        // Each callback must observe the other entering before it can return.
+        // The timeout is only a deadlock fail-safe for a serial implementation;
+        // successful channel receives, not elapsed time, prove overlap.
+        let rendezvous = |entered: std::sync::mpsc::Sender<()>,
+                          other: std::sync::mpsc::Receiver<()>| {
+            move || {
+                entered.send(()).map_err(|error| {
+                    OTelSdkError::InternalFailure(format!("flush rendezvous send: {error}"))
+                })?;
+                other
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|error| {
+                        OTelSdkError::InternalFailure(format!(
+                            "flush callbacks did not overlap: {error}"
+                        ))
+                    })?;
+                Ok(())
+            }
+        };
+        let (logs, traces) = flush_logs_and_traces(
+            rendezvous(logs_entered, observe_traces),
+            Some(rendezvous(traces_entered, observe_logs)),
+        );
+        logs.unwrap();
+        traces.unwrap();
+    }
+    #[test]
+    fn blocked_flush_keeps_five_second_deadline() {
+        blocked_deadline("blocked_flush_keeps_five_second_deadline", true, false);
+    }
+    #[test]
+    fn blocked_shutdown_without_metrics_keeps_short_deadline() {
+        blocked_deadline(
+            "blocked_shutdown_without_metrics_keeps_short_deadline",
+            false,
+            false,
+        );
+    }
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn blocked_shutdown_with_metrics_keeps_sdk_five_second_bound() {
+        blocked_deadline(
+            "blocked_shutdown_with_metrics_keeps_sdk_five_second_bound",
+            false,
+            true,
+        );
+    }
+    #[test]
+    fn flush_reports_real_export_span_loss() {
+        if let Some(output) = child("flush_reports_real_export_span_loss", &[]) {
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(stderr.matches("runtime span export failed").count(), 1);
+            assert_eq!(stderr.matches("; dropped spans: 1").count(), 1);
+            assert!(!stderr.contains("span shutdown"));
+            return;
+        }
+        let dir = crate::test_temp::TempDir::new();
+        let guard = Config::new("export-loss").dir(&dir.0).init().unwrap();
+        let name = "x".repeat(1_100_000);
+        drop(tracing::info_span!("oversized", otel.name = name));
+        let error = guard.flush().unwrap_err();
+        assert_eq!(error.lost(Signal::Traces), 1);
+        assert_eq!(
+            error.signal_kind(Signal::Traces),
+            Some(FlushErrorKind::Failed)
+        );
+        assert_eq!(error.lost(Signal::Logs), 0);
+        guard.shutdown().unwrap();
+    }
+    #[test]
+    fn trace_shutdown_spawn_failure_runs_inline() {
+        if child("trace_shutdown_spawn_failure_runs_inline", &[]).is_some() {
+            return;
+        }
+        let dir = crate::test_temp::TempDir::new();
+        let mut guard = Config::new("inline").dir(&dir.0).init().unwrap();
+        drop(tracing::info_span!("inline"));
+        let retained = guard.traces.clone().unwrap();
+        let fail = || std::thread::Builder::new().stack_size(usize::MAX / 2 + 1);
+        guard
+            .stop_with_builder(Duration::from_secs(1), fail(), fail(), fail())
+            .unwrap();
+        assert!(matches!(
+            retained.shutdown(),
+            Err(OTelSdkError::AlreadyShutdown)
+        ));
+        assert_eq!(records(&dir.0, "traces", "Spans").len(), 1);
     }
 }

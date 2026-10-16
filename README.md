@@ -2,12 +2,12 @@
 
 *Verifiable Integrity-Guarded Instrumentation & Logging* (V·I·G·I·L): the opinionated observability crate for vig-os Rust projects.
 
-> **Pre-alpha.** The design is settled; the code is being built. Logs, metrics and the audit writer (behind the `audit` feature) are implemented; the audit operator commands are implemented; the audit verifier (#13 C1) and traces (#8) are being built. Track progress in the milestones.
+> **Pre-alpha.** The design is settled; the code is being built. Logs, metrics, traces and the audit writer (behind the `audit` feature) are implemented; the audit operator commands are implemented; the audit verifier (#13 C1) and trace propagation (#8 8e) are being built. Track progress in the milestones.
 
 ## Stability
 
 vigil publishes no 0.x: the first release is 1.0.0, so what follows is the 1.0
-promise. Logs and metrics are implemented today; the rest of the promised surface is still
+promise. Logs, metrics and traces are implemented today; the rest of the promised surface is still
 being built, and the pre-1.0 `dev` branch may change it.
 
 - **Not covered.** Error `Display` and `Debug` text may change even in a patch,
@@ -56,6 +56,34 @@ being built, and the pre-1.0 `dev` branch may change it.
   (default histogram boundaries, span and cardinality limits, batch sizes), which may
   change in a minor release with a changelog entry; and copies of files that a shipper
   has rewritten.
+
+## Traces
+
+The default `traces` feature exports spans to `traces.jsonl` beside logs and
+metrics. Set `VIGIL_TRACES=0` or `Config::traces(false)` to disable it completely;
+`1` enables it and explicit builder values win. Unset or empty values enable
+traces; other values warn once and use the default.
+
+Enter the span for correlation: log records emitted while it is entered carry
+its trace and span IDs. An explicit event parent on an unentered span does not
+activate correlation. Each event is written to logs once. Span events are not
+recorded: ERROR events set span status to Error and increment
+`droppedEventsCount`, while the exported events array stays empty.
+
+Sampling is `ParentBased(AlwaysOn)`: local roots and sampled traces are recorded,
+and an upstream W3C sample-out is respected. No global tracer or propagator is
+installed by default. End root spans before shutting down the guard.
+
+The special fields `otel.name`, `otel.kind`, `otel.status_code` and
+`otel.status_description` override span name, kind and status. ERROR events and
+`#[instrument(err)]` set Error status; a message-less error supplies its status
+description, while an error with a message leaves that description empty.
+Typed error span fields populate `exception.message` and `exception.stacktrace`.
+Location, thread and target attributes are recorded; inactivity is not tracked.
+
+`OTEL_*` environment variables have no effect on vigil configuration, including
+sampler, span limits and batch settings. `OTEL_BSP_EXPORT_TIMEOUT` and
+`OTEL_BSP_MAX_CONCURRENT_EXPORTS` do not apply to the synchronous processor.
 
 ## Metrics
 
@@ -209,7 +237,7 @@ guard.shutdown()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Logs and metrics are available now, and the audit writer behind the `audit` feature ([Audit format](#audit-format-opt-in)); traces are in progress (#8: only the unstable span exporter has landed). Keep the guard
+Logs, metrics and traces are available now, and the audit writer behind the `audit` feature ([Audit format](#audit-format-opt-in)). Keep the guard
 alive until shutdown to flush queued logs. `let _ = vigil::init(..)` drops it immediately. The batch queue holds 65,536 records by default (512 per export, every second).
 Memory is bounded by queue size times record size; overflow drops records with
 a stderr warning. `VIGIL_QUEUE_SIZE` or `Config::queue_size` changes the bound
@@ -218,8 +246,7 @@ that cap with a warning. Measured memory is approximately 16 B per reserved
 slot (16 MiB at the cap), plus approximately 0.4 KB per queued small record;
 larger fields need more memory. Guard drop waits up to five seconds, including directory-lock waits,
 then warns that remaining records may be lost; the SDK worker may continue
-until the lock is released. `std::process::exit` skips flushing. Tracing
-spans alone do not currently populate OTLP trace/span IDs.
+until the lock is released. `std::process::exit` skips flushing. Enter spans to populate OTLP trace/span IDs on log records.
 
 Use `vigil::init("my-service")` for defaults. `RUST_LOG` defaults to `info`.
 `VIGIL_DIR` selects the full state directory; otherwise vigil uses
@@ -233,8 +260,8 @@ and `HOME` are ignored, with rejected values explained if no path is available. 
 at the next prune. Explicit `retention(None)` overrides the environment.
 Explicit `Config` values override environment values.
 `Config::revision` or `VIGIL_VCS_REVISION` supplies the producer commit.
-Log storage initialization failures make logs fall back to stderr; metrics
-storage initialization failures disable metrics with their own warning.
+Log storage initialization failures make logs fall back to stderr; metrics and traces
+storage initialization failures disable their signal with its own warning.
 A second initialization returns an error before creating storage. An existing
 `log` logger is preserved: initialization succeeds with one warning that `log`
 records cannot reach vigil; tracing events continue to be written.
@@ -243,8 +270,8 @@ Call `init` **after forking**. A child forked after initialization inherits the
 parent's directory lock and subscriber but has no batch worker; it cannot safely
 continue using that logging instance.
 
-Log storage-open failures fall back to stderr; metrics storage failures disable
-metrics with their own warning. Runtime export failures drop the affected
+Log storage-open failures fall back to stderr; metrics and traces storage failures disable
+their signal with its own warning. Runtime export failures drop the affected
 records: the first error is reported on stderr, followed by cumulative dropped-record
 summaries at most once per minute during failing exports and at shutdown if needed.
 After the guard drops, events are discarded with one stderr warning.
@@ -258,7 +285,7 @@ filter and terminal-only ANSI. Its format may change; do not parse it.
 `Config::layer` composes into your own `tracing_subscriber::registry()` with
 per-layer filters, so your other layers keep their own filtering.
 See `examples/flock.rs`. `Guard::dir()` gives the actual directory, or `None`
-when logs fell back to stderr; metrics may still write `metrics.jsonl`.
+when logs fell back to stderr; metrics and traces may still write `metrics.jsonl` and `traces.jsonl`.
 One successful `init` or `layer` permanently occupies
 the process slot; later attempts return `AlreadyRunning`, even after shutdown.
 A previously set global or scoped default subscriber returns `ForeignSubscriber`,
@@ -272,7 +299,7 @@ with a warning naming the instance identity generation failure. The synchronous 
 explicitly sets its queue size, batch size and delay; `OTEL_BLRP_*` variables do
 not configure vigil.
 
-`Guard::flush()` exports queued logs and collects and exports metrics with a
+`Guard::flush()` exports queued logs and spans and collects and exports metrics with a
 five-second timeout; `shutdown()`
 uses the same timeout and `shutdown_with_timeout(Duration)` accepts another.
 A blocked metrics export can hold shutdown for the SDK reader's fixed five seconds
@@ -293,7 +320,7 @@ and return
 A failed durable log line counts its records even if another copy was delivered;
 records on earlier successful lines are excluded. Records emitted after shutdown
 begins are rejected with one warning and are not counted. Logs falling back to
-stderr contribute no error; metrics still report their outcome. Explicit shutdown
+stderr contribute no error; metrics and traces still report their outcomes. Explicit shutdown
 makes Drop a no-op and returns countable losses without
 printing them again; Drop reports only losses not yet printed on stderr, naming the actual outcome.
 
@@ -431,7 +458,7 @@ line splitting and poisoned-name filtering. Run
 [Prometheus oracle](scripts/prometheus_conformance.py), including cross-scope
 sharing, collision poisoning and every valid shared translation fixture row.
 Spans from the unstable span exporter make the same round trip through the Collector;
-the `init` traces bridge is #8.
+the `init` traces bridge exports to `traces.jsonl`.
 
 ## Semver
 

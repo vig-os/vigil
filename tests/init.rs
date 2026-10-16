@@ -152,8 +152,14 @@ fn logging_and_builder_precedence() {
             for record in scope["logRecords"].as_array().unwrap() {
                 assert_ne!(record["timeUnixNano"], "0");
                 assert!(record["severityNumber"].as_u64().unwrap() >= 9);
-                assert!(record["traceId"].as_str().unwrap_or_default().is_empty());
-                assert!(record["spanId"].as_str().unwrap_or_default().is_empty());
+                assert_eq!(
+                    record["traceId"].as_str().unwrap_or_default().is_empty(),
+                    !cfg!(feature = "traces")
+                );
+                assert_eq!(
+                    record["spanId"].as_str().unwrap_or_default().is_empty(),
+                    !cfg!(feature = "traces")
+                );
                 count += 1;
             }
         }

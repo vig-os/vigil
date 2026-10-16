@@ -84,6 +84,12 @@ fn test_child_with_env(
         .envs(env.iter().copied())
         .output()
         .unwrap();
+    assert_test_child(name, &output);
+    Some(output)
+}
+
+#[cfg(test)]
+fn assert_test_child(name: &str, output: &std::process::Output) {
     assert!(
         output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
         "{name}: {}\n{}\n{}",
@@ -91,7 +97,6 @@ fn test_child_with_env(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    Some(output)
 }
 
 #[cfg(test)]
@@ -134,7 +139,6 @@ mod order_tests;
 #[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
 pub mod span_export;
 #[cfg(all(feature = "traces", not(vigil_unstable)))]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into init by 8c (#8)"))]
 mod span_export;
 
 #[cfg(feature = "traces")]
