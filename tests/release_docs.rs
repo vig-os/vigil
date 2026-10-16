@@ -5,6 +5,31 @@ const ADR: &str = include_str!("../docs/adr/0004-public-api-and-stability.md");
 const MANIFEST: &str = include_str!("../Cargo.toml");
 const CHANGELOG: &str = include_str!("../CHANGELOG.md");
 
+// Once published, keep checking v0.1.0 while later Unreleased notes may describe
+// real breaking changes. Before publication, Unreleased holds the first release.
+fn first_release_notes(changelog: &str) -> &str {
+    for heading in ["## [0.1.0]", "## 0.1.0", "## [Unreleased]", "## Unreleased"] {
+        if let Some(start) = changelog.lines().find(|line| line.starts_with(heading)) {
+            let body = changelog
+                .split_once(start)
+                .unwrap()
+                .1
+                .trim_start_matches('\n');
+            return body.split("\n## ").next().unwrap();
+        }
+    }
+    panic!("first release notes are missing");
+}
+
+#[test]
+fn first_release_checks_leave_future_notes_independent() {
+    let fixture = "## Unreleased\n- **Breaking:** later public API change\n\n## [0.1.0] - 2026-10-16\n- Initial shipped state\n\n## [0.0.0]\n- Older section\n";
+    let notes = first_release_notes(fixture);
+    assert!(notes.contains("Initial shipped state"));
+    assert!(!notes.contains("**Breaking:**"));
+    assert!(!notes.contains("Older section"));
+}
+
 #[test]
 fn early_release_policy() {
     assert!(README.contains("a patch never does"));
@@ -43,17 +68,18 @@ fn trace_status() {
 
 #[test]
 fn consumer_release_notes() {
+    let notes = first_release_notes(CHANGELOG);
     for item in [
         "span_export::OtlpJsonSpanExporter",
         "vigil::sink::{LineSink, AppendFile, MemorySink}",
         "vigil::logs::OtlpJsonLogExporter",
     ] {
-        let line = CHANGELOG.lines().find(|line| line.contains(item)).unwrap();
+        let line = notes.lines().find(|line| line.contains(item)).unwrap();
         assert!(line.contains("requires `--cfg vigil_unstable`"));
     }
-    assert!(!CHANGELOG.contains("**Breaking:**"));
-    assert!(!CHANGELOG.contains("test-only fault-injection"));
-    assert!(!CHANGELOG.contains("amendment 12 (Proposed)"));
+    assert!(!notes.contains("**Breaking:**"));
+    assert!(!notes.contains("test-only fault-injection"));
+    assert!(!notes.contains("amendment 12 (Proposed)"));
 }
 
 #[test]
@@ -201,6 +227,7 @@ fn unstable_pins_cover_both_release_phases() {
 
 #[test]
 fn consumer_details_survive_changelog_curation() {
+    let notes = first_release_notes(CHANGELOG);
     for detail in [
         "not `Copy`",
         "`Display` text is outside",
@@ -215,7 +242,7 @@ fn consumer_details_survive_changelog_curation() {
         "range digest",
         "owns its newline",
     ] {
-        assert!(CHANGELOG.contains(detail), "missing {detail}");
+        assert!(notes.contains(detail), "missing {detail}");
     }
 }
 
@@ -286,7 +313,8 @@ fn all_unstable_pin_advice_is_phase_specific() {
 
 #[test]
 fn changelog_describes_shipped_state() {
-    assert!(CHANGELOG.contains("`Clone` but not `Copy`"));
+    let notes = first_release_notes(CHANGELOG);
+    assert!(notes.contains("`Clone` but not `Copy`"));
     for obsolete in [
         "KeySeed",
         "no longer",
@@ -295,10 +323,7 @@ fn changelog_describes_shipped_state() {
         "instead of serializing null",
         "instead of record findings",
     ] {
-        assert!(
-            !CHANGELOG.contains(obsolete),
-            "unreleased history: {obsolete}"
-        );
+        assert!(!notes.contains(obsolete), "unreleased history: {obsolete}");
     }
-    assert!(CHANGELOG.contains("`KeyFileSigner`"));
+    assert!(notes.contains("`KeyFileSigner`"));
 }
