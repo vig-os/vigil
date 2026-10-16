@@ -1715,3 +1715,23 @@ fn resume_base_refuses_non_checkpoint_without_archived_predecessor() {
     let result = history_segment(&file, TRAIL, None, true, None, &mut None, &mut false);
     assert!(matches!(result, Err(e) if e.kind() == AuditErrorKind::CorruptTrail));
 }
+
+#[test]
+fn inherited_run_reaches_first_strict_scan_of_later_history() {
+    let d = Temp::new();
+    let first = fixture(&d.0);
+    append_bytes(&d.0.join("audit.jsonl"), b"xyz\n");
+    let file = File::open(d.0.join("audit.jsonl")).unwrap();
+    let mut run = false;
+    let state = history_segment(&file, TRAIL, None, true, None, &mut None, &mut run).unwrap();
+    assert!(run);
+    // An otherwise strict-valid segment must close the inherited run with an
+    // immediate resume; a normal entry cannot silently erase that obligation.
+    let opening = cp(1, first.hash(), &seeded(&first));
+    write_records(&d.0, &[&opening, &entry(&opening)]);
+    let file = File::open(d.0.join("audit.jsonl")).unwrap();
+    bad(
+        history_segment(&file, TRAIL, state, true, None, &mut None, &mut run),
+        AuditErrorKind::CorruptTrail,
+    );
+}

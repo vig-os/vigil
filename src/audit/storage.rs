@@ -383,29 +383,22 @@ pub(crate) fn history_segment(
     }
     loop {
         let mut line = Vec::new();
-        let bytes = reader
-            .by_ref()
-            .take(MAX_READ_BYTES)
-            .read_until(b'\n', &mut line)
-            .map_err(io_error)?;
+        let (bytes, newline) = read_line(&mut reader, &mut line)?;
         if bytes == 0 {
             break;
         }
         #[cfg(test)]
         SCANNED.with(|n| n.set(n.get() + bytes));
         offset += bytes as u64;
-        let newline = line.ends_with(b"\n");
         let payload = line.strip_suffix(b"\n").unwrap_or(&line);
-        if payload.len() > MAX_PAYLOAD_BYTES {
-            return Err(corrupt("audit line exceeds byte cap"));
-        }
-        let records = match Record::parse_line(payload) {
-            Ok(records) => records,
-            Err(error) if error.finding_kind() == Some(super::FindingKind::Unparsable) => {
+        let classification = super::lines::classify(payload);
+        let records = match classification {
+            super::lines::Line::Record(Ok(records)) => records,
+            super::lines::Line::Fragment | super::lines::Line::Unparsable(_) => {
                 // A fragment-only segment and an Unparsable crash outcome are
                 // retained evidence. Ordinary repair attestations still apply
                 // to fragments between complete records in the same segment.
-                if fragment(payload) {
+                if matches!(classification, super::lines::Line::Fragment) {
                     if !first {
                         gap.get_or_insert_with(|| {
                             let mut hash = blake3::Hasher::new();
@@ -429,7 +422,9 @@ pub(crate) fn history_segment(
                 }
                 continue;
             }
-            Err(_) => return Err(corrupt("invalid audit record in sealed run")),
+            super::lines::Line::Record(Err(_)) => {
+                return Err(corrupt("invalid audit record in sealed run"));
+            }
         };
         if records.len() != 1 {
             return Err(corrupt("multiple records in native audit line"));
@@ -642,15 +637,8 @@ fn resume_header(file: &File, trail: [u8; 16]) -> Result<Option<u64>, AuditError
     let mut reader = BufReader::new(file);
     for index in 0..2 {
         let mut line = Vec::new();
-        reader
-            .by_ref()
-            .take(MAX_READ_BYTES)
-            .read_until(b'\n', &mut line)
-            .map_err(io_error)?;
+        read_line(&mut reader, &mut line)?;
         let payload = line.strip_suffix(b"\n").unwrap_or(&line);
-        if payload.len() > MAX_PAYLOAD_BYTES {
-            return Ok(None);
-        }
         let Ok(records) = Record::parse_line(payload) else {
             return Ok(None);
         };
@@ -768,6 +756,34 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
     Ok(())
 }
 
+/// Reads through one physical LF while retaining a bounded classification prefix.
+/// Oversized tails are one Unparsable line, never several lines or a repair gap.
+fn read_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> Result<(usize, bool), AuditError> {
+    let mut count = reader
+        .by_ref()
+        .take(MAX_READ_BYTES)
+        .read_until(b'\n', line)
+        .map_err(io_error)?;
+    let mut newline = line.ends_with(b"\n");
+    if count as u64 == MAX_READ_BYTES && !newline {
+        loop {
+            let bytes = reader.fill_buf().map_err(io_error)?;
+            if bytes.is_empty() {
+                break;
+            }
+            let take = bytes.iter().position(|b| *b == b'\n').map(|p| p + 1);
+            let length = take.unwrap_or(bytes.len());
+            reader.consume(length);
+            count += length;
+            if take.is_some() {
+                newline = true;
+                break;
+            }
+        }
+    }
+    Ok((count, newline))
+}
+
 const MAX_READ_BYTES: u64 = MAX_PAYLOAD_BYTES as u64 + 2; // LF plus one excess byte.
 
 /// Bounded reads: each payload is capped even when it is only a fragment.
@@ -857,25 +873,17 @@ fn scan_inner(
     }
     loop {
         let mut line = Vec::new();
-        let count = reader
-            .by_ref()
-            .take(MAX_READ_BYTES)
-            .read_until(b'\n', &mut line)
-            .map_err(io_error)?;
+        let (count, newline) = read_line(&mut reader, &mut line)?;
         if count == 0 {
             break;
         }
         #[cfg(test)]
         SCANNED.with(|n| n.set(n.get() + count));
         offset += count as u64;
-        let newline = line.ends_with(b"\n");
         let payload = line.strip_suffix(b"\n").unwrap_or(&line);
-        if payload.len() > MAX_PAYLOAD_BYTES {
-            return Err(corrupt("audit line exceeds byte cap"));
-        }
-        let records = match Record::parse_line(payload) {
-            Ok(records) => records,
-            Err(_) if !first && !boundary_resume && fragment(payload) => {
+        let records = match super::lines::classify(payload) {
+            super::lines::Line::Record(Ok(records)) => records,
+            super::lines::Line::Fragment if !first && !boundary_resume => {
                 gap.get_or_insert_with(|| {
                     let mut h = blake3::Hasher::new();
                     h.update(b"vigil.audit.v1.repaired\0");
@@ -887,7 +895,7 @@ fn scan_inner(
                 }
                 continue;
             }
-            Err(_) => return Err(corrupt("invalid audit line or opening checkpoint")),
+            _ => return Err(corrupt("invalid audit line or opening checkpoint")),
         };
         // Native writer files contain one record per line. Collector batches
         // are a verifier input (#13), never a native storage representation.
@@ -1073,22 +1081,6 @@ fn apply_checked(
         checkpoint_previous: record.context.previous,
     });
     Ok(())
-}
-fn fragment(bytes: &[u8]) -> bool {
-    if bytes.is_empty()
-        || bytes.iter().all(u8::is_ascii_whitespace)
-        || bytes.iter().any(|b| *b < 0x20)
-    {
-        return false;
-    }
-    let valid = match std::str::from_utf8(bytes) {
-        Ok(_) => bytes,
-        Err(e) if e.error_len().is_none() && bytes.len() - e.valid_up_to() <= 3 => {
-            &bytes[..e.valid_up_to()]
-        }
-        Err(_) => return false,
-    };
-    matches!(serde_json::from_slice::<serde_json::Value>(valid), Err(e) if e.is_eof())
 }
 
 #[cfg(test)]

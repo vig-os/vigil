@@ -446,7 +446,7 @@ fn codec_line_size_bound() {
     bytes.push(b' ');
     let error = Record::parse_line(&bytes).unwrap_err();
     assert_eq!(error.kind(), AuditErrorKind::TooLarge);
-    assert_eq!(error.finding_kind(), Some(FindingKind::InvalidField));
+    assert_eq!(error.finding_kind(), Some(FindingKind::Unparsable));
 }
 #[test]
 fn codec_verifier_finding_kinds() {
@@ -454,6 +454,9 @@ fn codec_verifier_finding_kinds() {
         ("", FindingKind::Unparsable),
         ("{", FindingKind::Unparsable),
         ("{}", FindingKind::MissingField),
+        ("[1]", FindingKind::Unparsable),
+        ("1", FindingKind::Unparsable),
+        ("\0", FindingKind::Unparsable),
         (
             r#"{"resourceLogs":[],"resourceLogs":[]}"#,
             FindingKind::InvalidField,
