@@ -121,7 +121,7 @@ impl Entry {
         fields
     }
 }
-/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 /// Applications only: library pins constrain every dependent to that minor.
 ///
 /// Checkpoint commitment to all leaves preceding its own sequence number.
@@ -134,7 +134,7 @@ pub struct CheckpointFields {
     signature: [u8; 64],
 }
 impl CheckpointFields {
-    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
     /// Applications only: library pins constrain every dependent to that minor.
     ///
     /// Creates fields; peak count must equal the population count of `size`.
@@ -185,7 +185,7 @@ pub(super) enum Kind {
     Checkpoint(CheckpointFields),
 }
 
-/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 /// Applications only: library pins constrain every dependent to that minor.
 ///
 /// Context supplied by a writer under its lock; times are nanoseconds since epoch.
@@ -200,7 +200,7 @@ pub struct RecordContext {
     pub(super) previous: [u8; 32],
 }
 impl RecordContext {
-    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
     /// Applications only: library pins constrain every dependent to that minor.
     ///
     /// Sets trail identity, order, timestamp, service and previous chain hash.
@@ -221,7 +221,7 @@ impl RecordContext {
             previous,
         }
     }
-    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
     /// Applications only: library pins constrain every dependent to that minor.
     ///
     /// Attests a torn-tail gap repaired by the writer, including repair newlines.
@@ -232,7 +232,7 @@ impl RecordContext {
         self.repaired = Some(digest);
         self
     }
-    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
     /// Applications only: library pins constrain every dependent to that minor.
     ///
     /// Adds the authenticated host name when present in the writer's resource.
@@ -242,7 +242,7 @@ impl RecordContext {
     }
 }
 
-/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 /// Applications only: library pins constrain every dependent to that minor.
 ///
 /// A validated v1 record with explicit format context. This is an I/O-free
@@ -253,7 +253,7 @@ pub struct Record {
     pub(super) kind: Kind,
 }
 impl Record {
-    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
     /// Applications only: library pins constrain every dependent to that minor.
     ///
     /// Builds a record. `previous` must be the genesis hash at sequence zero,
@@ -281,7 +281,7 @@ impl Record {
         entry.validate()?;
         Self::build(context, Kind::Entry(entry))
     }
-    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
     /// Applications only: library pins constrain every dependent to that minor.
     ///
     /// Builds a checkpoint. MMR size counts records preceding this checkpoint,
@@ -357,7 +357,7 @@ impl Record {
         fields.push((0x7f, self.context.previous.to_vec()));
         fields
     }
-    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
     /// Applications only: library pins constrain every dependent to that minor.
     ///
     /// Returns canonical tag + u32 big-endian length + value bytes.
@@ -365,7 +365,7 @@ impl Record {
     pub fn canonical(&self) -> Vec<u8> {
         encode(self.fields(), false)
     }
-    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
     /// Applications only: library pins constrain every dependent to that minor.
     ///
     /// Returns the domain-separated BLAKE3 record hash, including a
@@ -376,7 +376,7 @@ impl Record {
         hasher.update(&self.canonical());
         *hasher.finalize().as_bytes()
     }
-    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
     /// Applications only: library pins constrain every dependent to that minor.
     ///
     /// Returns the signing message for a checkpoint, omitting only tag 0x24.
@@ -387,7 +387,7 @@ impl Record {
             Kind::Checkpoint(_) => Some(super::checkpoint_message(&encode(self.fields(), true))),
         }
     }
-    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
     /// Applications only: library pins constrain every dependent to that minor.
     ///
     /// Computes the sequence-zero previous hash for a trail id.

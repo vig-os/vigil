@@ -1,5 +1,5 @@
 //! **Unstable:** shared OTLP envelope bounding. Enable `--cfg vigil_unstable`
-//! and pin vigil with `~1.N`. Metadata is repeated without copying item arrays.
+//! and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0. Metadata is repeated without copying item arrays.
 use crate::logs::NON_FINITE;
 use crate::ordered_json::{self, Rules};
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};

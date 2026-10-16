@@ -1,5 +1,5 @@
 //! **Unstable:** OTLP/JSON metric data path. Enable `--cfg vigil_unstable`
-//! and pin vigil with `~1.N`. Reader and file lifecycle wiring follows in #7.
+//! and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0. The default pipeline manages reader and file lifecycle through `Config` and `Guard`.
 use crate::{
     envelope::{self, BoundedLine, Envelope},
     lifecycle::Losses,
@@ -22,7 +22,7 @@ use std::{
 /// **Unstable:** writes cumulative metrics as bounded OTLP/JSON lines.
 /// Oversized data points are dropped; attributes are never shortened because
 /// they identify series. Non-finite doubles retain their proto3 JSON spelling.
-/// Use `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// Use `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 #[derive(Debug)]
 #[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
 pub struct OtlpJsonMetricExporter<S: LineSink> {

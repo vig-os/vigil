@@ -36,7 +36,10 @@ mod sink;
 
 /// Exact OpenTelemetry versions used by vigil; outside its semver promise.
 ///
-/// Enable `--cfg vigil_unstable` in the application's build and pin `~1.N`.
+/// Enable `--cfg vigil_unstable` in the application's build. Before 1.0,
+/// unstable items may change in any release; from 1.0, in any minor.
+/// Applications should pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
+/// Stable-only applications should pin `~0.N` before 1.0; any minor may break stable items.
 /// Libraries using these paths require their applications to enable the cfg.
 /// Global-provider installation is available (meter only; the tracer in #8).
 /// The tracing integration re-export follows with traces in #8.

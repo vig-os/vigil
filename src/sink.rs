@@ -1,4 +1,4 @@
-//! **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+//! **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 //! Libraries using this API require their applications to set the cfg.
 //!
 //! The seam between serialization and storage: a [`LineSink`] takes one
@@ -20,7 +20,7 @@ use std::sync::Arc;
 #[cfg(any(test, vigil_unstable))]
 use std::sync::{Mutex, PoisonError};
 
-/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 ///
 /// Receives finished lines, one per call.
 #[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
@@ -55,7 +55,7 @@ impl<T: LineSink + ?Sized> LineSink for Arc<T> {
     }
 }
 
-/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 ///
 /// Appends lines to one file, each with a single `write(2)` on an `O_APPEND`
 /// descriptor.
@@ -206,7 +206,7 @@ fn append_line(out: &impl Appender, line: &[u8], path: &Path) -> io::Result<()> 
     Ok(())
 }
 
-/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 ///
 /// Collects lines in memory. Cheap to clone; clones share the same buffer, so a
 /// test can hand one clone to an exporter and read lines back from another.
