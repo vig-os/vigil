@@ -231,5 +231,11 @@
     "items": {
       "vigil::audit::AuditConfig::resume": "fn"
     }
+  },
+  {
+    "justification": "ADR-0005 amendment 12, OQ11: stable checkpoint listing for the operator CLI (#13 C2)",
+    "items": {
+      "vigil::audit::checkpoints": "fn"
+    }
   }
 ]

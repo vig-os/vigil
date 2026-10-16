@@ -2,7 +2,7 @@
 
 *Verifiable Integrity-Guarded Instrumentation & Logging* (V·I·G·I·L): the opinionated observability crate for vig-os Rust projects.
 
-> **Pre-alpha.** The design is settled; the code is being built. Logs, metrics and the audit writer (behind the `audit` feature) are implemented; the audit verifier and command line (#13) and traces (#8) are being built. Track progress in the milestones.
+> **Pre-alpha.** The design is settled; the code is being built. Logs, metrics and the audit writer (behind the `audit` feature) are implemented; the audit operator commands are implemented; the audit verifier (#13 C1) and traces (#8) are being built. Track progress in the milestones.
 
 ## Stability
 
@@ -472,13 +472,50 @@ of a regulated deployment can set up, run, rotate, resume and review a trail wit
 reading the ADR; each subsection names the ADR section it restates, and the ADR decides
 where the two differ.
 
-The verifier and the `vigil-audit` command line are not part of vigil yet; they are
-[#13](https://github.com/vig-os/vigil/issues/13). The procedures below use the library
+The `vigil-audit` operator commands are available with the `audit` feature. The
+verifier remains [#13 C1](https://github.com/vig-os/vigil/issues/13). The procedures below use the library
 calls that exist, and every step that needs the verifier, a waiver or an accept line is
 marked "(#13)". The low-level primitives (`Record`, `Record::parse_line`, `Mmr`,
 `checkpoint_message`, `verify_signature`) are public only under `--cfg vigil_unstable`
 and crate-visible otherwise ([decision 13][d13]). They persist nothing and establish no
 trust.
+
+### Operator command line
+
+Build with `cargo build --features audit --bin vigil-audit`. Arguments use the
+following synopsis (`verify` follows in #13 C1):
+
+```text
+vigil-audit keygen <keyfile>
+vigil-audit create --key <keyfile> --service <name> <dir>
+vigil-audit checkpoints <dir>
+vigil-audit checkpoint --key <keyfile> --expect-head <seq>:<hash> <dir>
+vigil-audit rotate --key <keyfile> --actor <who> --reason <why> --bound <seq>:<hash> --expect-head <seq>:<hash> <dir>
+vigil-audit resume --key <keyfile> --actor <who> --reason <why> --head <seq>:<hash> --lost-through <seq> <dir>
+```
+
+Hashes are `blake3:` followed by 64 lowercase hex digits. Keep expected heads
+outside the trail directory; use the highest sequence among all held receipts and
+close checkpoints. `resume` instead takes the head found after loss, plus the
+highest sequence for which the deployment holds evidence.
+
+`keygen` writes the secret file and its `.pub` companion, and prints the public
+key. `create` prints the 32-hex trail id and its close checkpoint. `checkpoints`
+prints parseable checkpoint JSON lines in segment order, including the live file;
+it checks neither signatures nor chain history and ignores unparsable lines.
+`checkpoint` prints its receipt and checkpoint; `rotate` prints its rotation
+receipt and checkpoint. `resume` prints its opening checkpoint, resume receipt
+and close checkpoint, in sequence order. Receipts are `<seq> blake3:<hex>`;
+checkpoint lines preserve the on-disk JSON payload.
+
+`create` uses `--service`; records from `rotate`, `checkpoint` and `resume` use
+`service.name = "vigil-audit"`. `--actor` names the human. `create` and `resume`
+explicitly close the handle before exit, so the printed close checkpoint is the
+clean-stop head. Successful outputs remain available if a later close fails.
+Exit codes are 0 for success, 2 for usage, `Io` or `InvalidConfig`, and 1 for other
+audit errors and signer errors. If stdout fails, successful output lines are
+repeated on stderr and the exit code is 2 (architect ruling 13-d3, clarified by
+13C2-d1).
 
 ### Supported filesystems and durability
 
@@ -806,7 +843,7 @@ record inside the run. The live file and the trail marker must stay. **Batch *n*
 set of segments moved by the *n*-th archiving. The **start of batch *n*** is the opening
 checkpoint of the oldest segment that stays after it, and the first record of batch *n*+1 (or of the trail directory).
 
-Every `vigil-audit` command below is #13 and not yet available. The commands are
+`vigil-audit checkpoints` is available; `vigil-audit verify` remains #13 C1. The commands are
 copied from the ADR.
 
 1. **Snapshot and verify.** Take a snapshot (a copy of the trail files) and verify it

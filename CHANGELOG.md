@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `vigil-audit` operator commands (`keygen`, `create`, `checkpoints`, `checkpoint`, `rotate`, `resume`) and stable `audit::checkpoints(dir)` ([#13](https://github.com/vig-os/vigil/issues/13), C2).
+
 - ADR-0005 amendment 12 (Proposed): the verifier surface and line classification. `TrustPolicy::builder()` replaces `new()`, `Verifier` configuration and every verify entry point return `AuditError`, `Report` and `Finding` gain `is_strict_valid`, `first_broken_link`, `first_seq`, `accepted_kind` and `run_digest`, the JSON schema is fixed, a public `checkpoints(dir)` is added, `Unparsable` is defined once for the reader and the verifier (a NUL-filled crash tail is `Unparsable`, so `resume` can seal it), and a genesis resume has the gap `0..=lost_through` with R10 reported as `ChainBroken`. Docs only; #13 and 13-R implement it ([#13](https://github.com/vig-os/vigil/issues/13), [#143](https://github.com/vig-os/vigil/issues/143)).
 - Private tracer pipeline builders and configured OpenTelemetry layer ([#8](https://github.com/vig-os/vigil/issues/8), 8c-1).
 - Operator `resume` (`AuditConfig::resume`) with a receipt and signer-retaining writer handle ([#11](https://github.com/vig-os/vigil/issues/11)).
