@@ -69,6 +69,8 @@
           # would otherwise drop them (a missing fixture fails the golden test).
           extraSrcFiles = [
             "README.md"
+            "CHANGELOG.md"
+            "docs/adr/0004-public-api-and-stability.md"
             "docs/adr/0005-audit-trail.md"
             ".config/nextest.toml"
             "tests/fixtures"
@@ -83,6 +85,8 @@
           toolchainHash = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
           extraSrcFiles = [
             "README.md"
+            "CHANGELOG.md"
+            "docs/adr/0004-public-api-and-stability.md"
             "docs/adr/0005-audit-trail.md"
             ".config/nextest.toml"
             "tests/fixtures"
