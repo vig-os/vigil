@@ -43,6 +43,7 @@ format:
 # Run pre-commit hooks on all files
 [group('quality')]
 precommit:
+    python3 -m unittest discover -s scripts -p test_set_crate_version.py -v
     prek run --all-files
 
 # -------------------------------------------------------------------------------

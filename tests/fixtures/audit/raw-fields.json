@@ -1,0 +1,20 @@
+[
+  {"field": "bytesValue", "raw": "\"YQ==\"", "accepted": true},
+  {"field": "bytesValue", "raw": "\"\"", "accepted": true},
+  {"field": "bytesValue", "raw": "\"Y\\r\\nQ==\"", "accepted": false},
+  {"field": "bytesValue", "raw": "\"\\/w==\"", "accepted": false},
+  {"field": "bytesValue", "raw": "\"YQ==\\n\"", "accepted": false},
+  {"field": "bytesValue", "raw": "\"Y\\u0051==\"", "accepted": false},
+  {"field": "bytesValue", "raw": "\"/w==\"", "accepted": true},
+  {"field": "bytesValue", "raw": "\"YQ\"", "accepted": false},
+  {"field": "traceId", "raw": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", "accepted": true},
+  {"field": "traceId", "raw": "\"\"", "accepted": true},
+  {"field": "traceId", "raw": "\"\\u00300000000000000000000000000000000\"", "accepted": false},
+  {"field": "traceId", "raw": "\"0000000000000000000000000000000\"", "accepted": false},
+  {"field": "traceId", "raw": "\"gggggggggggggggggggggggggggggggg\"", "accepted": false},
+  {"field": "spanId", "raw": "\"aaaaaaaaaaaaaaaa\"", "accepted": true},
+  {"field": "spanId", "raw": "\"\"", "accepted": true},
+  {"field": "spanId", "raw": "\"\\u0030000000000000000\"", "accepted": false},
+  {"field": "spanId", "raw": "\"000000000000000\"", "accepted": false},
+  {"field": "spanId", "raw": "\"gggggggggggggggg\"", "accepted": false}
+]

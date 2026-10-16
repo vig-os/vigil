@@ -17,7 +17,16 @@ name: CI Extension
 
 on:  # yamllint disable-line rule:truthy
   workflow_call:
+    outputs:
+      labels:
+        description: "Live label set used by the completed semver evaluation"
+        value: ${{ jobs.semver.outputs.labels }}
     inputs:
+      label-only:
+        description: "Reevaluate semver after a label change without rebuilding heavy lanes"
+        required: false
+        type: boolean
+        default: false
       mode:
         description: "Resolved delivery mode (devcontainer/direnv/both/bare)"
         required: false
@@ -35,22 +44,254 @@ on:  # yamllint disable-line rule:truthy
         required: false
         type: string
         default: '["ubuntu-26.04"]'
+      dev-profile-path:
+        description: "Optional absolute path for the Nix dev-shell gcroot profile"
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
+  # Workaround for vig-os/devkit#1811; remove when the managed Tests/Lint lanes
+  # run Rust. Until then `just lint`/`just test` are Python recipes that skip
+  # without a pyproject.toml, so nothing else compiles or tests the crate.
+  # `nix flake check` runs the crane checks from flake.nix: clippy, fmt,
+  # nextest, doctests and docs.
   extension:
-    name: Extension Hook (Default No-op)
+    if: ${{ !inputs.label-only }}
+    name: Rust checks (nix flake check)
     runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 30
     steps:
-      - name: Default extension summary
-        env:
-          MODE: ${{ inputs.mode }}
-          IMAGE: ${{ inputs.image }}
-          IMAGE_TAG: ${{ inputs.image-tag }}
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Nix is required whatever the resolved delivery mode is, so the mode is
+      # pinned to `direnv` (the action's only Nix path) rather than forwarded.
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+
+      - name: Validate benchmark correctness without timing assertions
+        run: nix develop -c cargo test --locked --bench performance
+
+      # Plain Cargo shares a process between library tests; nextest does not.
+      - name: Cargo tests with default test threads
+        run: nix develop -c cargo test --locked --lib --bins --tests --examples --all-features
+      - name: Cargo tests with one test thread
+        run: nix develop -c cargo test --locked --lib --bins --tests --examples --all-features -- --test-threads=1
+
+      - name: Stable public API snapshot and ADR allowlist
+        run: nix develop -c python3 scripts/check_public_api.py
+      - name: Unstable API compilation
+        run: nix develop -c env RUSTFLAGS="--cfg vigil_unstable" cargo check --locked --all-features
+      - name: Unstable exporter and sink tests
         run: |
-          echo "No CI extension configured."
-          echo "Mode: $MODE"
-          echo "Image: $IMAGE"
-          echo "Image tag: $IMAGE_TAG"
+          nix develop -c env RUSTFLAGS="--cfg vigil_unstable" cargo test --locked --lib --bins --tests --examples --all-features
+          nix develop -c env RUSTFLAGS="--cfg vigil_unstable" cargo test --locked --doc --all-features
+      - name: Run nix flake check
+        run: nix flake check -L
+
+  json-order:
+    if: ${{ !inputs.label-only }}
+    name: JSON ordering (${{ matrix.map }})
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - map: default
+            cargo-args: --no-default-features --features traces
+          - map: preserve-order
+            cargo-args: --no-default-features --features audit,traces,test-preserve-order
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+      - name: Verify golden bytes and deterministic ordering (including traces)
+        env:
+          RUSTFLAGS: --cfg vigil_unstable
+          CARGO_ARGS: ${{ matrix.cargo-args }}
+        run: |
+          nix develop -c cargo test --locked $CARGO_ARGS --test golden
+          nix develop -c cargo test --locked $CARGO_ARGS --lib ordered
+          nix develop -c cargo test --locked $CARGO_ARGS --features metrics --lib metrics::tests::identity_determinism
+      - name: Verify audit shuffle, hashes and committed corpus with preserve-order
+        if: ${{ matrix.map == 'preserve-order' }}
+        env:
+          RUSTFLAGS: --cfg vigil_unstable
+        run: nix develop -c cargo test --locked --features audit,test-preserve-order --lib audit
+
+  conformance:
+    if: ${{ !inputs.label-only }}
+    name: Collector conformance
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+      - name: Compare rotated logs through the reference Collector
+        run: |
+          nix develop -c python3 -m unittest discover -s scripts
+          nix develop -c python3 scripts/conformance.py
+          nix develop -c python3 scripts/prometheus_conformance.py
+
+  supply-chain:
+    if: ${{ !inputs.label-only }}
+    name: Supply chain (cargo-deny)
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+      # Live RustSec fetch needs network access unavailable in Nix derivations.
+      # The executable still comes exclusively from flake-pinned nixpkgs.
+      - name: Check supply-chain policy
+        run: nix develop -c python3 scripts/check_supply_chain.py
+
+  semver:
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      labels: ${{ steps.review.outputs.labels }}
+    # Run after every heavy lane, even on failure/skip, so the final verdict
+    # reads labels at the end of full CI rather than before a long build.
+    # Stop superseded runs promptly; always() would hold the concurrency slot.
+    needs: [extension, json-order, conformance, supply-chain, msrv, latest-stable, performance]
+    if: ${{ !cancelled() }}
+    name: Semver compatibility
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository and baseline history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+      # Git baseline checkout requires history and writable storage, outside
+      # the Nix derivation sandbox. The tools still come from pinned nixpkgs.
+      - name: Check stable API against merge base with dev
+        id: review
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: nix develop -c python3 scripts/check_semver.py
+
+  msrv:
+    if: ${{ !inputs.label-only }}
+    name: MSRV (Linux and Apple target)
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+      - name: Build and test all features
+        run: nix develop .#msrv -c python3 scripts/check_rust_version.py msrv
+
+  latest-stable:
+    if: ${{ !inputs.label-only }}
+    name: Latest stable (Linux)
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+      - name: Build and test all features
+        run: nix develop .#latest-stable -c python3 scripts/check_rust_version.py latest-stable
+
+  performance:
+    if: ${{ !inputs.label-only }}
+    name: Performance comparison
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 30
+    # Build/run/estimate failures block; only measured slowdowns are advisory.
+    env:
+      CARGO_TARGET_DIR: target/performance
+      CARGO_BUILD_JOBS: '3'
+      BASE_REF: ${{ github.event.pull_request.base.sha || 'origin/dev' }}
+      VIGIL_BENCH_QUICK: '1'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ inputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ inputs.dev-profile-path }}
+      - name: Measure merge-base and head on the same runner
+        run: |
+          nix develop -c python3 scripts/compare_performance.py --base-ref "$BASE_REF"

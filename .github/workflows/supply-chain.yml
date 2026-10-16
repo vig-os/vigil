@@ -1,0 +1,52 @@
+# Consumer-owned: check dev weekly even when no pull requests are opened.
+name: Scheduled supply chain
+
+on:  # yamllint disable-line rule:truthy
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-toolchain:
+    name: Resolve toolchain
+    runs-on: ${{ vars.DEVKIT_CI_RESOLVE_RUNNER || 'ubuntu-26.04' }}
+    timeout-minutes: 2
+    outputs:
+      runner-json: ${{ steps.resolve.outputs.runner-json }}
+      image-tag: ${{ steps.resolve.outputs.image-tag }}
+      dev-profile-path: ${{ steps.resolve.outputs.dev-profile-path }}
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: dev
+          persist-credentials: false
+      - name: Resolve toolchain
+        id: resolve
+        uses: ./.github/actions/resolve-toolchain
+
+  supply-chain:
+    name: Supply chain (dev)
+    needs: resolve-toolchain
+    runs-on: ${{ fromJSON(needs.resolve-toolchain.outputs.runner-json) }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: dev
+          persist-credentials: false
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+          devkit-version: ${{ needs.resolve-toolchain.outputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ needs.resolve-toolchain.outputs.dev-profile-path }}
+      # Failure remains a red Actions run; no issue-writing permission needed.
+      - name: Check supply-chain policy
+        run: nix develop -c python3 scripts/check_supply_chain.py
