@@ -11,9 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Early-release stability guidance, known issues and a package allowlist for consumers of v0.1.0 ([#151](https://github.com/vig-os/vigil/issues/151)).
 
-- `vigil-audit` operator commands (`keygen`, `create`, `checkpoints`, `checkpoint`, `rotate`, `resume`) and stable `audit::checkpoints(dir)` ([#13](https://github.com/vig-os/vigil/issues/13), C2).
-- Trace export through `init` and `Config::layer`, `Config::traces`/`VIGIL_TRACES`, correlated logs and concurrent Guard lifecycle ([#8](https://github.com/vig-os/vigil/issues/8), 8c-2).
-- `vigil-audit` operator commands (`keygen`, `create`, `checkpoints`, `checkpoint`, `rotate`, `resume`) with usage and `--help` output, and stable `audit::checkpoints(dir)` ([#13](https://github.com/vig-os/vigil/issues/13), C2).
+- Trace export through `init` and `Config::layer`, `Config::traces`/`VIGIL_TRACES`, correlated logs and concurrent Guard lifecycle ([#8](https://github.com/vig-os/vigil/issues/8)).
+- `vigil-audit` operator commands (`keygen`, `create`, `checkpoints`, `checkpoint`, `rotate`, `resume`) with usage and `--help` output, and stable `audit::checkpoints(dir)` ([#13](https://github.com/vig-os/vigil/issues/13)).
 
 - Operator `resume` (`AuditConfig::resume`) returning the opening `Checkpoint`, with a receipt and signer-retaining writer handle ([#11](https://github.com/vig-os/vigil/issues/11)).
 - Default `traces` feature and `span_export::OtlpJsonSpanExporter` (requires `--cfg vigil_unstable`) ([#8](https://github.com/vig-os/vigil/issues/8)).
