@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.1.0] - TBD
+
+### Added
+
 - Early-release stability guidance, known issues and a package allowlist for consumers of v0.1.0 ([#151](https://github.com/vig-os/vigil/issues/151)).
 
 - Trace export through `init` and `Config::layer`, `Config::traces`/`VIGIL_TRACES`, correlated logs and concurrent Guard lifecycle; sampling respects upstream sample-out, only ended spans export, and span overflow is counted per flush ([#8](https://github.com/vig-os/vigil/issues/8)).
@@ -72,10 +86,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shutdown stops recording before draining; explicit shutdown reports losses to the caller without repeating them on stderr, and Drop reports them once. Failed durable log lines count only records not already written, plus diagnostic replacements (ADR-0003 decisions 3, 4 and 23; [#42](https://github.com/vig-os/vigil/issues/42)).
 - One successful pipeline permanently occupies the process slot, including after shutdown. Filters apply per layer; empty filter variables count as unset, and explicit `retention(None)` overrides environment retention ([#42](https://github.com/vig-os/vigil/issues/42)).
 
-### Deprecated
-
-### Removed
-
 ### Fixed
 
 - Release preparation sets the root crate version on the release branch ([#151](https://github.com/vig-os/vigil/issues/151)).
@@ -89,4 +99,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OTLP/JSON output is independent of consumer `serde_json/preserve_order` feature unification ([#64](https://github.com/vig-os/vigil/issues/64)).
 - Absent log bodies are omitted from OTLP JSON, so audit records produced by the shared encoder satisfy the required body absence ([#11](https://github.com/vig-os/vigil/issues/11)).
 
-### Security
