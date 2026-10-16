@@ -7,6 +7,7 @@ use vigil::audit::{AuditConfig, KeyFileSigner, checkpoints, keygen};
 
 pub(super) fn run(command: Command, output: &mut Output) -> Result<(), Failure> {
     match command {
+        Command::Help(text) => output.line(text),
         Command::Keygen(path) => output.line(hex(&keygen(path)?)),
         Command::Checkpoints(dir) => {
             for checkpoint in checkpoints(&dir)? {

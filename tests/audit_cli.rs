@@ -502,3 +502,87 @@ fn close_invalid_config_keeps_successful_resume_output() {
     assert_eq!(lines[0], records[records.len() - 2]);
     assert_eq!(lines[1], receipt(records.last().unwrap()));
 }
+
+#[test]
+fn global_help_lists_commands_and_exit_codes() {
+    let f = Fixture::new();
+    for alias in ["--help", "-h", "help"] {
+        let output = f.cli(&[alias]);
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        let text = String::from_utf8(output.stdout).unwrap();
+        for command in [
+            "keygen",
+            "create",
+            "checkpoints",
+            "checkpoint",
+            "rotate",
+            "resume",
+        ] {
+            assert!(text.contains(&format!("vigil-audit {command} ")), "{text}");
+        }
+        assert!(text.contains("verify: not yet available (#13)"));
+        for code in [
+            "0  Success",
+            "1  AuditError or SignerError",
+            "2  Usage, Io or InvalidConfig",
+        ] {
+            assert!(text.contains(code), "{text}");
+        }
+    }
+}
+
+#[test]
+fn usage_errors_include_synopsis() {
+    let f = Fixture::new();
+    for args in [
+        vec![],
+        vec!["unknown"],
+        vec!["create"],
+        vec!["keygen", "--bad"],
+        vec!["verify"],
+    ] {
+        let output = f.cli(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert!(text.starts_with("error: Usage: "), "{text}");
+        assert!(text.contains("Usage:\n  vigil-audit "), "{text}");
+    }
+}
+
+#[test]
+fn command_help_matches_parser_commands() {
+    let f = Fixture::new();
+    // Read the dispatch arms independently of the shared argument/help table:
+    // removing a help row must not silently remove this coverage.
+    let source = include_str!("../src/bin/vigil-audit/args.rs");
+    let parser: std::collections::BTreeSet<_> = source
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim().strip_prefix('"')?;
+            let (name, rest) = line.split_once('"')?;
+            rest.contains("=> Command::").then_some(name)
+        })
+        .collect();
+    let output = f.cli(&["--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    let help: std::collections::BTreeSet<_> = text
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("  vigil-audit ")?
+                .split_whitespace()
+                .next()
+        })
+        .collect();
+    assert!(!parser.is_empty());
+    assert_eq!(help, parser);
+    for command in parser {
+        let output = f.cli(&[command, "--help"]);
+        assert_eq!(output.status.code(), Some(0), "{command}");
+        assert!(output.stderr.is_empty());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.starts_with(&format!("Usage: vigil-audit {command} ")));
+    }
+}

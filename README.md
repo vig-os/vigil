@@ -509,7 +509,8 @@ trust.
 
 ### Operator command line
 
-Build with `cargo build --features audit --bin vigil-audit`. Arguments use the
+Build with `cargo build --features audit --bin vigil-audit`. Run `vigil-audit --help`
+for commands and exit codes, or `vigil-audit <command> --help` for command help. Arguments use the
 following synopsis (`verify` follows in #13 C1):
 
 ```text

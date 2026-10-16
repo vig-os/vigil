@@ -6,7 +6,7 @@ mod output;
 fn main() -> std::process::ExitCode {
     let mut output = output::Output::default();
     let result = args::parse(std::env::args_os().skip(1))
-        .map_err(|detail| output::Failure(2, format!("Usage: {detail}")))
+        .map_err(|detail| output::Failure(2, format!("Usage: {detail}\n{}", args::usage(false))))
         .and_then(|command| commands::run(command, &mut output));
     let flushed = output.flush();
     if let Err(output::Failure(code, detail)) = flushed.and(result) {
