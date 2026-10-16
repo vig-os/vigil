@@ -91,6 +91,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Release preparation sets the root crate version on the release branch ([#151](https://github.com/vig-os/vigil/issues/151)).
+
 - **Audit tail classification** ([#143](https://github.com/vig-os/vigil/issues/143)): `resume` seals NUL-filled, control-byte and oversized tails. Reading raw controls, oversized payloads and JSON non-objects now reports `AuditError::finding_kind()` as `Unparsable` instead of record findings; writer validation is unchanged.
 
 - Audit rustdoc no longer says resume is pending or that `vigil-audit verify` exists; it marks the command as #13 and states which head resume takes ([#136](https://github.com/vig-os/vigil/issues/136)).

@@ -412,6 +412,7 @@
                 python3 scripts/check_changelog.py
                 python3 -m unittest discover -s scripts -p test_check_changelog.py -v
                 python3 -m unittest discover -s scripts -p test_check_rust_version.py -v
+                python3 -m unittest discover -s scripts -p test_set_crate_version.py -v
                 touch "$out"
               '';
         };
