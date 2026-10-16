@@ -288,6 +288,25 @@ pub struct Guard {
     #[cfg(all(test, any(feature = "metrics", feature = "traces")))]
     signal_files: [std::sync::Weak<RotatingFile>; 3],
 }
+// Keep the scheduling seam shared with the deterministic concurrency proof.
+fn flush_logs_and_traces(
+    logs: impl FnOnce() -> OTelSdkResult,
+    traces: Option<impl FnOnce() -> OTelSdkResult + Send>,
+) -> (OTelSdkResult, OTelSdkResult) {
+    std::thread::scope(|scope| {
+        let traces = traces.map(|flush| scope.spawn(flush));
+        let logs = logs();
+        let traces = traces.map_or(Ok(()), |thread| {
+            thread.join().unwrap_or_else(|_| {
+                Err(OTelSdkError::InternalFailure(
+                    "span flush thread panicked".into(),
+                ))
+            })
+        });
+        (logs, traces)
+    })
+}
+
 impl Guard {
     /// The actual log directory, or `None` when logs fell back to stderr.
     /// Metrics and traces may still write `metrics.jsonl` and `traces.jsonl` there; `None` does not mean
@@ -332,26 +351,21 @@ impl Guard {
         let metrics = self.start_metrics_flush();
         #[cfg(all(test, feature = "metrics"))]
         self.losses.observe_flush_order();
-        let (logs, traces) = std::thread::scope(|_scope| {
-            #[cfg(feature = "traces")]
-            let traces = self.traces.as_ref().map(|provider| {
-                _scope.spawn(move || crate::lifecycle::flush(|| provider.force_flush()))
-            });
-            let logs = self.provider.as_ref().map_or(Ok(()), |provider| {
-                crate::lifecycle::flush(|| provider.force_flush())
-            });
-            #[cfg(feature = "traces")]
-            let traces = traces.map_or(Ok(()), |thread| {
-                thread.join().unwrap_or_else(|_| {
-                    Err(OTelSdkError::InternalFailure(
-                        "span flush thread panicked".into(),
-                    ))
+        #[cfg(feature = "traces")]
+        let traces = self
+            .traces
+            .as_ref()
+            .map(|provider| move || crate::lifecycle::flush(|| provider.force_flush()));
+        #[cfg(not(feature = "traces"))]
+        let traces: Option<fn() -> OTelSdkResult> = None;
+        let (logs, traces) = flush_logs_and_traces(
+            || {
+                self.provider.as_ref().map_or(Ok(()), |provider| {
+                    crate::lifecycle::flush(|| provider.force_flush())
                 })
-            });
-            #[cfg(not(feature = "traces"))]
-            let traces = Ok(());
-            (logs, traces)
-        });
+            },
+            traces,
+        );
         self.losses.outcome(Signal::Logs, &logs);
         #[cfg(feature = "metrics")]
         let metrics = metrics.map_or(Ok(()), |target| {
@@ -3440,30 +3454,65 @@ mod traces_wiring_tests {
         assert_eq!(guard.flush().unwrap_err().lost(Signal::Traces), 4);
         guard.shutdown().unwrap();
     }
+    #[test]
+    fn directory_lock_child() {
+        let Ok(dir) = std::env::var("VIGIL_TRACE_LOCK_DIRECTORY") else {
+            return;
+        };
+        let held = std::fs::File::open(dir).unwrap();
+        held.lock().unwrap();
+        println!("ready");
+        std::io::stdout().flush().unwrap();
+        let mut release = String::new();
+        std::io::stdin().read_line(&mut release).unwrap();
+        assert_eq!(release, "release\n");
+        held.unlock().unwrap();
+    }
     struct DirectoryBlock(std::process::Child);
     impl DirectoryBlock {
         fn new(dir: &Path) -> Self {
             use std::io::BufRead as _;
-            let mut process = std::process::Command::new("flock")
-                .arg("--exclusive")
-                .arg(dir)
-                .args(["sh", "-c", "printf 'ready\\n'; read release"])
+            let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "init::traces_wiring_tests::directory_lock_child",
+                    "--nocapture",
+                ])
+                .env("VIGIL_TRACE_LOCK_DIRECTORY", dir)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
             let mut ready = String::new();
-            std::io::BufReader::new(process.stdout.take().unwrap())
-                .read_line(&mut ready)
-                .unwrap();
-            assert_eq!(ready, "ready\n");
+            let mut output = std::io::BufReader::new(process.stdout.take().unwrap());
+            loop {
+                ready.clear();
+                assert_ne!(output.read_line(&mut ready).unwrap(), 0);
+                if ready.ends_with("ready\n") {
+                    break;
+                }
+            }
+            process.stdout = Some(output.into_inner());
             Self(process)
         }
     }
     impl Drop for DirectoryBlock {
         fn drop(&mut self) {
             writeln!(self.0.stdin.take().unwrap(), "release").unwrap();
-            assert!(self.0.wait().unwrap().success());
+            use std::io::Read as _;
+            let mut stdout = Vec::new();
+            self.0
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_end(&mut stdout)
+                .unwrap();
+            let output = std::process::Output {
+                status: self.0.wait().unwrap(),
+                stdout,
+                stderr: Vec::new(),
+            };
+            crate::assert_test_child("init::traces_wiring_tests::directory_lock_child", &output);
         }
     }
     fn blocked_deadline(name: &str, flushing: bool, metrics: bool) {
@@ -3528,12 +3577,30 @@ mod traces_wiring_tests {
         assert!(elapsed < bound, "{elapsed:?}");
     }
     #[test]
-    fn blocked_flush_runs_logs_and_traces_concurrently() {
-        blocked_deadline(
-            "blocked_flush_runs_logs_and_traces_concurrently",
-            true,
-            false,
+    fn flush_runs_logs_and_traces_concurrently() {
+        use std::sync::Mutex;
+        let logs_thread = Mutex::new(None);
+        let traces_thread = Mutex::new(None);
+        let (logs, traces) = flush_logs_and_traces(
+            || {
+                *logs_thread.lock().unwrap() = Some(std::thread::current().id());
+                Ok(())
+            },
+            Some(|| {
+                *traces_thread.lock().unwrap() = Some(std::thread::current().id());
+                Ok(())
+            }),
         );
+        logs.unwrap();
+        traces.unwrap();
+        assert_ne!(
+            logs_thread.into_inner().unwrap(),
+            traces_thread.into_inner().unwrap()
+        );
+    }
+    #[test]
+    fn blocked_flush_keeps_five_second_deadline() {
+        blocked_deadline("blocked_flush_keeps_five_second_deadline", true, false);
     }
     #[test]
     fn blocked_shutdown_without_metrics_keeps_short_deadline() {
