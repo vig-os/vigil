@@ -3576,25 +3576,33 @@ mod traces_wiring_tests {
     }
     #[test]
     fn flush_runs_logs_and_traces_concurrently() {
-        use std::sync::Mutex;
-        let logs_thread = Mutex::new(None);
-        let traces_thread = Mutex::new(None);
+        let (logs_entered, observe_logs) = std::sync::mpsc::channel();
+        let (traces_entered, observe_traces) = std::sync::mpsc::channel();
+        // Each callback must observe the other entering before it can return.
+        // The timeout is only a deadlock fail-safe for a serial implementation;
+        // successful channel receives, not elapsed time, prove overlap.
+        let rendezvous = |entered: std::sync::mpsc::Sender<()>,
+                          other: std::sync::mpsc::Receiver<()>| {
+            move || {
+                entered.send(()).map_err(|error| {
+                    OTelSdkError::InternalFailure(format!("flush rendezvous send: {error}"))
+                })?;
+                other
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|error| {
+                        OTelSdkError::InternalFailure(format!(
+                            "flush callbacks did not overlap: {error}"
+                        ))
+                    })?;
+                Ok(())
+            }
+        };
         let (logs, traces) = flush_logs_and_traces(
-            || {
-                *logs_thread.lock().unwrap() = Some(std::thread::current().id());
-                Ok(())
-            },
-            Some(|| {
-                *traces_thread.lock().unwrap() = Some(std::thread::current().id());
-                Ok(())
-            }),
+            rendezvous(logs_entered, observe_traces),
+            Some(rendezvous(traces_entered, observe_logs)),
         );
         logs.unwrap();
         traces.unwrap();
-        assert_ne!(
-            logs_thread.into_inner().unwrap(),
-            traces_thread.into_inner().unwrap()
-        );
     }
     #[test]
     fn blocked_flush_keeps_five_second_deadline() {
