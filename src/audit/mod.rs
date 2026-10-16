@@ -10,8 +10,9 @@
 //! close checkpoints, anchors and pins). Builder `expect_head` is `InvalidConfig`
 //! for it. Offline verification follows in #13.
 //!
-//! Format primitives require `--cfg vigil_unstable` and are provisional. Pin
-//! vigil with `~1.N` when opting in; they may change in a minor release.
+//! Format primitives require `--cfg vigil_unstable` and are provisional.
+//! Applications should pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
+//! Before 1.0 they may change in any release; from 1.0, in any minor.
 
 mod checkpoints;
 mod config;

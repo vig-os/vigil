@@ -748,7 +748,7 @@ impl Config {
     /// No effect when metrics are off or failed.
     /// Global instruments cannot cause poisoning, but streams under names poisoned
     /// by vigil handles are filtered too (ADR-0003 d21). Use `--cfg vigil_unstable`
-    /// and pin vigil with `~1.N`.
+    /// and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
     #[cfg(vigil_unstable)]
     #[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
     #[must_use]

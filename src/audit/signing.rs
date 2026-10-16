@@ -256,7 +256,7 @@ pub fn keygen(path: impl AsRef<Path>) -> Result<[u8; 32], SignerError> {
     result
 }
 
-/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 /// Applications only: library pins constrain every dependent to that minor.
 ///
 /// Builds `vigil.audit.v1.checkpoint\0 || blake3(fields without tag 0x24)`.
@@ -267,7 +267,7 @@ pub fn checkpoint_message(unsigned_fields: &[u8]) -> Vec<u8> {
     message
 }
 
-/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 /// Applications only: library pins constrain every dependent to that minor.
 ///
 /// Checks a pure Ed25519 signature with strict canonical/small-order checks.

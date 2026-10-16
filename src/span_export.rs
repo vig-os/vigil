@@ -1,5 +1,5 @@
 //! **Unstable:** bounded OTLP/JSON span export. Enable `--cfg vigil_unstable`
-//! and pin vigil with `~1.N`.
+//! and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 use crate::{
     envelope::{self, Envelope},
     logs::{self, StringCandidate},
@@ -30,7 +30,7 @@ use std::{
 /// names are reserved on spans; shortening replaces caller-supplied values.
 /// Known limit: an SDK scope with a NaN-valued attribute never equals itself,
 /// so each span has its own `scopeSpans` entry. Output remains deterministic.
-/// Use `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// Use `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 #[derive(Debug)]
 #[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
 pub struct OtlpJsonSpanExporter<S: LineSink> {

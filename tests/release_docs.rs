@@ -247,3 +247,58 @@ fn readme_relative_links_are_packaged() {
         );
     }
 }
+
+#[test]
+fn all_unstable_pin_advice_is_phase_specific() {
+    fn check_tree(dir: &std::path::Path, checked: &mut usize) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                check_tree(&path, checked);
+            } else if matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("rs" | "md")
+            ) {
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (index, line) in text
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| line.contains("~1.N"))
+                {
+                    assert!(
+                        line.contains("`=0.N.M` before 1.0") && line.contains("`~1.N` from 1.0"),
+                        "{}:{}: pin advice must cover both phases: {line}",
+                        path.display(),
+                        index + 1
+                    );
+                    *checked += 1;
+                }
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut checked = 0;
+    for dir in ["src", "docs"] {
+        check_tree(&root.join(dir), &mut checked);
+    }
+    assert!(checked > 0, "pin-advice scan must inspect real occurrences");
+}
+
+#[test]
+fn changelog_describes_shipped_state() {
+    assert!(CHANGELOG.contains("`Clone` but not `Copy`"));
+    for obsolete in [
+        "KeySeed",
+        "no longer",
+        "NON_FINITE",
+        "retention_days",
+        "instead of serializing null",
+        "instead of record findings",
+    ] {
+        assert!(
+            !CHANGELOG.contains(obsolete),
+            "unreleased history: {obsolete}"
+        );
+    }
+    assert!(CHANGELOG.contains("`KeyFileSigner`"));
+}

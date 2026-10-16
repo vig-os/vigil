@@ -271,7 +271,7 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
     Ok(record)
 }
 impl Record {
-    /// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+    /// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
     /// Applications only: library pins constrain every dependent to that minor.
     ///
     /// Decodes one complete OTLP/JSON LogsData value, preserving nested record order.

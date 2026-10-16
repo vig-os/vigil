@@ -228,7 +228,7 @@ for the exact versions linked by vigil. Before 1.0, unstable items may change in
 applications that set the cfg should pin `=0.N.M` before 1.0, and pin `~1.N` from 1.0.
 From 1.0 these APIs may change in any minor. A library using them forces its
 applications to enable the cfg, must document that requirement, and should avoid
-pinning `~1.N` itself because that constrains every dependent in the graph.
+imposing its own version pin because that constrains compatible dependents in the graph.
 Global-provider installation is available for the meter provider through
 `Config::install_opentelemetry_globals` (requires `--cfg vigil_unstable`). The tracer
 provider opt-in and the tracing integration re-export remain open in #8 8f.

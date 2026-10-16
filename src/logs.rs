@@ -1,4 +1,4 @@
-//! **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+//! **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 //! Libraries using this API require their applications to set the cfg.
 //!
 //! An OpenTelemetry [`LogExporter`] that writes OTLP/JSON Lines.
@@ -90,7 +90,7 @@ pub(crate) const MAX_LOG_VALUE_DEPTH: usize = 16;
 /// or the Collector.
 pub(crate) const NON_FINITE: [&str; 3] = ["NaN", "Infinity", "-Infinity"];
 
-/// **Unstable:** enable `--cfg vigil_unstable` and pin vigil with `~1.N`.
+/// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 ///
 /// Writes each log export batch as bounded OTLP/JSON `LogsData` lines to a
 /// [`LineSink`].
