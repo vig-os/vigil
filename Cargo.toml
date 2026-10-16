@@ -9,7 +9,7 @@ repository = "https://github.com/vig-os/vigil"
 documentation = "https://docs.rs/vigil-telemetry"
 readme = "README.md"
 # Keep build targets and compile-time test fixtures; omit repository tooling.
-include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "LICENSE", "docs/adr/**", "examples/**", "benches/**", "tests/**"]
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/CHANGELOG.md", "/LICENSE", "/docs/adr/**", "/examples/**", "/benches/**", "/tests/**"]
 keywords = ["opentelemetry", "otlp", "logging", "audit-trail", "tracing"]
 categories = ["development-tools::debugging"]
 

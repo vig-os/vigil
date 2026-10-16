@@ -12,7 +12,7 @@ before adopting an early release.
 ## Stability
 
 Early GitHub releases start with v0.1.0; crates.io publication comes later and
-remains the owner's decision. Before 1.0, a minor bump may break compatibility;
+remains the owner's decision. Before 1.0, a minor bump may break stable items;
 a patch never does. Applications should pin `~0.N` (or `=0.N.M`). Every breaking
 change is labelled `semver:major` and recorded in the CHANGELOG. The stability
 promise below applies from 1.0.0. Version changes are managed by the release train (#151).
@@ -30,7 +30,9 @@ promise below applies from 1.0.0. Version changes are managed by the release tra
   hidden items and macro expansions, alongside the semver gate ([Semver](#semver)).
 - **`vigil_unstable` is excluded.** Items behind `--cfg vigil_unstable` (the exporters,
   sinks and the re-exported OpenTelemetry crates; global-provider installation (meter only; the tracer in #8)) may
-  change in any minor release. Applications that set the cfg should pin `~1.N`
+  change in any minor release from 1.0. Before 1.0, unstable items may change in any release;
+  applications that set the cfg should pin `=0.N.M` before 1.0, and pin `~1.N` from 1.0.
+  Stable-only applications should pin `~0.N` before 1.0 because any minor may break stable items
   ([ADR-0004](docs/adr/0004-public-api-and-stability.md) decision 4).
 - **On-disk format.** Every line is valid OTLP/JSON, one signal per file, with the
   field encoding and time-first key order of
@@ -210,7 +212,7 @@ so a dependency upgrade starts new series; aggregate with
 `sum without (otel_scope_version)`. Other Prometheus-compatible backends need
 the equivalent setting. Collector configurations use the `otlp_http` exporter.
 
-The [Prometheus conformance script](scripts/prometheus_conformance.py) is the
+The [Prometheus conformance script](https://github.com/vig-os/vigil/blob/dev/scripts/prometheus_conformance.py) is the
 mapping oracle: it checks exact series sets and values through the Collector and
 Prometheus against [the shared fixture](tests/fixtures/prometheus_names.json).
 Rows the facade rejects (d24) are checked against the translator only; a Rust
@@ -222,8 +224,9 @@ Exporters and sinks are crate-private by default. Applications composing their
 own SDK pipeline can opt in with `RUSTFLAGS="--cfg vigil_unstable" cargo build`,
 or set `[build] rustflags = ["--cfg", "vigil_unstable"]` in their own
 `.cargo/config.toml`. Use `vigil::unstable::{opentelemetry, opentelemetry_sdk}`
-for the exact versions linked by vigil. These APIs may change in any minor;
-applications should pin vigil with `~0.N` (or `=0.N.M`) before 1.0, and `~1.N` from 1.0. A library using them forces its
+for the exact versions linked by vigil. Before 1.0, unstable items may change in any release;
+applications that set the cfg should pin `=0.N.M` before 1.0, and pin `~1.N` from 1.0.
+From 1.0 these APIs may change in any minor. A library using them forces its
 applications to enable the cfg, must document that requirement, and should avoid
 pinning `~1.N` itself because that constrains every dependent in the graph.
 Global-provider installation is available for the meter provider through
@@ -235,7 +238,7 @@ Cargo uses one rustflags source, in precedence order: `CARGO_ENCODED_RUSTFLAGS`,
 then build rustflags. Earlier sources replace later ones: add the cfg to whichever
 source the application already uses. Changing flags rebuilds dependencies once.
 Docs.rs labels the unstable surface; CI compiles and tests it separately from
-the stable [API snapshot and ADR allowlist](api/README.md) and semver gate.
+the stable [API snapshot and ADR allowlist](https://github.com/vig-os/vigil/blob/dev/api/README.md) and semver gate.
 
 ## Rust version policy
 
@@ -483,7 +486,7 @@ default omission and integer spelling changes. Valid unterminated final records
 are delivered; unterminated garbage is dropped. Metrics include non-finite values,
 line splitting and poisoned-name filtering. Run
 `nix develop -c python3 scripts/prometheus_conformance.py` for the
-[Prometheus oracle](scripts/prometheus_conformance.py), including cross-scope
+[Prometheus oracle](https://github.com/vig-os/vigil/blob/dev/scripts/prometheus_conformance.py), including cross-scope
 sharing, collision poisoning and every valid shared translation fixture row.
 Spans from the unstable span exporter make the same round trip through the Collector;
 the `init` traces bridge exports to `traces.jsonl`.
@@ -499,7 +502,7 @@ Run locally with `git fetch origin` followed by
 The gate refuses to compare when the merge base equals HEAD, including a
 workflow dispatch on `dev` or a release PR from `dev` to `main`; run it on a
 feature PR into `dev`. Self-comparison cannot prove compatibility.
-CI also checks the committed [API snapshot and ADR allowlist](api/README.md),
+CI also checks the committed [API snapshot and ADR allowlist](https://github.com/vig-os/vigil/blob/dev/api/README.md),
 including hidden exports, without any exception.
 See [ADR-0004](docs/adr/0004-public-api-and-stability.md) for the stability policy
 and the `semver:major` exception before publication. Only the architect/owner

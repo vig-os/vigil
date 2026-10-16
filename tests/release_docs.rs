@@ -126,3 +126,124 @@ fn known_issues() {
         );
     }
 }
+
+#[path = "common/temp.rs"]
+mod temp;
+
+fn package_patterns() -> Vec<&'static str> {
+    MANIFEST
+        .split_once("include = [")
+        .unwrap()
+        .1
+        .split_once(']')
+        .unwrap()
+        .0
+        .split('"')
+        .enumerate()
+        .filter_map(|(index, pattern)| (index % 2 == 1).then_some(pattern))
+        .collect()
+}
+
+#[test]
+fn package_excludes_nested_tooling() {
+    let dir = temp::TempDir::new();
+    for path in [
+        "src",
+        ".claude/skills/inception_explore",
+        ".github",
+        ".githooks",
+        ".vscode",
+    ] {
+        std::fs::create_dir_all(dir.0.join(path)).unwrap();
+    }
+    for path in [
+        "src/lib.rs",
+        "README.md",
+        ".claude/skills/inception_explore/README.md",
+        ".github/README.md",
+        ".githooks/README.md",
+        ".vscode/README.md",
+    ] {
+        std::fs::write(dir.0.join(path), "").unwrap();
+    }
+    let patterns = package_patterns();
+    std::fs::write(
+        dir.0.join("Cargo.toml"),
+        format!("[package]\nname = \"release-docs-packaging-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\ninclude = {patterns:?}\n"),
+    ).unwrap();
+    let output = std::process::Command::new("cargo")
+        .args(["package", "--list", "--allow-dirty", "--offline"])
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let list = String::from_utf8(output.stdout).unwrap();
+    for tooling in [".claude/", ".github/", ".githooks/", ".vscode/"] {
+        assert!(!list.contains(tooling), "ships {tooling}: {list}");
+    }
+    assert!(patterns.iter().all(|pattern| pattern.starts_with('/')));
+}
+
+#[test]
+fn unstable_pins_cover_both_release_phases() {
+    let rustdoc = include_str!("../src/lib.rs");
+    for text in [README, rustdoc] {
+        assert!(text.contains("unstable items may change in any release"));
+        assert!(text.contains("pin `=0.N.M` before 1.0"));
+        assert!(text.contains("pin `~1.N` from 1.0"));
+    }
+    assert!(!README.contains("Applications that set the cfg should pin `~1.N`"));
+}
+
+#[test]
+fn consumer_details_survive_changelog_curation() {
+    for detail in [
+        "not `Copy`",
+        "`Display` text is outside",
+        "validated `file=`",
+        "genesis digest",
+        "hard-link recovery",
+        "clock rollback",
+        "`CorruptTrail`",
+        "`--start-from`",
+        "`accept-run`",
+        "batch-start anchor",
+        "range digest",
+        "owns its newline",
+    ] {
+        assert!(CHANGELOG.contains(detail), "missing {detail}");
+    }
+}
+
+#[test]
+fn readme_relative_links_are_packaged() {
+    let inline = README
+        .split("](")
+        .skip(1)
+        .map(|part| part.split(')').next().unwrap());
+    let references = README
+        .lines()
+        .filter(|line| line.starts_with('['))
+        .filter_map(|line| line.split_once("]: ").map(|(_, target)| target));
+    for target in inline.chain(references) {
+        if target.starts_with(['#', '/']) || target.contains("://") || target.starts_with("mailto:")
+        {
+            continue;
+        }
+        let path = target.split('#').next().unwrap();
+        assert!(
+            package_patterns().iter().any(|pattern| {
+                let pattern = pattern.trim_start_matches('/');
+                pattern == path
+                    || pattern.strip_suffix("/**").is_some_and(|dir| {
+                        path == format!("{dir}/") || path.starts_with(&format!("{dir}/"))
+                    })
+            }),
+            "relative link omitted from package: {path}"
+        );
+    }
+}
