@@ -98,4 +98,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audit signer-outage reporting tolerates unwritable stderr without panicking or failing an acknowledged record ([#100](https://github.com/vig-os/vigil/issues/100)).
 - OTLP/JSON output is independent of consumer `serde_json/preserve_order` feature unification ([#64](https://github.com/vig-os/vigil/issues/64)).
 - Absent log bodies are omitted from OTLP JSON, so audit records produced by the shared encoder satisfy the required body absence ([#11](https://github.com/vig-os/vigil/issues/11)).
-
