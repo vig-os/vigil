@@ -1,12 +1,15 @@
 [package]
 name = "vigil-telemetry"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 description = "vigil — Verifiable Integrity-Guarded Instrumentation & Logging: opinionated OpenTelemetry (OTLP/JSON Lines) logs, metrics and traces for Rust, plus an opt-in hash-chained, signed audit trail"
 license = "Apache-2.0"
 repository = "https://github.com/vig-os/vigil"
+documentation = "https://docs.rs/vigil-telemetry"
 readme = "README.md"
+# Keep build targets and compile-time test fixtures; omit repository tooling.
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/CHANGELOG.md", "/LICENSE", "/docs/adr/**", "/examples/**", "/benches/**", "/tests/**"]
 keywords = ["opentelemetry", "otlp", "logging", "audit-trail", "tracing"]
 categories = ["development-tools::debugging"]
 
@@ -15,8 +18,73 @@ categories = ["development-tools::debugging"]
 # package is `vigil-telemetry` while code still writes `vigil::init(...)`.
 name = "vigil"
 
+[features]
+default = ["metrics", "traces"]
+metrics = ["opentelemetry_sdk/metrics", "opentelemetry_sdk/experimental_metrics_custom_reader", "opentelemetry-proto/metrics"]
+traces = ["opentelemetry_sdk/trace", "opentelemetry-proto/trace", "dep:tracing-opentelemetry"]
+# CI-only consumer feature-unification regression coverage.
+test-preserve-order = ["serde_json/preserve_order"]
+audit = ["dep:blake3", "dep:ed25519-dalek", "dep:zeroize", "dep:base64", "rustix/process"]
+
 [dependencies]
+getrandom = { version = "0.3", default-features = false }
+base64 = { version = "0.22", optional = true }
+blake3 = { version = "1", optional = true, default-features = false, features = ["std", "pure"] }
+ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["std", "zeroize", "fast"] }
+zeroize = { version = "1", optional = true, default-features = false }
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["logs"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["logs", "gen-tonic-messages", "with-serde"] }
+serde = "1"
+serde_json = { version = "1", features = ["raw_value"] }
+rustix = { version = "1.1.5", features = ["fs", "system"] }
+opentelemetry-appender-tracing = "0.33"
+tracing-opentelemetry = { version = "0.34", default-features = false, optional = true }
+tracing = "0.1"
+tracing-core = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry", "env-filter", "fmt"] }
+tracing-log = "0.2"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[dev-dependencies]
+rustix = { version = "1.1.5", features = ["stdio"] }
+allocation-counter = "0.8.1"
+flate2 = "1"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+log = "0.4"
+
+[[bench]]
+name = "performance"
+harness = false
+
+[[example]]
+name = "flock"
+test = true
+
+[[example]]
+name = "prometheus_conformance"
+test = true
+
+# Public documentation is a build contract for stable and vigil_unstable APIs.
+# Cargo applies these levels to every feature set, including flake/CI clippy.
+[lints.clippy]
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
+
+[lints.rust]
+missing_docs = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(vigil_unstable)'] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs", "--cfg", "vigil_unstable"]
+rustc-args = ["--cfg", "vigil_unstable"]
+
+[[bin]]
+name = "vigil-audit"
+path = "src/bin/vigil-audit/main.rs"
+required-features = ["audit"]

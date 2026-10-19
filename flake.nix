@@ -44,7 +44,12 @@
         #   ];
         # ────────────────────────────────────────────────────────────────────
         extraPackages = pkgs: [
-          # add project tools here (the Rust toolchain comes from `rust`)
+          pkgs.cargo-deny
+          pkgs.cargo-semver-checks
+          pkgs.cargo-public-api
+          pkgs.opentelemetry-collector-contrib
+          pkgs.prometheus
+          pkgs.python3
         ];
 
         # The Rust pack (vigos.lib.mkRustProject): the toolchain pinned by
@@ -59,9 +64,146 @@
           # vigil is a library crate: doctests are part of its contract.
           doctest = true;
           toolchainHash = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
-          # The crate's rustdoc front page is the README (include_str!).
-          extraSrcFiles = [ "README.md" ];
+          # The crate's rustdoc front page is the README (include_str!); the
+          # ADR assertions and golden fixtures are checked in tests; crane's source filter
+          # would otherwise drop them (a missing fixture fails the golden test).
+          extraSrcFiles = [
+            "README.md"
+            "CHANGELOG.md"
+            "docs/adr/0004-public-api-and-stability.md"
+            "docs/adr/0005-audit-trail.md"
+            ".config/nextest.toml"
+            "tests/fixtures"
+          ];
         };
+
+        audit = vigos.lib.mkRustProject {
+          inherit pkgs;
+          src = ./.;
+          doctest = true;
+          cargoExtraArgs = "--all-features";
+          toolchainHash = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
+          extraSrcFiles = [
+            "README.md"
+            "CHANGELOG.md"
+            "docs/adr/0004-public-api-and-stability.md"
+            "docs/adr/0005-audit-trail.md"
+            ".config/nextest.toml"
+            "tests/fixtures"
+          ];
+        };
+
+        rustChecks =
+          rust.checks
+          // nixpkgs.lib.mapAttrs' (name: value: nixpkgs.lib.nameValuePair "audit-${name}" value) audit.checks
+          // featureClippyChecks;
+
+        # ADR-0004 covers every combination of user features. `default` is
+        # Cargo's feature selector; test-preserve-order is CI-only consumer
+        # unification coverage and remains covered by the all-features checks.
+        cargoManifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+        userFeatures = builtins.filter (name: name != "default" && name != "test-preserve-order") (
+          builtins.attrNames cargoManifest.features
+        );
+        # #41's push feature will double today's 8 sets to 16. Above 16,
+        # require a ruling rather than silently sampling the stable surface.
+        featureSets =
+          assert pkgs.lib.assertMsg (
+            builtins.length userFeatures <= 4
+          ) "Clippy feature powerset would exceed 16 sets; request a ruling before adding more features";
+          builtins.foldl' (sets: feature: sets ++ map (set: set ++ [ feature ]) sets) [ [ ] ] userFeatures;
+        dependencyTables = pkgs.lib.concatMap (
+          manifest:
+          map (section: manifest.${section} or { }) [
+            "dependencies"
+            "build-dependencies"
+            "dev-dependencies"
+          ]
+        ) ([ cargoManifest ] ++ builtins.attrValues (cargoManifest.target or { }));
+        implicitFeatures = pkgs.lib.unique (
+          pkgs.lib.concatMap (
+            deps:
+            builtins.filter (
+              name:
+              builtins.isAttrs deps.${name}
+              && (deps.${name}.optional or false)
+              && !(builtins.elem "dep:${name}" (
+                pkgs.lib.concatMap (feature: cargoManifest.features.${feature}) userFeatures
+              ))
+            ) (builtins.attrNames deps)
+          ) dependencyTables
+        );
+        featureArgsFor =
+          features:
+          "--no-default-features"
+          + pkgs.lib.optionalString (features != [ ]) (
+            " --features " + pkgs.lib.concatStringsSep "," features
+          );
+        unstableArgs = audit.commonArgs // {
+          RUSTFLAGS = (audit.commonArgs.RUSTFLAGS or "") + " --cfg vigil_unstable";
+        };
+        # Cache check artifacts for every dependency feature variant with the
+        # same cfg as clippy; all-features also covers consumer unification.
+        unstableArtifacts = audit.craneLib.buildDepsOnly (
+          unstableArgs
+          // {
+            doCheck = false;
+            buildPhaseCargoCommand = pkgs.lib.concatMapStringsSep "\n" (
+              args: "cargoWithProfile check --locked --all-targets ${args}"
+            ) ([ "--all-features" ] ++ map featureArgsFor featureSets);
+          }
+        );
+        featureClippyEntries = pkgs.lib.concatMap (
+          features:
+          let
+            suffix = if features == [ ] then "no-default" else pkgs.lib.concatStringsSep "-" features;
+            clippyFor =
+              unstable:
+              audit.craneLib.cargoClippy (
+                (if unstable then unstableArgs else audit.commonArgs)
+                // {
+                  cargoArtifacts = if unstable then unstableArtifacts else audit.cargoArtifacts;
+                  cargoExtraArgs = featureArgsFor features;
+                  cargoClippyExtraArgs = "--all-targets -- -D warnings";
+                }
+              );
+          in
+          map
+            (unstable: {
+              name = "clippy-${suffix}" + pkgs.lib.optionalString unstable "-unstable";
+              value = clippyFor unstable;
+            })
+            [
+              false
+              true
+            ]
+        ) featureSets;
+        featureClippyChecks =
+          assert pkgs.lib.assertMsg (implicitFeatures == [ ])
+            "Optional dependencies have implicit features that would go unchecked: ${pkgs.lib.concatStringsSep "," implicitFeatures}; reference each as dep:<name> in a user feature";
+          assert pkgs.lib.assertMsg (
+            builtins.length featureClippyEntries
+            == builtins.length (pkgs.lib.unique (map (entry: entry.name) featureClippyEntries))
+          ) "Clippy check names collide; request a ruling before adding these features";
+          builtins.listToAttrs featureClippyEntries;
+
+        # Independent of rust-toolchain.toml: ADR-0004 decision 11.
+        fenix = vigos.inputs.fenix.packages.${system};
+        msrvVersion = "1.95.0";
+        declaredMsrv = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.rust-version;
+        msrvToolchain =
+          assert pkgs.lib.assertMsg (
+            declaredMsrv == msrvVersion || "${declaredMsrv}.0" == msrvVersion
+          ) "Cargo.toml rust-version (${declaredMsrv}) and the MSRV toolchain (${msrvVersion}) disagree";
+          fenix.fromToolchainFile {
+            file = pkgs.writeText "msrv-toolchain.toml" ''
+              [toolchain]
+              channel = "${msrvVersion}"
+              profile = "minimal"
+              targets = ["aarch64-apple-darwin"]
+            '';
+            sha256 = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
+          };
 
         # Devkit knobs read from .vig-os (#1224, #1432, #1431, #1282, #1633): the
         # flake-generated pre-commit hooks — the branch guard and the
@@ -128,99 +270,156 @@
       {
         # The dev shell = the shared vigOS toolchain + your extras.
         # `direnv allow` (via .envrc) or `nix develop` enters it.
-        devShells.default = vigos.lib.mkProjectShell (
-          {
-            inherit pkgs;
-            extraPackages = extraPackages pkgs;
+        devShells = {
+          default = vigos.lib.mkProjectShell (
+            {
+              inherit pkgs;
+              extraPackages = extraPackages pkgs;
 
-            # The rust capability module, fed the same toolchain the checks
-            # build with (what mkRustProject's own devShell would wire).
-            modules = [
-              {
-                name = "rust";
-                checks = "mkRustProject";
-                inherit (rust) toolchain;
-              }
+              # The rust capability module, fed the same toolchain the checks
+              # build with (what mkRustProject's own devShell would wire).
+              modules = [
+                {
+                  name = "rust";
+                  checks = "mkRustProject";
+                  inherit (rust) toolchain;
+                }
+              ];
+
+              # Host-runner hooks (#1167): direnv CI runs on the bare host
+              # runner, so let the flake GENERATE .pre-commit-config.yaml from
+              # the shared base hook set, resolved entirely from the Nix store
+              # (incl. pymarkdown, now a flake system hook, #1170) rather than
+              # building the committed YAML remote pre-commit repo hook envs
+              # per runner. Customize like the opt-in block below; the generated
+              # config is a gitignored /nix/store symlink.
+              hooks = {
+                changelog = {
+                  enable = true;
+                  name = "changelog structure";
+                  entry = "${pkgs.python3}/bin/python3 scripts/check_changelog.py";
+                  language = "system";
+                  pass_filenames = false;
+                  always_run = true;
+                };
+                # Rust gates, run by `just precommit` (and so by CI's lint job).
+                cargo-fmt = {
+                  enable = true;
+                  name = "cargo fmt --check";
+                  entry = "cargo fmt --all -- --check";
+                  files = "\\.rs$";
+                  language = "system";
+                  pass_filenames = false;
+                };
+                cargo-clippy = {
+                  enable = true;
+                  name = "cargo clippy -D warnings";
+                  entry = "cargo clippy --all-targets --all-features --locked -- -D warnings";
+                  files = "(\\.rs$|^Cargo\\.(toml|lock)$)";
+                  language = "system";
+                  pass_filenames = false;
+                };
+              };
+
+              # Opt-in: let the flake GENERATE .pre-commit-config.yaml from the
+              # shared base hook set instead of hand-managing the scaffolded
+              # YAML — toggle base hooks, add per-hook/global excludes, or add
+              # fully custom hooks; hook updates then flow with `nix flake
+              # update vigos`, and your customization lives HERE (preserved).
+              # Contract + migration steps:
+              # https://github.com/vig-os/devkit/blob/main/docs/MIGRATION.md ("Customizing
+              # pre-commit hooks from the project flake"). Uncomment to opt in, then
+              # delete .pre-commit-config.yaml (the generated config refuses to
+              # overwrite an existing file). The generated store symlink is ignored
+              # automatically on (re)scaffold (#1092); add durable root ignores you
+              # own to .gitignore.project.
+              #
+              #   hooks = {
+              #     typos.enable = false;                    # toggle a base hook
+              #     detect-private-keys.excludes = [ "worker/src/index\\.ts" ];
+              #     my-data-check = {                        # fully custom hook
+              #       enable = true;
+              #       entry = "./scripts/check-dat.sh";
+              #       files = "\\.dat$";
+              #       language = "system";
+              #     };
+              #   };
+              #   hooksExcludes = [ "^data/stopping/" "\\.dat$" ]; # global excludes
+            }
+            # Forwarded only when the resolved devkit accepts it (#1249): the vigos
+            # input floats to main, which may predate the argument; older builders
+            # then fall back to their gitflow default instead of failing eval.
+            // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? workflow) {
+              # Branch guard follows the workspace workflow model (#1224).
+              inherit workflow;
+            }
+            // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? branchTypes) {
+              # Branch guard follows the workspace branch-type set (#1432).
+              inherit branchTypes;
+            }
+            // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? commitTypes) {
+              # validate-commit-msg follows the workspace commit-type set (#1431).
+              inherit commitTypes;
+            }
+            // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? refsPolicy) {
+              # validate-commit-msg follows the workspace Refs policy (#1282).
+              inherit refsPolicy;
+            }
+            // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? refsOptionalTypes) {
+              # validate-commit-msg follows the workspace exempt set (#1633).
+              inherit refsOptionalTypes;
+            }
+          );
+
+          msrv = pkgs.mkShell {
+            packages = [
+              msrvToolchain
+              pkgs.python3
             ];
+            MSRV_VERSION = msrvVersion;
+          };
+          # Latest stable, resolved by the locked fenix implementation with a
+          # separate fixed manifest. Advance this pin on each stable release.
+          latest-stable = pkgs.mkShell {
+            packages = [
+              (fenix.toolchainOf {
+                channel = "1.99.0";
+                sha256 = "18mn2v2wrc66a6cqasrdm0dp76xyrq914xqlcmw8skrnhv4dsvff";
+              }).minimalToolchain
+              pkgs.python3
+            ];
+          };
 
-            # Host-runner hooks (#1167): direnv CI runs on the bare host
-            # runner, so let the flake GENERATE .pre-commit-config.yaml from
-            # the shared base hook set, resolved entirely from the Nix store
-            # (incl. pymarkdown, now a flake system hook, #1170) rather than
-            # building the committed YAML remote pre-commit repo hook envs
-            # per runner. Customize like the opt-in block below; the generated
-            # config is a gitignored /nix/store symlink.
-            hooks = {
-              # Rust gates, run by `just precommit` (and so by CI's lint job).
-              cargo-fmt = {
-                enable = true;
-                name = "cargo fmt --check";
-                entry = "cargo fmt --all -- --check";
-                files = "\\.rs$";
-                language = "system";
-                pass_filenames = false;
-              };
-              cargo-clippy = {
-                enable = true;
-                name = "cargo clippy -D warnings";
-                entry = "cargo clippy --all-targets --locked -- -D warnings";
-                files = "(\\.rs$|^Cargo\\.(toml|lock)$)";
-                language = "system";
-                pass_filenames = false;
-              };
-            };
+        };
 
-            # Opt-in: let the flake GENERATE .pre-commit-config.yaml from the
-            # shared base hook set instead of hand-managing the scaffolded
-            # YAML — toggle base hooks, add per-hook/global excludes, or add
-            # fully custom hooks; hook updates then flow with `nix flake
-            # update vigos`, and your customization lives HERE (preserved).
-            # Contract + migration steps:
-            # https://github.com/vig-os/devkit/blob/main/docs/MIGRATION.md ("Customizing
-            # pre-commit hooks from the project flake"). Uncomment to opt in, then
-            # delete .pre-commit-config.yaml (the generated config refuses to
-            # overwrite an existing file). The generated store symlink is ignored
-            # automatically on (re)scaffold (#1092); add durable root ignores you
-            # own to .gitignore.project.
-            #
-            #   hooks = {
-            #     typos.enable = false;                    # toggle a base hook
-            #     detect-private-keys.excludes = [ "worker/src/index\\.ts" ];
-            #     my-data-check = {                        # fully custom hook
-            #       enable = true;
-            #       entry = "./scripts/check-dat.sh";
-            #       files = "\\.dat$";
-            #       language = "system";
-            #     };
-            #   };
-            #   hooksExcludes = [ "^data/stopping/" "\\.dat$" ]; # global excludes
-          }
-          # Forwarded only when the resolved devkit accepts it (#1249): the vigos
-          # input floats to main, which may predate the argument; older builders
-          # then fall back to their gitflow default instead of failing eval.
-          // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? workflow) {
-            # Branch guard follows the workspace workflow model (#1224).
-            inherit workflow;
-          }
-          // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? branchTypes) {
-            # Branch guard follows the workspace branch-type set (#1432).
-            inherit branchTypes;
-          }
-          // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? commitTypes) {
-            # validate-commit-msg follows the workspace commit-type set (#1431).
-            inherit commitTypes;
-          }
-          // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? refsPolicy) {
-            # validate-commit-msg follows the workspace Refs policy (#1282).
-            inherit refsPolicy;
-          }
-          // nixpkgs.lib.optionalAttrs (builtins.functionArgs vigos.lib.mkProjectShell ? refsOptionalTypes) {
-            # validate-commit-msg follows the workspace exempt set (#1633).
-            inherit refsOptionalTypes;
-          }
-        );
-
-        inherit (rust) checks;
+        checks = rustChecks // {
+          # Docs.rs exposes this surface too. Enforce the Cargo documentation
+          # lints for all features with vigil_unstable, as CI already does.
+          unstable-clippy = audit.craneLib.cargoClippy (
+            unstableArgs
+            // {
+              cargoArtifacts = unstableArtifacts;
+              cargoClippyExtraArgs = "--all-targets -- -D warnings";
+            }
+          );
+          changelog =
+            pkgs.runCommand "changelog-check"
+              {
+                nativeBuildInputs = [
+                  pkgs.python3
+                  pkgs.git
+                ];
+              }
+              ''
+                export HOME="$TMPDIR"
+                cd ${self}
+                python3 scripts/check_changelog.py
+                python3 -m unittest discover -s scripts -p test_check_changelog.py -v
+                python3 -m unittest discover -s scripts -p test_check_rust_version.py -v
+                python3 -m unittest discover -s scripts -p test_set_crate_version.py -v
+                touch "$out"
+              '';
+        };
         packages = rust.packages // {
           vigil = rust.packages.default;
         };

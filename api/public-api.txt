@@ -1,0 +1,246 @@
+pub mod vigil
+pub mod vigil::audit
+#[non_exhaustive] pub enum vigil::audit::AuditErrorKind
+pub vigil::audit::AuditErrorKind::CorruptTrail
+pub vigil::audit::AuditErrorKind::HeadMismatch
+pub vigil::audit::AuditErrorKind::InvalidConfig
+pub vigil::audit::AuditErrorKind::InvalidEntry
+pub vigil::audit::AuditErrorKind::Io
+pub vigil::audit::AuditErrorKind::MissingTrail
+pub vigil::audit::AuditErrorKind::Poisoned
+pub vigil::audit::AuditErrorKind::Signer
+pub vigil::audit::AuditErrorKind::TooLarge
+pub vigil::audit::AuditErrorKind::TrailExists
+#[non_exhaustive] pub enum vigil::audit::FindingKind
+pub vigil::audit::FindingKind::HashMismatch
+pub vigil::audit::FindingKind::InvalidField
+pub vigil::audit::FindingKind::MissingField
+pub vigil::audit::FindingKind::UnknownField
+pub vigil::audit::FindingKind::UnknownVersion
+pub vigil::audit::FindingKind::Unparsable
+#[non_exhaustive] pub enum vigil::audit::Value
+pub vigil::audit::Value::Digest([u8; 32])
+pub vigil::audit::Value::Text(alloc::string::String)
+impl vigil::audit::Value
+pub fn vigil::audit::Value::digest_of(bytes: &[u8]) -> Self
+pub struct vigil::audit::AuditConfig
+impl vigil::audit::AuditConfig
+pub fn vigil::audit::AuditConfig::checkpoint(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>, expect_head: (u64, [u8; 32])) -> core::result::Result<vigil::audit::Checkpoint, vigil::audit::AuditError>
+pub fn vigil::audit::AuditConfig::checkpoint_every(self, records: u64) -> Self
+pub fn vigil::audit::AuditConfig::checkpoint_interval(self, interval: core::time::Duration) -> Self
+pub fn vigil::audit::AuditConfig::create(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>) -> core::result::Result<vigil::audit::AuditTrail, vigil::audit::AuditError>
+pub fn vigil::audit::AuditConfig::dir(self, dir: impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn vigil::audit::AuditConfig::expect_head(self, seq: u64, hash: [u8; 32]) -> Self
+pub fn vigil::audit::AuditConfig::max_bytes(self, bytes: u64) -> Self
+pub fn vigil::audit::AuditConfig::mirror_to_logs(self, on: bool) -> Self
+pub fn vigil::audit::AuditConfig::new(service: impl core::convert::Into<alloc::string::String>) -> Self
+pub fn vigil::audit::AuditConfig::open(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>) -> core::result::Result<vigil::audit::AuditTrail, vigil::audit::AuditError>
+pub fn vigil::audit::AuditConfig::resume(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>, head: (u64, [u8; 32]), lost_through: u64, actor: impl core::convert::Into<alloc::string::String>, reason: impl core::convert::Into<alloc::string::String>) -> core::result::Result<(vigil::audit::AuditTrail, vigil::audit::Receipt, vigil::audit::Checkpoint), vigil::audit::AuditError>
+pub fn vigil::audit::AuditConfig::rotate(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>, bound: (u64, [u8; 32]), expect_head: (u64, [u8; 32]), actor: impl core::convert::Into<alloc::string::String>, reason: impl core::convert::Into<alloc::string::String>) -> core::result::Result<(vigil::audit::Receipt, vigil::audit::Checkpoint), vigil::audit::AuditError>
+pub struct vigil::audit::AuditError
+impl vigil::audit::AuditError
+pub fn vigil::audit::AuditError::finding_kind(&self) -> core::option::Option<vigil::audit::FindingKind>
+pub fn vigil::audit::AuditError::kind(&self) -> vigil::audit::AuditErrorKind
+impl core::error::Error for vigil::audit::AuditError
+impl core::fmt::Display for vigil::audit::AuditError
+pub fn vigil::audit::AuditError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct vigil::audit::AuditTrail
+impl vigil::audit::AuditTrail
+pub fn vigil::audit::AuditTrail::checkpoint(&self) -> core::result::Result<vigil::audit::Checkpoint, vigil::audit::AuditError>
+pub fn vigil::audit::AuditTrail::close(self) -> core::result::Result<vigil::audit::Checkpoint, vigil::audit::AuditError>
+pub fn vigil::audit::AuditTrail::dir(&self) -> &std::path::Path
+pub fn vigil::audit::AuditTrail::record(&self, entry: &vigil::audit::Entry) -> core::result::Result<vigil::audit::Receipt, vigil::audit::AuditError>
+pub fn vigil::audit::AuditTrail::trail(&self) -> [u8; 16]
+impl core::fmt::Debug for vigil::audit::AuditTrail
+pub fn vigil::audit::AuditTrail::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct vigil::audit::Checkpoint
+impl vigil::audit::Checkpoint
+pub fn vigil::audit::Checkpoint::hash(&self) -> [u8; 32]
+pub fn vigil::audit::Checkpoint::key_id(&self) -> [u8; 32]
+pub fn vigil::audit::Checkpoint::line(&self) -> &str
+pub fn vigil::audit::Checkpoint::mmr_root(&self) -> [u8; 32]
+pub fn vigil::audit::Checkpoint::mmr_size(&self) -> u64
+pub fn vigil::audit::Checkpoint::parse(line: &str) -> core::result::Result<Self, vigil::audit::AuditError>
+pub fn vigil::audit::Checkpoint::seq(&self) -> u64
+pub struct vigil::audit::Entry
+impl vigil::audit::Entry
+pub fn vigil::audit::Entry::after(self, value: vigil::audit::Value) -> Self
+pub fn vigil::audit::Entry::before(self, value: vigil::audit::Value) -> Self
+pub fn vigil::audit::Entry::details(self, value: impl core::convert::Into<alloc::string::String>) -> Self
+pub fn vigil::audit::Entry::new(actor: impl core::convert::Into<alloc::string::String>, action: impl core::convert::Into<alloc::string::String>, object: impl core::convert::Into<alloc::string::String>) -> Self
+pub fn vigil::audit::Entry::reason(self, value: impl core::convert::Into<alloc::string::String>) -> Self
+pub struct vigil::audit::KeyFileSigner(_)
+impl vigil::audit::KeyFileSigner
+pub fn vigil::audit::KeyFileSigner::load(path: impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, vigil::audit::SignerError>
+impl core::fmt::Debug for vigil::audit::KeyFileSigner
+pub fn vigil::audit::KeyFileSigner::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl vigil::audit::Signer for vigil::audit::KeyFileSigner
+pub fn vigil::audit::KeyFileSigner::public_key(&self) -> [u8; 32]
+pub fn vigil::audit::KeyFileSigner::sign(&self, message: &[u8]) -> core::result::Result<[u8; 64], vigil::audit::SignerError>
+pub struct vigil::audit::Receipt
+impl vigil::audit::Receipt
+pub fn vigil::audit::Receipt::hash(&self) -> [u8; 32]
+pub fn vigil::audit::Receipt::hash_string(&self) -> alloc::string::String
+pub fn vigil::audit::Receipt::seq(&self) -> u64
+pub fn vigil::audit::Receipt::trail(&self) -> [u8; 16]
+pub fn vigil::audit::Receipt::unsigned_records(&self) -> u64
+pub struct vigil::audit::SignerError(_)
+impl vigil::audit::SignerError
+pub fn vigil::audit::SignerError::new(detail: impl core::convert::Into<alloc::string::String>) -> Self
+impl core::error::Error for vigil::audit::SignerError
+impl core::fmt::Display for vigil::audit::SignerError
+pub fn vigil::audit::SignerError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub trait vigil::audit::Signer: core::marker::Send + core::marker::Sync + core::fmt::Debug
+pub fn vigil::audit::Signer::public_key(&self) -> [u8; 32]
+pub fn vigil::audit::Signer::sign(&self, message: &[u8]) -> core::result::Result<[u8; 64], vigil::audit::SignerError>
+impl vigil::audit::Signer for vigil::audit::KeyFileSigner
+pub fn vigil::audit::KeyFileSigner::public_key(&self) -> [u8; 32]
+pub fn vigil::audit::KeyFileSigner::sign(&self, message: &[u8]) -> core::result::Result<[u8; 64], vigil::audit::SignerError>
+pub fn vigil::audit::checkpoints(dir: &std::path::Path) -> std::io::error::Result<alloc::vec::Vec<vigil::audit::Checkpoint>>
+pub fn vigil::audit::keygen(path: impl core::convert::AsRef<std::path::Path>) -> core::result::Result<[u8; 32], vigil::audit::SignerError>
+pub mod vigil::metrics
+#[non_exhaustive] pub enum vigil::metrics::Value
+pub vigil::metrics::Value::Bool(bool)
+pub vigil::metrics::Value::F64(f64)
+pub vigil::metrics::Value::I64(i64)
+pub vigil::metrics::Value::Str(alloc::borrow::Cow<'static, str>)
+impl core::convert::From<&'static str> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: &'static str) -> Self
+impl core::convert::From<alloc::string::String> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: alloc::string::String) -> Self
+impl core::convert::From<bool> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: bool) -> Self
+impl core::convert::From<f32> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: f32) -> Self
+impl core::convert::From<f64> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: f64) -> Self
+impl core::convert::From<i16> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: i16) -> Self
+impl core::convert::From<i32> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: i32) -> Self
+impl core::convert::From<i64> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: i64) -> Self
+impl core::convert::From<i8> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: i8) -> Self
+impl core::convert::From<isize> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: isize) -> Self
+impl core::convert::From<u16> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: u16) -> Self
+impl core::convert::From<u32> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: u32) -> Self
+impl core::convert::From<u64> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: u64) -> Self
+impl core::convert::From<u8> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: u8) -> Self
+impl core::convert::From<usize> for vigil::metrics::Value
+pub fn vigil::metrics::Value::from(value: usize) -> Self
+pub struct vigil::metrics::Counter(_)
+impl vigil::metrics::Counter
+pub fn vigil::metrics::Counter::add(&self, value: u64, attrs: &[(&'static str, vigil::metrics::Value)])
+pub const fn vigil::metrics::Counter::new(scope: vigil::metrics::Scope, name: &'static str) -> Self
+pub const fn vigil::metrics::Counter::with_description(self, description: &'static str) -> Self
+pub const fn vigil::metrics::Counter::with_unit(self, unit: &'static str) -> Self
+pub struct vigil::metrics::CounterF64(_)
+impl vigil::metrics::CounterF64
+pub fn vigil::metrics::CounterF64::add(&self, value: f64, attrs: &[(&'static str, vigil::metrics::Value)])
+pub const fn vigil::metrics::CounterF64::new(scope: vigil::metrics::Scope, name: &'static str) -> Self
+pub const fn vigil::metrics::CounterF64::with_description(self, description: &'static str) -> Self
+pub const fn vigil::metrics::CounterF64::with_unit(self, unit: &'static str) -> Self
+pub struct vigil::metrics::Gauge(_)
+impl vigil::metrics::Gauge
+pub const fn vigil::metrics::Gauge::new(scope: vigil::metrics::Scope, name: &'static str) -> Self
+pub fn vigil::metrics::Gauge::record(&self, value: f64, attrs: &[(&'static str, vigil::metrics::Value)])
+pub const fn vigil::metrics::Gauge::with_description(self, description: &'static str) -> Self
+pub const fn vigil::metrics::Gauge::with_unit(self, unit: &'static str) -> Self
+pub struct vigil::metrics::Histogram(_)
+impl vigil::metrics::Histogram
+pub const fn vigil::metrics::Histogram::new(scope: vigil::metrics::Scope, name: &'static str) -> Self
+pub fn vigil::metrics::Histogram::record(&self, value: f64, attrs: &[(&'static str, vigil::metrics::Value)])
+pub const fn vigil::metrics::Histogram::with_boundaries(self, boundaries: &'static [f64]) -> Self
+pub const fn vigil::metrics::Histogram::with_description(self, description: &'static str) -> Self
+pub const fn vigil::metrics::Histogram::with_unit(self, unit: &'static str) -> Self
+pub struct vigil::metrics::Scope
+impl vigil::metrics::Scope
+pub const fn vigil::metrics::Scope::new(name: &'static str, version: &'static str) -> Self
+pub struct vigil::metrics::UpDownCounter(_)
+impl vigil::metrics::UpDownCounter
+pub fn vigil::metrics::UpDownCounter::add(&self, value: i64, attrs: &[(&'static str, vigil::metrics::Value)])
+pub const fn vigil::metrics::UpDownCounter::new(scope: vigil::metrics::Scope, name: &'static str) -> Self
+pub const fn vigil::metrics::UpDownCounter::with_description(self, description: &'static str) -> Self
+pub const fn vigil::metrics::UpDownCounter::with_unit(self, unit: &'static str) -> Self
+pub mod vigil::rotate
+pub struct vigil::rotate::RotatingFile
+impl vigil::rotate::RotatingFile
+pub fn vigil::rotate::RotatingFile::append(&self, line: &[u8]) -> std::io::error::Result<()>
+pub fn vigil::rotate::RotatingFile::open(dir: &std::path::Path, signal: &str, cfg: vigil::rotate::RotationConfig) -> std::io::error::Result<Self>
+impl core::fmt::Debug for vigil::rotate::RotatingFile
+pub fn vigil::rotate::RotatingFile::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct vigil::rotate::RotationConfig
+impl vigil::rotate::RotationConfig
+pub fn vigil::rotate::RotationConfig::max_bytes(self, bytes: u64) -> Self
+pub fn vigil::rotate::RotationConfig::retention(self, retention: core::option::Option<core::time::Duration>) -> Self
+impl core::default::Default for vigil::rotate::RotationConfig
+pub fn vigil::rotate::RotationConfig::default() -> Self
+pub fn vigil::rotate::find_newest<T>(dir: &std::path::Path, signal: &str, pick: impl core::ops::function::FnMut(&str) -> core::option::Option<T>) -> std::io::error::Result<core::option::Option<T>>
+pub fn vigil::rotate::read_since(dir: &std::path::Path, signal: &str, since: core::option::Option<std::time::SystemTime>) -> std::io::error::Result<alloc::vec::Vec<alloc::string::String>>
+pub fn vigil::rotate::segments(dir: &std::path::Path, signal: &str) -> std::io::error::Result<alloc::vec::Vec<std::path::PathBuf>>
+pub fn vigil::rotate::segments_since(dir: &std::path::Path, signal: &str, since: core::option::Option<std::time::SystemTime>) -> std::io::error::Result<alloc::vec::Vec<std::path::PathBuf>>
+pub macro vigil::scope!
+#[non_exhaustive] pub enum vigil::Console
+pub vigil::Console::Off
+pub vigil::Console::Stderr
+#[non_exhaustive] pub enum vigil::FlushErrorKind
+pub vigil::FlushErrorKind::DataLost
+pub vigil::FlushErrorKind::Failed
+pub vigil::FlushErrorKind::Timeout
+#[non_exhaustive] pub enum vigil::InitErrorKind
+pub vigil::InitErrorKind::AlreadyRunning
+pub vigil::InitErrorKind::ForeignSubscriber
+pub vigil::InitErrorKind::InvalidFilter
+pub vigil::InitErrorKind::InvalidServiceName
+#[non_exhaustive] pub enum vigil::Signal
+pub vigil::Signal::Logs
+pub vigil::Signal::Metrics
+pub vigil::Signal::Traces
+pub struct vigil::Config
+impl vigil::Config
+pub fn vigil::Config::console(self, console: vigil::Console) -> Self
+pub fn vigil::Config::default_filter(self, directives: impl core::convert::Into<alloc::string::String>) -> Self
+pub fn vigil::Config::dir(self, dir: impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn vigil::Config::filter_env(self, name: impl core::convert::Into<alloc::string::String>) -> Self
+pub fn vigil::Config::init(self) -> core::result::Result<vigil::Guard, vigil::InitError>
+pub fn vigil::Config::layer<S>(self) -> core::result::Result<(alloc::boxed::Box<(dyn tracing_subscriber::layer::Layer<S> + core::marker::Send + core::marker::Sync + 'static)>, vigil::Guard), vigil::InitError> where S: tracing_core::subscriber::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + core::marker::Send + core::marker::Sync + 'static
+pub fn vigil::Config::max_bytes(self, bytes: u64) -> Self
+pub fn vigil::Config::metrics(self, enabled: bool) -> Self
+pub fn vigil::Config::metrics_interval(self, interval: core::time::Duration) -> Self
+pub fn vigil::Config::new(service: impl core::convert::Into<alloc::string::String>) -> Self
+pub fn vigil::Config::queue_size(self, size: usize) -> Self
+pub fn vigil::Config::retention(self, retention: core::option::Option<core::time::Duration>) -> Self
+pub fn vigil::Config::revision(self, revision: impl core::convert::Into<alloc::string::String>) -> Self
+pub fn vigil::Config::traces(self, enabled: bool) -> Self
+pub fn vigil::Config::version(self, version: impl core::convert::Into<alloc::string::String>) -> Self
+pub struct vigil::FlushError
+impl vigil::FlushError
+pub fn vigil::FlushError::kind(&self) -> vigil::FlushErrorKind
+pub fn vigil::FlushError::lost(&self, signal: vigil::Signal) -> u64
+impl core::error::Error for vigil::FlushError
+pub fn vigil::FlushError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for vigil::FlushError
+pub fn vigil::FlushError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct vigil::Guard
+impl vigil::Guard
+pub fn vigil::Guard::dir(&self) -> core::option::Option<&std::path::Path>
+pub fn vigil::Guard::flush(&self) -> core::result::Result<(), vigil::FlushError>
+pub fn vigil::Guard::shutdown(self) -> core::result::Result<(), vigil::FlushError>
+pub fn vigil::Guard::shutdown_with_timeout(self, timeout: core::time::Duration) -> core::result::Result<(), vigil::FlushError>
+impl core::ops::drop::Drop for vigil::Guard
+pub fn vigil::Guard::drop(&mut self)
+pub struct vigil::InitError
+impl vigil::InitError
+pub fn vigil::InitError::kind(&self) -> vigil::InitErrorKind
+impl core::error::Error for vigil::InitError
+pub fn vigil::InitError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for vigil::InitError
+pub fn vigil::InitError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub const vigil::VERSION: &str
+pub fn vigil::init(service: impl core::convert::Into<alloc::string::String>) -> core::result::Result<vigil::Guard, vigil::InitError>

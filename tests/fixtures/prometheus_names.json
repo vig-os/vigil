@@ -1,0 +1,1225 @@
+[
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "d",
+    "expected": [
+      "app_x_days_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.days.x",
+    "unit": "d",
+    "expected": [
+      "app_days_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "h",
+    "expected": [
+      "app_x_hours_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.hours.x",
+    "unit": "h",
+    "expected": [
+      "app_hours_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "min",
+    "expected": [
+      "app_x_minutes_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.minutes.x",
+    "unit": "min",
+    "expected": [
+      "app_minutes_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "s",
+    "expected": [
+      "app_x_seconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.seconds.x",
+    "unit": "s",
+    "expected": [
+      "app_seconds_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "ms",
+    "expected": [
+      "app_x_milliseconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.milliseconds.x",
+    "unit": "ms",
+    "expected": [
+      "app_milliseconds_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "us",
+    "expected": [
+      "app_x_microseconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.microseconds.x",
+    "unit": "us",
+    "expected": [
+      "app_microseconds_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "ns",
+    "expected": [
+      "app_x_nanoseconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.nanoseconds.x",
+    "unit": "ns",
+    "expected": [
+      "app_nanoseconds_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "By",
+    "expected": [
+      "app_x_bytes_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.bytes.x",
+    "unit": "By",
+    "expected": [
+      "app_bytes_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "KiBy",
+    "expected": [
+      "app_x_kibibytes_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.kibibytes.x",
+    "unit": "KiBy",
+    "expected": [
+      "app_kibibytes_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "MiBy",
+    "expected": [
+      "app_x_mebibytes_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.mebibytes.x",
+    "unit": "MiBy",
+    "expected": [
+      "app_mebibytes_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "GiBy",
+    "expected": [
+      "app_x_gibibytes_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.gibibytes.x",
+    "unit": "GiBy",
+    "expected": [
+      "app_gibibytes_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "TiBy",
+    "expected": [
+      "app_x_tibibytes_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.tibibytes.x",
+    "unit": "TiBy",
+    "expected": [
+      "app_tibibytes_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "KBy",
+    "expected": [
+      "app_x_kilobytes_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.kilobytes.x",
+    "unit": "KBy",
+    "expected": [
+      "app_kilobytes_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "MBy",
+    "expected": [
+      "app_x_megabytes_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.megabytes.x",
+    "unit": "MBy",
+    "expected": [
+      "app_megabytes_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "GBy",
+    "expected": [
+      "app_x_gigabytes_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.gigabytes.x",
+    "unit": "GBy",
+    "expected": [
+      "app_gigabytes_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "TBy",
+    "expected": [
+      "app_x_terabytes_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.terabytes.x",
+    "unit": "TBy",
+    "expected": [
+      "app_terabytes_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "m",
+    "expected": [
+      "app_x_meters_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.meters.x",
+    "unit": "m",
+    "expected": [
+      "app_meters_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "V",
+    "expected": [
+      "app_x_volts_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.volts.x",
+    "unit": "V",
+    "expected": [
+      "app_volts_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "A",
+    "expected": [
+      "app_x_amperes_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.amperes.x",
+    "unit": "A",
+    "expected": [
+      "app_amperes_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "J",
+    "expected": [
+      "app_x_joules_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.joules.x",
+    "unit": "J",
+    "expected": [
+      "app_joules_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "W",
+    "expected": [
+      "app_x_watts_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.watts.x",
+    "unit": "W",
+    "expected": [
+      "app_watts_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "g",
+    "expected": [
+      "app_x_grams_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.grams.x",
+    "unit": "g",
+    "expected": [
+      "app_grams_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "Cel",
+    "expected": [
+      "app_x_celsius_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.celsius.x",
+    "unit": "Cel",
+    "expected": [
+      "app_celsius_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "Hz",
+    "expected": [
+      "app_x_hertz_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.hertz.x",
+    "unit": "Hz",
+    "expected": [
+      "app_hertz_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "%",
+    "expected": [
+      "app_x_percent_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.percent.x",
+    "unit": "%",
+    "expected": [
+      "app_percent_x_total"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.x",
+    "unit": "By/s",
+    "expected": [
+      "app_x_bytes_per_second"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.x",
+    "unit": "By/m",
+    "expected": [
+      "app_x_bytes_per_minute"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.x",
+    "unit": "By/h",
+    "expected": [
+      "app_x_bytes_per_hour"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.x",
+    "unit": "By/d",
+    "expected": [
+      "app_x_bytes_per_day"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.x",
+    "unit": "By/w",
+    "expected": [
+      "app_x_bytes_per_week"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.x",
+    "unit": "By/mo",
+    "expected": [
+      "app_x_bytes_per_month"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.x",
+    "unit": "By/y",
+    "expected": [
+      "app_x_bytes_per_year"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.total.x",
+    "unit": "",
+    "expected": [
+      "app_x_total"
+    ]
+  },
+  {
+    "kind": "CounterF64",
+    "name": "app__y",
+    "unit": "",
+    "expected": [
+      "app_y_total"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.r",
+    "unit": "1",
+    "expected": [
+      "app_r_ratio"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.ratio.x",
+    "unit": "1",
+    "expected": [
+      "app_x_ratio"
+    ]
+  },
+  {
+    "kind": "UpDownCounter",
+    "name": "app.x",
+    "unit": "1",
+    "expected": [
+      "app_x"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.x",
+    "unit": "{requests}/s",
+    "expected": [
+      "app_x_per_second"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.x",
+    "unit": "By/{requests}",
+    "expected": [
+      "app_x_bytes"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.x",
+    "unit": "custom-unit",
+    "expected": [
+      "app_x_custom_unit"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "1x",
+    "unit": "",
+    "expected": [
+      "_1x"
+    ],
+    "translation_only": "ADR-0003 d24 rejects names starting with a digit"
+  },
+  {
+    "kind": "Histogram",
+    "name": "app.y",
+    "unit": "ms",
+    "expected": [
+      "app_y_milliseconds_bucket",
+      "app_y_milliseconds_sum",
+      "app_y_milliseconds_count"
+    ]
+  },
+  {
+    "kind": "Histogram",
+    "name": "valid",
+    "unit": "",
+    "expected": [
+      "valid_bucket",
+      "valid_sum",
+      "valid_count"
+    ]
+  },
+  {
+    "kind": "Histogram",
+    "name": "valid",
+    "unit": "us",
+    "expected": [
+      "valid_microseconds_bucket",
+      "valid_microseconds_sum",
+      "valid_microseconds_count"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "pending",
+    "unit": "",
+    "expected": [
+      "pending_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "sentinel.survives",
+    "unit": "",
+    "expected": [
+      "sentinel_survives_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "requests",
+    "unit": "",
+    "expected": [
+      "requests_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "many",
+    "unit": "",
+    "expected": [
+      "many_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "oversize",
+    "unit": "",
+    "expected": [
+      "oversize_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "valid",
+    "unit": "",
+    "expected": [
+      "valid_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "requests",
+    "unit": "{request}",
+    "expected": [
+      "requests_total"
+    ]
+  },
+  {
+    "kind": "CounterF64",
+    "name": "cpu",
+    "unit": "s",
+    "expected": [
+      "cpu_seconds_total"
+    ]
+  },
+  {
+    "kind": "UpDownCounter",
+    "name": "inflight",
+    "unit": "",
+    "expected": [
+      "inflight"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "memory",
+    "unit": "By",
+    "expected": [
+      "memory_bytes"
+    ]
+  },
+  {
+    "kind": "Histogram",
+    "name": "latency",
+    "unit": "",
+    "expected": [
+      "latency_bucket",
+      "latency_sum",
+      "latency_count"
+    ]
+  },
+  {
+    "kind": "Histogram",
+    "name": "defaults",
+    "unit": "",
+    "expected": [
+      "defaults_bucket",
+      "defaults_sum",
+      "defaults_count"
+    ]
+  },
+  {
+    "kind": "Histogram",
+    "name": "empty",
+    "unit": "",
+    "expected": [
+      "empty_bucket",
+      "empty_sum",
+      "empty_count"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "bound",
+    "unit": "",
+    "expected": [
+      "bound_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "late",
+    "unit": "",
+    "expected": [
+      "late_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "off",
+    "unit": "",
+    "expected": [
+      "off_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "failed",
+    "unit": "",
+    "expected": [
+      "failed_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "unbound",
+    "unit": "",
+    "expected": [
+      "unbound_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "staged.x",
+    "unit": "ms",
+    "expected": [
+      "staged_x_milliseconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "staged.x",
+    "unit": "s",
+    "expected": [
+      "staged_x_seconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "staged.ok",
+    "unit": "",
+    "expected": [
+      "staged_ok_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "empty.x",
+    "unit": "ms",
+    "expected": [
+      "empty_x_milliseconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "empty.x",
+    "unit": "s",
+    "expected": [
+      "empty_x_seconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "conflict.x",
+    "unit": "ms",
+    "expected": [
+      "conflict_x_milliseconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "conflict.x",
+    "unit": "s",
+    "expected": [
+      "conflict_x_seconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "identity.ok",
+    "unit": "",
+    "expected": [
+      "identity_ok_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "global.x",
+    "unit": "ms",
+    "expected": [
+      "global_x_milliseconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "global.x",
+    "unit": "s",
+    "expected": [
+      "global_x_seconds_total"
+    ]
+  },
+  {
+    "kind": "Histogram",
+    "name": "zero.h",
+    "unit": "",
+    "expected": [
+      "zero_h_bucket",
+      "zero_h_sum",
+      "zero_h_count"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "global.x",
+    "unit": "",
+    "expected": [
+      "global_x_total"
+    ]
+  },
+  {
+    "kind": "Histogram",
+    "name": "hist",
+    "unit": "",
+    "expected": [
+      "hist_bucket",
+      "hist_sum",
+      "hist_count"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "counter",
+    "unit": "",
+    "expected": [
+      "counter_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "count",
+    "unit": "",
+    "expected": [
+      "count_total"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "gauge",
+    "unit": "",
+    "expected": [
+      "gauge"
+    ]
+  },
+  {
+    "kind": "Histogram",
+    "name": "histogram",
+    "unit": "",
+    "expected": [
+      "histogram_bucket",
+      "histogram_sum",
+      "histogram_count"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "conformance.conflict",
+    "unit": "ms",
+    "expected": [
+      "conformance_conflict_milliseconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "conformance.conflict",
+    "unit": "s",
+    "expected": [
+      "conformance_conflict_seconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "conformance.kept",
+    "unit": "",
+    "expected": [
+      "conformance_kept_total"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "nonfinite",
+    "unit": "",
+    "expected": [
+      "nonfinite"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.requests",
+    "unit": "{request}",
+    "expected": [
+      "app_requests_total"
+    ]
+  },
+  {
+    "kind": "CounterF64",
+    "name": "process.cpu.time",
+    "unit": "s",
+    "expected": [
+      "process_cpu_time_seconds_total"
+    ]
+  },
+  {
+    "kind": "Histogram",
+    "name": "app.latency",
+    "unit": "ms",
+    "expected": [
+      "app_latency_milliseconds_bucket",
+      "app_latency_milliseconds_sum",
+      "app_latency_milliseconds_count"
+    ]
+  },
+  {
+    "kind": "UpDownCounter",
+    "name": "app.inflight",
+    "unit": "",
+    "expected": [
+      "app_inflight"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.memory",
+    "unit": "By",
+    "expected": [
+      "app_memory_bytes"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "",
+    "expected": [
+      "app_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "App.X",
+    "unit": "",
+    "expected": [
+      "App_X_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app_x",
+    "unit": "",
+    "expected": [
+      "app_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x.milliseconds",
+    "unit": "",
+    "expected": [
+      "app_x_milliseconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app__y",
+    "unit": "",
+    "expected": [
+      "app_y_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app_y",
+    "unit": "",
+    "expected": [
+      "app_y_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x.seconds",
+    "unit": "",
+    "expected": [
+      "app_x_seconds_total"
+    ]
+  },
+  {
+    "kind": "Histogram",
+    "name": "app.x",
+    "unit": "ms",
+    "expected": [
+      "app_x_milliseconds_bucket",
+      "app_x_milliseconds_sum",
+      "app_x_milliseconds_count"
+    ]
+  },
+  {
+    "kind": "Histogram",
+    "name": "app.x",
+    "unit": "",
+    "expected": [
+      "app_x_bucket",
+      "app_x_sum",
+      "app_x_count"
+    ]
+  },
+  {
+    "kind": "Histogram",
+    "name": "app.y",
+    "unit": "",
+    "expected": [
+      "app_y_bucket",
+      "app_y_sum",
+      "app_y_count"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.y.count",
+    "unit": "",
+    "expected": [
+      "app_y_count"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "app.r.ratio",
+    "unit": "",
+    "expected": [
+      "app_r_ratio"
+    ]
+  },
+  {
+    "kind": "CounterF64",
+    "name": "app.x",
+    "unit": "",
+    "expected": [
+      "app_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "same.name",
+    "unit": "ms",
+    "expected": [
+      "same_name_milliseconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "same.name",
+    "unit": "s",
+    "expected": [
+      "same_name_seconds_total"
+    ]
+  },
+  {
+    "kind": "CounterF64",
+    "name": "same.name",
+    "unit": "ms",
+    "expected": [
+      "same_name_milliseconds_total"
+    ]
+  },
+  {
+    "kind": "CounterF64",
+    "name": "same.name",
+    "unit": "s",
+    "expected": [
+      "same_name_seconds_total"
+    ]
+  },
+  {
+    "kind": "UpDownCounter",
+    "name": "same.name",
+    "unit": "ms",
+    "expected": [
+      "same_name_milliseconds"
+    ]
+  },
+  {
+    "kind": "UpDownCounter",
+    "name": "same.name",
+    "unit": "s",
+    "expected": [
+      "same_name_seconds"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "same.name",
+    "unit": "ms",
+    "expected": [
+      "same_name_milliseconds"
+    ]
+  },
+  {
+    "kind": "Gauge",
+    "name": "same.name",
+    "unit": "s",
+    "expected": [
+      "same_name_seconds"
+    ]
+  },
+  {
+    "kind": "Histogram",
+    "name": "same.name",
+    "unit": "ms",
+    "expected": [
+      "same_name_milliseconds_bucket",
+      "same_name_milliseconds_sum",
+      "same_name_milliseconds_count"
+    ]
+  },
+  {
+    "kind": "Histogram",
+    "name": "same.name",
+    "unit": "s",
+    "expected": [
+      "same_name_seconds_bucket",
+      "same_name_seconds_sum",
+      "same_name_seconds_count"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "a",
+    "unit": "",
+    "expected": [
+      "a_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "A0_./-z",
+    "unit": "",
+    "expected": [
+      "A0_z_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "unit": "",
+    "expected": [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "valid",
+    "unit": "s",
+    "expected": [
+      "valid_seconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "valid",
+    "unit": "\u0000",
+    "expected": [
+      "valid_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "valid",
+    "unit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expected": [
+      "valid_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "counter-0",
+    "unit": "",
+    "expected": [
+      "counter_0_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "counter-1",
+    "unit": "",
+    "expected": [
+      "counter_1_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "counter-2",
+    "unit": "",
+    "expected": [
+      "counter_2_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "counter-3",
+    "unit": "",
+    "expected": [
+      "counter_3_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x",
+    "unit": "1",
+    "expected": [
+      "app_x_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.x.milliseconds",
+    "unit": "ms",
+    "expected": [
+      "app_x_milliseconds_total"
+    ]
+  },
+  {
+    "kind": "Counter",
+    "name": "app.witness",
+    "unit": "",
+    "expected": [
+      "app_witness_total"
+    ]
+  }
+]

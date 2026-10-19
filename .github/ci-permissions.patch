@@ -1,0 +1,18 @@
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -524,6 +524,7 @@
+               git config --global --add safe.directory /workspace
+               /root/assets/init-workspace.sh --force --no-prompts
+               cd /workspace
++              git apply --whitespace=error .github/ci-permissions.patch
+               git add -A
+               if git diff --cached --quiet; then
+                 echo "No scaffold drift detected — managed files match devkit ${VIG_OS_VERSION}."
+@@ -648,6 +649,7 @@
+     permissions:
+       contents: read
+       packages: read
++      pull-requests: read
+     with:
+       mode: ${{ needs.resolve-toolchain.outputs.mode }}
+       image: ${{ needs.resolve-toolchain.outputs.image }}
