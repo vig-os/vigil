@@ -216,13 +216,18 @@ fn package_excludes_nested_tooling() {
 
 #[test]
 fn unstable_pins_cover_both_release_phases() {
+    // Split deliberately incomplete pin examples so the package-wide scan does
+    // not mistake test assertions for consumer advice.
     let rustdoc = include_str!("../src/lib.rs");
     for text in [README, rustdoc] {
         assert!(text.contains("unstable items may change in any release"));
         assert!(text.contains("pin `=0.N.M` before 1.0"));
-        assert!(text.contains("pin `~1.N` from 1.0"));
+        assert!(text.contains(concat!("pin `~", "1.N` from 1.0")));
     }
-    assert!(!README.contains("Applications that set the cfg should pin `~1.N`"));
+    assert!(!README.contains(concat!(
+        "Applications that set the cfg should pin `~",
+        "1.N`"
+    )));
 }
 
 #[test]
@@ -275,40 +280,67 @@ fn readme_relative_links_are_packaged() {
     }
 }
 
-#[test]
-fn all_unstable_pin_advice_is_phase_specific() {
-    fn check_tree(dir: &std::path::Path, checked: &mut usize) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                check_tree(&path, checked);
-            } else if matches!(
-                path.extension().and_then(|ext| ext.to_str()),
-                Some("rs" | "md")
-            ) {
-                let text = std::fs::read_to_string(&path).unwrap();
-                for (index, line) in text
-                    .lines()
-                    .enumerate()
-                    .filter(|(_, line)| line.contains("~1.N"))
-                {
-                    assert!(
-                        line.contains("`=0.N.M` before 1.0") && line.contains("`~1.N` from 1.0"),
-                        "{}:{}: pin advice must cover both phases: {line}",
-                        path.display(),
-                        index + 1
-                    );
-                    *checked += 1;
-                }
-            }
+fn check_pin_advice_tree(path: &std::path::Path, checked: &mut usize) {
+    // devkit's generated docs/issues/ and docs/pull-requests/ quote historical
+    // discussions verbatim; they are not authored consumer documentation.
+    if path.ends_with("docs/issues") || path.ends_with("docs/pull-requests") {
+        return;
+    }
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path).unwrap() {
+            check_pin_advice_tree(&entry.unwrap().path(), checked);
+        }
+    } else if matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("rs" | "md")
+    ) {
+        let text = std::fs::read_to_string(path).unwrap();
+        for (index, line) in text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(concat!("~", "1.N")))
+        {
+            assert!(
+                line.contains("`=0.N.M` before 1.0") && line.contains("`~1.N` from 1.0"),
+                "{}:{}: pin advice must cover both phases: {line}",
+                path.display(),
+                index + 1
+            );
+            *checked += 1;
         }
     }
+}
+
+#[test]
+fn all_unstable_pin_advice_is_phase_specific() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut checked = 0;
-    for dir in ["src", "docs"] {
-        check_tree(&root.join(dir), &mut checked);
+    for pattern in package_patterns() {
+        let path = pattern.trim_start_matches('/');
+        let path = path.strip_suffix("/**").unwrap_or(path);
+        check_pin_advice_tree(&root.join(path), &mut checked);
     }
     assert!(checked > 0, "pin-advice scan must inspect real occurrences");
+}
+
+#[test]
+fn pin_advice_scan_ignores_generated_mirrors_but_rejects_authored_sources() {
+    let dir = temp::TempDir::new();
+    let bad_advice = concat!("Applications should pin `~", "1.N`.\n");
+    for mirror in ["docs/issues", "docs/pull-requests"] {
+        std::fs::create_dir_all(dir.0.join(mirror)).unwrap();
+        std::fs::write(dir.0.join(mirror).join("quoted.md"), bad_advice).unwrap();
+    }
+    let mut checked = 0;
+    check_pin_advice_tree(&dir.0, &mut checked);
+    assert_eq!(checked, 0);
+
+    std::fs::create_dir(dir.0.join("src")).unwrap();
+    std::fs::write(dir.0.join("src/lib.rs"), bad_advice).unwrap();
+    assert!(
+        std::panic::catch_unwind(|| check_pin_advice_tree(&dir.0, &mut 0)).is_err(),
+        "authored source with phase-incomplete advice must fail"
+    );
 }
 
 #[test]
