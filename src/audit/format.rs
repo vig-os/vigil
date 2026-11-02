@@ -30,13 +30,15 @@ impl Value {
 /// Validation occurs when constructing a record, before any bytes are emitted.
 #[derive(Clone, Debug)]
 pub struct Entry {
-    actor: String,
+    pub(super) actor: String,
     pub(super) action: String,
     pub(super) object: String,
-    reason: Option<String>,
-    before: Option<Value>,
-    after: Option<Value>,
+    pub(super) reason: Option<String>,
+    pub(super) before: Option<Value>,
+    pub(super) after: Option<Value>,
     pub(super) details: Option<String>,
+    /// Caller attributes, consumed only by schema-checked writer preparation.
+    pub(super) attrs: std::collections::BTreeMap<String, super::AttrValue>,
 }
 impl Entry {
     /// Creates an action with its actor and regulated object identifier.
@@ -53,7 +55,14 @@ impl Entry {
             before: None,
             after: None,
             details: None,
+            attrs: Default::default(),
         }
+    }
+    /// Sets a typed attribute, replacing the previous value for this key.
+    /// Checked against the trail schema at `record()`; a schema is required.
+    pub fn attr(mut self, key: impl Into<String>, value: super::AttrValue) -> Self {
+        self.attrs.insert(key.into(), value);
+        self
     }
     /// Sets the reason for the change.
     pub fn reason(mut self, value: impl Into<String>) -> Self {
@@ -71,6 +80,7 @@ impl Entry {
         self
     }
     /// Sets additional authenticated text, such as application JSON.
+    /// Text starting with `vigil.attrs.` is refused when constructing a record.
     pub fn details(mut self, value: impl Into<String>) -> Self {
         self.details = Some(value.into());
         self
@@ -265,13 +275,20 @@ impl Record {
     /// `i64::MAX` (the OTLP int64 bound), or [`AuditErrorKind::InvalidEntry`]
     /// if any supplied text (including
     /// service, host, or before/after text) is empty or contains NUL, or the
-    /// action starts with the reserved `vigil.audit.` prefix, or
+    /// action starts with the reserved `vigil.audit.` prefix, details start with
+    /// the reserved `vigil.attrs.` prefix, the entry carries typed attributes, or
     /// [`AuditErrorKind::TooLarge`] if a canonical field exceeds `u32::MAX` bytes.
     pub fn new(context: RecordContext, entry: Entry) -> Result<Self, AuditError> {
-        if entry.action.starts_with("vigil.audit.") {
+        if !entry.attrs.is_empty()
+            || entry.action.starts_with("vigil.audit.")
+            || entry
+                .details
+                .as_deref()
+                .is_some_and(|text| text.starts_with("vigil.attrs."))
+        {
             return Err(AuditError::new(
                 AuditErrorKind::InvalidEntry,
-                "reserved action prefix",
+                "reserved action or details prefix",
             ));
         }
         Self::new_internal(context, entry)

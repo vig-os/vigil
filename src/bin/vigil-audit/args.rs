@@ -5,6 +5,7 @@ type Head = (u64, [u8; 32]);
 pub(super) enum Command {
     Help(String),
     Keygen(PathBuf),
+    Schema(PathBuf),
     Checkpoints(PathBuf),
     Create {
         key: PathBuf,
@@ -18,6 +19,7 @@ pub(super) enum Command {
     },
     Rotate {
         key: PathBuf,
+        schema: Option<PathBuf>,
         actor: String,
         reason: String,
         bound: Head,
@@ -26,6 +28,7 @@ pub(super) enum Command {
     },
     Resume {
         key: PathBuf,
+        schema: Option<PathBuf>,
         actor: String,
         reason: String,
         head: Head,
@@ -36,6 +39,11 @@ pub(super) enum Command {
 
 // ADR-0005 decision 11 is the source of these command arguments.
 const COMMANDS: &[(&str, &str, &str)] = &[
+    (
+        "schema",
+        "<file>",
+        "Parse a canonical schema and print its blake3: digest.",
+    ),
     (
         "checkpoints",
         "<dir>",
@@ -48,7 +56,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ),
     (
         "rotate",
-        "--key <keyfile> --actor <who> --reason <why> --bound <seq>:<hash> --expect-head <seq>:<hash> <dir>",
+        "--key <keyfile> --actor <who> --reason <why> --bound <seq>:<hash> --expect-head <seq>:<hash> [--schema <file>] <dir>",
         "Record a key rotation and sign a checkpoint.",
     ),
     (
@@ -58,7 +66,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ),
     (
         "resume",
-        "--key <keyfile> --actor <who> --reason <why> --head <seq>:<hash> --lost-through <seq> <dir>",
+        "--key <keyfile> --actor <who> --reason <why> --head <seq>:<hash> --lost-through <seq> [--schema <file>] <dir>",
         "Resume a trail after operator-confirmed loss.",
     ),
     (
@@ -103,7 +111,11 @@ pub(super) fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Command,
     let flags: Vec<_> = spec
         .1
         .split_whitespace()
-        .filter(|arg| arg.starts_with("--"))
+        .filter_map(|arg| {
+            let optional = arg.starts_with('[');
+            let flag = arg.trim_start_matches('[');
+            flag.starts_with("--").then_some((flag, optional))
+        })
         .collect();
     let mut args = rest.into_iter();
     let mut options = BTreeMap::new();
@@ -111,7 +123,7 @@ pub(super) fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Command,
     while let Some(arg) = args.next() {
         if arg.as_encoded_bytes().starts_with(b"--") {
             let flag = arg.to_str().ok_or("invalid option")?.to_owned();
-            if !flags.contains(&flag.as_str()) || options.contains_key(&flag) {
+            if !flags.iter().any(|(name, _)| *name == flag) || options.contains_key(&flag) {
                 return Err(format!("unknown or duplicate option: {flag}"));
             }
             options.insert(flag, args.next().ok_or("missing option value")?);
@@ -119,8 +131,8 @@ pub(super) fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Command,
             return Err("unexpected positional argument".into());
         }
     }
-    for flag in &flags {
-        if !options.contains_key(*flag) {
+    for (flag, optional) in &flags {
+        if !optional && !options.contains_key(*flag) {
             return Err(format!("missing {flag}"));
         }
     }
@@ -134,6 +146,7 @@ pub(super) fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Command,
     };
     Ok(match command {
         "keygen" => Command::Keygen(dir),
+        "schema" => Command::Schema(dir),
         "checkpoints" => Command::Checkpoints(dir),
         "create" => Command::Create {
             key: key(),
@@ -147,6 +160,7 @@ pub(super) fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Command,
         },
         "rotate" => Command::Rotate {
             key: key(),
+            schema: options.get("--schema").map(PathBuf::from),
             actor: text("--actor")?,
             reason: text("--reason")?,
             bound: head(&text("--bound")?)?,
@@ -155,6 +169,7 @@ pub(super) fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Command,
         },
         "resume" => Command::Resume {
             key: key(),
+            schema: options.get("--schema").map(PathBuf::from),
             actor: text("--actor")?,
             reason: text("--reason")?,
             head: head(&text("--head")?)?,

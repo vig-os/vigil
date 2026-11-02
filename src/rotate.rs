@@ -1,4 +1,4 @@
-//! Multi-process-safe size rotation and age retention for JSON Lines files.
+//! Multi-process-safe size rotation, age retention and segment counts for JSON Lines files.
 //!
 //! [`RotatingFile`] appends whole lines to `<dir>/<signal>.jsonl`. Once a line
 //! would push the file past [`RotationConfig::max_bytes`], the file is renamed
@@ -54,8 +54,8 @@
 //! * Reaching the same directory through a bind mount (or any second path to
 //!   it) gives two lock handles in one process, which block each other; that
 //!   is unsupported. Use one canonical path.
-//! * Segments whose mtime is in the future are not pruned until that time has
-//!   passed.
+//! * Age pruning keeps segments whose mtime is in the future. A count cap
+//!   can still delete them; age runs before count.
 //! * Readers never lock. They retry when segment names or the live inode
 //!   change during a read, up to eight copies. On exhaustion, `read_since`
 //!   returns only its last rotated-file prefix, excluding the live tail;
@@ -103,6 +103,10 @@ const MIB: u64 = 1024 * 1024;
 const DAY: u64 = 86_400;
 
 /// When to rotate a [`RotatingFile`] and how long to keep rotated segments.
+/// Age, count, then total pruning run at open and before a write exceeding the
+/// size limit, after any rotation. Count and total zero
+/// keep no rotated segments; size zero clamps to one; environment retention days
+/// zero keeps everything. See [`crate::Config::signal_rotation`] for precedence.
 ///
 /// ```
 /// use std::time::Duration;
@@ -120,9 +124,113 @@ pub struct RotationConfig {
     /// Delete rotated segments whose last write is older than this. `None`
     /// keeps every segment. Default: 90 days.
     retention: Option<Duration>,
+    max_segments: Option<usize>,
+    max_total_bytes: Option<u64>,
+    signals: [SignalRotation; 3],
+}
+
+/// Per-signal size, count and age overrides; unset fields inherit their global value.
+/// Explicit `None` disables an age or count limit. Age pruning precedes count pruning.
+/// Size zero clamps to one; count zero keeps no rotated segments. Environment
+/// retention days zero keeps everything, unlike `Some(Duration::ZERO)`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SignalRotation {
+    pub(crate) max_bytes: Option<u64>,
+    pub(crate) max_segments: Option<Option<usize>>,
+    pub(crate) retention: Option<Option<Duration>>,
+}
+
+impl SignalRotation {
+    /// Inherit every limit. Config builders take precedence over environment values.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override size; zero clamps to one. See [`Config::signal_rotation`](crate::Config::signal_rotation)
+    /// for environment names and precedence.
+    #[must_use]
+    pub fn max_bytes(mut self, bytes: u64) -> Self {
+        self.max_bytes = Some(bytes.max(1));
+        self
+    }
+
+    /// Override count; `None` is unlimited, `Some(0)` keeps no rotated segments.
+    /// Age runs first. Retention days zero in the environment instead keeps everything.
+    #[must_use]
+    pub fn max_segments(mut self, segments: Option<usize>) -> Self {
+        self.max_segments = Some(segments);
+        self
+    }
+
+    /// Override age; `None` disables age pruning, `Some(Duration::ZERO)` expires
+    /// past-mtime segments, before count pruning. Environment retention days zero
+    /// instead disables age pruning. Count zero also deletes future-mtime segments.
+    #[must_use]
+    pub fn retention(mut self, retention: Option<Duration>) -> Self {
+        self.retention = Some(retention);
+        self
+    }
+}
+
+pub(crate) fn signal_index(signal: crate::Signal) -> usize {
+    match signal {
+        crate::Signal::Logs => 0,
+        crate::Signal::Metrics => 1,
+        crate::Signal::Traces => 2,
+    }
 }
 
 impl RotationConfig {
+    /// Limit rotated segments per signal, after age pruning; `None` is unlimited
+    /// (default), `Some(0)` keeps none. Live and audit files survive. Environment
+    /// retention days zero instead keeps everything. Config builders beat environment.
+    #[must_use]
+    pub fn max_segments(mut self, segments: Option<usize>) -> Self {
+        self.max_segments = segments;
+        self
+    }
+
+    /// Limit total telemetry bytes in the directory, after age and count pruning.
+    /// `None` is unlimited (default); `Some(0)` prunes every rotated segment.
+    /// Live files reserve their size limit or current length, whichever is larger,
+    /// including the pending write for this signal. Audit files never count.
+    /// Oldest stamps go first across signals, then signal name and integer counter;
+    /// clock steps can change chronological order across signals, never the bound.
+    /// [`crate::Config::max_total_bytes`] overrides `VIGIL_MAX_TOTAL_BYTES`.
+    /// Environment retention days zero instead keeps everything.
+    #[must_use]
+    pub fn max_total_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.max_total_bytes = bytes;
+        self
+    }
+
+    /// Replace one signal's overrides. Unset fields inherit global limits;
+    /// custom signal names always use globals. Age pruning precedes count pruning.
+    /// See [`crate::Config::signal_rotation`] for environment precedence and zero rules.
+    #[must_use]
+    pub fn signal(mut self, signal: crate::Signal, rotation: SignalRotation) -> Self {
+        self.signals[signal_index(signal)] = rotation;
+        self
+    }
+
+    // Shared resolution for writers and the directory-wide budget.
+    fn resolved(mut self, signal: &str) -> Self {
+        let index = match signal {
+            "logs" => Some(signal_index(crate::Signal::Logs)),
+            "metrics" => Some(signal_index(crate::Signal::Metrics)),
+            "traces" => Some(signal_index(crate::Signal::Traces)),
+            _ => None,
+        };
+        if let Some(index) = index {
+            let overrides = &self.signals[index];
+            self.max_bytes = overrides.max_bytes.unwrap_or(self.max_bytes);
+            self.max_segments = overrides.max_segments.unwrap_or(self.max_segments);
+            self.retention = overrides.retention.unwrap_or(self.retention);
+        }
+        self
+    }
+
     /// Rotate before a write exceeds this many bytes (default 50 MiB).
     /// Zero clamps to one. A single larger line is written alone.
     #[must_use]
@@ -132,7 +240,8 @@ impl RotationConfig {
     }
 
     /// Keep rotated segments for this duration (default 90 days).
-    /// `None` keeps everything; `Some(Duration::ZERO)` prunes at the next prune.
+    /// `None` disables age pruning; `Some(Duration::ZERO)` expires past-mtime
+    /// segments at the next prune. Count pruning then applies independently.
     #[must_use]
     pub fn retention(mut self, retention: Option<Duration>) -> Self {
         self.retention = retention;
@@ -145,6 +254,9 @@ impl Default for RotationConfig {
         Self {
             max_bytes: 50 * MIB,
             retention: Some(Duration::from_secs(90 * DAY)),
+            max_segments: None,
+            max_total_bytes: None,
+            signals: std::array::from_fn(|_| SignalRotation::default()),
         }
     }
 }
@@ -214,6 +326,8 @@ impl DirLock {
     }
 
     fn lock_current(&self, path: &Path) -> io::Result<(MutexGuard<'_, File>, Unlock, Entered)> {
+        #[cfg(test)]
+        LOCK_ACQUISITIONS.with(|count| count.set(count.get() + 1));
         let entered = Entered::new(self as *const Self as usize)?;
         let start = Instant::now();
         let mut dir = lock_ignore_poison(&self.gate);
@@ -358,7 +472,7 @@ impl RotatingFile {
     }
 
     /// Open (creating as needed) the signal's directory (`0700`) and live file
-    /// (`0600`), and prune expired segments once.
+    /// (`0600`), and prune by age, count, then total bytes once.
     ///
     /// Opening the same directory again in this process (for this or another
     /// signal) shares the first open's directory lock instead of deadlocking on
@@ -382,13 +496,21 @@ impl RotatingFile {
         signal: &str,
         cfg: RotationConfig,
     ) -> io::Result<Self> {
+        Self::with_lock_observed(lock, dir, signal, cfg, |_| {})
+    }
+
+    fn with_lock_observed(
+        lock: Arc<DirLock>,
+        dir: PathBuf,
+        signal: &str,
+        cfg: RotationConfig,
+        observe: impl FnOnce(&File),
+    ) -> io::Result<Self> {
         let live_path = dir.join(format!("{signal}.jsonl"));
         let live = {
             let (handle, _unlock, _entered) = lock.lock_current(&dir)?;
             let live = Live::open(&handle, Path::new(&format!("{signal}.jsonl")), signal)?;
-            if let Some(keep) = cfg.retention {
-                prune_at(&handle, signal, keep);
-            }
+            prune_at_observed(&handle, signal, &cfg, &dir, 0, || observe(&handle));
             live
         };
         Ok(Self {
@@ -424,6 +546,15 @@ impl RotatingFile {
         line: &[u8],
         write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.append_observed(line, write, |_, _| {})
+    }
+
+    fn append_observed(
+        &self,
+        line: &[u8],
+        write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
+        observe: impl FnOnce(&File, u64),
+    ) -> io::Result<()> {
         let mut buf = Vec::with_capacity(line.len().saturating_add(1));
         buf.extend_from_slice(line);
         buf.push(b'\n');
@@ -440,12 +571,11 @@ impl RotatingFile {
             live.file.read_exact_at(&mut last, len - 1)?;
         }
         let need = (buf.len() as u64).saturating_add(u64::from(last[0] != b'\n'));
-        if len > 0 && len.checked_add(need).is_none_or(|n| n > self.cfg.max_bytes) {
+        let max_bytes = self.cfg.clone().resolved(&self.signal).max_bytes;
+        let exceeds = len.checked_add(need).is_none_or(|n| n > max_bytes);
+        if len > 0 && exceeds {
             rotate(&dir, &self.signal, &name)?;
             *live = Live::open(&dir, &name, &self.signal)?;
-            if let Some(keep) = self.cfg.retention {
-                prune_at(&dir, &self.signal, keep);
-            }
         }
 
         let before = live.file.metadata()?.len();
@@ -455,6 +585,16 @@ impl RotatingFile {
             if last[0] != b'\n' {
                 buf.insert(0, b'\n');
             }
+        }
+        if exceeds {
+            prune_at_observed(
+                &dir,
+                &self.signal,
+                &self.cfg,
+                &self.dir,
+                buf.len() as u64,
+                || observe(&dir, buf.len() as u64),
+            );
         }
         if let Err(e) = write(&mut live.file, &buf) {
             // Best effort: never leave a half line for the next record.
@@ -823,7 +963,172 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 
 /// Delete rotated segments last written more than `keep` ago. Never touches
 /// the live or lock file; errors are ignored.
-fn prune_at(dir: &File, signal: &str, keep: Duration) {
+#[cfg(test)]
+fn prune_at(dir: &File, signal: &str, cfg: &RotationConfig, path: &Path) {
+    prune_at_observed(dir, signal, cfg, path, 0, || {});
+}
+
+static COUNT_WARNED: AtomicBool = AtomicBool::new(false);
+
+// Injection covers both age and count deletions, without changing production I/O.
+#[cfg(test)]
+fn prune_with(
+    dir: &File,
+    signal: &str,
+    cfg: &RotationConfig,
+    path: &Path,
+    mut unlink: impl FnMut(&File, &Path) -> io::Result<()>,
+) {
+    prune_pass(dir, signal, cfg, path, 0, &mut unlink);
+}
+
+/// Observe the completed pass while the caller still holds the directory lock.
+pub(crate) fn prune_at_observed(
+    dir: &File,
+    signal: &str,
+    cfg: &RotationConfig,
+    path: &Path,
+    pending_len: u64,
+    observe: impl FnOnce(),
+) {
+    prune_pass(dir, signal, cfg, path, pending_len, &mut unlink_name);
+    observe();
+}
+
+fn prune_pass(
+    dir: &File,
+    signal: &str,
+    global: &RotationConfig,
+    path: &Path,
+    pending_len: u64,
+    unlink: &mut impl FnMut(&File, &Path) -> io::Result<()>,
+) {
+    if signal == "audit" {
+        return;
+    }
+    let cfg = global.clone().resolved(signal);
+    if let Some(keep) = cfg.retention {
+        prune_age(dir, signal, keep, unlink);
+    }
+    if let Some(limit) = cfg.max_segments {
+        prune_count(dir, signal, limit, path, unlink);
+    }
+    if let Some(limit) = cfg.max_total_bytes {
+        let _ = prune_total(dir, signal, global, path, pending_len, limit, unlink);
+    }
+}
+
+fn prune_count(
+    dir: &File,
+    signal: &str,
+    limit: usize,
+    path: &Path,
+    unlink: &mut impl FnMut(&File, &Path) -> io::Result<()>,
+) {
+    let Ok(names) = rotated_names_at(dir, signal) else {
+        return;
+    };
+    let mut remaining = names.len();
+    for name in names {
+        if remaining <= limit {
+            break;
+        }
+        match unlink(dir, &name) {
+            Ok(()) => remaining -= 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => remaining -= 1,
+            Err(_) => {}
+        }
+    }
+    if remaining > limit && !COUNT_WARNED.swap(true, Ordering::Relaxed) {
+        let _ = writeln!(
+            io::stderr(),
+            "vigil: cannot meet max_segments={limit} in {}: {remaining} rotated segments remain",
+            path.display()
+        );
+    }
+}
+
+static TOTAL_WARNED: AtomicBool = AtomicBool::new(false);
+
+// List only valid telemetry live files and segments. Audit and foreign names
+// never enter either the reservation or the deletion candidates.
+fn prune_total(
+    dir: &File,
+    signal: &str,
+    global: &RotationConfig,
+    path: &Path,
+    pending_len: u64,
+    limit: u64,
+    unlink: &mut impl FnMut(&File, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut rotated = Vec::new();
+    let mut reserved = 0u128;
+    let mut bytes = 0u128;
+    for entry in rfs::Dir::read_from(dir)? {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".jsonl") else {
+            continue;
+        };
+        let (owner, segment) = match stem.split_once('-') {
+            Some((owner, _)) => (owner, true),
+            None => (stem, false),
+        };
+        if validate_signal(owner).is_err() {
+            continue;
+        }
+        let key = if segment {
+            let Some((stamp, counter)) = parse_segment(name, owner) else {
+                continue;
+            };
+            Some((stamp.to_owned(), owner.to_owned(), counter))
+        } else {
+            None
+        };
+        let stat = match rfs::statat(dir, name, AtFlags::empty()) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let len = u64::try_from(stat.st_size).unwrap_or(0);
+        if let Some(key) = key {
+            bytes += u128::from(len);
+            rotated.push((key, PathBuf::from(name), len));
+        } else {
+            let pending = if owner == signal { pending_len } else { 0 };
+            reserved += u128::from(global.clone().resolved(owner).max_bytes)
+                .max(u128::from(len) + u128::from(pending));
+        }
+    }
+    rotated.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, name, len) in rotated {
+        if bytes + reserved <= u128::from(limit) {
+            break;
+        }
+        match unlink(dir, &name) {
+            Ok(()) => bytes -= u128::from(len),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => bytes -= u128::from(len),
+            Err(_) => {}
+        }
+    }
+    if bytes + reserved > u128::from(limit) && !TOTAL_WARNED.swap(true, Ordering::Relaxed) {
+        let _ = writeln!(
+            io::stderr(),
+            "vigil: cannot meet max_total_bytes={limit} in {}: {bytes} rotated bytes remain and the live files reserve {reserved} bytes",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn prune_age(
+    dir: &File,
+    signal: &str,
+    keep: Duration,
+    unlink: &mut impl FnMut(&File, &Path) -> io::Result<()>,
+) {
     let Ok(names) = rotated_names_at(dir, signal) else {
         return;
     };
@@ -843,7 +1148,7 @@ fn prune_at(dir: &File, signal: &str, keep: Duration) {
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age > keep);
         if expired {
-            let _ = unlink_name(dir, &name);
+            let _ = unlink(dir, &name);
         }
     }
 }
@@ -1064,6 +1369,12 @@ pub fn find_newest<T>(
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Private per-thread acquisition counter for fail-closed validation tests.
+    pub(crate) static LOCK_ACQUISITIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
@@ -1085,9 +1396,842 @@ mod tests {
         RotationConfig {
             max_bytes,
             retention: None,
+            ..RotationConfig::default()
         }
     }
 
+    fn count_fixture(label: &str) -> (PathBuf, Vec<PathBuf>) {
+        let dir = tmp(label);
+        fs::create_dir_all(&dir).unwrap();
+        let names = [
+            "20260101T000000.000000000Z",
+            "20260101T000000.000000000Z_000001",
+            "20260101T000000.000000000Z_1000000",
+        ];
+        let paths = names
+            .map(|stamp| dir.join(format!("logs-{stamp}.jsonl")))
+            .to_vec();
+        for path in &paths {
+            fs::write(path, "segment\n").unwrap();
+        }
+        (dir, paths)
+    }
+
+    #[test]
+    fn count_open_deletes_oldest_and_zero_preserves_live_and_audit() {
+        let (dir, paths) = count_fixture("count-open");
+        let protected = [
+            "audit.jsonl",
+            "audit-20260101T000000.000000000Z.jsonl",
+            ".audit-next.jsonl",
+            "foreign",
+            "metrics-20260101T000000.000000000Z.jsonl",
+        ];
+        for name in protected {
+            fs::write(dir.join(name), "protected").unwrap();
+        }
+        let base = RotationConfig::default().retention(None);
+        let writer = RotatingFile::open(&dir, "logs", base.clone().max_segments(Some(2))).unwrap();
+        assert!(!paths[0].exists());
+        assert!(paths[1].exists() && paths[2].exists());
+        writer.append(b"live").unwrap();
+        let _writer = RotatingFile::open(&dir, "logs", base.max_segments(Some(0))).unwrap();
+        assert!(paths.iter().all(|path| !path.exists()));
+        assert_eq!(fs::read(dir.join("logs.jsonl")).unwrap(), b"live\n");
+        for name in protected {
+            assert_eq!(fs::read(dir.join(name)).unwrap(), b"protected");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn count_runs_after_rotation() {
+        let dir = tmp("count-rotation");
+        let writer = RotatingFile::open(&dir, "logs", cfg(2).max_segments(Some(0))).unwrap();
+        writer.append(b"a").unwrap();
+        writer.append(b"b").unwrap();
+        assert_eq!(all_lines(&dir, "logs"), ["b"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn age_then_count_and_each_alone() {
+        for (age, count, total, survivors) in [
+            (true, true, true, vec![2]),
+            (true, false, false, vec![0, 1, 2]),
+            (false, true, false, vec![2, 3]),
+            (false, false, true, vec![3]),
+        ] {
+            let (dir, mut paths) = count_fixture("age-count-total");
+            paths.push(dir.join("logs-20260102T000000.000000000Z.jsonl"));
+            fs::write(&paths[3], "segment\n").unwrap();
+            // Newest name has an old mtime: age removes it before count and total.
+            for (i, path) in paths.iter().enumerate() {
+                File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_modified(if i == 3 {
+                        UNIX_EPOCH
+                    } else {
+                        SystemTime::now() + Duration::from_secs(86_400)
+                    })
+                    .unwrap();
+            }
+            let config = cfg(100)
+                .retention(age.then_some(Duration::ZERO))
+                .max_segments(count.then_some(2))
+                .max_total_bytes(total.then_some(108));
+            let _writer = RotatingFile::open(&dir, "logs", config).unwrap();
+            let found: Vec<_> = paths
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| p.exists().then_some(i))
+                .collect();
+            assert_eq!(found, survivors);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    fn seed(dir: &Path, name: &str, len: usize) -> PathBuf {
+        fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, vec![b'x'; len]).unwrap();
+        path
+    }
+
+    #[test]
+    fn total_cross_signal_order_live_and_audit_exclusion() {
+        let dir = tmp("total-order");
+        let names = [
+            "traces-20250101T000000.000000000Z.jsonl",
+            "logs-20260101T000000.000000000Z.jsonl",
+            "logs-20260101T000000.000000000Z_999999.jsonl",
+            "logs-20260101T000000.000000000Z_1000000.jsonl",
+            "metrics-20260101T000000.000000000Z.jsonl",
+            "traces-20260101T000000.000000000Z.jsonl",
+        ];
+        let paths: Vec<_> = names.iter().map(|name| seed(&dir, name, 2)).collect();
+        let protected = [
+            "audit.jsonl",
+            "audit-20200101T000000.000000000Z.jsonl",
+            ".audit-next.jsonl",
+            "foreign",
+            "bad-name.jsonl",
+        ];
+        for name in protected {
+            seed(&dir, name, 1000);
+        }
+        for signal in ["logs", "metrics", "traces"] {
+            seed(&dir, &format!("{signal}.jsonl"), 1);
+        }
+        // Check each prefix, including numeric counters wider than six digits.
+        for removed in 0..=names.len() {
+            let config = cfg(2).max_total_bytes(Some(6 + 2 * (names.len() - removed) as u64));
+            let _writer = RotatingFile::open(&dir, "logs", config).unwrap();
+            for (i, path) in paths.iter().enumerate() {
+                assert_eq!(path.exists(), i >= removed, "{removed}: {path:?}");
+            }
+        }
+        let _writer = RotatingFile::open(&dir, "logs", cfg(2).max_total_bytes(Some(1))).unwrap();
+        for signal in ["logs", "metrics", "traces"] {
+            assert_eq!(fs::read(dir.join(format!("{signal}.jsonl"))).unwrap(), b"x");
+        }
+        for name in protected {
+            assert_eq!(fs::metadata(dir.join(name)).unwrap().len(), 1000);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn total_audit_and_foreign_bytes_are_neither_counted_nor_deleted() {
+        let dir = tmp("total-audit");
+        let telemetry = seed(&dir, "logs-20260101T000000.000000000Z.jsonl", 2);
+        let names = [
+            "audit.jsonl",
+            "audit-20200101T000000.000000000Z.jsonl",
+            ".audit-next.jsonl",
+            "foreign",
+        ];
+        for name in names {
+            seed(&dir, name, 4096);
+        }
+        let _writer = RotatingFile::open(&dir, "logs", cfg(1).max_total_bytes(Some(3))).unwrap();
+        assert!(telemetry.exists());
+        let _writer = RotatingFile::open(&dir, "logs", cfg(1).max_total_bytes(Some(1))).unwrap();
+        assert!(!telemetry.exists());
+        for name in names {
+            assert_eq!(fs::read(dir.join(name)).unwrap(), vec![b'x'; 4096]);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn total_reservation_threshold_long_live_and_original_globals() {
+        for (live, cap, expected) in [(10, 16, 3), (10, 15, 2), (12, 16, 2)] {
+            let (dir, paths) = count_fixture("reservation");
+            for path in &paths {
+                fs::write(path, b"xx").unwrap();
+            }
+            seed(&dir, "logs.jsonl", live);
+            let _writer =
+                RotatingFile::open(&dir, "logs", cfg(10).max_total_bytes(Some(cap))).unwrap();
+            assert_eq!(paths.iter().filter(|p| p.exists()).count(), expected);
+            fs::remove_dir_all(dir).unwrap();
+        }
+        let (dir, paths) = count_fixture("original-globals");
+        seed(&dir, "traces.jsonl", 0);
+        let config = cfg(100)
+            .signal(crate::Signal::Logs, SignalRotation::new().max_bytes(1))
+            .max_total_bytes(Some(125));
+        let writer = RotatingFile::open(&dir, "logs", config).unwrap();
+        assert!(paths.iter().all(|p| p.exists())); // 1 + 100 + 24 = 125
+        writer.append(b"x").unwrap(); // empty-live oversize must reserve 2, not 1
+        assert!(!paths[0].exists());
+        assert!(paths[1].exists() && paths[2].exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn total_pending_length_and_empty_live_prune() {
+        for initial in [0, 2] {
+            let (dir, paths) = count_fixture("pending");
+            seed(&dir, "logs.jsonl", initial);
+            let writer =
+                RotatingFile::open(&dir, "logs", cfg(4).max_total_bytes(Some(28))).unwrap();
+            assert!(paths.iter().all(|p| p.exists()));
+            writer.append(b"01234567890123456789").unwrap();
+            assert!(paths.iter().all(|p| !p.exists()));
+            assert_eq!(
+                fs::read(dir.join("logs.jsonl")).unwrap(),
+                b"01234567890123456789\n"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn total_unlink_failure_compensates_silently_and_retries() {
+        let name = "rotate::tests::total_unlink_failure_compensates_silently_and_retries";
+        if let Some(output) = crate::test_child(name, "VIGIL_TOTAL_CHILD") {
+            assert!(
+                output.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (dir, paths) = count_fixture("total-failure-met");
+        seed(&dir, "logs.jsonl", 0);
+        let handle = File::open(&dir).unwrap();
+        let config = cfg(10).max_total_bytes(Some(18));
+        let mut attempted = Vec::new();
+        prune_with(&handle, "logs", &config, &dir, |fd, path| {
+            attempted.push(path.to_owned());
+            if path == paths[0].file_name().unwrap() {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                unlink_name(fd, path)
+            }
+        });
+        assert_eq!(attempted.len(), 3);
+        assert!(paths[0].exists() && !paths[1].exists() && !paths[2].exists());
+        // A successful next pass retries the failed oldest segment.
+        prune_at(&handle, "logs", &config.max_total_bytes(Some(10)), &dir);
+        assert!(!paths[0].exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn total_below_live_reservations_warns_once_and_preserves_all_live() {
+        let name = "rotate::tests::total_below_live_reservations_warns_once_and_preserves_all_live";
+        if let Some(output) = crate::test_child(name, "VIGIL_TOTAL_CHILD") {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().count(), 1, "{stderr}");
+            assert!(stderr.contains("cannot meet max_total_bytes=1"));
+            assert!(stderr.contains("0 rotated bytes remain and the live files reserve 30 bytes"));
+            return;
+        }
+        let dir = tmp("below-live");
+        for signal in ["logs", "metrics", "traces"] {
+            seed(&dir, &format!("{signal}.jsonl"), 2);
+            seed(
+                &dir,
+                &format!("{signal}-20260101T000000.000000000Z.jsonl"),
+                8,
+            );
+        }
+        for _ in 0..2 {
+            let _writer =
+                RotatingFile::open(&dir, "logs", cfg(10).max_total_bytes(Some(1))).unwrap();
+            for signal in ["logs", "metrics", "traces"] {
+                assert!(rotated_segments(&dir, signal).unwrap().is_empty());
+                assert_eq!(
+                    fs::read(dir.join(format!("{signal}.jsonl"))).unwrap(),
+                    b"xx"
+                );
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn total_unmet_warns_once_enoent_and_retry() {
+        let name = "rotate::tests::total_unmet_warns_once_enoent_and_retry";
+        if let Some(output) = crate::test_child(name, "VIGIL_TOTAL_CHILD") {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().count(), 1, "{stderr}");
+            assert!(stderr.contains("cannot meet max_total_bytes=10"));
+            assert!(stderr.contains("8 rotated bytes remain and the live files reserve 10 bytes"));
+            return;
+        }
+        let (dir, paths) = count_fixture("total-unmet");
+        seed(&dir, "logs.jsonl", 0);
+        let handle = File::open(&dir).unwrap();
+        let config = cfg(10).max_total_bytes(Some(10));
+        for _ in 0..2 {
+            prune_with(&handle, "logs", &config, &dir, |fd, path| {
+                if path == paths[0].file_name().unwrap() {
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                } else {
+                    unlink_name(fd, path)?;
+                    Err(io::Error::from(io::ErrorKind::NotFound))
+                }
+            });
+        }
+        assert!(paths[0].exists() && !paths[1].exists() && !paths[2].exists());
+        prune_at(&handle, "logs", &config, &dir);
+        assert!(!paths[0].exists());
+        // Below the live reservation, all segments go, live survives, warning stays once.
+        let _writer = RotatingFile::open(&dir, "logs", cfg(10).max_total_bytes(Some(0))).unwrap();
+        assert!(dir.join("logs.jsonl").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    const TOTAL_CHILD_DIR: &str = "VIGIL_TOTAL_BOUND_DIR";
+    const TOTAL_CHILD_ID: &str = "VIGIL_TOTAL_BOUND_ID";
+
+    fn observed_bound(
+        dir: &File,
+        path: &Path,
+        config: &RotationConfig,
+        signal: &str,
+        pending: u64,
+    ) {
+        assert_eq!(
+            Directory::open(path)
+                .unwrap()
+                .with_lock(|_| ())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let mut bytes = 0u64;
+        let mut reservation = 0u64;
+        let mut count = 0;
+        for owner in ["logs", "metrics", "traces"] {
+            let names = rotated_names_at(dir, owner).unwrap();
+            assert!(names.len() <= config.clone().resolved(owner).max_segments.unwrap());
+            count += names.len();
+            for name in names {
+                bytes += rfs::statat(dir, name, AtFlags::empty()).unwrap().st_size as u64;
+            }
+            let live = rfs::statat(dir, format!("{owner}.jsonl"), AtFlags::empty()).unwrap();
+            let pending = if owner == signal { pending } else { 0 };
+            reservation += config
+                .clone()
+                .resolved(owner)
+                .max_bytes
+                .max(live.st_size as u64 + pending);
+        }
+        assert!(bytes + reservation <= config.max_total_bytes.unwrap() || count == 0);
+        for name in [
+            "audit.jsonl",
+            "audit-20200101T000000.000000000Z.jsonl",
+            ".audit-next.jsonl",
+            "foreign",
+        ] {
+            assert_eq!(fs::read(path.join(name)).unwrap(), b"audit seed");
+        }
+        let visible: u64 = ["logs", "metrics", "traces"]
+            .iter()
+            .map(|owner| {
+                segments(path, owner)
+                    .unwrap()
+                    .iter()
+                    .map(|p| fs::metadata(p).unwrap().len())
+                    .sum::<u64>()
+            })
+            .sum();
+        assert!(visible <= config.max_total_bytes.unwrap().max(reservation));
+    }
+
+    #[test]
+    fn total_bound_child() {
+        let Some(dir) = std::env::var_os(TOTAL_CHILD_DIR) else {
+            return;
+        };
+        let path = PathBuf::from(dir);
+        let id = std::env::var(TOTAL_CHILD_ID).unwrap();
+        let large = std::env::var_os("VIGIL_TOTAL_LARGE").is_some();
+        let config = if large {
+            cfg(MIB)
+                .max_segments(Some(2))
+                .max_total_bytes(Some(10 * MIB))
+        } else {
+            cfg(64).max_segments(Some(2)).max_total_bytes(Some(320))
+        };
+        let writers: Vec<_> = ["logs", "metrics", "traces"]
+            .iter()
+            .map(|signal| {
+                let Directory {
+                    lock,
+                    path: canonical,
+                } = Directory::open(&path).unwrap();
+                RotatingFile::with_lock_observed(lock, canonical, signal, config.clone(), |dir| {
+                    observed_bound(dir, &path, &config, signal, 0);
+                })
+                .unwrap()
+            })
+            .collect();
+        for i in 0..if large { 8 } else { 120 } {
+            let writer = &writers[i % 3];
+            let prefix = format!("{id}:{i}:");
+            let padding = if large {
+                4 * MIB as usize - prefix.len() - 1
+            } else {
+                24
+            };
+            let record = format!("{prefix}{}", "x".repeat(padding));
+            writer
+                .append_observed(record.as_bytes(), write_once, |dir, pending| {
+                    observed_bound(dir, &path, &config, &writer.signal, pending);
+                    // Each other writer can retain at most one segment; count writer instances.
+                    let retained: u64 = writers
+                        .iter()
+                        .filter_map(|w| w.live.try_lock().ok())
+                        .filter_map(|live| {
+                            let stat = rfs::fstat(&live.file).unwrap();
+                            (stat.st_nlink == 0).then_some(stat.st_size as u64)
+                        })
+                        .sum();
+                    let f = if large { 4 * MIB } else { 64 };
+                    assert!(retained <= 3 * f);
+                })
+                .unwrap();
+        }
+    }
+
+    fn multiprocess_total(large: bool) {
+        let dir = tmp("total-mp");
+        for signal in ["logs", "metrics", "traces"] {
+            seed(&dir, &format!("{signal}.jsonl"), 0);
+        }
+        for name in [
+            "audit.jsonl",
+            "audit-20200101T000000.000000000Z.jsonl",
+            ".audit-next.jsonl",
+            "foreign",
+        ] {
+            fs::write(dir.join(name), b"audit seed").unwrap();
+        }
+        let children: Vec<_> = (0..if large { 2 } else { 4 })
+            .map(|id| {
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "rotate::tests::total_bound_child",
+                        "--test-threads=1",
+                    ])
+                    .env(TOTAL_CHILD_DIR, &dir)
+                    .env(TOTAL_CHILD_ID, id.to_string());
+                if large {
+                    command.env("VIGIL_TOTAL_LARGE", "1");
+                }
+                command
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
+        }
+        let config = if large {
+            cfg(MIB)
+                .max_segments(Some(2))
+                .max_total_bytes(Some(10 * MIB))
+        } else {
+            cfg(64).max_segments(Some(2)).max_total_bytes(Some(320))
+        };
+        Directory::open(&dir)
+            .unwrap()
+            .with_lock(|fd| observed_bound(fd, &dir, &config, "logs", 0))
+            .unwrap();
+        let mut seen = HashSet::new();
+        for signal in ["logs", "metrics", "traces"] {
+            assert!(rotated_segments(&dir, signal).unwrap().len() <= 2);
+            for path in segments(&dir, signal).unwrap() {
+                let bytes = fs::read(path).unwrap();
+                assert!(bytes.is_empty() || bytes.ends_with(b"\n"));
+                for line in String::from_utf8(bytes).unwrap().lines() {
+                    let parts: Vec<_> = line.split(':').collect();
+                    assert_eq!(parts.len(), 3);
+                    assert!(parts[2].bytes().all(|b| b == b'x'));
+                    assert!(seen.insert((parts[0].to_owned(), parts[1].to_owned())));
+                }
+            }
+        }
+        assert!(!seen.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn total_multi_process_bound_and_whole_surviving_records() {
+        multiprocess_total(false);
+    }
+
+    #[test]
+    fn total_two_process_four_mib_records_including_empty_live() {
+        multiprocess_total(true);
+    }
+
+    #[test]
+    fn total_retained_writer_child() {
+        use std::io::BufRead;
+        let Some(dir) = std::env::var_os("VIGIL_RETAIN_DIR") else {
+            return;
+        };
+        let config = cfg(8).max_segments(Some(0)).max_total_bytes(Some(8));
+        let writers: Vec<_> = (0..16)
+            .map(|_| {
+                let writer = RotatingFile::open(Path::new(&dir), "logs", config.clone()).unwrap();
+                writer.append(b"1234567").unwrap();
+                writer
+            })
+            .collect();
+        println!("READY");
+        io::stdout().flush().unwrap();
+        let mut line = String::new();
+        io::stdin().lock().read_line(&mut line).unwrap();
+        let mut inodes = HashSet::new();
+        let retained: u64 = writers
+            .iter()
+            .map(|writer| {
+                let live = lock_ignore_poison(&writer.live);
+                let stat = rfs::fstat(&live.file).unwrap();
+                assert_eq!(stat.st_nlink, 0);
+                assert!(inodes.insert((stat.st_dev, stat.st_ino)));
+                stat.st_size as u64
+            })
+            .sum();
+        assert_eq!(retained, 16 * 8);
+        println!("RETAINED:{retained}");
+        io::stdout().flush().unwrap();
+        line.clear();
+        io::stdin().lock().read_line(&mut line).unwrap();
+        for writer in writers {
+            // Pin the old inode while comparing identities: refresh releases the
+            // writer's handle before rotation creates a new live file, and the
+            // filesystem may immediately reuse the released inode number.
+            let old = lock_ignore_poison(&writer.live).file.try_clone().unwrap();
+            writer
+                .append_with(b"7654321", |file, bytes| {
+                    let old = rfs::fstat(&old)?;
+                    let new = rfs::fstat(&*file)?;
+                    assert_eq!(old.st_nlink, 0);
+                    assert_ne!((old.st_dev, old.st_ino), (new.st_dev, new.st_ino));
+                    assert_eq!(new.st_nlink, 1);
+                    write_once(file, bytes)
+                })
+                .unwrap();
+            drop(old);
+        }
+    }
+
+    #[test]
+    fn total_retained_handles_count_each_writer_in_each_process() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::process::Stdio;
+        let dir = tmp("retained-writers");
+        let config = cfg(8).max_segments(Some(0)).max_total_bytes(Some(8));
+        let writer = RotatingFile::open(&dir, "logs", config).unwrap();
+        let mut children: Vec<_> = (0..2)
+            .map(|_| {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "rotate::tests::total_retained_writer_child",
+                        "--nocapture",
+                    ])
+                    .env("VIGIL_RETAIN_DIR", &dir)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut out = BufReader::new(child.stdout.take().unwrap());
+                loop {
+                    let mut line = String::new();
+                    assert!(
+                        out.read_line(&mut line).unwrap() > 0,
+                        "child exited before READY"
+                    );
+                    if line.contains("READY") {
+                        break;
+                    }
+                }
+                (child, out)
+            })
+            .collect();
+        writer.append(b"parent!").unwrap(); // unlink the final child's cached live file
+        for (child, _) in &mut children {
+            child.stdin.as_mut().unwrap().write_all(b"check\n").unwrap();
+        }
+        let mut retained = 0u64;
+        for (_, out) in &mut children {
+            let mut line = String::new();
+            assert!(out.read_line(&mut line).unwrap() > 0);
+            retained += line
+                .trim()
+                .strip_prefix("RETAINED:")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+        }
+        // Both children are still holding every measured inode at this barrier.
+        let visible: u64 = segments(&dir, "logs")
+            .unwrap()
+            .iter()
+            .map(|p| fs::metadata(p).unwrap().len())
+            .sum();
+        let cached = rfs::fstat(&lock_ignore_poison(&writer.live).file).unwrap();
+        assert_eq!(cached.st_nlink, 1);
+        let writers = 1 + 2 * 16;
+        let r = writers * 8;
+        assert_eq!(retained, 2 * 16 * 8);
+        assert!(visible + retained <= 8 + r);
+        assert!(
+            retained > 2 * 8,
+            "a per-process allowance cannot cover these handles"
+        );
+        for (child, _) in &mut children {
+            child.stdin.take().unwrap().write_all(b"release\n").unwrap();
+        }
+        for (child, mut out) in children {
+            let mut output = String::new();
+            out.read_to_string(&mut output).unwrap();
+            let status = child.wait_with_output().unwrap();
+            assert!(
+                status.status.success(),
+                "{}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            assert!(output.contains("1 passed;"), "{output}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn total_clock_step_changes_victim_but_preserves_bound() {
+        let dir = tmp("clock-step");
+        let earlier = seed(&dir, "traces-20250101T000000.000000000Z.jsonl", 4);
+        let later = seed(&dir, "logs-20260101T000000.000000000Z.jsonl", 4);
+        seed(&dir, "traces.jsonl", 0);
+        let _writer = RotatingFile::open(&dir, "logs", cfg(4).max_total_bytes(Some(12))).unwrap();
+        assert!(!earlier.exists() && later.exists());
+        assert_eq!(
+            segments(&dir, "logs")
+                .unwrap()
+                .iter()
+                .map(|p| fs::metadata(p).unwrap().len())
+                .sum::<u64>(),
+            4
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn override_inheritance_replacement_equality_and_rotation_sizes() {
+        use crate::Signal::{Logs, Metrics};
+        fn send_sync<T: Send + Sync + Eq>() {}
+        send_sync::<RotationConfig>();
+        send_sync::<SignalRotation>();
+        // This inference becomes ambiguous if either type ever implements Copy.
+        trait NotCopy<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> NotCopy<()> for T {}
+        struct IfCopy;
+        impl<T: Copy> NotCopy<IfCopy> for T {}
+        let _ = <RotationConfig as NotCopy<_>>::check;
+        let _ = <SignalRotation as NotCopy<_>>::check;
+        let base = cfg(100).max_segments(Some(2));
+        let logs = SignalRotation::new()
+            .max_bytes(0)
+            .max_segments(None)
+            .retention(None);
+        let metrics = SignalRotation::new().max_bytes(10);
+        assert_eq!(
+            base.clone()
+                .signal(Logs, logs.clone())
+                .signal(Metrics, metrics.clone()),
+            base.clone()
+                .signal(Metrics, metrics)
+                .signal(Logs, logs.clone())
+        );
+        assert_eq!(
+            base.clone()
+                .signal(Logs, logs)
+                .signal(Logs, SignalRotation::new()),
+            base.clone().signal(Logs, SignalRotation::new())
+        );
+        let inherited = base
+            .clone()
+            .signal(Logs, SignalRotation::new())
+            .resolved("logs");
+        assert_eq!(inherited.max_segments, Some(2));
+        let explicit = base
+            .clone()
+            .signal(Logs, SignalRotation::new().max_segments(None))
+            .resolved("logs");
+        assert_eq!(explicit.max_segments, None);
+        assert_eq!(
+            base.clone()
+                .signal(Logs, SignalRotation::new().max_bytes(1))
+                .resolved("custom")
+                .max_bytes,
+            100
+        );
+        assert_eq!(cfg(100).max_bytes(0).max_bytes, 1);
+        assert_eq!(cfg(100).max_total_bytes(Some(0)).max_total_bytes, Some(0));
+        assert_eq!(SignalRotation::new().max_bytes(0).max_bytes, Some(1));
+        let dir = tmp("signal-sizes");
+        let config = cfg(100).signal(Logs, SignalRotation::new().max_bytes(4));
+        for signal in ["logs", "metrics", "traces"] {
+            let writer = RotatingFile::open(&dir, signal, config.clone()).unwrap();
+            writer.append(b"aaa").unwrap();
+            writer.append(b"bbb").unwrap();
+            assert_eq!(
+                rotated_segments(&dir, signal).unwrap().len(),
+                usize::from(signal == "logs")
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn zero_age_keeps_future_but_zero_count_deletes_it() {
+        let (dir, paths) = count_fixture("future-count");
+        for path in &paths {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::now() + Duration::from_secs(86_400))
+                .unwrap();
+        }
+        let config = cfg(100).retention(Some(Duration::ZERO));
+        let _writer = RotatingFile::open(&dir, "logs", config.clone()).unwrap();
+        assert!(paths.iter().all(|p| p.exists()));
+        let _writer = RotatingFile::open(&dir, "logs", config.max_segments(Some(0))).unwrap();
+        assert!(paths.iter().all(|p| !p.exists()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn count_unlink_failure_compensates_silently_and_retries() {
+        let name = "rotate::tests::count_unlink_failure_compensates_silently_and_retries";
+        if let Some(output) = crate::test_child(name, "VIGIL_COUNT_CHILD") {
+            assert!(
+                output.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (dir, paths) = count_fixture("count-failure-met");
+        let handle = File::open(&dir).unwrap();
+        let config = cfg(100).max_segments(Some(1));
+        let mut attempted = Vec::new();
+        prune_with(&handle, "logs", &config, &dir, |fd, path| {
+            attempted.push(path.to_owned());
+            if path == paths[0].file_name().unwrap() {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                unlink_name(fd, path)
+            }
+        });
+        assert_eq!(attempted.len(), 3);
+        assert!(paths[0].exists());
+        assert!(!paths[1].exists() && !paths[2].exists());
+        prune_at(&handle, "logs", &config.max_segments(Some(0)), &dir);
+        assert!(!paths[0].exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn count_unmet_warns_once_and_retries() {
+        let name = "rotate::tests::count_unmet_warns_once_and_retries";
+        if let Some(output) = crate::test_child(name, "VIGIL_COUNT_CHILD") {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                stderr.matches("cannot meet max_segments=0").count(),
+                1,
+                "{stderr}"
+            );
+            assert!(stderr.contains("1 rotated segments remain"));
+            return;
+        }
+        let (dir, paths) = count_fixture("count-failure-unmet");
+        let handle = File::open(&dir).unwrap();
+        let config = cfg(100).max_segments(Some(0));
+        for _ in 0..2 {
+            prune_with(&handle, "logs", &config, &dir, |fd, path| {
+                if path == paths[0].file_name().unwrap() {
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                } else {
+                    unlink_name(fd, path)
+                }
+            });
+        }
+        assert!(paths[0].exists());
+        assert!(!paths[1].exists() && !paths[2].exists());
+        prune_at(&handle, "logs", &config, &dir);
+        assert!(!paths[0].exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn count_enoent_is_deleted() {
+        let (dir, paths) = count_fixture("count-enoent");
+        let handle = File::open(&dir).unwrap();
+        let mut attempts = 0;
+        prune_with(
+            &handle,
+            "logs",
+            &cfg(100).max_segments(Some(2)),
+            &dir,
+            |fd, path| {
+                attempts += 1;
+                unlink_name(fd, path).unwrap();
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            },
+        );
+        assert_eq!(attempts, 1);
+        assert!(!paths[0].exists());
+        assert!(paths[1].exists() && paths[2].exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
     fn all_lines(dir: &Path, signal: &str) -> Vec<String> {
         read_since(dir, signal, None).unwrap()
     }
@@ -1608,6 +2752,7 @@ mod tests {
         let old = RotationConfig {
             max_bytes: 1000,
             retention: Some(Duration::from_secs(90 * 86_400)),
+            ..RotationConfig::default()
         };
         let sigs = ["logs", "logs_2", "logs_2024"];
         let handles: Vec<_> = sigs
@@ -2501,6 +3646,7 @@ mod tests {
         let c = RotationConfig {
             max_bytes: 1000,
             retention: Some(Duration::from_secs(90 * 86_400)),
+            ..RotationConfig::default()
         };
         let _log = RotatingFile::open(&d, "s", c).unwrap();
         assert!(!old.exists());
@@ -2532,6 +3678,7 @@ mod tests {
         let c = RotationConfig {
             max_bytes: 10,
             retention: Some(Duration::from_secs(90 * 86_400)),
+            ..RotationConfig::default()
         };
         let log = RotatingFile::open(&d, "s", c).unwrap();
         let (old, fresh) = seed_old_and_fresh(&d);

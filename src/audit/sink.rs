@@ -21,6 +21,8 @@ use std::{
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) service: String,
+    /// Optional shape policy, checked before acquiring the directory lock.
+    pub(crate) schema: Option<RecordSchema>,
     pub(crate) checkpoint_every: u64,
     pub(crate) checkpoint_interval: Duration,
     pub(crate) max_bytes: u64,
@@ -29,6 +31,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             service: "vigil".into(),
+            schema: None,
             checkpoint_every: 1000,
             checkpoint_interval: Duration::from_secs(60),
             max_bytes: 50 * 1024 * 1024,
@@ -857,6 +860,8 @@ impl Sink {
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(error(AuditErrorKind::Poisoned, "handle durability failure"));
         }
+        let prepared = super::schema_validation::prepare(entry, self.config.schema.as_ref())?;
+        let entry = &prepared;
         self.reader.with_resumes(
             |dir| {
                 if self.poisoned.load(Ordering::Relaxed) {
@@ -869,6 +874,8 @@ impl Sink {
                 let time = clock()?;
                 let mut record = if let Some(action) = internal {
                     action.record(self.context(state, time)?, entry.clone())?
+                } else if self.config.schema.is_some() {
+                    Record::new_internal(self.context(state, time)?, entry.clone())?
                 } else {
                     Record::new(self.context(state, time)?, entry.clone())?
                 };
@@ -888,6 +895,8 @@ impl Sink {
                             current = state.clone();
                             record = if let Some(action) = internal {
                                 action.record(self.context(&current, time)?, entry.clone())?
+                            } else if self.config.schema.is_some() {
+                                Record::new_internal(self.context(&current, time)?, entry.clone())?
                             } else {
                                 Record::new(self.context(&current, time)?, entry.clone())?
                             };

@@ -243,5 +243,72 @@
     "items": {
       "vigil::audit::checkpoints": "fn"
     }
+  },
+  {
+    "justification": "ADR-0005 amendment 13 \u00a720.5: typed attribute kinds and values (#164 CP1a)",
+    "items": {
+      "vigil::audit::FieldKind": "struct",
+      "vigil::audit::FieldKind::id": "fn",
+      "vigil::audit::FieldKind::token": "fn",
+      "vigil::audit::FieldKind::one_of": "fn",
+      "vigil::audit::FieldKind::int": "fn",
+      "vigil::audit::FieldKind::digest": "fn",
+      "vigil::audit::AttrValue": "enum",
+      "vigil::audit::AttrValue::Id": "variant",
+      "vigil::audit::AttrValue::Token": "variant",
+      "vigil::audit::AttrValue::Int": "variant",
+      "vigil::audit::AttrValue::Digest": "variant"
+    }
+  },
+  {
+    "justification": "ADR-0002 amendment 3 decisions 16, 18 and 23; ADR-0004 decision 5: additive count and per-signal configuration",
+    "items": {
+      "vigil::Config::max_segments": "fn",
+      "vigil::Config::signal_rotation": "fn",
+      "vigil::rotate::RotationConfig::max_segments": "fn",
+      "vigil::rotate::RotationConfig::signal": "fn",
+      "vigil::rotate::SignalRotation": "struct",
+      "vigil::rotate::SignalRotation::new": "fn",
+      "vigil::rotate::SignalRotation::max_bytes": "fn",
+      "vigil::rotate::SignalRotation::max_segments": "fn",
+      "vigil::rotate::SignalRotation::retention": "fn",
+      "vigil::Config::max_total_bytes": "fn",
+      "vigil::rotate::RotationConfig::max_total_bytes": "fn"
+    }
+  },
+  {
+    "justification": "ADR-0005 amendment 13 \u00a720.5: validated record schema, canonical text, digest and builders (#164 CP1b)",
+    "items": {
+      "vigil::audit::RecordSchema": "struct",
+      "vigil::audit::RecordSchema::builder": "fn",
+      "vigil::audit::RecordSchema::parse": "fn",
+      "vigil::audit::RecordSchema::name": "fn",
+      "vigil::audit::RecordSchema::text": "fn",
+      "vigil::audit::RecordSchema::digest": "fn",
+      "vigil::audit::RecordSchema::digest_string": "fn",
+      "vigil::audit::RecordSchema::clone": "fn",
+      "vigil::audit::RecordSchema::fmt": "fn",
+      "vigil::audit::RecordSchema::eq": "fn",
+      "vigil::audit::RecordSchemaBuilder": "struct",
+      "vigil::audit::RecordSchemaBuilder::action": "fn",
+      "vigil::audit::RecordSchemaBuilder::build": "fn",
+      "vigil::audit::RecordSchemaBuilder::clone": "fn",
+      "vigil::audit::RecordSchemaBuilder::fmt": "fn",
+      "vigil::audit::ActionFields": "struct",
+      "vigil::audit::ActionFields::object": "fn",
+      "vigil::audit::ActionFields::required": "fn",
+      "vigil::audit::ActionFields::optional": "fn",
+      "vigil::audit::ActionFields::action": "fn",
+      "vigil::audit::ActionFields::build": "fn",
+      "vigil::audit::ActionFields::clone": "fn",
+      "vigil::audit::ActionFields::fmt": "fn"
+    }
+  },
+  {
+    "justification": "ADR-0005 amendment 13 \u00a720.5: CP2 schema-checked writer and typed entry attributes",
+    "items": {
+      "vigil::audit::Entry::attr": "fn",
+      "vigil::audit::AuditConfig::schema": "fn"
+    }
   }
 ]

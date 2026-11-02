@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.2.0](https://github.com/vig-os/vigil/releases/tag/0.2.0) - 2026-11-02
+
+### Added
+
+- Optional rotated-segment count and directory-wide telemetry byte caps, with per-signal size, count and age rotation overrides and environment equivalents ([#163](https://github.com/vig-os/vigil/issues/163), #176, #178). Zero caps are honoured. Pruning runs at open and after rotation in age, count, then total-byte order, deleting oldest segments first; the total pass also runs before an oversized write into an empty live file. Live files and audit files are never pruned. Total-byte pressure can erase a quiet signal's entire rotated history. Failed deletions remain counted, later segments are tried, and an unmet cap warns. Live-file and pending-write reservations and retained writer handles are included in the documented logical-byte bound.
+- Audit `FieldKind`, `AttrValue` and `Entry::attr`, with a canonical typed attribute block; `RecordSchema`, `RecordSchemaBuilder` and `ActionFields`, with canonical schema text and a domain-separated BLAKE3 digest (#164, #175, #177).
+- Schema-checked audit writers through `AuditConfig::schema`, with fail-closed record and operator validation and personal-data and erasure guidance (#164, #165, #179). The v1 byte encoding is unchanged.
+- `vigil-audit schema <file>` prints a canonical schema digest; optional `--schema <file>` on `rotate` and `resume` enforces opaque operator and reference ids (#164, #165, #180).
+
+### Changed
+
+- **Breaking:** audit record construction refuses caller-supplied `Entry::details` starting with the reserved `vigil.attrs.` prefix (`InvalidEntry`), with or without a schema; decoding existing records is unchanged (#164, #175).
+
 ## [0.1.0](https://github.com/vig-os/vigil/releases/tag/0.1.0) - 2026-10-18
 
 ### Added

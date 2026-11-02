@@ -1,6 +1,6 @@
 # ADR-0005: Audit trail
 
-- **Status:** Accepted (2026-10-11), amended by [#66](https://github.com/vig-os/vigil/issues/66); amendment 2 ([#68](https://github.com/vig-os/vigil/issues/68), [#70](https://github.com/vig-os/vigil/issues/70)) Accepted (2026-10-11, [PR #77](https://github.com/vig-os/vigil/pull/77)); amendment 3 ([#90](https://github.com/vig-os/vigil/issues/90)) Accepted (2026-10-12, [PR #91](https://github.com/vig-os/vigil/pull/91)); amendment 4 ([#11](https://github.com/vig-os/vigil/issues/11), marker form and trail-wide cadence) Accepted (2026-10-12, [PR #92](https://github.com/vig-os/vigil/pull/92)); amendment 5 ([#11](https://github.com/vig-os/vigil/issues/11), public writer validation and provisional primitives) Accepted (2026-10-12, [PR #105](https://github.com/vig-os/vigil/pull/105)); amendment 6 ([#87](https://github.com/vig-os/vigil/issues/87), reader runs sealed by resume) Accepted (2026-10-12, [PR #111](https://github.com/vig-os/vigil/pull/111)); amendment 7 ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12), file-backed signing and key generation) Accepted (2026-10-12, [PR #108](https://github.com/vig-os/vigil/pull/108)); amendment 8 ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12), exact-head operator writes and crash recovery) Accepted (2026-10-12); amendment 9 ([#11](https://github.com/vig-os/vigil/issues/11), settle/reader rules for operator resume) Accepted (2026-10-13); amendment 10 ([#107](https://github.com/vig-os/vigil/issues/107), prefix deletion, archiving and run review) Accepted (2026-10-12); accepted amendment 11 (2026-10-13) in [#138](https://github.com/vig-os/vigil/issues/138) for the returned opening checkpoint; proposed amendment 12 (2026-10-13, [#13](https://github.com/vig-os/vigil/issues/13), [#143](https://github.com/vig-os/vigil/issues/143)) for the verifier surface and the line classification; OQ9 classification Accepted ([PR #148](https://github.com/vig-os/vigil/pull/148)).
+- **Status:** Accepted (2026-10-11), amended by [#66](https://github.com/vig-os/vigil/issues/66); amendment 2 ([#68](https://github.com/vig-os/vigil/issues/68), [#70](https://github.com/vig-os/vigil/issues/70)) Accepted (2026-10-11, [PR #77](https://github.com/vig-os/vigil/pull/77)); amendment 3 ([#90](https://github.com/vig-os/vigil/issues/90)) Accepted (2026-10-12, [PR #91](https://github.com/vig-os/vigil/pull/91)); amendment 4 ([#11](https://github.com/vig-os/vigil/issues/11), marker form and trail-wide cadence) Accepted (2026-10-12, [PR #92](https://github.com/vig-os/vigil/pull/92)); amendment 5 ([#11](https://github.com/vig-os/vigil/issues/11), public writer validation and provisional primitives) Accepted (2026-10-12, [PR #105](https://github.com/vig-os/vigil/pull/105)); amendment 6 ([#87](https://github.com/vig-os/vigil/issues/87), reader runs sealed by resume) Accepted (2026-10-12, [PR #111](https://github.com/vig-os/vigil/pull/111)); amendment 7 ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12), file-backed signing and key generation) Accepted (2026-10-12, [PR #108](https://github.com/vig-os/vigil/pull/108)); amendment 8 ([#11](https://github.com/vig-os/vigil/issues/11), [#12](https://github.com/vig-os/vigil/issues/12), exact-head operator writes and crash recovery) Accepted (2026-10-12); amendment 9 ([#11](https://github.com/vig-os/vigil/issues/11), settle/reader rules for operator resume) Accepted (2026-10-13); amendment 10 ([#107](https://github.com/vig-os/vigil/issues/107), prefix deletion, archiving and run review) Accepted (2026-10-12); accepted amendment 11 (2026-10-13) in [#138](https://github.com/vig-os/vigil/issues/138) for the returned opening checkpoint; proposed amendment 12 (2026-10-13, [#13](https://github.com/vig-os/vigil/issues/13), [#143](https://github.com/vig-os/vigil/issues/143)) for the verifier surface and the line classification; OQ9 classification Accepted ([PR #148](https://github.com/vig-os/vigil/pull/148)); amendment 13, Proposed, partly accepted (CP1, CP2, CP3) (architect ruling 164-d3; 2026-11-02, [#164](https://github.com/vig-os/vigil/issues/164), [#165](https://github.com/vig-os/vigil/issues/165)) for the consumer audit profile and erasure.
 - **Amended 2026-10-11 ([#66](https://github.com/vig-os/vigil/issues/66)), Accepted:** decides the four open sub-decisions: the clean-stop head (`close()` returns a `Checkpoint`, decision 9), the receipts range (seq 0 or the start through the head, with waivers and an explicit live mode, decision 5), `start_from` acceptance (only an anchored start demotes anything, decision 11) and revocation scope (a key revoked on one trail is revoked on every trail that lists it, decision 9). Decision 16 states what each rule detects under the four threat models. Receipts across a `resume` were deferred to [#70](https://github.com/vig-os/vigil/issues/70), and `--strict` with reviewed warnings to [#68](https://github.com/vig-os/vigil/issues/68); amendment 2 decides both.
 - **Amended 2026-10-11 ([#68](https://github.com/vig-os/vigil/issues/68), [#70](https://github.com/vig-os/vigil/issues/70)), Accepted (2026-10-11, [PR #77](https://github.com/vig-os/vigil/pull/77)):** decides the two questions #66 deferred. **#68:** a writer that repairs a torn tail attests the fragment's bytes in the next line it writes (`audit.repaired`, decisions 3, 4 and 5), so an honest crash's fragment becomes `TornWriteRepaired` (info) once a trusted checkpoint covers that line, and a fragment no line attests is `RepairMismatch` (an error); warnings that stay for good (a trailing fragment no write can attest any more, `Resumed`, `ClockWentBackwards`, `DuplicateRecord`) pass `--strict` only through a hash-pinned `accept` line in a separate review file (decision 11). **#70:** `resume` never reuses a `seq`: it continues above `--lost-through`, the highest `seq` the deployment holds evidence of, so the chain may jump once at a declared resume gap; inputs inside a gap whose resume record is pinned from outside (a receipt or an `accept` line) are `LostRecord` (info), and `expect_head` and the rotation's expected head need no change (decisions 5, 7, 8 and 9). Decision 17 states what each rule detects under the four threat models. Format changes, before 1.0 (decision 12): one optional hashed attribute and `mmr_size` counting records instead of equalling `seq`.
 - **Amendment 3 (2026-10-12, [#90](https://github.com/vig-os/vigil/issues/90)), Accepted (2026-10-12, [PR #91](https://github.com/vig-os/vigil/pull/91)):** settles the scope of fsync poisoning (decision 6), which the text of the first amendments left open outside the live file's record write. **A failed fsync is never retried:** the writer either undoes what the fsync was to make durable, when the undo needs no durability (a staging file is truncated to 0), or stops every writer with `audit.poison`, when the change cannot be undone (a rename whose directory fsync failed). Staging files are neutralised, a directory fsync after a rename into or out of the live name poisons the directory, `create`'s marker failure leaves the marker and the "marker without a trail" state, `audit.poison` is checked before staging settlement, a poisoned handle is inert (`record`, `checkpoint`, `close` and `Drop` write nothing), and `checkpoint`, `close`, `Drop` and `resume` fail `Poisoned` while `audit.poison` exists. Decisions 6 and 8 carry the rules and the tests below list one acceptance test per case.
@@ -13,8 +13,9 @@
 - **Amendment 10 (2026-10-12, [#107](https://github.com/vig-os/vigil/issues/107), architect ruling 107-d1), Accepted (2026-10-12):** decides how the deletion of a trail's prefix or tail is detected across archiving, and how a reviewer signs off a run sealed by `resume`. `open` is a structural check and `verify` is the verifier (decisions 5 and 8). The archive procedure copies from the verified snapshot, verifies the archive in place per batch and checks the end of each batch on a schedule (decision 2, steps 4 to 7; `--end-before`, decision 11). A run's `SegmentStructure` finding names the missing `seq` range of every loss point, and an explicit `accept-run` review line accepts exactly the findings of one run, pinned by a run digest over its ranges and spans (decision 11; architect rulings 107-d2 and 107-d3 shaped the digest). Decision 18 states what each rule detects, the residuals and the README duties. Every changed sentence carries "(amended, #107, ruling 107-d1)", "(amended, #107, architect ruling 107-d2)" for the sentences the second review round changed, or "(amended, #107, architect ruling 107-d3)" for the third, and "(amended, #123)" or "(amended, #123, ruling 123-d1)" for the leftovers fixed afterwards ([#123](https://github.com/vig-os/vigil/issues/123)).
 - **Amendment 11 (2026-10-13, [#138](https://github.com/vig-os/vigil/issues/138), architect ruling 138-d1), Accepted (2026-10-13, [PR #141](https://github.com/vig-os/vigil/pull/141)):** `AuditConfig::resume` returns `(AuditTrail, Receipt, Checkpoint)`: the receipt is for the resume record at `lost_through + 2`, and the signed opening checkpoint at `lost_through + 1` must be anchored.
 - **Amendment 12 (2026-10-13, [#13](https://github.com/vig-os/vigil/issues/13), [#143](https://github.com/vig-os/vigil/issues/143), architect rulings 13-d1 and 13-d2), Proposed:** fixes the verifier surface before #13 implements it (a validated `TrustPolicy::builder()`, fallible `Verifier` configuration, `Result<Report, AuditError>` from every verify entry point, `Report` and `Finding` extras, the JSON schema and a public `checkpoints(dir)`), defines `Unparsable` once for the reader and the verifier (fragment, then decode, then record; a NUL-filled crash tail is `Unparsable` and `resume` seals it) and rules the genesis resume (gap `0..=lost_through`; a genesis opening anywhere but first, or with a start given, is `ChainBroken`, R10). Each part is flipped to Accepted by the slice that implements it ([§19](#19-verifier-surface-and-line-classification-amendment-12)); the OQ9 classification part Accepted (PR #148).
+- **Amendment 13 (2026-11-02, [#164](https://github.com/vig-os/vigil/issues/164), [#165](https://github.com/vig-os/vigil/issues/165)), Proposed, partly accepted (CP1, CP2, CP3) (architect ruling 164-d3):** a consumer audit profile with no v1 byte-format change. Typed attributes (`id`, `token`, `enum`, `int`, 32-byte `digest`) ride in `audit.details` as one canonical attribute block that names its schema's digest; a per-trail `RecordSchema` (`AuditConfig::schema`) closes the actions and their keys and is checked fail-closed at `record()` before the lock (`InvalidEntry`); the schema text is pinned out of band in the trust policy (`schema` line, `TrailTrust::schema`, `Verifier::schema`, `--schema`), never written to the trail, and the verifier reports `SchemaUnknown` and `SchemaViolation` (errors) and `OperatorText` (an acceptable warning for free text in an operator record). Under a schema a record carries no free text (#165 option 1, pseudonymous references); the section states what that rule cannot catch, what an erasure of the consumer's mapping leaves provable, and its interaction with archiving and the tessera export. Inclusion proofs go to a new issue. OQ1 to OQ5 are decided as recommended by architect ruling 164-d1, which also scopes the post-erasure guarantees to checkpoint coverage, receipts, anchors and verified archives, and makes CP1 a breaking behaviour change (`semver:major`). Each part is flipped to Accepted by the slice that implements it (CP1 to CP4, [§20](#20-consumer-audit-profile-typed-attributes-a-record-schema-pseudonymous-records-and-erasure-amendment-13)).
 - **Date:** 2026-10-11
-- **Issues:** [#10](https://github.com/vig-os/vigil/issues/10) (this decision); implemented by [#11](https://github.com/vig-os/vigil/issues/11) (sink and record API), [#12](https://github.com/vig-os/vigil/issues/12) (chain, MMR, checkpoints), [#13](https://github.com/vig-os/vigil/issues/13) (verify API and CLI, tamper tests); amended by [#66](https://github.com/vig-os/vigil/issues/66), [#68](https://github.com/vig-os/vigil/issues/68), [#70](https://github.com/vig-os/vigil/issues/70) and [#90](https://github.com/vig-os/vigil/issues/90); accepted amendment 4 (2026-10-12) in [#11](https://github.com/vig-os/vigil/issues/11) for marker form and trail-wide cadence; accepted amendment 5 (2026-10-12) in [#11](https://github.com/vig-os/vigil/issues/11) for public writer validation and provisional primitives; accepted amendment 6 (2026-10-12) in [#87](https://github.com/vig-os/vigil/issues/87) for reader runs sealed by resume ([PR #111](https://github.com/vig-os/vigil/pull/111)); accepted amendment 7 (2026-10-12) in [#11](https://github.com/vig-os/vigil/issues/11) and [#12](https://github.com/vig-os/vigil/issues/12) for file-backed signing and durable key generation; accepted amendment 8 (2026-10-12) in [#11](https://github.com/vig-os/vigil/issues/11) and [#12](https://github.com/vig-os/vigil/issues/12) for exact-head operator writes and crash recovery; accepted amendment 9 (2026-10-13) in [#11](https://github.com/vig-os/vigil/issues/11) for settle/reader rules for operator resume; accepted amendment 10 (2026-10-12) in [#107](https://github.com/vig-os/vigil/issues/107) for prefix deletion, archiving and run review; accepted amendment 11 (2026-10-13) in [#138](https://github.com/vig-os/vigil/issues/138) for the returned opening checkpoint; proposed amendment 12 (2026-10-13) in [#13](https://github.com/vig-os/vigil/issues/13) and [#143](https://github.com/vig-os/vigil/issues/143) for the verifier surface and line classification; deferred work in [#56](https://github.com/vig-os/vigil/issues/56), [#57](https://github.com/vig-os/vigil/issues/57), [#58](https://github.com/vig-os/vigil/issues/58), [#59](https://github.com/vig-os/vigil/issues/59)
+- **Issues:** [#10](https://github.com/vig-os/vigil/issues/10) (this decision); implemented by [#11](https://github.com/vig-os/vigil/issues/11) (sink and record API), [#12](https://github.com/vig-os/vigil/issues/12) (chain, MMR, checkpoints), [#13](https://github.com/vig-os/vigil/issues/13) (verify API and CLI, tamper tests); amended by [#66](https://github.com/vig-os/vigil/issues/66), [#68](https://github.com/vig-os/vigil/issues/68), [#70](https://github.com/vig-os/vigil/issues/70) and [#90](https://github.com/vig-os/vigil/issues/90); accepted amendment 4 (2026-10-12) in [#11](https://github.com/vig-os/vigil/issues/11) for marker form and trail-wide cadence; accepted amendment 5 (2026-10-12) in [#11](https://github.com/vig-os/vigil/issues/11) for public writer validation and provisional primitives; accepted amendment 6 (2026-10-12) in [#87](https://github.com/vig-os/vigil/issues/87) for reader runs sealed by resume ([PR #111](https://github.com/vig-os/vigil/pull/111)); accepted amendment 7 (2026-10-12) in [#11](https://github.com/vig-os/vigil/issues/11) and [#12](https://github.com/vig-os/vigil/issues/12) for file-backed signing and durable key generation; accepted amendment 8 (2026-10-12) in [#11](https://github.com/vig-os/vigil/issues/11) and [#12](https://github.com/vig-os/vigil/issues/12) for exact-head operator writes and crash recovery; accepted amendment 9 (2026-10-13) in [#11](https://github.com/vig-os/vigil/issues/11) for settle/reader rules for operator resume; accepted amendment 10 (2026-10-12) in [#107](https://github.com/vig-os/vigil/issues/107) for prefix deletion, archiving and run review; accepted amendment 11 (2026-10-13) in [#138](https://github.com/vig-os/vigil/issues/138) for the returned opening checkpoint; proposed amendment 12 (2026-10-13) in [#13](https://github.com/vig-os/vigil/issues/13) and [#143](https://github.com/vig-os/vigil/issues/143) for the verifier surface and line classification; proposed amendment 13 (2026-11-02) in [#164](https://github.com/vig-os/vigil/issues/164) and [#165](https://github.com/vig-os/vigil/issues/165) for the consumer audit profile and erasure; deferred work in [#56](https://github.com/vig-os/vigil/issues/56), [#57](https://github.com/vig-os/vigil/issues/57), [#58](https://github.com/vig-os/vigil/issues/58), [#59](https://github.com/vig-os/vigil/issues/59)
 
 ## Context
 
@@ -162,7 +163,7 @@ Scenarios A and C show the hazards of the old text (no poison for a directory fs
 - Audit records are **not** `tracing` events. A filter, a sampler or a full batch queue can drop a `tracing` event, and an audit record must never be dropped. The application calls `AuditTrail::record` directly and gets a `Result`.
 - The trail is opened on its own (`AuditConfig::open`), independent of `vigil::init`. An application can audit even when its telemetry has degraded to stderr.
 - **Exception to ADR-0004 decision 3:** opening a trail and writing to it **fail closed**. An environment fault (unwritable directory, failed fsync, unusable key) is an `Err`, never a degradation. The caller must not complete the audited action without an `Ok`.
-- **Out of scope:** electronic signatures (§11.50, §11.70, §11.100–300), identity management and authentication (the application passes an authenticated actor), access control beyond file modes (§11.10(d)), and making personal data erasable inside the trail (put a digest in the trail instead, decision 3).
+- **Out of scope:** electronic signatures (§11.50, §11.70, §11.100–300), identity management and authentication (the application passes an authenticated actor), access control beyond file modes (§11.10(d)), and making personal data erasable inside the trail (put a digest in the trail instead, decision 3; the schema profile of amendment 13, Accepted (CP2: writer checks and erasure documentation), makes that a checked rule: pseudonymous references and no free text (verifier enforcement remains Proposed, CP4), with what an erasure outside the trail leaves provable, [§20.6](#206-the-personal-data-rule-p6-p8) and [§20.7](#207-what-an-erasure-leaves-provable-p12)).
 
 ### 2. Files: ADR-0002's machinery in a directory of its own
 
@@ -351,7 +352,7 @@ invalid. Hashes authenticate record content, not JSON whitespace or key order.
 | `audit.reason` | record, optional | why (Annex 11 §9) | `0x13` |
 | `audit.before` / `audit.before_digest` | record, optional, at most one of the pair | the prior value as text, or `blake3:<hex>` of it | `0x14` / `0x15` |
 | `audit.after` / `audit.after_digest` | record, optional, at most one of the pair | the new value, same rule | `0x16` / `0x17` |
-| `audit.details` | record, optional | free text (for example JSON) | `0x18` |
+| `audit.details` | record, optional | free text (for example JSON); on a typed record, the canonical attribute block that vigil renders, beginning `vigil.attrs.v1` (amendment 13, Accepted, CP1, [§20.3](#203-field-kinds-and-the-attribute-block-p1-to-p4)) | `0x18` |
 | `audit.mmr_size`, `audit.mmr_root`, `audit.key_id`, `audit.sig` | checkpoint, required | decision 8 | `0x20`, `0x21`, `0x23`, `0x24` |
 | `audit.mmr_peaks` | checkpoint, present exactly when `audit.mmr_size` > 0, with exactly popcount(`mmr_size`) entries | decision 8; absent at size 0 because the Collector drops empty arrays | `0x22` |
 | `audit.prev_hash` | both | the previous record's `audit.hash` | `0x7f` |
@@ -361,7 +362,7 @@ invalid. Hashes authenticate record content, not JSON whitespace or key order.
 - **A v1 reader rejects every log-record attribute outside the v1 set** (`UnknownField`), and any attribute key that appears twice in one record (`InvalidField`). Otherwise an unhashed attribute such as `audit.note` or `approved_by` could be added to a signed record and look authoritative, or two values for one key could make vigil hash one while another OTLP tool shows the other. vigil writes no other attributes.
 - **Reserved context names (#79 review).** Resource/scope attributes and nested context kvlist keys must not start with `audit.`. The shared writer/reader validator rejects them (`InvalidConfig` on construction, `InvalidField` on decoding), so an unhashed context attribute cannot impersonate an authenticated audit field.
 - **Resource and scope attributes other than `service.name` and `host.name` are not authenticated.** They are context for shipping and debugging; `vigil-audit verify` never presents them as part of the record.
-- **The before and after values** are what makes a change "not obscure previously recorded information". Where a value is large or personal, the application passes `Value::Digest`, keeping the trail small and free of the data itself. The application's own store must then keep the value the digest refers to.
+- **The before and after values** are what makes a change "not obscure previously recorded information". Where a value is large or personal, the application passes `Value::Digest`, keeping the trail small and free of the data itself. The application's own store must then keep the value the digest refers to. A digest of erasable, guessable content must be a salted commitment, never a plain hash (amendment 13, Accepted, CP2, [§20.6](#206-the-personal-data-rule-p6-p8)).
 
 ### 4. Canonical encoding and record hash (frozen in v1)
 
@@ -606,7 +607,7 @@ hash         = blake3("vigil.audit.v1.record\0" ‖ fields)
     vigil never guesses which case is innocent.
   - **An operator decides** with `vigil-audit resume --key <keyfile> --actor <who> --reason <why> --head <seq>:<hash> --lost-through <seq> <dir>`. It continues the trail from the named head, which must be the last complete record found and is typically the last one verified against anchors or receipts. vigil never rewrites or prepends, so:
     - **A headless live file** (present, but its first complete record is no linking checkpoint), or a **well-formed live file whose head is behind what the deployment holds** (a rollback, seen as `HeadMismatch` or through receipts; amended, #70), is sealed as it is. It is renamed, unchanged, to the next segment name, no-replace, and keeps its `SegmentStructure` findings forever as the record of the damage (an `accept-run` line turns them into `Accepted`, which still reports them; amended, #107, ruling 107-d1). [Amendment 6](#amendment-6-reader-rule-for-runs-sealed-by-resume) specifies when the reader can open such a sealed run.
-    - **A new live file** is then written through the staging file (sealing steps 2, 5 and 6), starting with an opening checkpoint at `seq` `lost_through + 1` that links to the named head. It is followed by a record with action `vigil.audit.resume`: the operator as actor, the reason, and in `audit.details` the fixed form `head=<seq>:<blake3:hex> lost_through=<seq> file=<segment name the sealed live file received, or - when it was deleted>` (amended, #70), which the verifier reads (decision 5, "Resume gaps"). **Both lines go into `.audit-resume.jsonl` in one write and one fsync** (amended, #70), before the damaged live file is renamed, and `resume` holds the directory lock from before that write until after the final directory fsync, like every writer. A crash at any point leaves either a staging file holding both (promoted by the rule above, which then finishes the renames) or a prefix of it, which the rule discards, including a prefix that ends exactly after the opening checkpoint's newline. A crash can therefore never leave an opening checkpoint without its resume record, which the verifier would report as `SeqGap` when it jumps (review probe, every prefix). `file=` is informational: the verifier reads only `head=` and `lost_through=`. The command prints the resume record's receipt after the final directory fsync (amended, #66, decision 5).
+    - **A new live file** is then written through the staging file (sealing steps 2, 5 and 6), starting with an opening checkpoint at `seq` `lost_through + 1` that links to the named head. It is followed by a record with action `vigil.audit.resume`: the operator as actor, the reason, and in `audit.details` the fixed form `head=<seq>:<blake3:hex> lost_through=<seq> file=<segment name the sealed live file received, or - when it was deleted>` (amended, #70), which the verifier reads (decision 5, "Resume gaps"). **Both lines go into `.audit-resume.jsonl` in one write and one fsync** (amended, #70), before the damaged live file is renamed, and `resume` holds the directory lock from before that write until after the final directory fsync, like every writer. A crash at any point leaves either a staging file holding both (promoted by the rule above, which then finishes the renames) or a prefix of it, which the rule discards, including a prefix that ends exactly after the opening checkpoint's newline. A crash can therefore never leave an opening checkpoint without its resume record, which the verifier would report as `SeqGap` when it jumps (review probe, every prefix). `file=` is informational: the verifier reads only `head=` and `lost_through=` (in a typed trail it must also be `-` or a segment name of decision 2's form, `audit-<stamp>[_NNNNNN].jsonl`; amendment 13, Proposed, [§20.4](#204-the-record-schema-p5-p7-p9-to-p11)). The command prints the resume record's receipt after the final directory fsync (amended, #66, decision 5).
     - **`seq` continues above `--lost-through`, never from a `seq` already used** (amended, #70). `--lost-through` is mandatory, at least the head's `seq`, and at most `i64::MAX − 2` (`seq` is OTLP int64; architect ruling B3d2-d10) so the two new `seq`s fit (else a usage error, exit 2; `InvalidConfig` from `AuditConfig::resume`). It is **the highest `seq` the deployment holds any evidence of outside the trail directory**: the receipts and close checkpoints of every process (the expected head of decision 9), anchors and revocation pins. The trail cannot know how many records the deleted file held, so the operator takes it from that evidence. Equal to the head's `seq`, nothing was lost that anyone holds, and there is no gap: the core behaviour. **Higher than needed costs nothing** but a wider gap, so an operator in doubt adds a margin (for example `checkpoint_every`). **Lower than a held `seq` fails closed:** that receipt or anchor names a `seq` the new records reuse, so it is `ReceiptMismatch` or `AnchorMismatch` for good, and, if it is the highest held receipt, `open` with `expect_head` is `HeadMismatch` (probe). Records lost without any evidence held (written but never receipted) leave no trace in the trail; the application's durable request log (decision 5) is where they show.
     - **The verifier reports every `vigil.audit.resume` record as `Resumed`,** a warning that names the operator, the reason, the head, the gap and the number of `LostRecord` inputs in it. So plain verify passes with the decision visible, and `--strict` fails until a reviewer has accepted it with an `accept Resumed` line (decision 11, amended by #68).
     - **`vigil.audit.` is a reserved action prefix** (amended, #70). The verifier gives `vigil.audit.resume` records a meaning (the gap declaration and `Resumed`), so an `Entry` whose action starts with `vigil.audit.` is rejected with `AuditErrorKind::InvalidEntry`, wherever entries are validated: an application record can never be read as an operator's decision. A forged record with such an action is still `NoReceipt` like any other (decision 5).
@@ -717,6 +718,7 @@ README deployment duties belong to B3e, including amendment 10's separate `accep
   - **`end=` retires a trail** (amended, #66): the trail must end exactly at that record. **Its value comes from the application's last close checkpoint or receipt for that trail, or from an anchor, never from `vigil-audit checkpoints` or any other read of the trail directory**, for the same reason as `--expect-head` (decision 9): an attacker who can write the files chooses what the disk says. A different record at that `seq`, or any record above it, is `TrailEnded` (an error). A retired trail on WORM storage cannot be written to, so `rotate` cannot write a confirming checkpoint there. Instead, any bound at or below the `end=` record counts as confirmed: `end=` pins the exact head, so no record, by any key, may follow it. After a suspected compromise the bound is still the last anchored checkpoint (step 2), and the old key's checkpoints between it and `end=` are `UntrustedKey`, as in the compromise branch (probe).
     - **`end=` on a crashed tail.** The two pins are different things. `end=` pins the trail's last record, which may be any record (a retired trail whose last writer crashed ends with records after its last checkpoint). A key's `through=` bound is always a checkpoint, at or below `end=`. The records between the last checkpoint and `end=` are signed by no key, so the verifier still reports them as `UncoveredTail` (info), and an auditor sees that they are unsigned. A matching `end=` pins them through the chain, from a source outside the trail directory, as a receipt does, so **`--strict` does not fail on the uncovered tail of a trail whose `end=` matches**. Without `end=`, or with a mismatch (`TrailEnded`), `--strict` fails on it as usual.
   - `ed25519 <64 hex> [through=<seq>:<blake3:hex>] [comment]` lists a key trusted **for the trail of the section it is in**. A key line before the first `trail` line is a parse error.
+  - `schema blake3:<64 hex> [comment]` (amendment 13, Proposed, [§20.4](#204-the-record-schema-p5-p7-p9-to-p11)) pins a record-schema digest for the trail of its section; a section with at least one `schema` line is a **typed trail**. A digest that appears more than once in a section is a parse error, and so is a `schema` line before the first `trail` line. `TrailTrust::schema(digest)` does the same in code.
   - **Revocation scope** (amended, #66). **A key revoked on one trail is revoked on every trail that lists it.** A trust file in which a key carries `through=` in one section and no `through=` in another is a parse error (`TrustPolicy::from_file`, and the builder's `build()` (amendment 12, Proposed), fail with `AuditErrorKind::InvalidConfig`, naming the key and the sections). Otherwise a stolen key revoked only on trail X still forges trail Y, which then verifies clean (probe: `--strict` passed on Y; at most `NoReceipt` with receipts).
     - **Bounds do not combine across trails.** A `seq` means something only within its trail, so each section carries its own bound, a checkpoint of that trail, and its own confirmation (the *pinned*, *confirmed* and *bounded* rules above, per trail). Revoking a shared key therefore means running the rotation procedure on every trail that lists it that is still written to. A retired trail gets `end=` at its last record and the key's bound at the same record (probe).
     - **The check covers one trust file.** The verifier sees only the trust file it is given, so a key revoked in X's file and still trusted in a separate file for Y is not caught. **Every trail a key signs for belongs in one trust file**, which the rustdoc of `TrustPolicy` and the README require. A deployment that keeps one file per trail must use one key per trail.
@@ -765,6 +767,7 @@ README deployment duties belong to B3e, including amendment 10's separate `accep
     - `.waive(seq, hash, reason)`, `.receipts_from(seq, hash, reason)` and `.receipts_live(bool)`: an operator's waiver for one record, late adoption, and live reconciliation (decision 5). As in the receipts file, a second `waive` for the same `seq`, or a second `receipts_from`, is rejected: both methods return `Result<Self, AuditError>`, with kind `InvalidConfig` on the duplicate. `receipts_live` returns the same `Result` (amendment 12, Proposed): `InvalidConfig` when combined with `end_before`;
     - `.accept(kind, seq, hash, reviewer, reason)` (amended, #68): a reviewer's acceptance of one warning, pinned by a hash (the review file below). It returns `Result<Self, AuditError>`, with kind `InvalidConfig` for a kind that is not an acceptable warning, an empty reviewer or reason, or a second acceptance of the same kind at the same `seq`;
     - `.trail(id) -> Result<Self, AuditError>`: narrow to one pinned trail; an id the policy does not pin is `InvalidConfig` (amendment 12, Proposed);
+    - `.schema(RecordSchema) -> Result<Self, AuditError>` (amendment 13, Proposed, [§20.4](#204-the-record-schema-p5-p7-p9-to-p11)), CLI `--schema <file>` (repeatable): the text of a pinned record schema; `InvalidConfig` when no section pins its digest, or when it is supplied twice;
     - `.max_age(Duration) -> Result<Self, AuditError>`: report `StaleHead` (an error) when the newest trusted checkpoint is older than this, measured against the verifier's clock (decision 5); `InvalidConfig` when combined with `end_before` (amendment 12, Proposed);
     - `.verify_dir(&Path)` and `.verify_files(impl IntoIterator<Item = PathBuf>)`, the latter for copies shipped through a Collector. Both return `Result<Report, AuditError>` (amendment 12, Proposed; was `io::Result`).
 - **Errors versus findings** (amended: amendment 12, Proposed). `Err(AuditError)` means one of two things: the input cannot be read (kind `Io`, with the `io::Error` as its source), or the configuration is invalid (kind `InvalidConfig`, including a policy that pins several trails when the verification names none, below). Tampering is never an `Err`: it is a `Finding` in the `Report`. The CLI maps `Io` and `InvalidConfig` to exit 2.
@@ -782,21 +785,22 @@ README deployment duties belong to B3e, including amendment 10's separate `accep
     1. **Fragment.** The torn-write fragment conditions 1 to 3 of decision 5 are checked first. A line longer than the 1 000 000-byte cap is **never** a fragment: the writer never writes an over-cap line, so no prefix of a written line exceeds the cap. (An empty or whitespace-only line is not a fragment either, decision 5.)
     2. **Decode.** Decoding is vigil's framed decoder, **including its pre-parse checks**: a raw byte below 0x20 anywhere in the payload, or a payload over the cap, fails decoding *before* JSON parsing. A line that fails decoding, or that parses to something other than a JSON object, is **`Unparsable`**. That covers control bytes (NUL included), over-cap lines, non-JSON and JSON non-objects such as `[1]`.
     3. **Record.** A line that decodes to a JSON object is a record. Its record-level findings stay record findings and are never span bytes: `InvalidField`, `UnknownVersion`, `MissingField`, `UnknownField` and `HashMismatch`.
-  - errors: `Unparsable` (above), `UnknownVersion`, `UnknownField`, `MissingField`, `InvalidField`, `HashMismatch`, `ChainBroken`, `SeqGap`, `SeqConflict` (two different records with one `seq`), `TrailMismatch`, `MmrMismatch`, `BadSignature`, `UntrustedKey`, `RevocationMismatch`, `RevocationUnconfirmed`, `SegmentStructure`, `AnchorMismatch`, `StartMismatch`, `UnanchoredStart` (an input below a start that is not anchored, decision 11), `UnanchoredEnd` (an `--end-before` checkpoint that the batch-start anchor entry does not name, or none is given, decision 11; amended, #107, ruling 107-d1 and architect ruling 107-d2), `TrailEnded` (a record at or above a retired trail's `end=` that does not match it, decision 9; and a record at or above an `--end-before` checkpoint's `seq` in the files, decision 11; amended, #107, architect ruling 107-d2), `StaleHead`, `NoReceipt`, `ReceiptMismatch`, `RepairMismatch` (a gap of fragments that the line after it does not attest, decision 5, amended by #68), `AcceptMismatch` (an `accept` line whose record is missing or has another hash, or an `accept TornWrite` line naming a gap the verifier marked "no crash outcome": bytes after a rotation-sealed segment's closing checkpoint, decision 5; amended by #68; and an `accept-run` line whose resume record is missing, is not a resume record, has another hash, or whose run digest is not the run's, below; amended, #107, ruling 107-d1);
-  - warnings: `TornWrite` (a trailing gap, or one whose attesting line no trusted checkpoint covers yet), `Resumed`, `ClockWentBackwards`, `DuplicateRecord` (the same record twice: a Collector can redeliver a line, and in vigil's own files a duplicated line changes no content);
+  - errors: `Unparsable` (above), `UnknownVersion`, `UnknownField`, `MissingField`, `InvalidField`, `HashMismatch`, `ChainBroken`, `SeqGap`, `SeqConflict` (two different records with one `seq`), `TrailMismatch`, `MmrMismatch`, `BadSignature`, `UntrustedKey`, `RevocationMismatch`, `RevocationUnconfirmed`, `SegmentStructure`, `AnchorMismatch`, `StartMismatch`, `UnanchoredStart` (an input below a start that is not anchored, decision 11), `UnanchoredEnd` (an `--end-before` checkpoint that the batch-start anchor entry does not name, or none is given, decision 11; amended, #107, ruling 107-d1 and architect ruling 107-d2), `TrailEnded` (a record at or above a retired trail's `end=` that does not match it, decision 9; and a record at or above an `--end-before` checkpoint's `seq` in the files, decision 11; amended, #107, architect ruling 107-d2), `StaleHead`, `NoReceipt`, `ReceiptMismatch`, `RepairMismatch` (a gap of fragments that the line after it does not attest, decision 5, amended by #68), `AcceptMismatch` (an `accept` line whose record is missing or has another hash, or an `accept TornWrite` line naming a gap the verifier marked "no crash outcome": bytes after a rotation-sealed segment's closing checkpoint, decision 5; amended by #68; and an `accept-run` line whose resume record is missing, is not a resume record, has another hash, or whose run digest is not the run's, below; amended, #107, ruling 107-d1), `SchemaUnknown` (a typed record whose schema digest is not pinned for the trail, or whose schema text was not supplied) and `SchemaViolation` (a typed record that breaks its schema or is not in canonical form, a plain application record, an unknown `vigil.audit.*` action, or an operator record not in vigil's fixed form, in a typed trail) (both amendment 13, Proposed, [§20.4](#204-the-record-schema-p5-p7-p9-to-p11));
+  - warnings: `TornWrite` (a trailing gap, or one whose attesting line no trusted checkpoint covers yet), `Resumed`, `ClockWentBackwards`, `DuplicateRecord` (the same record twice: a Collector can redeliver a line, and in vigil's own files a duplicated line changes no content), `OperatorText` (an operator record in a typed trail whose actor or reason is not an `id`; amendment 13, Proposed, [§20.4](#204-the-record-schema-p5-p7-p9-to-p11));
   - info: `UncoveredTail`, `OutOfRange` (an input below an anchored start, or above an anchored `--end-before` checkpoint; amended, #107, ruling 107-d1), `Unreconciled` (records above the reconciled prefix with `--receipts-live`), `ReceiptWaived` (an operator's waiver or `from` line, decision 5), `TornWriteRepaired` (an attested and covered gap, decision 5, amended by #68), `Accepted` (a warning a reviewer accepted, naming its kind, the reviewer and the reason, amended by #68; and each finding of a run that an `accept-run` line accepted, naming its kind, the resume `seq`, the reviewer and the reason, amended, #107, ruling 107-d1), `AcceptUnused` (an `accept` line that matched no warning, amended by #68), `LostRecord` (an input naming a `seq` inside a confirmed resume gap, decision 5, amended by #70).
 - **How it verifies.** Records are ordered by `seq`, from vigil's segment order or from any order in shipped copies. Every record is checked; nothing stops at the first error. The first error in `seq` order is the **first broken link**, reported with file, line, `seq`, expected and found hash.
 - **Locking and offline use.** The verifier takes no lock and verifies a snapshot, using ADR-0002 decision 12's retry. Following ADR-0037 §1, it needs only the trail files, the trust file and local anchors: no network.
 - **CLI** (`vigil-audit`, std-only argument parsing, `required-features = ["audit"]`):
 
   ```text
-  vigil-audit verify --trust <file> [--trail <id>] [--receipts <file> [--receipts-live]] [--reviewed <file>] [--anchor <file>]... [--start-from <file>] [--end-before <file> --end-anchor <file>] [--max-age <duration>] [--strict] [--json] <dir|file>...
+  vigil-audit verify --trust <file> [--trail <id>] [--receipts <file> [--receipts-live]] [--reviewed <file>] [--anchor <file>]... [--start-from <file>] [--end-before <file> --end-anchor <file>] [--max-age <duration>] [--schema <file>]... [--strict] [--json] <dir|file>...
   vigil-audit checkpoints <dir>
   vigil-audit checkpoint --key <keyfile> --expect-head <seq>:<hash> <dir>
-  vigil-audit rotate --key <keyfile> --actor <who> --reason <why> --bound <seq>:<hash> --expect-head <seq>:<hash> <dir>
+  vigil-audit rotate --key <keyfile> --actor <who> --reason <why> --bound <seq>:<hash> --expect-head <seq>:<hash> [--schema <file>] <dir>
   vigil-audit create --key <keyfile> --service <name> <dir>
-  vigil-audit resume --key <keyfile> --actor <who> --reason <why> --head <seq>:<hash> --lost-through <seq> <dir>
+  vigil-audit resume --key <keyfile> --actor <who> --reason <why> --head <seq>:<hash> --lost-through <seq> [--schema <file>] <dir>
   vigil-audit keygen <keyfile>
+  vigil-audit schema <file>
   ```
 
   **The binary uses only the public API** (amendment 12, Accepted for checkpoint listing, [PR #147](https://github.com/vig-os/vigil/pull/147), ruling 13-d1 OQ11): `vigil-audit checkpoints` calls `checkpoints(dir)` (decision 13), and the receipts and review files are parsed in the binary, whose builder calls (`waive`, `receipts_from`, `accept`, `accept_run`) enforce the duplicate and kind rules below; an `InvalidConfig` from them is exit 2.
@@ -814,8 +818,8 @@ README deployment duties belong to B3e, including amendment 10's separate `accep
 - **Review file** (`--reviewed`, `Verifier::accept`, amended, #68). It records a reviewer's acceptance of a warning that stays for good, so that `--strict` can pass after a recorded human review without weakening plain verification. UTF-8 lines; blank lines and lines starting with `#` are ignored:
   - `accept <kind> <seq> <blake3:hex> <reviewer> <reason>`, where `<reviewer>` is one token naming who reviewed and the reason is the rest of the line, both required;
   - `accept-run <seq> <blake3:hex> <blake3:hex> <reviewer> <reason>` (amended, #107, ruling 107-d1; `Verifier::accept_run(seq, hash, run_digest, reviewer, reason)`): the review of one run sealed by `resume`, below. `<seq>` and the first hash pin the `vigil.audit.resume` record that closes the run, as an `accept Resumed` line pins it; the second hash is the run's **run digest**. The reviewer is one token and the reason the rest of the line, both required. A missing field, a hash not spelled `blake3:<64 lowercase hex>`, or two `accept-run` lines for one `<seq>` is a usage error (exit 2); the library method returns `Result<Self, AuditError>` with kind `InvalidConfig` for each;
-  - **acceptable kinds are the warnings, and only them:** `TornWrite`, `Resumed`, `ClockWentBackwards`, `DuplicateRecord`. An error can never be accepted **by an `accept` line** (`accept SegmentStructure …` is a usage error; the one reviewed route for errors is the `accept-run` line below, which names a run and not a kind; amended, #107, ruling 107-d1), an info finding needs no acceptance, and `UncoveredTail` and `Unreconciled` clear by themselves (the next checkpoint, a matching `end=`, a stored receipt). Any other kind, a missing field, an unknown line, or two lines for the same kind and `seq` is a usage error (exit 2).
-  - **What pins each kind.** For `Resumed`, `ClockWentBackwards` and `DuplicateRecord`: the `seq` and hash of the record the warning names; each of these is reported once per `seq` (a line delivered three times is one `DuplicateRecord`), so one line accepts it. For `TornWrite`: the `seq` of the last complete record before the gap in its file, and the gap digest the finding reports (decision 5), so the line accepts exactly those bytes at exactly that place. Only a **trailing** `TornWrite` can be accepted; one whose attesting line is not yet covered clears with the next trusted checkpoint, like `UncoveredTail`, and a line naming it is `AcceptUnused`.
+  - **acceptable kinds are the warnings, and only them:** `TornWrite`, `Resumed`, `ClockWentBackwards`, `DuplicateRecord`, `OperatorText` (amendment 13, Proposed; pinned like `Resumed`, by the record's `seq` and hash). An error can never be accepted **by an `accept` line** (`accept SegmentStructure …` is a usage error; the one reviewed route for errors is the `accept-run` line below, which names a run and not a kind; amended, #107, ruling 107-d1), an info finding needs no acceptance, and `UncoveredTail` and `Unreconciled` clear by themselves (the next checkpoint, a matching `end=`, a stored receipt). Any other kind, a missing field, an unknown line, or two lines for the same kind and `seq` is a usage error (exit 2).
+  - **What pins each kind.** For `Resumed`, `ClockWentBackwards`, `DuplicateRecord` and `OperatorText` (amendment 13, Proposed; one finding per record even when both its actor and its reason fail): the `seq` and hash of the record the warning names; each of these is reported once per `seq` (a line delivered three times is one `DuplicateRecord`), so one line accepts it. For `TornWrite`: the `seq` of the last complete record before the gap in its file, and the gap digest the finding reports (decision 5), so the line accepts exactly those bytes at exactly that place. Only a **trailing** `TornWrite` can be accepted; one whose attesting line is not yet covered clears with the next trusted checkpoint, like `UncoveredTail`, and a line naming it is `AcceptUnused`.
   - **One file per trail**, like the receipts file: a verification covers one pinned trail (`Report::trail`), and every `seq` in the file is that trail's.
   - **Outcomes.** A line that matches a reported warning replaces it with `Accepted` (info). A line whose `seq` holds no record, or a record with another hash, is `AcceptMismatch` (an error): the reviewed record was changed or rolled back, and the line is an outside pin like a receipt. A line that matches its record but no warning (for example a trailing fragment that a later write has since attested) is `AcceptUnused` (info). Like every input, a line below a start follows the start rule, and one inside a confirmed resume gap is `LostRecord`.
   - **An `accept Resumed` line also confirms that resume's gap** (decision 5), for deployments without receipts. It sets aside receipts, waivers, the `from` line and `accept` lines inside the gap, never anchors or `through=` pins, which need the gap's opening checkpoint anchored.
@@ -1021,6 +1025,7 @@ README deployment duties belong to B3e, including amendment 10's separate `accep
 - **Verifier finding kinds are not format** (amendment 12, Accepted, PR #148). Which kind the verifier reports for a line, such as `Unparsable` for a raw byte below 0x20 or an over-cap line, decides no byte a writer emits, so changing it needs no new format version: v1 is unchanged. The classification is frozen for 1.x with the report surface, because the span bytes of the run digest (decision 11) depend on it.
 - **Dependency bumps cannot change the format.** BLAKE3 output is fixed by its specification and Ed25519 signatures by RFC 8032, so a bump of `blake3` or `ed25519-dalek` changes no byte; the golden vectors catch it if one ever does. Neither crate's types are public, so a major bump of either is invisible to users.
 - **Collector copies.** The promise covers vigil's own files and copies whose attribute values are unchanged. A shipper that rewrites values is outside it.
+- **The attribute block and record schemas are v1 semantics, not a format change** (amendment 13, Accepted, CP1, [§20.2](#202-why-no-format-change-is-needed)). A typed record is an ordinary v1 record whose `audit.details` holds the canonical attribute block; no attribute, tag or hash rule changes. The block grammar, the schema text and the domain string `vigil.audit.v1.schema` are frozen with v1 at 1.0.0, and the golden vectors gain a schema digest and a typed record (slice CP1).
 
 ### 13. Public surface (feature `audit`, under ADR-0004's rules)
 
@@ -1046,6 +1051,7 @@ Only vigil's own types and std appear. Hashes and keys are byte arrays, not `bla
 | `Report` (`trail`, `records`, `first_seq`, `last_seq`, `covered_through`, `findings`, `is_valid`, `is_strict_valid`, `first_broken_link`) (amendment 12, Proposed, rulings 13-d1 OQ6 and 13-d2 C) | The verify result. `is_strict_valid` keeps the `--strict` predicate in the library; `first_seq` backs the JSON and text output (decision 11). |
 | `Finding` (`kind`, `severity`, `file`, `line`, `seq`, `detail`, `accepted_kind`, `run_digest`), `FindingKind` and `Severity` (both `#[non_exhaustive]`, `Copy + Eq + Debug`) (amendment 12, Proposed, ruling 13-d1 OQ6) | One finding. `accepted_kind` and `run_digest` carry what the review file and the JSON output need (decision 11). |
 | `checkpoints(dir: &Path) -> io::Result<Vec<Checkpoint>>` (amendment 12, Accepted, [PR #147](https://github.com/vig-os/vigil/pull/147), ruling 13-d1 OQ11) | The checkpoints of a trail directory in vigil's segment order, so `vigil-audit checkpoints` uses only the public API (decision 10). |
+| `RecordSchema` (`builder(name)`, `parse`, `name`, `text`, `digest`, `digest_string`), `RecordSchemaBuilder` (`action`, `build`), `ActionFields` (`object`, `required`, `optional`, `action`, `build`), `FieldKind` (`id`, `token`, `one_of`, `int`, `digest`), `AttrValue` (`Id`, `Token`, `Int`, `Digest`; `#[non_exhaustive]`) (amendment 13, Accepted, CP1, [§20.5](#205-public-surface)); `Entry::attr`, `AuditConfig::schema` (amendment 13, Accepted, CP2); `TrailTrust::schema`, `Verifier::schema` (amendment 13, Proposed, CP4) | The consumer audit profile: typed attributes, a per-trail record schema checked fail-closed at `record()`, and its out-of-band pin for the verifier (§20). |
 | `AuditError`, `AuditErrorKind` (`Io`, `Poisoned`, `TooLarge`, `InvalidEntry`, `CorruptTrail`, `HeadMismatch`, `MissingTrail`, `TrailExists`, `Signer`, `InvalidConfig`), `#[non_exhaustive]`, `Copy + Eq + Debug` like ADR-0004's kinds | Matchable failures (ADR-0004 decision 3 shape). |
 
 ### 14. Dependencies (feature `audit` only)
@@ -1388,6 +1394,382 @@ Every change is marked in place with "amendment 12" and its status; the OQ9 clas
 
 The slices are those of the #13 plan: 13-R (#143), V1, V3 and later, C1, C2 and the R10 slice. 13-R has flipped OQ9 to Accepted (PR #148). Each later slice flips its own part to Accepted, including the decision-5 writer/verifier prefix exception and §18.2 genesis-gap exception in V3, and removes "Proposed" from the tags of its part. The tests are the slices' acceptance items: a NUL-filled tail is `Unparsable` in the reader and the verifier, `resume` seals it and `accept-run` can review it; a line that decodes to an object with `UnknownField` or `HashMismatch` adds no span; an over-cap line is `Unparsable` and never a fragment; a genesis opening anywhere but first, or with a start given, is `ChainBroken` with `SeqGap` beside it; `seq 0` inside a confirmed genesis-resume gap is no `SeqGap`; a policy with several trails and no `trail(id)` is `InvalidConfig`; the JSON keys are present with `null`.
 
+### 20. Consumer audit profile: typed attributes, a record schema, pseudonymous records and erasure (amendment 13)
+
+Source: [#164](https://github.com/vig-os/vigil/issues/164) (an audit backend for a regulated workflow system) and [#165](https://github.com/vig-os/vigil/issues/165) (erasure against the hash chain), with the architect's clarification comments of 2026-11-02 on both issues, which hold the consumer's confirmed requirements, and architect [ruling 164-d1](https://github.com/vig-os/vigil/pull/172#issuecomment-6570168722) on PR #172, which decides OQ1 to OQ5 as recommended and scopes §20.7 and §20.5. Numbers marked (est) are the consumer's design targets. **Status: Proposed, partly accepted (CP1, CP2, CP3)** (architect ruling 164-d3). Amendment 13 is accepted part by part; the amendment as a whole becomes Accepted when CP4 merges. The open questions are decided (ruling 164-d1). Each part is flipped to Accepted, here and in every `(amendment 13, Proposed)` tag in place, by the slice that implements it (§20.10). **No byte of the v1 format changes** (decision 12): no attribute name, tag, canonical encoding rule or record hash changes, every line these rules write is a v1 line that vigil 0.1.0's decoder already reads, and the only new domain string (`vigil.audit.v1.schema`, §20.4) names a digest that no trail line hashes.
+
+| Part | Rule | Implemented by | Status |
+|---|---|---|---|
+| [20.1](#201-gap-analysis) | what the two issues ask, against what exists | (context) | — |
+| [20.2](#202-why-no-format-change-is-needed) | typed values ride in `audit.details`; v1 is unchanged | CP1 | Accepted |
+| [20.3](#203-field-kinds-and-the-attribute-block-p1-to-p4) | five field kinds and the canonical attribute block; `vigil.attrs.` is reserved | CP1 | Accepted |
+| [20.4](#204-the-record-schema-p5-p7-p9-to-p11) | a per-trail record schema, checked fail-closed at `record()`, pinned in the trust policy | CP1, CP2, CP4 | Accepted (CP1: schema types, canonical text, digest; CP2: `record()` checks); Proposed (CP4: trust-file `schema` line and verifier) |
+| [20.5](#205-public-surface) | the exact public signatures | CP1 to CP4 | Accepted (CP1: schema types, `FieldKind`, `AttrValue`; CP2: `Entry::attr`, `AuditConfig::schema`; CP3: CLI); Proposed (CP4: `TrailTrust::schema`, `Verifier::schema`) |
+| [20.6](#206-the-personal-data-rule-p6-p8) | no free text in a schema-checked record | CP2, CP3, CP4 | Accepted (CP2: P6/P8 writer enforcement; CP3: CLI); Proposed (CP4: verifier) |
+| [20.7](#207-what-an-erasure-leaves-provable-p12) | what an auditor can and cannot prove after an erasure | CP2 (README), CP4 (test) | Accepted (CP2: README); Proposed (CP4: test) |
+| [20.8](#208-inclusion-proofs-for-one-record) | single-record inclusion proofs: a new issue, not the first slice | [#173](https://github.com/vig-os/vigil/issues/173) (OQ4) | Proposed |
+
+#### 20.1 Gap analysis
+
+Each requirement of the two clarification comments, and of the issues' own acceptance lists, is **met** (with the decision and the code item), **planned** (with the issue), or **new** (decided by this amendment).
+
+| Requirement | Status | Where |
+|---|---|---|
+| Volume: under 10 records/s per host, peak about 100/s (est); decisions about 1–10 per minute per tenant (est); one record per query for a read, carrying a read-set digest | **Met for decisions; planned for the read peak.** One fsync per record gives 30–37 records/s per trail on slow virtual disks (Context, probe), more on local NVMe, so the decision rate is far inside it. The read peak of about 100/s needs group commit. Not measured: 20 trails fsyncing on one disk at once. | Decision 6; [#56](https://github.com/vig-os/vigil/issues/56) |
+| One trail per tenant, one writer process per trail, 1–20 trails per host, no trail spans hosts | **Met.** Each trail is its own directory (`AuditConfig::dir`) with its own lock. The directory lock **serialises** writers across processes; it does not enforce one writer process per trail. One writer process per trail is the consumer's deployment choice, which vigil supports but does not require (ruling 164-d1). Local filesystems only. A verification covers one pinned trail. | Decision 2 (`src/rotate.rs` locked section, `src/audit/sink.rs`); decision 11, "The trail is always pinned" |
+| Class (a): decisions durable before the action is acknowledged, through a synchronous `record()` that returns a receipt | **Met.** | Decisions 1 and 6; `AuditTrail::record(&self, &Entry) -> Result<Receipt, AuditError>` (`src/audit/trail.rs`) |
+| Class (b): reads through group commit with a bounded window of about 100 ms (est); a crash surfaces any lost window as a reported gap | **Planned.** Two constraints from this amendment are recorded for #56: every entry of a batch is checked against the schema (§20.4) before any of them is queued, and a batch fails whole; and a window lost in a crash must be detectable after the restart, never silent, even when the caller that queued it is gone. The mechanism is #56's to design. | [#56](https://github.com/vig-os/vigil/issues/56) |
+| An opaque principal id | **Met in form, new in rule.** `audit.actor` (tag `0x10`) carries it as text; nothing checks its shape today. Under a schema it must be an `id` (§20.6). | Decision 3; §20.3, §20.6 |
+| The action kind | **Met; new: a closed set.** `audit.action` (tag `0x11`); a schema closes the set of actions (§20.4). | Decision 3 |
+| The time | **Met.** `timeUnixNano` (tag `0x03`) is taken by vigil inside the locked section; the API takes no timestamp. Anchored time is planned; off-device signers too. | Decision 3; [#57](https://github.com/vig-os/vigil/issues/57), [#58](https://github.com/vig-os/vigil/issues/58) |
+| The on-behalf-of chain (agent principal and grant id), the tenant id, target and parent commit roots (32-byte digests), the verdict ref, the gate-definition hash, the signature meaning and the approval-statement digest, the read-set digest and the query kind | **New.** v1 has two digest slots (`audit.before_digest`, `audit.after_digest`, BLAKE3 only) and one free-text slot (`audit.details`). Typed attributes in a canonical block (§20.2, §20.3), declared by a schema (§20.4). | §20.2 to §20.5 |
+| A fixed record shape of 300–600 B (est), mostly hashes | **Larger than the estimate, within the cap.** Hex spelling doubles every digest: the consumer's shape is about 0.6–1 KB of block and about 1.6 KB per line (§20.3), above the 300–600 B estimate and far below the 1 000 000-byte cap. | Decision 3, "Framing and bounds"; §20.3 |
+| An offline verifier that proves integrity, order and existence, not semantic truth; the full trail is enough at first | **Planned.** The contract is decision 11 (with amendment 12, Proposed); [#13](https://github.com/vig-os/vigil/issues/13) implements it. The schema checks join it (CP4). | Decision 11; [#13](https://github.com/vig-os/vigil/issues/13) |
+| Anchored time | **Planned.** | [#57](https://github.com/vig-os/vigil/issues/57) |
+| Inclusion proofs for handing one record to an auditor (next, not first) | **New issue:** [#173](https://github.com/vig-os/vigil/issues/173) (§20.8, OQ4). | §20.8 |
+| Principal ids always opaque, names and emails in a separate erasable store | **The consumer's duty;** vigil enforces the shape (§20.6) and states what it cannot catch. | §20.6 |
+| Free text only as a digest; read records never carry a subject id | **New.** A schema has no free-text kind, `audit.reason` and text values are refused, and `audit.details` carries only the block (§20.6). "No subject id on reads" is a schema choice: the consumer declares no subject key on its read actions, because no rule can tell a subject id from any other id (§20.6, limits). | §20.6 |
+| Option 1 (pseudonymous references) with a lint or schema rule that rejects attributes shaped like personal data | **New.** | §20.6 |
+| Crypto-shredding only through an external custodian, never vigil | **Agreed; rejected inside vigil.** | §20.6, "Rejected" |
+| After an erasure: chain intact; record N existed at time T, in order; action kind, signature meaning, commit roots and verdict refs unchanged; made by "a principal" | **New.** Stated, with what cannot be proved. | §20.7 |
+| #165: the interaction with archiving (amendment 10) and with tessera export ([#59](https://github.com/vig-os/vigil/issues/59)) | **New.** | §20.7 |
+| #165: a test erases one subject and verifies the trail end to end | **New.** CP4's acceptance test. | §20.10 |
+| #164's ask: does the record shape fit, or does it need a consumer semantic-convention namespace ([#9](https://github.com/vig-os/vigil/issues/9))? | **Answered: a typed block, not a namespace.** #9 pins telemetry semantic conventions through `schemaUrl`; the audit record's attribute set is closed (decision 3), and a namespace of new attributes would be a v2. | §20.2, §20.9 |
+| #164's ask: how do many writer processes share one trail? | **Met** (the directory lock and the multi-process writer); the consumer confirmed one writer per trail suffices. | Decision 2 |
+
+#### 20.2 Why no format change is needed
+
+- **What v1 has.** Decision 3 fixes a closed set of record attributes; any other attribute is `UnknownField`. Adding attributes (`audit.attr.<key>`, each with a tag) would change what is written, which decision 12 calls a v2. This amendment needs no v2.
+- **What carries a typed value canonically.** A value is canonical when it has exactly one spelling. A 32-byte digest spelled `<alg>:<64 lowercase hex>` and an id from a fixed alphabet have one spelling each, so they can be carried as text. `audit.details` (tag `0x18`) is hashed as its UTF-8 bytes as written (decision 4), so a vigil-defined canonical text inside it is hashed exactly, and equal content gives an equal record hash.
+- **The smallest v1-compatible rule** is therefore the **attribute block** (§20.3): the typed attributes, rendered by vigil in one canonical form, as the value of `audit.details`. The attribute names, tags, encoding, domain strings, MMR and checkpoint message of v1 are untouched, and a v1 decoder reads a typed record as an ordinary record with a details string and the same hash. `audit.before_digest` and `audit.after_digest` stay as they are (BLAKE3).
+- **Nothing here truly needs a format change**, so this amendment raises no format OQ.
+
+#### 20.3 Field kinds and the attribute block (P1 to P4)
+
+**P1. Field kinds.** Every typed attribute has one of five kinds. There is **no free-text kind**; that absence is the root of the personal-data rule (§20.6).
+
+| Kind | Schema spelling | Value spelling (the only one) | `AttrValue` |
+|---|---|---|---|
+| id | `id` | 1 to 128 bytes of `[A-Za-z0-9._:-]` | `Id(String)` |
+| token | `token` | 1 to 64 bytes of `[a-z0-9._-]` | `Token(String)` |
+| enum | `enum:<v>,<v>,…`: 1 to 64 distinct tokens in ascending byte order | one of the listed tokens | `Token(String)` |
+| int | `int:<min>:<max>`, with `min` ≤ `max`, both i64 | canonical decimal: decision 3's integer rule, plus one leading `-` for a negative value; no `-0` | `Int(i64)` |
+| digest | `digest:<alg>`, where `<alg>` is 1 to 16 bytes of `[a-z0-9-]` beginning with a letter (for example `blake3`, `sha256`) | `<alg>:<64 lowercase hex>`: 32 bytes | `Digest([u8; 32])` |
+
+- Only 32-byte digests exist. A digest of another length is not a kind; a 20-byte id is spelled as an `id`. A new kind is additive (`FieldKind` has private fields, §20.5), but it extends the schema grammar, so it needs an amendment.
+- The algorithm label comes from the schema, never from the value: the application passes 32 bytes, and vigil spells them with the label the schema declares for that key.
+
+**P2. Keys.** 1 to 64 bytes of `[a-z][a-z0-9_.]*`, never starting with `vigil.`.
+
+**P3. The attribute block.** The value of `audit.details` on a typed record is exactly:
+
+```text
+block  = "vigil.attrs.v1 blake3:" schema-digest-hex *( LF key "=" value )
+```
+
+- `schema-digest-hex` is the 64 lowercase hex characters of the schema digest (§20.4), so the block names the schema it was checked against;
+- one line per attribute, in ascending byte order of the key, each key at most once;
+- LF (0x0A) separates lines; there is no trailing LF; a record with no attributes carries the header line alone.
+
+No value alphabet contains LF or `=`, and no key alphabet contains `=`, so the block parses one way and has exactly one spelling per schema and attribute set. In the OTLP/JSON line each LF is the escape `\n`, which decision 3 accepts as content. Example, for a decision record (generic keys):
+
+```text
+vigil.attrs.v1 blake3:5c1f…(64 hex)
+gate_definition=sha256:9a0e…(64 hex)
+grant=g_01HZX3K9Q4
+meaning=approved
+on_behalf_of=agt_7f3e2a91
+parent_root=blake3:44d1…(64 hex)
+statement=blake3:e2b7…(64 hex)
+target_root=blake3:0b9c…(64 hex)
+tenant=t_2c81f0
+verdict=vdt_01HZX3M2
+```
+
+**Size.** The header is 86 bytes; a digest line is the key plus 2 plus the label plus 64. The shape above, with the query kind and read-set digest of a read record instead of the decision fields, is about 0.6–1 KB of block, about 1.6 KB per line: close to the 1.4 KB records of the cost probe (Context), above the consumer's 300–600 B estimate, and far below the 1 000 000-byte cap.
+
+**P4. `vigil.attrs.` is a reserved details prefix,** on every trail, with or without a schema (OQ5). Text the caller supplies through `Entry::details` that starts with `vigil.attrs.` is `InvalidEntry` in `Record::new`, and so at `record()`, exactly where an action starting with `vigil.audit.` is refused (decision 8). P4 checks only caller-supplied details: the writer renders the block from the entry's attributes after this check, inside record construction under its schema, through the crate-internal path that reserved actions already use. `Record::new` (the unstable primitive, which has no schema) refuses an `Entry` that carries attributes, with `InvalidEntry`, like `record()` without a schema (P7). Decoding is unchanged (a decoded record is never refused for its details).
+
+#### 20.4 The record schema (P5, P7, P9 to P11)
+
+**What a schema declares.** A name (a `token`) and a closed set of actions. Each action declares the kind of `audit.object` (default `id`), its required keys and its optional keys, each with a kind. vigil knows nothing of what the actions mean; it checks shapes only.
+
+- At least one action. Action names are 1 to 128 bytes of `[a-z0-9._-]`, never starting with `vigil.audit.`, each declared once. A key appears at most once per action, as required or optional.
+- **Canonical text.** A schema has exactly one text:
+
+  ```text
+  vigil.schema.v1 <name>
+  action <action> object=<kind>
+  field <key> required|optional <kind>
+  ```
+
+  Actions in ascending byte order, each followed by its `field` lines in ascending byte order of the key; LF between lines; no trailing LF. `RecordSchema::parse` accepts a text only when it equals the text vigil renders from what it parsed (one canonical form, like the trail marker, amendment 4); anything else is `InvalidConfig`.
+- **Digest.** `blake3("vigil.audit.v1.schema\0" ‖ text)`, spelled `blake3:<64 lowercase hex>`. The domain string is new; it is frozen with the rest of v1 at 1.0.0 (decision 12) and hashes no trail line.
+
+**Where the schema lives (the decision the brief asked for).** **Its digest is recorded in every typed record** (the block header). **Its text is not recorded in the trail**: it is pinned out of band in the verifier's trust policy, like the trail's keys. Reasons:
+
+1. A schema decides what verifies, so it is a trust input. A declaration written into the trail directory would be writable by whoever can write the files; decision 9 keeps every trust input outside that directory (the marker is never one).
+2. A declaration written by vigil would be an `audit.record` without a receipt, and decision 5 exempts no action from `NoReceipt`. Returning its receipt would change `open`'s signature.
+3. The trust file covers every archive batch, so a verification with `--start-from` (amendment 10) still has every schema; a declaration record would leave with the batch that holds it.
+4. Each record names its schema, so one record, its inclusion proof (§20.8) and the schema file describe themselves.
+
+**P5. The writer checks, fail-closed, before anything is written.** `AuditConfig::schema(schema)` sets the schema for `create`, `open`, `resume` and `rotate`. With a schema, `AuditTrail::record` checks the entry against it (§20.6) **before taking the directory lock**: a failure returns `AuditErrorKind::InvalidEntry`, nothing is written, no `seq` is used, and the caller must not complete the action (decision 1). The check uses the same validation module as the verifier (decision 3's writer/reader invariant), and the writer renders the block from the entry's attributes. `#56`'s batch API applies it to every entry before queueing any (§20.1).
+
+**P7. Attributes need a schema.** `Entry::attr` on a handle opened without a schema is `InvalidEntry` at `record()`: a value's kind, and a digest's label, exist only in a schema.
+
+**P9. The verifier's pins.** A trust-file line `schema blake3:<64 hex> [comment]` inside a trail section pins a schema digest for that trail; a digest appears at most once per section (a second line is a parse error, like a second key line). `TrailTrust::schema(digest)` does the same in code. The texts come from `Verifier::schema(RecordSchema)` or the repeatable CLI option `--schema <file>`; a text whose digest no section of the policy pins, or one supplied twice, is `InvalidConfig` (exit 2).
+
+**P10. The verifier's rules.**
+
+- **Only a typed trail is schema-checked.** A **typed trail** is one whose trust section has at least one `schema` line. In a trail with no `schema` line the verifier makes no schema claim and reports no schema finding, so a trail written by vigil 0.1.0, which accepted any details text (OQ5), never gains a schema error.
+- In a typed trail, a record whose `audit.details` starts with `vigil.attrs.` is **typed**. Its header must parse and name a digest that is pinned for the trail **and** whose text was supplied; otherwise **`SchemaUnknown`** (an error, whose detail says which of the two is missing).
+- A typed record must satisfy every rule of §20.6 against the schema it names, and its block must byte-equal the block vigil renders from its parsed attributes under that schema (one canonical form: a digest label other than the schema's, a non-canonical integer or an unsorted line is caught here); otherwise **`SchemaViolation`** (an error).
+- In a typed trail, every record of kind `audit.record` whose action does not start with `vigil.audit.` must be typed; a plain one is `SchemaViolation`.
+- **Operator records in a typed trail.** A `vigil.audit.resume` or `vigil.audit.key_rotated` record is not checked against a schema, but **its object, details and values must have exactly the fixed form vigil writes** (time, `seq`, `service.name` and `audit.repaired` vary as on any record): `audit.object` is the trail id as 32 lowercase hex, `audit.details` is the fixed form of decision 8 (`head=… lost_through=… file=…`, for a resume, with `file=` either `-` or a segment name of decision 2's form) or decision 9 (`old_key=… bound=…`, for a key rotation), and no before or after value is present; anything else is **`SchemaViolation`** (an error), because only a forged or modified writer produces it. Its `audit.actor` and `audit.reason`, which the operator types, must each be an `id`; otherwise **`OperatorText`**, a **warning** that an `accept` line can accept (decision 11), because an operator record cannot be rewritten and a reviewer must be able to sign off an honest mistake, while the finding keeps the text visible. **Accepting it records the review; it does not restore the claim that the trail holds no free text** (§20.7): the text stays, and cannot be erased. A record with any other action that starts with `vigil.audit.` is `SchemaViolation`: no other reserved action exists.
+- `SchemaUnknown` and `SchemaViolation` are errors, so no `accept` line accepts them (decision 11). A writer that enforces the schema with the right pins never produces one; a finding means a writer without the schema, a bug, or a forgery. An operator who decides that an honest plain record in a typed trail is acceptable removes the trail's `schema` lines from the trust file, which is a reviewed, out-of-band decision, and the verification then no longer claims the profile.
+
+**P11. How a schema changes over a trail's life.** A schema is never edited in place: a changed text is a new digest. To change it, pin the new digest in the trust file (keeping the old pins), then deploy writers with the new schema. Writers with the old and the new schema may run side by side during a rolling restart, because each record names its own. A pin can be removed only once no record in any verified batch names it, or those records become `SchemaUnknown`; so pins accumulate over a trail's life, which is cheap (one line each). Bounding a schema to a `seq` range is not part of this amendment (OQ3).
+
+#### 20.5 Public surface
+
+All under feature `audit`, in `vigil::audit`, following ADR-0004 (builders with private fields, `#[non_exhaustive]` enums, only vigil's own types and std) and the TrustPolicy builder shape of amendment 12 ([§19.1](#191-the-trustpolicy-builder-oq1)). Every item is additive in the API, but **CP1 is a breaking behaviour change** under ADR-0004 (ruling 164-d1): P4 makes `Entry::details` refuse text starting with `vigil.attrs.`, which vigil 0.1.0 accepts (OQ5). CP1a's PR therefore carries the `semver:major` label (in 0.x it ships as a minor bump, per the stability policy) and a CHANGELOG entry under `Changed` that names the refused input. CP1a (#175) implements that behaviour change; CP1b adds the schema surface (architect ruling 164-d2).
+
+```rust
+/// A per-trail record schema (§20.4). Only a validated schema exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordSchema { /* private */ }
+impl RecordSchema {
+    pub fn builder(name: impl Into<String>) -> RecordSchemaBuilder;
+    /// Accepts only the canonical text; anything else is `InvalidConfig`.
+    pub fn parse(text: &str) -> Result<Self, AuditError>;
+    pub fn name(&self) -> &str;
+    /// The canonical text (§20.4), the content of a `--schema` file.
+    pub fn text(&self) -> &str;
+    /// `blake3("vigil.audit.v1.schema\0" ‖ text)`.
+    pub fn digest(&self) -> [u8; 32];
+    /// `blake3:<64 lowercase hex>`, the trust file's spelling.
+    pub fn digest_string(&self) -> String;
+}
+
+#[derive(Clone, Debug)]
+#[must_use]
+pub struct RecordSchemaBuilder { /* private */ }
+impl RecordSchemaBuilder {
+    /// Declares an action; returns its field builder.
+    pub fn action(self, action: impl Into<String>) -> ActionFields;
+    /// `InvalidConfig` for no action, or any rule of §20.3 or §20.4 broken.
+    pub fn build(self) -> Result<RecordSchema, AuditError>;
+}
+
+#[derive(Clone, Debug)]
+#[must_use]
+pub struct ActionFields { /* private */ }
+impl ActionFields {
+    /// The kind of `audit.object` for this action (default: `FieldKind::id()`).
+    pub fn object(self, kind: FieldKind) -> Self;
+    pub fn required(self, key: impl Into<String>, kind: FieldKind) -> Self;
+    pub fn optional(self, key: impl Into<String>, kind: FieldKind) -> Self;
+    /// Declares the next action.
+    pub fn action(self, action: impl Into<String>) -> ActionFields;
+    pub fn build(self) -> Result<RecordSchema, AuditError>;
+}
+
+/// The kind of one typed attribute (§20.3). Arguments are validated by `build`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldKind { /* private */ }
+impl FieldKind {
+    pub fn id() -> Self;
+    pub fn token() -> Self;
+    pub fn one_of<I, S>(values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>;
+    pub fn int(min: i64, max: i64) -> Self;
+    pub fn digest(algorithm: impl Into<String>) -> Self;
+}
+
+/// One typed attribute value; an `enum` value is a `Token`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AttrValue {
+    Id(String),
+    Token(String),
+    Int(i64),
+    Digest([u8; 32]),
+}
+
+impl Entry {
+    /// Sets a typed attribute (replaces an earlier value for the same key).
+    /// Checked against the trail's schema at `record()` (§20.4, P5 and P7).
+    pub fn attr(self, key: impl Into<String>, value: AttrValue) -> Self;
+}
+
+impl AuditConfig {
+    /// Checks every record, and the actor and reason of `rotate` and `resume`,
+    /// against this schema (§20.4 P5, §20.6 P8).
+    pub fn schema(self, schema: RecordSchema) -> Self;
+}
+
+impl TrailTrust {
+    /// Pins a schema digest for this trail (trust file: `schema blake3:<hex>`).
+    /// A digest pinned twice in one section is `InvalidConfig` at `build`.
+    pub fn schema(self, digest: [u8; 32]) -> Self;
+}
+
+impl Verifier {
+    /// Supplies a pinned schema's text; `InvalidConfig` when no section pins
+    /// its digest, or when the same schema is supplied twice.
+    pub fn schema(self, schema: RecordSchema) -> Result<Self, AuditError>;
+}
+```
+
+- **Findings.** `FindingKind` gains `SchemaUnknown` and `SchemaViolation`, both errors, and `OperatorText`, a warning that an `accept` line can accept (P10). `FindingKind` is `#[non_exhaustive]`, so they are additive; the JSON output spells them by their variant names (amendment 12, [§19.4](#194-json-and-text-output-oq7)).
+- **Errors.** No new `AuditErrorKind`: a schema failure at `record()` is `InvalidEntry` (OQ2).
+- **CLI.** `vigil-audit verify … [--schema <file>]…`; `vigil-audit rotate … [--schema <file>]` and `vigil-audit resume … [--schema <file>]` (P8); and `vigil-audit schema <file>`, which parses a schema file with `RecordSchema::parse` and prints its `digest_string()`, so the operator can write the trust-file line without computing a hash by hand. Exit codes follow decision 11 (`InvalidConfig` is 2).
+- **Unchanged.** `Entry::details`, `Value`, `Receipt`, `AuditTrail` and every other item keep their signatures; P4 adds one refused input to `Entry::details` (OQ5), the breaking behaviour change above.
+
+#### 20.6 The personal-data rule (P6, P8)
+
+This is #165's option 1: records carry only pseudonymous references, and the mapping lives outside the trail, where it can be deleted. vigil's part is a **shape rule**: under a schema, **a record carries no free text** in its attributes and record fields (the hashed resource fields `service.name` and `host.name` are the deployment's duty, below).
+
+**P6. Under a schema, `record()` refuses (`InvalidEntry`), and the verifier reports (`SchemaViolation`):**
+
+1. an `audit.actor` that is not an `id`;
+2. an `audit.action` the schema does not declare;
+3. an `audit.object` not of the action's object kind; the object is text (`Entry::new` takes a string), checked against the kind's value spelling (for a digest, `<alg>:<64 lowercase hex>` with the schema's label);
+4. any `audit.reason` (Annex 11 §9's reason is kept in the application's erasable store, and the record carries a digest commitment of it as a `digest` attribute, for example a key `reason` of kind `digest:blake3`);
+5. a `Value::Text` before or after value (only `Value::Digest` is allowed);
+6. any `Entry::details` text (the only details is the block vigil renders);
+7. a missing required key, an undeclared key, or a value not of its key's kind (§20.3).
+
+**P8. Operator records under a schema.** `AuditConfig::rotate` and `AuditConfig::resume` with a schema set refuse (`InvalidEntry`) an `actor` or `reason` that is not an `id`: the operator passes an opaque operator id and a reference (for example a change-ticket id), never a name or a sentence. `vigil-audit rotate` and `vigil-audit resume` apply the same check when given `--schema <file>`. The trail itself does not know it is typed (the schema lives in the trust policy), so an operator who omits `--schema` is not stopped at write time; the verifier then reports the free text as `OperatorText`, a warning (P10), and that text can never be erased from the trail. So **passing `--schema` to every operator command on a typed trail is an operator duty**, which the README states (CP2).
+
+**On by default?** On whenever a schema is set, and it cannot be switched off for a schema-checked handle. Without a schema nothing changes: vigil 0.1.0's behaviour stays for existing trails and other consumers, and the README says that such a trail is **not erasure-ready**. vigil does not apply the rule without a schema, because without kinds it cannot tell an id from free text.
+
+**Where.** At `record()` (fail-closed, before the lock: P5) and in the verifier (P10). There is no separate lint: `vigil-audit verify` with the schema files is the lint, and `vigil-audit schema <file>` checks a schema file.
+
+**What the rule catches.** Names with spaces, email addresses (`@` is in no alphabet), sentences, JSON or any other free text in any field; any `reason`, any text value and any free details; a field or an action the schema does not declare; a value longer than its kind allows.
+
+**What it cannot catch, and the consumer's duties.** A rule cannot prove that a record holds no personal data. Each of these passes the rule:
+
+- an `id` or `token` that is itself a name or a username (`jdoe`); the consumer's ids must be minted opaque (random), as the consumer already does;
+- an `int` that encodes a birth date or a phone number;
+- **a digest of a guessable value**: the plain BLAKE3 of an email address is re-identifiable by a dictionary. A digest of erasable content must be a **commitment**: `H(salt ‖ content)` with a random salt of at least 128 bits, stored next to the content in the erasable store and erased with it;
+- a subject id on a read action: vigil cannot tell a subject id from any other id; the consumer declares no subject key on its read actions;
+- linkability: the same opaque id on many records links them to one principal, by design (§20.7);
+- the hashed resource fields `service.name` (tag `0x05`, chosen by the deployment, on every record) and `host.name` (tag `0x06`, when present): they are not attributes, no schema covers them, and they can never be erased, so the deployment names its service and hosts without personal names (no `janes-laptop`).
+
+**Rejected.**
+
+- **Heuristics** (patterns for emails, phone numbers or names) in `record()` or the verifier: with the closed alphabets the obvious shapes are already impossible, and the rest would be false positives that fail closed on legitimate values, and false assurance on the misses.
+- **Crypto-shredding inside vigil** (personal fields encrypted under a per-subject key, the hash over the ciphertext): vigil would hold or fetch the keys, which puts the keys with the writer, that is with the audited party, and makes vigil a key-management system; losing a key would lose audit content. The consumer confirmed that if it is ever needed, an external custodian or KMS holds the keys; the trail then carries ciphertext digests as ordinary `digest` attributes, and nothing in vigil changes.
+- **Redactable records** (a salted commitment per field in the hash, so a field can be dropped): the hash would cover commitments instead of values, a v2 (decision 12), and the verifier would have to accept records with fields absent, which breaks decision 3's closed record and the frozen chain. The consumer-side commitment duty above gives the same erasure property with no format change.
+
+#### 20.7 What an erasure leaves provable (P12)
+
+This is user-facing; the README gets a pointer to it (CP2). **The setting:** the consumer erases its id-to-person mapping, its free-text store and the salts of its commitments. **No trail byte changes**: no line, checkpoint, anchor, receipt or review line is touched, and the verifier never reads the consumer's stores. So the verification of decision 11 gives the same result after the erasure as before it. **An erasure weakens nothing**: whatever the trail proved before it, it proves after it, and nothing more.
+
+**What backs each guarantee** (ruling 164-d1). The guarantees below are exactly decision 5's, and hold for the records that one of these covers:
+
+- **checkpoint-signed coverage**: the records through the last checkpoint signed by a trusted key (decisions 5 and 8);
+- **external receipts and anchors**: a record whose receipt the application holds (decision 5), or that an anchored checkpoint covers (decision 10, [#57](https://github.com/vig-os/vigil/issues/57));
+- **verified archive ranges**: batches verified in place and checked against their anchored end (decision 2, steps 6 and 7; amendment 10).
+
+**The unsigned tail after the last trusted checkpoint is not protected** against an attacker who can write the files, with or without an erasure: they can recompute every hash after it, or roll the trail back to an earlier checkpoint (decision 5); only receipts and anchors detect that. Without those, a check of the files alone ("the chain alone", decision 5) detects only accidental damage.
+
+**Advice, not a rule:** before an erasure-relevant retention event (erasing a subject's mapping, rotating the free-text store), take a checkpoint (`AuditTrail::checkpoint`, or `vigil-audit checkpoint`) and anchor it, so every record written before the event is covered. vigil cannot know when the consumer erases, so it cannot enforce this; the README states it as a recommendation (CP2).
+
+**Within that coverage, an auditor can still prove:**
+
+- **the chain is intact**: every record hash, `prev_hash` link, MMR root and checkpoint signature verifies (decisions 5, 7 and 8);
+- **record N existed, at `seq` N, in this order, with time T** as vigil's clock wrote it inside the lock (decision 3); with anchoring ([#57](https://github.com/vig-os/vigil/issues/57)) T is also bounded by an outside time;
+- **its content is unchanged**: the action kind and every attribute value (the signature meaning, the commit roots, the verdict ref, the gate-definition hash, the statement and read-set digests) are exactly as written: a change to a covered record is `HashMismatch`, `ChainBroken`, `MmrMismatch` or a signature finding, and a change that rewrites the uncovered tail consistently is caught only by a receipt (`ReceiptMismatch`, `NoReceipt`) or an anchor (`AnchorMismatch`);
+- **it was made by "a principal"**: an opaque id X, and which other records X made;
+- **it conforms to its schema** (P10): its attributes and record fields hold no free text; and, with no `OperatorText` finding, accepted or not, neither do the trail's operator records.
+
+**An auditor can no longer prove:**
+
+- who X is;
+- what a digest stands for: the content is gone, and, because it was a salted commitment, a guess cannot even be tested (with a plain digest of guessable content it could, which is why §20.6 makes the commitment a duty);
+- that X was authenticated, or meant the recorded signature meaning: vigil records what the application passes (decision 1; electronic signatures are out of scope);
+- that the action was right: semantic truth was never provable.
+
+Whether the remaining linkable pseudonymous ids are personal data is the controller's legal assessment; this section states the technical facts only.
+
+**Archiving (amendment 10).** Archives are copies of trail bytes; an erasure touches none of them. Under the rule the application records hold no free text, and the operator records hold none unless an operator omitted `--schema` (P8), which the verifier reports as `OperatorText`; such text cannot be erased without breaking the chain, which is why the writer check and the operator duty exist. With no `OperatorText` finding, accepted or not, no archive needs rewriting after an erasure. The batch-start anchors, the archive records and the step 6 and step 7 verifications (decision 2) are unchanged. The schema files are kept with the trust file, outside the trail directory and outside any single archive, so every batch verifies with them.
+
+**Tessera export ([#59](https://github.com/vig-os/vigil/issues/59)).** An exported segment carries the same bytes, so the same holds: nothing in it needs erasing. Requirement recorded for #59: the product carries the texts of the schemas its records name (in sealed metadata), so the product verifies on its own.
+
+**Telemetry.** The optional log mirror (`AuditConfig::mirror_to_logs`) emits the action and object; under a schema these are an action name and an id or digest. Telemetry retention deletes them anyway (ADR-0002).
+
+#### 20.8 Inclusion proofs for one record
+
+Out of scope for the first slice, as the consumer asked. **They are not #57's**: #57 is anchor transports (RFC 3161, a transparency log) and consistency proofs for anchor holders, that is, proofs between checkpoints. An inclusion proof is a different artefact for a different reader: one record line, its MMR inclusion proof against a signed checkpoint that covers it, that checkpoint, and the schema text the record names, verified offline against the trust policy. **Decided (ruling 164-d1): a new issue** (OQ4), [#173](https://github.com/vig-os/vigil/issues/173), *feat(audit): single-record inclusion proofs for auditors*: a `vigil-audit prove <dir> --seq <n>` that writes that bundle, and a verify entry point that checks one bundle. It depends on #13 and on CP4, and shares the MMR proof generation that decision 14 places with #57.
+
+#### 20.9 Alternatives rejected for the typed attributes
+
+- **New record attributes per field** (`audit.attr.<key>` with new tags): a v2 (decision 12), with a second verifier path, for no gain over a canonical block.
+- **A JSON object in `audit.details`** (RFC 8785 canonical JSON): canonical JSON needs JCS's escaping and number rules in the writer and the verifier; a block whose alphabets exclude every separator is canonical by construction and still readable in any OTLP tool.
+- **A schema declared by a record in the trail:** a trust input in the writable directory, and a vigil-written record without a receipt (§20.4, reasons 1 to 3).
+- **A verifier-only lint, with no writer check:** the consumer needs the refusal before the action is acknowledged (fail-closed, decision 1), not a finding afterwards.
+- **A consumer semantic-convention namespace ([#9](https://github.com/vig-os/vigil/issues/9)):** #9 is telemetry `schemaUrl` pinning; the audit record set is closed.
+
+#### 20.10 Slices and tests
+
+Ordered; each is under about 400 diff lines. The consumer's minimum first slice (class (a), the fixed shape and the erasure rule) is CP1 and CP2; class (a) itself already exists.
+
+| Slice | Content | Depends on | Acceptance |
+|---|---|---|---|
+| **CP1** format layer, no I/O (Accepted: CP1a and CP1b; architect rulings 164-d2 and 164-d3) | `RecordSchema`, `RecordSchemaBuilder`, `ActionFields`, `FieldKind`, `AttrValue`; the canonical schema text, `parse`, the digest; the shared block render and parse in the validation module; P4 | — | the tests of P1 to P4; golden vectors: a schema text and its digest, and a typed record's canonical bytes and hash, committed as test data; CP1a (#175) carries `semver:major` and a CHANGELOG `Changed` entry naming the refused `vigil.attrs.` details prefix (ruling 164-d1); CP1b is additive (ruling 164-d2) |
+| **CP2** writer | `Entry::attr`, `AuditConfig::schema`; P5 to P8 in `record`, `rotate` and `resume`; README "Personal data and erasure" (a pointer to §20.6 and §20.7, the not-erasure-ready warning, the commitment duty, and `--schema` on every operator command of a typed trail); rustdoc | CP1 | the tests of P5 to P8; a refused record leaves the live file byte-identical and the next receipt's `seq` unchanged |
+| **CP3** operator CLI | `vigil-audit schema <file>`; `--schema` on `rotate` and `resume` | CP2 | `schema` prints the digest of a canonical file and exits 2 on a non-canonical one; `rotate --schema` with a name as `--actor` exits 1 with `InvalidEntry` and writes nothing |
+| **CP4** verifier | the trust-file `schema` line, `TrailTrust::schema`, `Verifier::schema`, `--schema` on `verify`, `SchemaUnknown`, `SchemaViolation`, `OperatorText` and its review-file line, the typed-trail rule and the operator-record rule; flips §20 to Accepted | CP1; #13 (V3 and C1) | the tests of P9 to P11; **the erasure test (#165)**: a trail with typed records for two principals A and B, A's mapping, free text and salts kept in a test store; erase A's; `verify` with the trust file and schema passes `--strict` with the same report as before, every attribute of A's records reads back unchanged, and a test that knows A's statement text cannot match it to the record's commitment without the salt |
+
+**One test per rule** (each in the slice that implements it):
+
+| Rule | Test |
+|---|---|
+| P1 | each kind accepts its boundary values (1 and max bytes; `min` and `max`; every alphabet byte) and refuses one byte beyond each bound, a byte outside the alphabet, uppercase hex and a 31- or 33-byte digest |
+| P2 | keys: `vigil.x`, an uppercase letter, 65 bytes and an empty key are refused at `build` |
+| P3 | the block of a fixed attribute set equals the golden bytes; parsing it back gives the same set; an unsorted, duplicated or trailing-LF block is refused by the shared parser |
+| P4 | `Entry::details("vigil.attrs.v1 …")` on a trail without a schema is `InvalidEntry` and writes nothing |
+| P5 | with a schema, each refusal of P6 returns `InvalidEntry` before the lock (a test hook asserts the lock was not taken) and leaves the trail unchanged |
+| P6 | one test per item 1 to 7 |
+| P7 | `Entry::attr` on a handle without a schema is `InvalidEntry` |
+| P8 | `rotate` and `resume` with a schema and a name as actor, or a sentence as reason, are `InvalidEntry`; with ids they succeed |
+| P9 | a trust file with a duplicated `schema` line, and one with a `schema` line before the first `trail` line, fail to parse; `Verifier::schema` with an unpinned schema, or the same one twice, is `InvalidConfig` |
+| P10 | a forged typed record with an undeclared key (re-hashed, unsigned tail) is `SchemaViolation`; a record naming an unpinned digest, and one whose text was not supplied, are `SchemaUnknown`; a block that parses but differs from the rendered bytes (a digest label other than the schema's) is `SchemaViolation`; a plain record in a typed trail is `SchemaViolation`; a `vigil.audit.resume` record with a name as actor is `OperatorText` and an `accept OperatorText` line accepts it; a forged `vigil.audit.other` record is `SchemaViolation`; a forged `vigil.audit.resume` record with free text in its details (otherwise well formed), and one with a before value, are `SchemaViolation`; a trail without `schema` lines holding a 0.1.0-style details text beginning `vigil.attrs.` has no schema finding |
+| P11 | records under two pinned schemas, interleaved, verify clean; removing the older pin makes its records `SchemaUnknown` |
+| P12 | the erasure test of CP4 |
+
+Mutation proofs follow the repository's rule (a runtime failure, then exit 0 after the revert): dropping the sort in the block renderer, accepting uppercase hex, skipping the required-key check, and checking the schema after the lock are each killed by the tests above.
+
+#### 20.11 Open questions (all decided, ruling 164-d1)
+
+- **OQ1. The shape of an `id`.** (a) The alphabet `[A-Za-z0-9._:-]` and 1 to 128 bytes; (b) fixed formats only (UUID, ULID); (c) (a) plus a minimum length of 16 to look "random". **Decided (ruling 164-d1): (a)**, as recommended. (b) is consumer-specific and would refuse many real id schemes; (c) refuses short legitimate ids and still passes a 16-byte username, so it buys false assurance (§20.6, limits).
+- **OQ2. The error kind of a schema failure at `record()`.** (a) `InvalidEntry`; (b) a new `AuditErrorKind::SchemaViolation`. **Decided (ruling 164-d1): (a)**, as recommended. The caller's reaction is the same as for any entry that can never be written (refuse the action, fix the caller), and `InvalidEntry` already means exactly that; the detail names the rule. (b) is additive and can be added later without a break if a consumer needs to match it.
+- **OQ3. Bounding a schema to a `seq` range** (`schema blake3:<hex> through=<seq>:<hash>`, like a key's revocation bound). (a) Not now; every pinned schema is valid for the whole trail; (b) now. **Decided (ruling 164-d1): (a)**, as recommended. Records are immutable and a schema only admits closed-kind values, so an old schema used late admits no free text; a bound is an additive trust-file field if a consumer ever needs it.
+- **OQ4. Inclusion proofs.** (a) A new issue (§20.8); (b) folded into #57. **Decided (ruling 164-d1): (a)**, as recommended, filed by the architect, titled *feat(audit): single-record inclusion proofs for auditors*: [#173](https://github.com/vig-os/vigil/issues/173).
+- **OQ5. Reserving `vigil.attrs.` in `Entry::details` on every trail** (P4), which refuses one input that vigil 0.1.0 accepts. (a) Reserve it everywhere; (b) only on schema-checked handles. **Decided (ruling 164-d1): (a)**, as recommended. Under (b) a plain record could carry a details text that looks typed, and a reader or an auditor holding one record could not tell a vigil-rendered block from an imitation; the cost is one refused prefix before 1.0, stated in the CHANGELOG of CP1. A trail that 0.1.0 already wrote with such a details text is unaffected: it has no `schema` line, so P10 checks nothing in it.
+
+#### 20.12 The sentences this amendment changes
+
+Every change is marked in place with an amendment 13 status tag: Accepted for the implemented CP1 and CP2 items, Proposed for later slices (architect rulings 164-d3 and 164-d4). Outside this section they are:
+
+| Where | Now |
+|---|---|
+| Status block, Issues line, References | amendment 13 entry; #164, #165 |
+| Decision 1, "Out of scope" | erasure through pseudonymous records and the schema profile, §20.6 and §20.7 |
+| Decision 3, `audit.details` row and "The before and after values" | the attribute block; the commitment duty |
+| Decision 8, the resume record's `file=` sentence | the segment-name form in a typed trail |
+| Decision 9, "Trust file format" | the `schema` line; `TrailTrust::schema` |
+| Decision 11, "Library", CLI synopsis, finding list, review file | `Verifier::schema`, `--schema`, `SchemaUnknown`, `SchemaViolation`, `OperatorText` (an acceptable warning); `vigil-audit schema` |
+| Decision 12 | the block and the schema digest are v1 semantics, with no byte-format change |
+| Decision 13, table | the new rows |
+| Consequences, Alternatives considered | the profile and its limits; §20.9 |
+
+Every slice that implements a part flips its tags and its row in the table at the top of this section to Accepted.
+
 ## Consequences
 
 - **Regulated consumers get a trail they can show an auditor:**
@@ -1409,6 +1791,7 @@ The slices are those of the #13 plan: 13-R (#143), V1, V3 and later, C1, C2 and 
   The README's audit section lists them.
 - **Creating a trail is a deployment step** (`create`), not something `open` does. An application whose audit directory was deleted stops until an operator acts, and a re-created trail fails verification until its new id is pinned.
 - **Disk only grows.** Archiving is the operator's job; vigil only guarantees that any sealed segment can be moved.
+- **A consumer profile without a format change** (amendment 13, Accepted, CP2, [§20](#20-consumer-audit-profile-typed-attributes-a-record-schema-pseudonymous-records-and-erasure-amendment-13)). A trail opened with a `RecordSchema` refuses free text and undeclared shapes before anything is written, so it can serve a regulated consumer whose personal data must stay erasable outside the trail. The rule is a shape rule and cannot prove that no personal data is present; the consumer keeps the duties of [§20.6](#206-the-personal-data-rule-p6-p8) (opaque ids, salted commitments). Schema texts become one more trust input that operators keep beside the trust file (amendment 13, Proposed, CP4).
 - **The format is a long-term promise.** v1's encoding, domain strings and MMR can never change in 1.x. Every fix must be expressible as a v2, which costs an ADR and a second verifier path kept alive alongside v1.
 - **Code that must stay small.** The audit sink adds a second writer to the crate's riskiest file (`src/rotate.rs`, a crate-internal locked-section API). It is shared code, so the multi-process tests of ADR-0002 must cover both callers.
 - **Dependencies.** 17 more crates with `audit` on, and crate-scoped BSD-3-Clause licence exceptions for the three reviewed crypto crates.
@@ -1448,6 +1831,7 @@ The slices are those of the #13 plan: 13-R (#143), V1, V3 and later, C1, C2 and 
 
 ## Alternatives considered
 
+- **Amendment 13's rejected alternatives** (new attributes per field, a JSON block, a schema record in the trail, a verifier-only lint, a semantic-convention namespace, heuristic personal-data detection, crypto-shredding inside vigil, redactable records) are in [§20.6](#206-the-personal-data-rule-p6-p8) and [§20.9](#209-alternatives-rejected-for-the-typed-attributes).
 - **Build on `tessera-core` now** (the plan in #12). It is git-only, so vigil could not be published: `cargo package` exits 101 (pre-mortem R3). Its format is deliberately unfrozen (ADR-0052), so the promise of decision 12 would rest on another crate's moving format. It has no chain or checkpoint primitive and cannot resume an MMR. It would add 41 crates against 23. Rejected; its useful part is adopted as a construction (decision 7), and the rest is the adoption path (#59).
 - **Wait for tessera-core 1.0 before shipping audit.** It would tie vigil 1.0 to another project's release, for primitives two mature crates already provide. Rejected.
 - **Leave audit out of the 1.0 surface** (pre-mortem R3's third option). The 0.3.0 milestone and the owner want audit in 1.0, and nothing in the design needs an unstable dependency any more. Rejected.
@@ -1543,3 +1927,4 @@ The slices are those of the #13 plan: 13-R (#143), V1, V3 and later, C1, C2 and 
 - [vig-os/vigil#107](https://github.com/vig-os/vigil/issues/107) (amendment 10: prefix deletion, archiving and run review; architect ruling 107-d1, [issue comment](https://github.com/vig-os/vigil/issues/107#issuecomment-6127681252), with the two pre-mortems of its first drafts)
 - [vig-os/vigil#138](https://github.com/vig-os/vigil/issues/138) (amendment 11: resume returns the opening checkpoint; architect ruling 138-d1)
 - [vig-os/vigil#13](https://github.com/vig-os/vigil/issues/13) (amendment 12: the verifier surface and the line classification; architect rulings 13-d1 and 13-d2, posted on the issue) and [#143](https://github.com/vig-os/vigil/issues/143) (`resume` refuses a NUL-filled tail)
+- [vig-os/vigil#164](https://github.com/vig-os/vigil/issues/164) and [#165](https://github.com/vig-os/vigil/issues/165) (amendment 13: the consumer audit profile and erasure; the architect's clarification comments of 2026-11-02 on both issues); GDPR Art. 17 (right to erasure); 21 CFR Part 11 §11.50 (signature manifestations)

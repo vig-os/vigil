@@ -14,6 +14,11 @@
 //! Applications should pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 //! Before 1.0 they may change in any release; from 1.0, in any minor.
 
+mod attributes;
+pub use attributes::{AttrValue, FieldKind};
+mod schema;
+mod schema_validation;
+pub use schema::{ActionFields, RecordSchema, RecordSchemaBuilder};
 mod checkpoints;
 mod config;
 mod format;
@@ -167,3 +172,6 @@ mod codec_tests;
 
 #[cfg(test)]
 mod trail_tests;
+
+#[cfg(test)]
+mod schema_writer_tests;

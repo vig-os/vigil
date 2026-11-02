@@ -2,7 +2,7 @@
 
 *Verifiable Integrity-Guarded Instrumentation & Logging* (V·I·G·I·L): the opinionated observability crate for vig-os Rust projects.
 
-> **Early release (v0.1.0).** The first GitHub release; the API follows the [Stability](#stability) policy. It ships logs, metrics and traces as OTLP/JSON Lines files, the opt-in `audit` writer with its operator commands (the `vigil-audit` binary), and the testing helpers. Still open: the offline audit verifier (#13 C1) and trace propagation and the tracer globals (#8 8e, 8f). Open spans at shutdown (#8 8d) also remain. See the [known issues](#known-issues).
+> **Early release (v0.2.0).** Ships logs, metrics and traces as OTLP/JSON Lines files, the opt-in `audit` writer and `vigil-audit` operator commands, and testing helpers. Adds optional count and directory byte caps with per-signal rotation overrides, plus typed audit attributes, record schemas and schema-checked writers and operator commands. The offline verifier ([#13](https://github.com/vig-os/vigil/issues/13)), inclusion proofs ([#173](https://github.com/vig-os/vigil/issues/173)) and remaining trace lifecycle and propagation work ([#8](https://github.com/vig-os/vigil/issues/8), 8d–8f) remain open; see [known issues](#known-issues) and [upgrading from 0.1.0](#upgrading-from-010).
 
 **Pre-1.0 caveats.** Logs, metrics and traces export today, but open spans at
 shutdown (#8 8d), propagation (#8 8e), and the tracer globals opt-in (#8 8f)
@@ -11,14 +11,14 @@ before adopting an early release.
 
 ## Install
 
-The package is `vigil-telemetry`; the library is imported as `vigil`. v0.1.0 is a
-[GitHub release](https://github.com/vig-os/vigil/releases/tag/0.1.0) (git tag `0.1.0`);
+The package is `vigil-telemetry`; the library is imported as `vigil`. v0.2.0 is a
+[GitHub release](https://github.com/vig-os/vigil/releases/tag/0.2.0) (git tag `0.2.0`);
 crates.io publication comes later. Add it to `Cargo.toml` together with `tracing`,
 which your code uses to emit logs and spans:
 
 ```toml
 [dependencies]
-vigil-telemetry = { git = "https://github.com/vig-os/vigil", tag = "0.1.0" }
+vigil-telemetry = { git = "https://github.com/vig-os/vigil", tag = "0.2.0" }
 tracing = "0.1"
 ```
 
@@ -26,11 +26,11 @@ Default features are `metrics` and `traces`. Logs are always on. Add `audit` for
 lossless audit trail, or turn the defaults off:
 
 ```toml
-vigil-telemetry = { git = "https://github.com/vig-os/vigil", tag = "0.1.0", features = ["audit"] }
+vigil-telemetry = { git = "https://github.com/vig-os/vigil", tag = "0.2.0", features = ["audit"] }
 # only logs: default-features = false
 ```
 
-Pin the exact `tag = "0.1.0"`: before 1.0 a minor bump may break stable items, and
+Pin the exact `tag = "0.2.0"`: before 1.0 a minor bump may break stable items, and
 a git dependency does not resolve version ranges, so a newer release is a deliberate
 change of the tag (see [Stability](#stability): `~0.N` once it is on crates.io, `=0.N.M` for
 applications using `--cfg vigil_unstable`).
@@ -38,7 +38,7 @@ applications using `--cfg vigil_unstable`).
 The audit operator tool is a separate binary, `vigil-audit`:
 
 ```sh
-cargo install --git https://github.com/vig-os/vigil --tag 0.1.0 --features audit --bin vigil-audit vigil-telemetry
+cargo install --git https://github.com/vig-os/vigil --tag 0.2.0 --features audit --bin vigil-audit vigil-telemetry
 ```
 
 ## Quick start
@@ -75,6 +75,25 @@ The files appear in `$XDG_STATE_HOME/my-service` (or `$HOME/.local/state/my-serv
 per line. `Guard::dir()` reports the actual directory. Do not write
 `let _ = vigil::init(..)`: that drops the guard at once and stops the export.
 Configuration and environment variables are described below.
+
+## Upgrading from 0.1.0
+
+**Breaking:** caller-supplied `Entry::details` starting with `vigil.attrs.` is
+reserved for the canonical typed attribute block. `Entry::details` only sets the
+text; constructing the record rejects that prefix with `AuditErrorKind::InvalidEntry`,
+with or without a schema. Change the caller's text to avoid the reserved prefix,
+or configure `AuditConfig::schema` and use `Entry::attr` for typed attributes. Already-written records remain decodable.
+
+The rotated-segment count cap, directory byte cap and record schema are off by
+default. Size and age defaults remain 50 MiB and 90 days when no rotation
+environment override is set. An unchanged builder still reads `VIGIL_MAX_BYTES`,
+`VIGIL_RETENTION_DAYS`, `VIGIL_MAX_SEGMENTS`, `VIGIL_MAX_TOTAL_BYTES`, and
+`VIGIL_LOGS_MAX_BYTES`, `VIGIL_METRICS_MAX_BYTES`, `VIGIL_TRACES_MAX_BYTES`,
+`VIGIL_LOGS_MAX_SEGMENTS`, `VIGIL_METRICS_MAX_SEGMENTS`, `VIGIL_TRACES_MAX_SEGMENTS`,
+`VIGIL_LOGS_RETENTION_DAYS`, `VIGIL_METRICS_RETENTION_DAYS` and
+`VIGIL_TRACES_RETENTION_DAYS`. Setting a valid override changes the corresponding
+behavior unless an explicit builder value takes precedence; see the
+[rotation settings](#what-it-is) below for precedence and zero values.
 
 ## Stability
 
@@ -140,6 +159,10 @@ promise below applies from 1.0.0. Version changes are managed by the release tra
 - [#13](https://github.com/vig-os/vigil/issues/13): no offline audit verifier yet; `open` and operator commands do not verify a trail.
 - [#89](https://github.com/vig-os/vigil/issues/89): crash guarantees remain unproven.
 - [#46](https://github.com/vig-os/vigil/issues/46): no macOS CI test lane yet.
+- [#164](https://github.com/vig-os/vigil/issues/164) and [#13](https://github.com/vig-os/vigil/issues/13): verifier schema checks (`verify --schema`, `SchemaUnknown`, `SchemaViolation` and `OperatorText`) are not implemented.
+- [#173](https://github.com/vig-os/vigil/issues/173): no single-record inclusion proofs yet.
+- [#168](https://github.com/vig-os/vigil/issues/168): default disk caps remain undecided; count and directory byte caps are unlimited by default.
+- [#8](https://github.com/vig-os/vigil/issues/8), 8d–8f: open spans at shutdown, trace propagation and tracer globals opt-in remain open. End root spans before shutdown.
 
 ## Traces
 
@@ -357,6 +380,64 @@ and `HOME` are ignored, with rejected values explained if no path is available. 
 `None` keeps everything, while `Some(Duration::ZERO)` prunes rotated segments
 at the next prune. Explicit `retention(None)` overrides the environment.
 Explicit `Config` values override environment values.
+Rotation also supports `Config::max_segments(Some(k))` and
+`RotationConfig::max_segments(Some(k))`: at open and after rotation, age pruning
+runs first, then the oldest rotated segments of that signal are deleted until
+at most `k` remain. Live files, audit files and foreign files are preserved.
+`Config::max_total_bytes(Some(t))` and `RotationConfig::max_total_bytes(Some(t))`
+then enforce one directory-wide telemetry budget, deleting by `(stamp, signal,
+integer counter)`. Clock steps can weaken chronological ordering across signals.
+Live files reserve `V_s = max(M_s, live_len + pending_len)` for the writing signal
+and `max(M_s, live_len)` for every other signal. Pending bytes include the newline
+and any repair byte. Pruning runs before an oversized write even into an empty
+live file. A total cap can evict all of a quiet signal's rotated history.
+Set both caps to bound directory size and the number of files listed per pass.
+Both caps default to `None` (unlimited); disk use is unbounded within the
+retention age by default. Failed deletions remain counted; pruning tries later
+segments and warns once per process per cap kind if a cap remains unmet, including when live reservations exceed the total cap.
+
+Use `Config::signal_rotation(Signal::Logs, SignalRotation::new().max_bytes(16 *
+1024 * 1024).max_segments(Some(4)))` (types in `vigil::rotate` and `vigil`) or
+`RotationConfig::signal` to replace one signal's overrides. Unset fields inherit;
+an explicit `None` disables a count or age limit. Custom `RotatingFile` signal
+names use global values. Per-option precedence is signal builder, global builder,
+signal environment, global environment, default.
+
+| Setting | Global environment | Per-signal environment (`S` = `LOGS`, `METRICS`, `TRACES`) | Zero |
+|---|---|---|---|
+| Size | `VIGIL_MAX_BYTES` | `VIGIL_S_MAX_BYTES` | Builder clamps to 1; environment minimum is 1 |
+| Total bytes | `VIGIL_MAX_TOTAL_BYTES` | None | Prunes every rotated segment |
+| Rotated count | `VIGIL_MAX_SEGMENTS` | `VIGIL_S_MAX_SEGMENTS` | Keeps no rotated segments |
+| Age in days | `VIGIL_RETENTION_DAYS` | `VIGIL_S_RETENTION_DAYS` | Environment keeps everything; builder `Some(Duration::ZERO)` expires past-mtime segments |
+
+The per-signal names are `VIGIL_LOGS_MAX_BYTES`, `VIGIL_METRICS_MAX_BYTES`,
+`VIGIL_TRACES_MAX_BYTES`, `VIGIL_LOGS_MAX_SEGMENTS`, `VIGIL_METRICS_MAX_SEGMENTS`,
+`VIGIL_TRACES_MAX_SEGMENTS`, `VIGIL_LOGS_RETENTION_DAYS`,
+`VIGIL_METRICS_RETENTION_DAYS`, and `VIGIL_TRACES_RETENTION_DAYS`.
+Empty values are unset; invalid numbers warn once per variable per configuration
+build. Count zero deletes even future-mtime segments that age zero keeps.
+
+With a count cap `K_s` for every signal, visible telemetry lengths are bounded by
+`D_count = Σ_S (K_s + 1) · F_s`, where `F_s = max(M_s, l_s)` and `l_s` is the
+longest line including newline, and `S` contains telemetry signals with a live file.
+With a total cap `T`, `D_total = max(T, Σ_S V_s) ≤ max(T, Σ_S F_s)`;
+with both caps, `D = min(D_count, D_total)`. Without a count cap for every signal,
+only the total bound applies. With neither cap, visible bytes are unbounded
+within retention age. Idle writer handles can retain unlinked segments:
+`R = Σ_s W_s · max(M_s, l_s)` and `D_logical ≤ D + R`, counting writer instances
+across processes. For logs 16 MiB/4 segments, traces 32 MiB/4 and metrics 8 MiB/2
+(with lines below those sizes), a 512 MiB total cap gives `D_total = max(512, 56) = 512 MiB`,
+so `D = min(264, 512) = 264 MiB`. Logical
+bytes at most `264 + 56·W` MiB for `W` processes using `init`. Insert your process
+count; additional writers each add their own allowance. Each cached handle retains at
+most one segment until that writer next appends, drops, or its process exits. These bounds assume
+consistent limits across writers and segments written under those size limits,
+and successful completed pruning. They count file lengths, excluding audit data,
+filesystem block rounding and metadata. For volume sizing add `F · B`, where
+`F = |S| + Σ_S K_s + Σ_s W_s` is the live, rotated and retained file count and `B`
+is the filesystem block size, plus a metadata margin; preallocation and delayed
+allocation are not bounded. See [ADR-0002 decision 22](docs/adr/0002-rotation-and-retention.md).
+
 `Config::revision` or `VIGIL_VCS_REVISION` supplies the producer commit.
 Log storage initialization failures make logs fall back to stderr; metrics and traces
 storage initialization failures disable their signal with its own warning.
@@ -466,6 +547,11 @@ Decisions and their evidence are recorded as ADRs in [`docs/adr/`](docs/adr/): [
 
 ## Development
 
+The `just publish-candidate 0.1.0 …` command in the devkit-managed
+[release workflow guide](https://github.com/vig-os/vigil/blob/release/0.2.0/docs/DOWNSTREAM_RELEASE.md#pre-release-format)
+is a generic prerelease-format example. For this release, use `0.2.0` as the
+version argument. The guide's format examples do not select vigil's current version.
+
 Enter the pinned environment with `direnv allow` (or `nix develop`). `nix flake check` runs fmt, clippy, tests, doctests and docs. Changes enter through PRs to `dev`; `main` only takes release PRs.
 
 ### Supply chain
@@ -482,12 +568,11 @@ skips recorded in `deny.toml`.
 `nix flake check` includes only the offline cargo-deny subset: bans, licenses
 and sources. The CI extension and `.github/workflows/supply-chain.yml` run the
 full gate, including advisories and the OpenTelemetry compatibility rule.
-The consumer-owned workflow checks `dev` weekly (Monday 06:23 UTC) and supports
-manual dispatch. Failures remain visible as red Actions runs; maintainers should
-subscribe to workflow failure notifications. Neither scheduled runs nor manual
-`workflow_dispatch` runs work until this workflow file reaches the default branch,
-`main`, in the 1.0 release ([GitHub trigger requirements](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)).
-PR CI is the supply-chain gate until then. Once enabled, both triggers check `dev`.
+The consumer-owned workflow is present on the default branch, `main`, so its
+weekly schedule (Monday 06:23 UTC) and manual dispatch are available today.
+Both triggers check out and check `dev`; PR CI also runs the supply-chain gate.
+Failures remain visible as red Actions runs; maintainers should subscribe to
+workflow failure notifications.
 
 The gate explicitly fetches RustSec and registry data, then checks with
 `--disable-fetch`. The wrapper enforces a seven-day limit on the actual DB HEAD
@@ -612,13 +697,17 @@ for commands and exit codes, or `vigil-audit <command> --help` for command help.
 following synopsis (`verify` follows in #13 C1):
 
 ```text
+vigil-audit schema <file>
 vigil-audit keygen <keyfile>
 vigil-audit create --key <keyfile> --service <name> <dir>
 vigil-audit checkpoints <dir>
 vigil-audit checkpoint --key <keyfile> --expect-head <seq>:<hash> <dir>
-vigil-audit rotate --key <keyfile> --actor <who> --reason <why> --bound <seq>:<hash> --expect-head <seq>:<hash> <dir>
-vigil-audit resume --key <keyfile> --actor <who> --reason <why> --head <seq>:<hash> --lost-through <seq> <dir>
+vigil-audit rotate --key <keyfile> --actor <who> --reason <why> --bound <seq>:<hash> --expect-head <seq>:<hash> [--schema <file>] <dir>
+vigil-audit resume --key <keyfile> --actor <who> --reason <why> --head <seq>:<hash> --lost-through <seq> [--schema <file>] <dir>
 ```
+
+`schema` parses a canonical schema file and prints its `blake3:` digest line.
+Non-canonical or missing files exit 2.
 
 Hashes are `blake3:` followed by 64 lowercase hex digits. Keep expected heads
 outside the trail directory; use the highest sequence among all held receipts and
@@ -635,7 +724,8 @@ and close checkpoint, in sequence order. Receipts are `<seq> blake3:<hex>`;
 checkpoint lines preserve the on-disk JSON payload.
 
 `create` uses `--service`; records from `rotate`, `checkpoint` and `resume` use
-`service.name = "vigil-audit"`. `--actor` names the human. `create` and `resume`
+`service.name = "vigil-audit"`. `--actor` names the human; with `--schema` it must be an opaque operator id,
+and `--reason` a reference id (P8). `create` and `resume`
 explicitly close the handle before exit, so the printed close checkpoint is the
 clean-stop head. Successful outputs remain available if a later close fails.
 Exit codes are 0 for success, 2 for usage, `Io` or `InvalidConfig`, and 1 for other
@@ -1087,6 +1177,45 @@ every unstable item.
 
 Use digests rather than personal data in entries, retaining the referenced values in the
 application's own store.
+
+### Personal data and erasure
+
+A trail without a `RecordSchema` is **not erasure-ready**. Set
+`AuditConfig::schema` on every writer configuration and attach typed values with
+`Entry::attr`. The schema checks shapes before the directory lock is taken:
+opaque actor ids, declared actions and object kinds, declared typed attributes,
+no reason text, no text before/after values and no caller details. See
+[ADR-0005 §20.6](docs/adr/0005-audit-trail.md#206-the-personal-data-rule-p6-p8)
+for the personal-data rule and
+[§20.7](docs/adr/0005-audit-trail.md#207-what-an-erasure-leaves-provable-p12)
+for the evidence that remains after erasure.
+
+Keep personal data, names, reasons and the id-to-person mapping in a separate,
+erasable store. Mint opaque random ids: a username can pass a shape check.
+Avoid personal information in integer values and service or host names too;
+those resource names are outside the schema and cannot be erased. Declare no
+subject key on read actions if reads must not identify their subjects.
+A digest of erasable content must be a commitment: `H(salt ‖ content)` with a
+random salt of at least 128 bits, stored with the content in the erasable store
+and erased with it. A plain hash of guessable content permits dictionary attacks.
+
+Pass `--schema` to `vigil-audit rotate` and `vigil-audit resume` on every typed trail. In the library,
+set `AuditConfig::schema` for `rotate` and `resume`; their actor and reason must
+both be opaque ids (for example an operator id and a change-ticket id). Without
+a schema, operator free text is permitted and becomes permanent. The CLI supports `schema <file>` and `--schema <file>` on `rotate` and
+`resume`; verifier schema checks (`verify --schema` and schema findings) remain open in
+[#164](https://github.com/vig-os/vigil/issues/164) and [#13](https://github.com/vig-os/vigil/issues/13).
+
+Erasing the external mapping, content and salts changes no trail bytes. Within
+trusted checkpoint coverage, externally held receipts and anchors, or verified
+archive ranges, integrity, record order and unchanged action/attribute values
+remain provable. The opaque principal and its linked records remain visible;
+the principal's identity and the content behind erased commitments do not.
+Authentication, intent and semantic truth were never proved by vigil. An
+unsigned tail needs external receipts or anchors against rewriting or rollback.
+Before an erasure-relevant retention event, we recommend taking a checkpoint
+**and anchoring it**, so earlier records are covered. This is advice; vigil
+cannot detect or enforce an external erasure event.
 
 [d1]: docs/adr/0005-audit-trail.md#1-scope-a-separate-synchronous-fail-closed-api-behind-feature-audit
 [d2]: docs/adr/0005-audit-trail.md#2-files-adr-0002s-machinery-in-a-directory-of-its-own

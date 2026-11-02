@@ -58,3 +58,12 @@ reserved `audit.*` context keys are refused at the writer and reader boundaries.
 accepted lines; it does not discard a successfully emitted unverifiable line.
 Depth counts container edges from root AnyValue depth zero. Invalid context
 returns InvalidConfig; oversized payloads return TooLarge before writing.
+
+`schema.json` contains the canonical schema text as a JSON string: its decoded
+UTF-8 bytes have LF separators and no trailing LF. `schema.digest` fixes BLAKE3
+of `b"vigil.audit.v1.schema\0"` followed by those bytes, in lowercase prefixed hex.
+`schema-record.bin`, `schema-record.hash` (lowercase hex) and
+`schema-record.jsonl` fix a second typed record whose block names that real
+schema digest. The schema's action `a` declares the same `a`, `b`, `c` kinds
+used by CP1a's block vector. The CP1a vectors, including the 0.1.0 encoder's
+output and their placeholder `[0x11; 32]` schema digest, remain unchanged.
