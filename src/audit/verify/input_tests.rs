@@ -121,16 +121,20 @@ fn retry_discards_old_decode_items_and_reads_live_tail() {
     let dir = Dir::new();
     dir.put("audit.jsonl", b"not json\n");
     let mut attempts = 0;
-    let result = collect_with(vec![dir.0.clone()], |path, attempt| {
-        attempts = attempt;
-        if attempt == 1 {
-            // A changed segment listing retries while the same live inode is
-            // completed in place. Tentative decoder errors must be discarded.
-            fs::write(path.join(format!("{STAMP}.jsonl")), b"")?;
-            fs::write(path.join("audit.jsonl"), GOLDEN.lines().next().unwrap())?;
-        }
-        Ok(())
-    })
+    let result = collect_with(
+        vec![dir.0.clone()],
+        |_, _| Ok(()),
+        |path, attempt| {
+            attempts = attempt;
+            if attempt == 1 {
+                // A changed segment listing retries while the same live inode is
+                // completed in place. Tentative decoder errors must be discarded.
+                fs::write(path.join(format!("{STAMP}.jsonl")), b"")?;
+                fs::write(path.join("audit.jsonl"), GOLDEN.lines().next().unwrap())?;
+            }
+            Ok(())
+        },
+    )
     .unwrap();
     assert_eq!(attempts, 2);
     assert_eq!(result.inputs.len(), 2);
@@ -146,14 +150,18 @@ fn eight_races_are_io_not_success() {
     let dir = Dir::new();
     dir.put("audit.jsonl", b"");
     let mut attempts = 0;
-    let result = collect_with(vec![dir.0.clone()], |path, attempt| {
-        attempts = attempt;
-        fs::rename(
-            path.join("audit.jsonl"),
-            path.join(format!("{STAMP}_{attempt:06}.jsonl")),
-        )?;
-        fs::write(path.join("audit.jsonl"), b"")
-    });
+    let result = collect_with(
+        vec![dir.0.clone()],
+        |_, _| Ok(()),
+        |path, attempt| {
+            attempts = attempt;
+            fs::rename(
+                path.join("audit.jsonl"),
+                path.join(format!("{STAMP}_{attempt:06}.jsonl")),
+            )?;
+            fs::write(path.join("audit.jsonl"), b"")
+        },
+    );
     assert_eq!(attempts, 8);
     error(result, AuditErrorKind::Io);
 }
@@ -161,12 +169,16 @@ fn eight_races_are_io_not_success() {
 fn disappearing_selected_input_is_not_silently_omitted() {
     let dir = Dir::new();
     let segment = dir.put(&format!("{STAMP}.jsonl"), b"");
-    let result = collect_with(vec![dir.0.clone()], |_, attempt| {
-        if attempt == 1 {
-            fs::remove_file(&segment)?;
-        }
-        Ok(())
-    });
+    let result = collect_with(
+        vec![dir.0.clone()],
+        |_, _| Ok(()),
+        |_, attempt| {
+            if attempt == 1 {
+                fs::remove_file(&segment)?;
+            }
+            Ok(())
+        },
+    );
     error(result, AuditErrorKind::Io);
 }
 #[test]
@@ -354,4 +366,105 @@ fn checkpoint_operator_and_native_span_context_survives_compaction() {
             )
         );
     }
+}
+
+#[test]
+fn rotation_between_listing_and_open_retries() {
+    let dir = Dir::new();
+    let live = dir.put("audit.jsonl", line(4));
+    let inode = fs::metadata(&live).unwrap().ino();
+    let segment = dir.0.join(format!("{STAMP}.jsonl"));
+    let mut attempts = 0;
+    let result = collect_with(
+        vec![dir.0.clone()],
+        |_, attempt| {
+            attempts = attempt;
+            if attempt == 1 {
+                fs::rename(&live, &segment)?;
+            }
+            Ok(())
+        },
+        |_, _| Ok(()),
+    )
+    .unwrap_or_else(|e| {
+        panic!("rotation retained the inode under its segment name, but collect returned {e:?}")
+    });
+    assert_eq!(attempts, 2);
+    assert_eq!(result.inputs.len(), 1);
+    assert_eq!(result.inputs[0].path, segment);
+    assert_eq!(fs::metadata(&result.inputs[0].path).unwrap().ino(), inode);
+    assert_eq!(result.inputs[0].data.records.len(), 1);
+    assert_eq!(result.inputs[0].data.records[0].seq, 4);
+}
+
+#[test]
+fn deletion_between_listing_and_open_retries() {
+    let dir = Dir::new();
+    let live = dir.put("audit.jsonl", line(4));
+    let mut attempts = 0;
+    let result = collect_with(
+        vec![dir.0.clone()],
+        |_, attempt| {
+            attempts = attempt;
+            if attempt == 1 {
+                fs::remove_file(&live)?;
+            }
+            Ok(())
+        },
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(attempts, 2);
+    assert!(result.inputs.is_empty());
+}
+
+#[test]
+fn stable_unreadable_listing_keeps_original_source() {
+    let dir = Dir::new();
+    fs::create_dir(dir.0.join("audit.jsonl")).unwrap();
+    let mut attempts = 0;
+    let mut tentative_copies = 0;
+    let result = collect_with(
+        vec![dir.0.clone()],
+        |_, attempt| {
+            attempts = attempt;
+            Ok(())
+        },
+        |_, _| {
+            tentative_copies += 1;
+            Ok(())
+        },
+    );
+    let Err(error) = result else {
+        panic!("unreadable file succeeded")
+    };
+    assert_eq!(attempts, 1);
+    assert_eq!(tentative_copies, 1);
+    assert_eq!(error.kind(), AuditErrorKind::Io);
+    let source = error.source().unwrap().downcast_ref::<io::Error>().unwrap();
+    assert_eq!(source.kind(), io::ErrorKind::IsADirectory);
+}
+
+#[test]
+fn open_races_exhaust_after_eight_attempts() {
+    let dir = Dir::new();
+    dir.put("audit.jsonl", line(4));
+    let mut attempts = 0;
+    let result = collect_with(
+        vec![dir.0.clone()],
+        |path, attempt| {
+            attempts = attempt;
+            // Replace the selected path before open with a differently named segment.
+            // Every attempt changes the listing and makes the selected path unreadable.
+            if attempt == 1 {
+                fs::remove_file(path.join("audit.jsonl"))?;
+            } else {
+                fs::remove_file(path.join(format!("{STAMP}_{:06}.jsonl", attempt - 1)))?;
+            }
+            fs::write(path.join(format!("{STAMP}_{attempt:06}.jsonl")), line(4))
+        },
+        |_, _| Ok(()),
+    );
+    assert_eq!(attempts, 8);
+    error(result, AuditErrorKind::Io);
 }

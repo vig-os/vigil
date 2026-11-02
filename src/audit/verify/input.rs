@@ -170,12 +170,15 @@ pub(super) fn collect(paths: impl IntoIterator<Item = PathBuf>) -> Result<Collec
         paths,
         #[cfg(test)]
         |_, _| Ok(()),
+        #[cfg(test)]
+        |_, _| Ok(()),
     )
 }
 
 // Deterministic per-attempt hook, private to this module and its tests.
 fn collect_with(
     paths: impl IntoIterator<Item = PathBuf>,
+    #[cfg(test)] mut before_copy: impl FnMut(&Path, usize) -> io::Result<()>,
     #[cfg(test)] mut after_copy: impl FnMut(&Path, usize) -> io::Result<()>,
 ) -> Result<Collection, AuditError> {
     let mut directories = BTreeSet::new();
@@ -197,21 +200,29 @@ fn collect_with(
             &directory,
             "audit",
             |paths| {
-                let result = copy(paths, &cache)?;
-                let present: BTreeSet<_> = result.iter().map(|(inode, _)| *inode).collect();
-                if !required.is_subset(&present) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "selected audit input disappeared",
-                    ));
-                }
-                required.extend(present);
                 #[cfg(test)]
                 {
                     attempt += 1;
+                    before_copy(&directory, attempt)?;
+                }
+                // Native read errors are tentative until retry_snapshot confirms
+                // the listing. A rotation can move a listed inode before open.
+                let result = copy(paths, &cache).and_then(|result| {
+                    let present: BTreeSet<_> = result.iter().map(|(inode, _)| *inode).collect();
+                    if !required.is_subset(&present) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "selected audit input disappeared",
+                        ));
+                    }
+                    required.extend(present);
+                    Ok(result)
+                });
+                #[cfg(test)]
+                {
                     after_copy(&directory, attempt)?;
                 }
-                Ok(Ok(result))
+                Ok(result)
             },
             |_| {
                 Err(io::Error::other(
