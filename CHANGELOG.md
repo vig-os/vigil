@@ -19,25 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-## [0.2.0] - TBD
+## [0.2.0](https://github.com/vig-os/vigil/releases/tag/0.2.0) - 2026-11-02
 
 ### Added
 
-- `vigil-audit schema <file>` prints a canonical schema digest; optional `--schema <file>` on `rotate` and `resume` enforces opaque operator and reference ids (#164 CP3, #165).
-
-- Schema-checked audit writers with `Entry::attr`, `AuditConfig::schema`, fail-closed record and operator validation, and personal-data and erasure guidance (#164 CP2, #165).
-
-- Audit `RecordSchema`, `RecordSchemaBuilder` and `ActionFields`, with canonical schema parsing and a domain-separated BLAKE3 digest (ADR-0005 amendment 13 §20.4–§20.5, #164 CP1b).
-- Optional directory-wide telemetry byte cap with live-file and pending-write reservations, oldest-first pruning after age and count, and a documented logical-byte bound including retained writer handles ([#163](https://github.com/vig-os/vigil/issues/163), slice 163b).
-
-- Audit `FieldKind` and `AttrValue`, with the shared canonical attribute block format (ADR-0005 amendment 13 §20.3–§20.5, #164 CP1a).
-- Per-signal size, count and age rotation overrides and an optional rotated-segment count cap, with environment equivalents and oldest-first pruning at open and after rotation ([#163](https://github.com/vig-os/vigil/issues/163), slice 163a).
-
-- ADR-0005 amendment 13 (Proposed): a consumer audit profile with no v1 byte-format change. Typed attributes (`id`, `token`, `enum`, `int`, 32-byte `digest`) ride in `audit.details` as a canonical attribute block naming its schema's digest; a per-trail `RecordSchema` set with `AuditConfig::schema` is checked fail-closed at `record()`; schema texts are pinned in the trust policy and the verifier reports `SchemaUnknown` and `SchemaViolation` (errors) and `OperatorText` (an acceptable warning for free text in an operator record); under a schema a record carries no free text (pseudonymous references), and the ADR states what that rule cannot catch and what an erasure outside the trail leaves provable. Open questions decided by architect ruling 164-d1; CP1 will refuse `Entry::details` text starting with `vigil.attrs.` and is marked breaking. Docs only; slices CP1 to CP4 implement it ([#164](https://github.com/vig-os/vigil/issues/164), [#165](https://github.com/vig-os/vigil/issues/165)).
+- Optional rotated-segment count and directory-wide telemetry byte caps, with per-signal size, count and age rotation overrides and environment equivalents ([#163](https://github.com/vig-os/vigil/issues/163), #176, #178). Zero caps are honoured. Pruning runs at open and after rotation in age, count, then total-byte order, deleting oldest segments first; the total pass also runs before an oversized write into an empty live file. Live files and audit files are never pruned. Total-byte pressure can erase a quiet signal's entire rotated history. Failed deletions remain counted, later segments are tried, and an unmet cap warns. Live-file and pending-write reservations and retained writer handles are included in the documented logical-byte bound.
+- Audit `FieldKind`, `AttrValue` and `Entry::attr`, with a canonical typed attribute block; `RecordSchema`, `RecordSchemaBuilder` and `ActionFields`, with canonical schema text and a domain-separated BLAKE3 digest (#164, #175, #177).
+- Schema-checked audit writers through `AuditConfig::schema`, with fail-closed record and operator validation and personal-data and erasure guidance (#164, #165, #179). The v1 byte encoding is unchanged.
+- `vigil-audit schema <file>` prints a canonical schema digest; optional `--schema <file>` on `rotate` and `resume` enforces opaque operator and reference ids (#164, #165, #180).
 
 ### Changed
 
-- Audit record construction refuses caller-supplied `Entry::details` starting with the reserved `vigil.attrs.` prefix (`InvalidEntry`); decoding existing records is unchanged (#164 CP1a).
+- **Breaking:** audit record construction refuses caller-supplied `Entry::details` starting with the reserved `vigil.attrs.` prefix (`InvalidEntry`), with or without a schema; decoding existing records is unchanged (#164, #175).
 
 ## [0.1.0](https://github.com/vig-os/vigil/releases/tag/0.1.0) - 2026-10-18
 
