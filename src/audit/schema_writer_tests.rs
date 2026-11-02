@@ -67,7 +67,10 @@ fn p6_actor() {
 }
 #[test]
 fn p6_action() {
-    refused(Entry::new("p_01", "unknown", "o_01"));
+    refused(Entry {
+        action: "unknown".into(),
+        ..entry()
+    });
 }
 #[test]
 fn p6_object() {
@@ -75,7 +78,8 @@ fn p6_object() {
 }
 #[test]
 fn p6_reason() {
-    refused(entry().reason(""));
+    // Valid v1 text: only the schema prohibition on a reason is violated.
+    refused(entry().reason("change reason"));
 }
 #[test]
 fn p6_text_values() {
@@ -84,7 +88,8 @@ fn p6_text_values() {
 }
 #[test]
 fn p6_details() {
-    refused(entry().details(""));
+    // Valid v1 text: only the schema prohibition on caller details is violated.
+    refused(entry().details("application details"));
 }
 #[test]
 fn p6_required_key() {
