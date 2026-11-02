@@ -1932,15 +1932,21 @@ mod tests {
         line.clear();
         io::stdin().lock().read_line(&mut line).unwrap();
         for writer in writers {
-            let old = rfs::fstat(&lock_ignore_poison(&writer.live).file).unwrap();
+            // Pin the old inode while comparing identities: refresh releases the
+            // writer's handle before rotation creates a new live file, and the
+            // filesystem may immediately reuse the released inode number.
+            let old = lock_ignore_poison(&writer.live).file.try_clone().unwrap();
             writer
                 .append_with(b"7654321", |file, bytes| {
+                    let old = rfs::fstat(&old)?;
                     let new = rfs::fstat(&*file)?;
+                    assert_eq!(old.st_nlink, 0);
                     assert_ne!((old.st_dev, old.st_ino), (new.st_dev, new.st_ino));
                     assert_eq!(new.st_nlink, 1);
                     write_once(file, bytes)
                 })
                 .unwrap();
+            drop(old);
         }
     }
 
