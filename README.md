@@ -1146,6 +1146,44 @@ every unstable item.
 Use digests rather than personal data in entries, retaining the referenced values in the
 application's own store.
 
+### Personal data and erasure
+
+A trail without a `RecordSchema` is **not erasure-ready**. Set
+`AuditConfig::schema` on every writer configuration and attach typed values with
+`Entry::attr`. The schema checks shapes before the directory lock is taken:
+opaque actor ids, declared actions and object kinds, declared typed attributes,
+no reason text, no text before/after values and no caller details. See
+[ADR-0005 §20.6](docs/adr/0005-audit-trail.md#206-the-personal-data-rule-p6-p8)
+for the personal-data rule and
+[§20.7](docs/adr/0005-audit-trail.md#207-what-an-erasure-leaves-provable-p12)
+for the evidence that remains after erasure.
+
+Keep personal data, names, reasons and the id-to-person mapping in a separate,
+erasable store. Mint opaque random ids: a username can pass a shape check.
+Avoid personal information in integer values and service or host names too;
+those resource names are outside the schema and cannot be erased. Declare no
+subject key on read actions if reads must not identify their subjects.
+A digest of erasable content must be a commitment: `H(salt ‖ content)` with a
+random salt of at least 128 bits, stored with the content in the erasable store
+and erased with it. A plain hash of guessable content permits dictionary attacks.
+
+Pass `--schema` on **every operator command of a typed trail**. In the library,
+set `AuditConfig::schema` for `rotate` and `resume`; their actor and reason must
+both be opaque ids (for example an operator id and a change-ticket id). Without
+a schema, operator free text is permitted and becomes permanent. The CLI's
+`--schema` support is planned for CP3, and verifier schema checks for CP4.
+
+Erasing the external mapping, content and salts changes no trail bytes. Within
+trusted checkpoint coverage, externally held receipts and anchors, or verified
+archive ranges, integrity, record order and unchanged action/attribute values
+remain provable. The opaque principal and its linked records remain visible;
+the principal's identity and the content behind erased commitments do not.
+Authentication, intent and semantic truth were never proved by vigil. An
+unsigned tail needs external receipts or anchors against rewriting or rollback.
+Before an erasure-relevant retention event, we recommend taking a checkpoint
+**and anchoring it**, so earlier records are covered. This is advice; vigil
+cannot detect or enforce an external erasure event.
+
 [d1]: docs/adr/0005-audit-trail.md#1-scope-a-separate-synchronous-fail-closed-api-behind-feature-audit
 [d2]: docs/adr/0005-audit-trail.md#2-files-adr-0002s-machinery-in-a-directory-of-its-own
 [d5]: docs/adr/0005-audit-trail.md#5-hash-chain

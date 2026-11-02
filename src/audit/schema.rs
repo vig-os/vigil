@@ -15,13 +15,14 @@ use super::{AuditError, AuditErrorKind, FieldKind};
 pub struct RecordSchema {
     name: String,
     text: String,
+    pub(super) actions: Vec<Action>,
 }
 
-#[derive(Clone, Debug)]
-struct Action {
-    name: String,
-    object: FieldKind,
-    fields: Vec<(String, bool, FieldKind)>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Action {
+    pub(super) name: String,
+    pub(super) object: FieldKind,
+    pub(super) fields: Vec<(String, bool, FieldKind)>,
 }
 
 /// Collects action declarations; validation happens at `build()`.
@@ -177,6 +178,7 @@ impl RecordSchemaBuilder {
         Ok(RecordSchema {
             name: self.name,
             text,
+            actions: self.actions,
         })
     }
 }

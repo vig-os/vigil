@@ -126,7 +126,7 @@ impl FieldKind {
         Ok(text)
     }
 
-    fn parse(&self, text: &str) -> Result<AttrValue, AuditError> {
+    pub(super) fn parse(&self, text: &str) -> Result<AttrValue, AuditError> {
         let value = match &self.0 {
             Kind::Id => AttrValue::Id(text.into()),
             Kind::Token | Kind::Enum(_) => AttrValue::Token(text.into()),
