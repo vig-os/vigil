@@ -194,8 +194,12 @@ mod mod_tests;
 ///
 /// **Incomplete (#13):** V3b supplies fragment/resume context and report
 /// predicates; V4–V8/R10 supply folds, signatures, coverage, anchors, receipts,
-/// review and archive rules. Gaps are reported pessimistically until confirmed.
-/// No release from dev carries this partial verifier before #13 through C1.
+/// review and archive rules. Native gaps are reported, never excused, until V5
+/// supplies trusted coverage: a matching `audit.repaired` is a `TornWrite`, a
+/// missing or different one is `RepairMismatch`, and a trailing gap is
+/// `TornWrite` with the bytes-to-EOF digest. V5 then promotes a covered
+/// `TornWrite` to `TornWriteRepaired`. No release from dev carries this
+/// partial verifier before #13 through C1.
 /// Open, or record once, before reviewing a crashed trail to settle staging.
 /// Strict live review must target a stopped trail: an in-flight append can look
 /// torn. Reads take no locks and offer per-directory snapshots, not global atomicity.

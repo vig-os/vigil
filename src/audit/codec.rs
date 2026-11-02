@@ -266,7 +266,7 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
         return Err(corrupt());
     }
     if record.hash() != claimed {
-        return Err(finding(FindingKind::HashMismatch));
+        return Err(finding(FindingKind::HashMismatch).with_seq(record.context.seq));
     }
     Ok(record)
 }

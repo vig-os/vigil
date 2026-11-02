@@ -1,8 +1,9 @@
-//! Collecting chain checks. The collection retains located physical neighbours,
-//! spans, checkpoint and operator context for #13 V3b; no gap is confirmed here.
+//! Collecting chain and gap checks. Native spans are attested or reported
+//! pessimistically (ruling 13-V3-d3); V5 promotes a covered `TornWrite` to
+//! `TornWriteRepaired` when trusted coverage lands.
 use super::{
     Finding, Report,
-    input::{Collection, LineContent, Summary},
+    input::{Collection, Input, LineContent, Summary},
 };
 use crate::audit::{FindingKind as K, Record, digest_string, hex};
 use std::{collections::BTreeMap, path::Path};
@@ -12,27 +13,88 @@ fn finding(kind: K, path: &Path, line: Option<u64>, seq: Option<u64>, detail: St
     Finding::new(kind, Some(path.to_owned()), line, seq, detail)
 }
 
+/// Pessimistic gap and shipped-fragment findings (ruling 13-V3-d3).
+fn file_findings(input: &Input, findings: &mut Vec<Finding>) {
+    let data = &input.data;
+    let path = input.path.as_path();
+    let mut spans = data.spans.iter();
+    let mut gap: Option<u64> = None;
+    let fragment_absent = |r: &Summary| {
+        r.repaired.is_some().then(|| {
+            let d = "fragment not present".into();
+            finding(K::TornWriteRepaired, path, Some(r.line), Some(r.seq), d)
+        })
+    };
+    for item in &data.items {
+        let at = Some(item.line);
+        match &item.content {
+            LineContent::Invalid(e) | LineContent::Unparsable(e) => {
+                let k = e.finding_kind().expect("decoder finding");
+                findings.push(finding(k, path, at, e.seq(), e.to_string()));
+            }
+            LineContent::Fragment if !input.native => {
+                let d = "fragment line in shipped input".into();
+                findings.push(finding(K::Unparsable, path, at, None, d));
+            }
+            LineContent::Records(range) if !input.native => {
+                findings.extend(
+                    data.records[range.clone()]
+                        .iter()
+                        .filter_map(fragment_absent),
+                );
+            }
+            _ => {}
+        }
+        if !input.native {
+            continue;
+        }
+        match &item.content {
+            LineContent::Fragment | LineContent::Unparsable(_) => {
+                gap.get_or_insert(item.line);
+            }
+            LineContent::Records(range) => {
+                let r = &data.records[range.start];
+                if gap.take().is_none() {
+                    findings.extend(fragment_absent(r));
+                    continue;
+                }
+                let s = spans.next().expect("span");
+                let got = r.repaired;
+                let (kind, detail) = if got == Some(s.digest) {
+                    (K::TornWrite, format!("{} gap bytes attested", s.len))
+                } else {
+                    let got = got.map_or_else(|| "none".into(), |d| digest_string(&d));
+                    (
+                        K::RepairMismatch,
+                        format!("expected {}, got {}", digest_string(&s.digest), got),
+                    )
+                };
+                findings.push(finding(kind, path, at, Some(r.seq), detail));
+            }
+            LineContent::Invalid(_) if gap.take().is_some() => {
+                let s = spans.next().expect("span");
+                let d = format!("unattested gap digest {}", digest_string(&s.digest));
+                findings.push(finding(K::RepairMismatch, path, at, None, d));
+            }
+            _ => {}
+        }
+    }
+    if let Some(line) = gap {
+        let s = spans.next().expect("trailing span");
+        let d = format!(
+            "trailing gap of {} bytes, digest {}",
+            s.len,
+            digest_string(&s.digest)
+        );
+        findings.push(finding(K::TornWrite, path, Some(line), None, d));
+    }
+}
+
 pub(super) fn check(collection: Collection, trail: [u8; 16]) -> Report {
     let mut findings = Vec::new();
     let mut groups: BTreeMap<u64, Vec<Located<'_>>> = BTreeMap::new();
     for input in &collection.inputs {
-        for item in &input.data.items {
-            let error = match &item.content {
-                LineContent::Invalid(e) | LineContent::Unparsable(e) => Some(e),
-                // Located candidates and their unchanged span bytes remain in
-                // collection for #13 V3b's fragment conditions 1 and 3.
-                LineContent::Fragment | LineContent::Records(_) => None,
-            };
-            if let Some(error) = error {
-                findings.push(finding(
-                    error.finding_kind().expect("decoder finding"),
-                    &input.path,
-                    Some(item.line),
-                    None,
-                    error.to_string(),
-                ));
-            }
-        }
+        file_findings(input, &mut findings);
         if input.native
             && input
                 .data
