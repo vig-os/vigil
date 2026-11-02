@@ -1,6 +1,11 @@
 //! Offline verifier results. The engine and entry points follow in #13 V3.
 use super::FindingKind;
 use std::path::{Path, PathBuf};
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the verifier engine, #13 V3a-2")
+)]
+mod input;
 mod lines;
 
 /// Severity of a finding produced by the offline verifier (#13).

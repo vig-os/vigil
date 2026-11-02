@@ -1,24 +1,20 @@
 //! Physical lines and maximal non-record spans; fragment context follows in V3.
+use super::super::format::validation::MAX_PAYLOAD_BYTES;
 use super::super::{
     AuditError, Record, gap_hasher,
     lines::{Line, classify},
 };
-use std::ops::Range;
+use std::{
+    io::{self, BufRead},
+    ops::Range,
+};
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the verifier engine, #13 V3")
-)]
 pub(crate) enum Content {
     Records(Vec<Record>),
     Invalid(AuditError),
     Unparsable(AuditError),
     Fragment,
 }
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the verifier engine, #13 V3")
-)]
 pub(crate) struct Item {
     pub(crate) bytes: Range<usize>,
     pub(crate) line: u64,
@@ -32,47 +28,101 @@ pub(crate) struct Span {
     pub(crate) digest: [u8; 32],
 }
 
-/// Reads one segment; offsets include each physical line's terminating LF.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the verifier engine, #13 V3")
-)]
-pub(crate) fn read(bytes: &[u8], seg: u32) -> (Vec<Item>, Vec<Span>) {
-    let mut offset = 0;
-    let items: Vec<_> = bytes
-        .split_inclusive(|b| *b == b'\n')
-        .enumerate()
-        .map(|(line, bytes)| {
-            let start = offset;
-            offset += bytes.len();
-            let content = match classify(bytes) {
-                Line::Record(Ok(records)) => Content::Records(records),
-                Line::Record(Err(error)) => Content::Invalid(error),
-                Line::Unparsable(error) => Content::Unparsable(error),
-                Line::Fragment => Content::Fragment,
-            };
-            Item {
-                bytes: start..offset,
-                line: line as u64 + 1,
-                content,
+/// Streams physical lines with bounded buffering, including over-cap lines.
+/// The visitor consumes decoded records before the next line is read. Gap
+/// bytes are hashed as they arrive; no raw file or oversized suffix is retained.
+pub(crate) fn stream(
+    mut reader: impl BufRead,
+    seg: u32,
+    mut visit: impl FnMut(Item),
+) -> io::Result<Vec<Span>> {
+    let mut spans = Vec::new();
+    let (mut offset, mut line, mut after) = (0, 0, u64::MAX);
+    let mut gap = gap_hasher();
+    let mut gap_len = 0;
+    loop {
+        let start = offset;
+        let mut bytes = Vec::new();
+        let mut line_hash = gap.clone();
+        loop {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                break;
             }
-        })
-        .collect();
-    let boundaries: Vec<_> = items
-        .iter()
-        .filter_map(|item| match &item.content {
-            Content::Records(records) => {
-                Some((item.bytes.clone(), records.last().map(|r| r.context.seq)))
+            let take = available
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(available.len(), |i| i + 1);
+            let chunk = &available[..take];
+            line_hash.update(chunk);
+            let keep = take.min((MAX_PAYLOAD_BYTES + 2).saturating_sub(bytes.len()));
+            bytes.extend_from_slice(&chunk[..keep]);
+            let ended = chunk.last() == Some(&b'\n');
+            offset += take;
+            reader.consume(take);
+            if ended {
+                break;
             }
-            Content::Invalid(_) => Some((item.bytes.clone(), None)),
-            _ => None,
-        })
-        .collect();
-    let spans = assemble(bytes, seg, &boundaries);
+        }
+        if start == offset {
+            break;
+        }
+        line += 1;
+        let content = match classify(&bytes) {
+            Line::Record(Ok(records)) => Content::Records(records),
+            Line::Record(Err(error)) => Content::Invalid(error),
+            Line::Unparsable(error) => Content::Unparsable(error),
+            Line::Fragment => Content::Fragment,
+        };
+        if matches!(content, Content::Records(_) | Content::Invalid(_)) {
+            if gap_len != 0 {
+                spans.push(Span {
+                    seg,
+                    after,
+                    len: gap_len,
+                    digest: *gap.finalize().as_bytes(),
+                });
+            }
+            gap = gap_hasher();
+            gap_len = 0;
+            if let Content::Records(records) = &content {
+                after = records
+                    .last()
+                    .expect("decoded batch is nonempty")
+                    .context
+                    .seq;
+            }
+        } else {
+            gap = line_hash;
+            gap_len += (offset - start) as u64;
+        }
+        visit(Item {
+            bytes: start..offset,
+            line,
+            content,
+        });
+    }
+    if gap_len != 0 {
+        spans.push(Span {
+            seg,
+            after,
+            len: gap_len,
+            digest: *gap.finalize().as_bytes(),
+        });
+    }
+    Ok(spans)
+}
+
+/// In-memory adapter retained for the V2 golden vectors.
+#[cfg(test)]
+fn read(bytes: &[u8], seg: u32) -> (Vec<Item>, Vec<Span>) {
+    let mut items = Vec::new();
+    let spans = stream(bytes, seg, |item| items.push(item)).unwrap();
     (items, spans)
 }
 
 /// Shared assembly also supports the ADR's fixed-length record stand-ins.
+#[cfg(test)]
 fn assemble(bytes: &[u8], seg: u32, records: &[(Range<usize>, Option<u64>)]) -> Vec<Span> {
     let mut spans = Vec::new();
     let mut end = 0;
@@ -87,6 +137,7 @@ fn assemble(bytes: &[u8], seg: u32, records: &[(Range<usize>, Option<u64>)]) -> 
     append_span(&mut spans, bytes, seg, after, end..bytes.len());
     spans
 }
+#[cfg(test)]
 fn append_span(spans: &mut Vec<Span>, bytes: &[u8], seg: u32, after: u64, range: Range<usize>) {
     if range.is_empty() {
         return;
@@ -104,7 +155,7 @@ fn append_span(spans: &mut Vec<Span>, bytes: &[u8], seg: u32, after: u64, range:
 /// Callers supply ranges in ascending sequence order and spans in segment/byte order.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the verifier engine, #13 V3")
+    expect(dead_code, reason = "consumed by run verification, #13 V4")
 )]
 pub(crate) fn run_digest(ranges: &[(u64, u64)], spans: &[Span]) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
