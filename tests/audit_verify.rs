@@ -215,10 +215,15 @@ fn reversed_shipped_files_and_batches_have_same_findings_and_physical_lines() {
     assert_eq!(forward.findings(), reverse.findings());
     assert_eq!(forward.records(), 1);
     assert_eq!(kinds(&forward, K::DuplicateRecord).len(), 1);
+    assert_eq!(kinds(&forward, K::DuplicateRecord)[0].line(), Some(2));
     let bad = kinds(&forward, K::Unparsable);
     assert_eq!(bad[0].file(), Some(a.as_path()));
     assert_eq!(bad[0].line(), Some(1));
-    let invalid = dir.put("invalid-batch", "\n{\"a\":1,\"a\":1}\n");
+    batch["resourceLogs"][0]["scopeLogs"][0]["logRecords"][1]["attributes"][0]["value"]["intValue"] =
+        "2".into();
+    let invalid = dir.put("invalid-batch", format!("!\n{batch}\n{}\n", entry()));
     let report = verifier.verify_files([invalid]).unwrap();
-    assert_eq!(kinds(&report, K::InvalidField)[0].line(), Some(2));
+    assert_eq!(kinds(&report, K::UnknownVersion)[0].line(), Some(2));
+    assert_eq!(report.records(), 1); // The valid member in the failed batch never leaks.
+    assert_eq!(kinds(&report, K::DuplicateRecord).len(), 0);
 }
