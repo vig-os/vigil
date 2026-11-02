@@ -1,0 +1,247 @@
+[
+  {
+    "justification": "ADR-0004 decisions 1, 2, 3, 5 and 6: lifecycle and composition",
+    "items": {
+      "vigil": "mod",
+      "vigil::Config": "struct",
+      "vigil::Config::console": "fn",
+      "vigil::Config::default_filter": "fn",
+      "vigil::Config::dir": "fn",
+      "vigil::Config::filter_env": "fn",
+      "vigil::Config::init": "fn",
+      "vigil::Config::layer": "fn",
+      "vigil::Config::max_bytes": "fn",
+      "vigil::Config::new": "fn",
+      "vigil::Config::queue_size": "fn",
+      "vigil::Config::retention": "fn",
+      "vigil::Config::revision": "fn",
+      "vigil::Config::version": "fn",
+      "vigil::Console": "enum",
+      "vigil::Console::Off": "variant",
+      "vigil::Console::Stderr": "variant",
+      "vigil::FlushError": "struct",
+      "vigil::FlushError::fmt": "fn",
+      "vigil::FlushError::kind": "fn",
+      "vigil::FlushError::lost": "fn",
+      "vigil::FlushError::source": "fn",
+      "vigil::FlushErrorKind": "enum",
+      "vigil::FlushErrorKind::DataLost": "variant",
+      "vigil::FlushErrorKind::Failed": "variant",
+      "vigil::FlushErrorKind::Timeout": "variant",
+      "vigil::Guard": "struct",
+      "vigil::Guard::dir": "fn",
+      "vigil::Guard::drop": "fn",
+      "vigil::Guard::flush": "fn",
+      "vigil::Guard::shutdown": "fn",
+      "vigil::Guard::shutdown_with_timeout": "fn",
+      "vigil::InitError": "struct",
+      "vigil::InitError::fmt": "fn",
+      "vigil::InitError::kind": "fn",
+      "vigil::InitError::source": "fn",
+      "vigil::InitErrorKind": "enum",
+      "vigil::InitErrorKind::AlreadyRunning": "variant",
+      "vigil::InitErrorKind::ForeignSubscriber": "variant",
+      "vigil::InitErrorKind::InvalidFilter": "variant",
+      "vigil::InitErrorKind::InvalidServiceName": "variant",
+      "vigil::Signal": "enum",
+      "vigil::Signal::Logs": "variant",
+      "vigil::Signal::Metrics": "variant",
+      "vigil::Signal::Traces": "variant",
+      "vigil::VERSION": "const",
+      "vigil::init": "fn"
+    }
+  },
+  {
+    "justification": "ADR-0004 decision 6 and ADR-0002 decision 15: rotating files and readers",
+    "items": {
+      "vigil::rotate": "mod",
+      "vigil::rotate::RotatingFile": "struct",
+      "vigil::rotate::RotatingFile::append": "fn",
+      "vigil::rotate::RotatingFile::fmt": "fn",
+      "vigil::rotate::RotatingFile::open": "fn",
+      "vigil::rotate::RotationConfig": "struct",
+      "vigil::rotate::RotationConfig::default": "fn",
+      "vigil::rotate::RotationConfig::max_bytes": "fn",
+      "vigil::rotate::RotationConfig::retention": "fn",
+      "vigil::rotate::find_newest": "fn",
+      "vigil::rotate::read_since": "fn",
+      "vigil::rotate::segments": "fn",
+      "vigil::rotate::segments_since": "fn"
+    }
+  },
+  {
+    "justification": "ADR-0005 decisions 4, 7 and 9; #12 format primitives: audit entries, hashes, MMR and signatures",
+    "items": {
+      "vigil::audit": "mod",
+      "vigil::audit::AuditError": "struct",
+      "vigil::audit::AuditError::fmt": "fn",
+      "vigil::audit::AuditError::kind": "fn",
+      "vigil::audit::AuditErrorKind": "enum",
+      "vigil::audit::AuditErrorKind::CorruptTrail": "variant",
+      "vigil::audit::AuditErrorKind::HeadMismatch": "variant",
+      "vigil::audit::AuditErrorKind::InvalidConfig": "variant",
+      "vigil::audit::AuditErrorKind::InvalidEntry": "variant",
+      "vigil::audit::AuditErrorKind::Io": "variant",
+      "vigil::audit::AuditErrorKind::MissingTrail": "variant",
+      "vigil::audit::AuditErrorKind::Poisoned": "variant",
+      "vigil::audit::AuditErrorKind::Signer": "variant",
+      "vigil::audit::AuditErrorKind::TooLarge": "variant",
+      "vigil::audit::AuditErrorKind::TrailExists": "variant",
+      "vigil::audit::Entry": "struct",
+      "vigil::audit::Entry::after": "fn",
+      "vigil::audit::Entry::before": "fn",
+      "vigil::audit::Entry::details": "fn",
+      "vigil::audit::Entry::new": "fn",
+      "vigil::audit::Entry::reason": "fn",
+      "vigil::audit::Signer": "trait",
+      "vigil::audit::Signer::public_key": "fn",
+      "vigil::audit::Signer::sign": "fn",
+      "vigil::audit::SignerError": "struct",
+      "vigil::audit::SignerError::fmt": "fn",
+      "vigil::audit::SignerError::new": "fn",
+      "vigil::audit::Value": "enum",
+      "vigil::audit::Value::Digest": "variant",
+      "vigil::audit::Value::Text": "variant",
+      "vigil::audit::Value::digest_of": "fn"
+    }
+  },
+  {
+    "justification": "ADR-0005 decisions 3, 4, 7 and 9; #11/#12 B1 strict decoding, checkpoint anchors and typed verifier findings",
+    "items": {
+      "vigil::audit::AuditError::finding_kind": "fn",
+      "vigil::audit::Checkpoint": "struct",
+      "vigil::audit::Checkpoint::hash": "fn",
+      "vigil::audit::Checkpoint::key_id": "fn",
+      "vigil::audit::Checkpoint::line": "fn",
+      "vigil::audit::Checkpoint::mmr_root": "fn",
+      "vigil::audit::Checkpoint::mmr_size": "fn",
+      "vigil::audit::Checkpoint::parse": "fn",
+      "vigil::audit::Checkpoint::seq": "fn",
+      "vigil::audit::FindingKind": "enum",
+      "vigil::audit::FindingKind::HashMismatch": "variant",
+      "vigil::audit::FindingKind::InvalidField": "variant",
+      "vigil::audit::FindingKind::MissingField": "variant",
+      "vigil::audit::FindingKind::UnknownField": "variant",
+      "vigil::audit::FindingKind::UnknownVersion": "variant",
+      "vigil::audit::FindingKind::Unparsable": "variant"
+    }
+  },
+  {
+    "justification": "ADR-0005 decision 13 (l.~874), ADR-0004 d6: public audit writer surface",
+    "items": {
+      "vigil::audit::AuditConfig": "struct",
+      "vigil::audit::AuditConfig::new": "fn",
+      "vigil::audit::AuditConfig::dir": "fn",
+      "vigil::audit::AuditConfig::max_bytes": "fn",
+      "vigil::audit::AuditConfig::checkpoint_every": "fn",
+      "vigil::audit::AuditConfig::checkpoint_interval": "fn",
+      "vigil::audit::AuditConfig::mirror_to_logs": "fn",
+      "vigil::audit::AuditConfig::expect_head": "fn",
+      "vigil::audit::AuditConfig::create": "fn",
+      "vigil::audit::AuditConfig::open": "fn",
+      "vigil::audit::AuditTrail": "struct",
+      "vigil::audit::AuditTrail::fmt": "fn",
+      "vigil::audit::AuditTrail::record": "fn",
+      "vigil::audit::AuditTrail::checkpoint": "fn",
+      "vigil::audit::AuditTrail::close": "fn",
+      "vigil::audit::AuditTrail::dir": "fn",
+      "vigil::audit::AuditTrail::trail": "fn",
+      "vigil::audit::Receipt": "struct",
+      "vigil::audit::Receipt::trail": "fn",
+      "vigil::audit::Receipt::seq": "fn",
+      "vigil::audit::Receipt::hash": "fn",
+      "vigil::audit::Receipt::hash_string": "fn",
+      "vigil::audit::Receipt::unsigned_records": "fn"
+    }
+  },
+  {
+    "justification": "ADR-0003 decisions 5 and 9 (A4 l.~75), ADR-0004 l.~351",
+    "items": {
+      "vigil::Config::metrics": "fn",
+      "vigil::Config::metrics_interval": "fn"
+    }
+  },
+  {
+    "justification": "ADR-0003 decision 5 and ADR-0004 decision 6: trace signal builder switch",
+    "items": {
+      "vigil::Config::traces": "fn"
+    }
+  },
+  {
+    "justification": "ADR-0005 decision 13, ADR-0004 d1",
+    "items": {
+      "vigil::audit::KeyFileSigner": "struct",
+      "vigil::audit::KeyFileSigner::load": "fn",
+      "vigil::audit::KeyFileSigner::public_key": "fn",
+      "vigil::audit::KeyFileSigner::sign": "fn",
+      "vigil::audit::KeyFileSigner::fmt": "fn",
+      "vigil::audit::keygen": "fn"
+    }
+  },
+  {
+    "justification": "ADR-0005 decision 9 and decision 13 amended by amendment 8: exact-head operator rotation and checkpoint",
+    "items": {
+      "vigil::audit::AuditConfig::rotate": "fn",
+      "vigil::audit::AuditConfig::checkpoint": "fn"
+    }
+  },
+  {
+    "justification": "ADR-0004 decision 8: metrics facade (instruments, constructors, recording, scope macro and attribute conversions); decision 5 and brief ruling 6: Debug, Clone and PartialEq for Scope and Value",
+    "items": {
+      "vigil::metrics": "mod",
+      "vigil::metrics::Counter": "struct",
+      "vigil::metrics::Counter::add": "fn",
+      "vigil::metrics::Counter::new": "fn",
+      "vigil::metrics::Counter::with_description": "fn",
+      "vigil::metrics::Counter::with_unit": "fn",
+      "vigil::metrics::CounterF64": "struct",
+      "vigil::metrics::CounterF64::add": "fn",
+      "vigil::metrics::CounterF64::new": "fn",
+      "vigil::metrics::CounterF64::with_description": "fn",
+      "vigil::metrics::CounterF64::with_unit": "fn",
+      "vigil::metrics::Gauge": "struct",
+      "vigil::metrics::Gauge::new": "fn",
+      "vigil::metrics::Gauge::record": "fn",
+      "vigil::metrics::Gauge::with_description": "fn",
+      "vigil::metrics::Gauge::with_unit": "fn",
+      "vigil::metrics::Histogram": "struct",
+      "vigil::metrics::Histogram::new": "fn",
+      "vigil::metrics::Histogram::record": "fn",
+      "vigil::metrics::Histogram::with_boundaries": "fn",
+      "vigil::metrics::Histogram::with_description": "fn",
+      "vigil::metrics::Histogram::with_unit": "fn",
+      "vigil::metrics::Scope": "struct",
+      "vigil::metrics::Scope::clone": "fn",
+      "vigil::metrics::Scope::eq": "fn",
+      "vigil::metrics::Scope::fmt": "fn",
+      "vigil::metrics::Scope::new": "fn",
+      "vigil::metrics::UpDownCounter": "struct",
+      "vigil::metrics::UpDownCounter::add": "fn",
+      "vigil::metrics::UpDownCounter::new": "fn",
+      "vigil::metrics::UpDownCounter::with_description": "fn",
+      "vigil::metrics::UpDownCounter::with_unit": "fn",
+      "vigil::metrics::Value": "enum",
+      "vigil::metrics::Value::Bool": "variant",
+      "vigil::metrics::Value::F64": "variant",
+      "vigil::metrics::Value::I64": "variant",
+      "vigil::metrics::Value::Str": "variant",
+      "vigil::metrics::Value::clone": "fn",
+      "vigil::metrics::Value::eq": "fn",
+      "vigil::metrics::Value::fmt": "fn",
+      "vigil::metrics::Value::from": "fn",
+      "vigil::scope": "macro"
+    }
+  },
+  {
+    "justification": "ADR-0005 decisions 8 and 13, amendment 11 (ruling 138-d1): pre-1.0 AuditConfig::resume returns the opening Checkpoint; no AuditErrorKind changes",
+    "items": {
+      "vigil::audit::AuditConfig::resume": "fn"
+    }
+  },
+  {
+    "justification": "ADR-0005 amendment 12, OQ11: stable checkpoint listing for the operator CLI (#13 C2)",
+    "items": {
+      "vigil::audit::checkpoints": "fn"
+    }
+  }
+]

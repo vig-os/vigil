@@ -1,0 +1,2 @@
+# Keep concurrent changelog additions; review ordering and duplicates after merging.
+CHANGELOG.md merge=union

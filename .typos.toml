@@ -21,3 +21,7 @@ passt = "passt"
 tatus = "tatus"
 fnd = "fnd"
 mis = "mis"
+
+[default.extend-identifiers]
+# rustix uses the POSIX write-only open flag name.
+WRONLY = "WRONLY"

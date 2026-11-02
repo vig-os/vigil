@@ -52,6 +52,10 @@ data/
 #   /scratch/
 #   /secrets.local.yaml
 
+# Ignore generated failure seeds: minimized invariant examples are kept as reviewed tests.
+**/*.proptest-regressions
+/proptest-regressions/
+
 # flake-hooks opt-in (#1092): the generated .pre-commit-config.yaml is a
 # /nix/store symlink — never commit it.
 .pre-commit-config.yaml

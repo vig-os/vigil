@@ -30,24 +30,68 @@ on:  # yamllint disable-line rule:truthy
 permissions:
   contents: read
 
+# The train supplies the bare X.Y.Z version. Only the release branch is bumped;
+# dev keeps the last released version until the train's release merges back.
 jobs:
   extension:
-    name: Prepare Extension Hook (Default No-op)
+    name: Set release crate version
     runs-on: ubuntu-26.04
     steps:
-      - name: Default extension summary
+      - name: Generate Commit App Token
+        id: commit_app_token
+        if: ${{ !inputs.dry_run }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3
+        with:
+          client-id: ${{ secrets.COMMIT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.COMMIT_APP_PRIVATE_KEY }}
+
+      - name: Checkout release branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.release_branch }}
+          persist-credentials: false
+
+      - name: Verify post-freeze head
+        env:
+          BRANCH_SHA: ${{ inputs.branch_sha }}
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BRANCH_SHA"
+          test "$RELEASE_BRANCH" = "release/$VERSION"
+
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: direnv
+
+      - name: Validate and set crate version
+        id: version
         env:
           VERSION: ${{ inputs.version }}
-          RELEASE_BRANCH: ${{ inputs.release_branch }}
-          BRANCH_SHA: ${{ inputs.branch_sha }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          echo "No prepare-release extension configured."
-          echo "Version: $VERSION"
-          echo "Release branch: $RELEASE_BRANCH"
-          echo "Branch head SHA: $BRANCH_SHA"
-          echo "Dry-run: $DRY_RUN"
-          echo "Replace this file to prepare the release branch before the PR"
-          echo "opens (e.g. rebuild + commit a generated artifact). A real"
-          echo "extension must honor dry-run (no writes) and may push to"
-          echo "$RELEASE_BRANCH via the COMMIT_APP token (secrets: inherit)."
+          set -euo pipefail
+          args=()
+          if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          python3 -I scripts/set_crate_version.py "$VERSION" "${args[@]}"
+          git diff --stat
+          changed=$(git diff --name-only)
+          if [ -n "$changed" ]; then
+            test "$changed" = "$(printf 'Cargo.lock\nCargo.toml')"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          printf 'chore(release): set crate version to %s\n' "$VERSION" > "$RUNNER_TEMP/release-message"
+          validate-commit-msg "$RUNNER_TEMP/release-message"
+
+      - name: Commit crate version to release branch via API
+        if: ${{ !inputs.dry_run && steps.version.outputs.changed == 'true' }}
+        uses: vig-os/commit-action@7ba7e1ae17547813e708d4cc6a771a09f978f724  # v0.3.3
+        env:
+          GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TARGET_BRANCH: refs/heads/${{ inputs.release_branch }}
+          MAX_ATTEMPTS: "1"
+          COMMIT_MESSAGE: 'chore(release): set crate version to ${{ inputs.version }}'
+          FILE_PATHS: Cargo.toml,Cargo.lock
