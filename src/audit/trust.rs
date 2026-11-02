@@ -87,18 +87,10 @@ impl TrustPolicy {
         validate(parse(text)?)
     }
     /// Whether the policy pins this trail id.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the verifier, #13 V3/V5")
-    )]
     pub(crate) fn pinned(&self, id: &[u8; 16]) -> bool {
         self.sections.contains_key(id)
     }
     /// Iterates pinned ids in byte order.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the verifier, #13 V3/V5")
-    )]
     pub(crate) fn trail_ids(&self) -> impl Iterator<Item = &[u8; 16]> {
         self.sections.keys()
     }

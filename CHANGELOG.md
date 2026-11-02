@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add collecting audit `verify` and `Verifier` entry points with pinned trail selection and basic chain checks; the verifier remains incomplete pending #13 V3b–V8/R10 and C1. Refs #13.
+
 - Add offline audit verifier result types and its internal line and span layer; the verifier itself follows in #13 V3. Refs #13.
 
 - Audit `TrustPolicy`, built in code or parsed from a trust file, with validated trail pins and revocation bounds. Refs #13.

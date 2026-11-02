@@ -15,7 +15,7 @@
 //! Before 1.0 they may change in any release; from 1.0, in any minor.
 
 mod verify;
-pub use verify::{Finding, Report, Severity};
+pub use verify::{Finding, Report, Severity, Verifier, verify};
 mod trust;
 pub use trust::{TrailTrust, TrustPolicy, TrustPolicyBuilder};
 mod attributes;

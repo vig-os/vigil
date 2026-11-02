@@ -28,9 +28,11 @@ pub(super) struct Summary {
     pub(super) hash: [u8; 32],
     pub(super) previous: [u8; 32],
     pub(super) time: u64,
+    #[cfg_attr(not(test), expect(dead_code, reason = "located context for #13 V3b"))]
     pub(super) repaired: Option<[u8; 32]>,
     pub(super) checkpoint: Option<CheckpointFields>,
     // Only reserved records need text for #13 V3b resume/fragment context.
+    #[cfg_attr(not(test), expect(dead_code, reason = "located context for #13 V3b"))]
     pub(super) operator: Option<Operator>,
     pub(super) line: u64,
 }
@@ -65,6 +67,7 @@ impl Summary {
 
 pub(super) enum LineContent {
     /// Indices into physical-order summaries, for native neighbour context.
+    #[cfg_attr(not(test), expect(dead_code, reason = "located context for #13 V3b"))]
     Records(Range<usize>),
     Invalid(AuditError),
     Unparsable(AuditError),
@@ -72,6 +75,7 @@ pub(super) enum LineContent {
     Fragment,
 }
 pub(super) struct LineItem {
+    #[cfg_attr(not(test), expect(dead_code, reason = "located context for #13 V3b"))]
     pub(super) bytes: Range<usize>,
     pub(super) line: u64,
     pub(super) content: LineContent,

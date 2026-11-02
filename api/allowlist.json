@@ -390,5 +390,18 @@
       "vigil::audit::Severity::Info": "variant",
       "vigil::audit::Severity::Warning": "variant"
     }
+  },
+  {
+    "justification": "ADR-0005 decisions 11/13, amendment 12 \u00a719.2: collecting verifier entry points (#13 V3a-2)",
+    "items": {
+      "vigil::audit::verify": "fn",
+      "vigil::audit::Verifier": "struct",
+      "vigil::audit::Verifier::new": "fn",
+      "vigil::audit::Verifier::trail": "fn",
+      "vigil::audit::Verifier::verify_dir": "fn",
+      "vigil::audit::Verifier::verify_files": "fn",
+      "vigil::audit::Verifier::clone": "fn",
+      "vigil::audit::Verifier::fmt": "fn"
+    }
   }
 ]
