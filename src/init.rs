@@ -705,6 +705,7 @@ pub struct Config {
     queue_size: Option<usize>,
     retention: Option<Option<Duration>>,
     max_segments: Option<Option<usize>>,
+    max_total_bytes: Option<Option<u64>>,
     signal_rotations: [SignalRotation; 3],
     version: Option<String>,
     revision: Option<String>,
@@ -732,6 +733,7 @@ impl Config {
             queue_size: None,
             retention: None,
             max_segments: None,
+            max_total_bytes: None,
             signal_rotations: std::array::from_fn(|_| SignalRotation::new()),
             version: None,
             revision: None,
@@ -845,6 +847,18 @@ impl Config {
     #[must_use]
     pub fn max_segments(mut self, segments: Option<usize>) -> Self {
         self.max_segments = Some(segments);
+        self
+    }
+
+    /// Cap total telemetry bytes after age and count pruning. `None` is unlimited;
+    /// `Some(0)` deletes every rotated segment. Overrides `VIGIL_MAX_TOTAL_BYTES`,
+    /// including explicit `None`. Environment retention days zero keeps everything.
+    /// Live files reserve their size limits or actual lengths, including a pending
+    /// write; audit files never count. Deletion orders stamps across signals, then
+    /// signal names and integer counters; clock steps can weaken chronological order.
+    #[must_use]
+    pub fn max_total_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.max_total_bytes = Some(bytes);
         self
     }
 
@@ -1063,6 +1077,7 @@ impl Config {
         let rotation = resolve_rotation(
             self.max_bytes,
             self.max_segments,
+            self.max_total_bytes,
             self.retention,
             self.signal_rotations,
         );
@@ -1441,11 +1456,13 @@ impl LoggerProvider for NamedProvider {
 fn resolve_rotation(
     max_bytes: Option<u64>,
     max_segments: Option<Option<usize>>,
+    max_total_bytes: Option<Option<u64>>,
     retention: Option<Option<Duration>>,
     overrides: [SignalRotation; 3],
 ) -> RotationConfig {
     let bytes = max_bytes.or_else(|| number("VIGIL_MAX_BYTES", 1));
     let count = max_segments.or_else(|| number("VIGIL_MAX_SEGMENTS", 0).map(|n| Some(n as usize)));
+    let total = max_total_bytes.or_else(|| number("VIGIL_MAX_TOTAL_BYTES", 0).map(Some));
     let age = retention.or_else(|| retention_days("VIGIL_RETENTION_DAYS"));
     let mut rotation = RotationConfig::default();
     if let Some(value) = bytes {
@@ -1453,6 +1470,9 @@ fn resolve_rotation(
     }
     if let Some(value) = count {
         rotation = rotation.max_segments(value);
+    }
+    if let Some(value) = total {
+        rotation = rotation.max_total_bytes(value);
     }
     if let Some(value) = age {
         rotation = rotation.retention(value);
@@ -3750,7 +3770,7 @@ mod traces_wiring_tests {
 #[cfg(test)]
 mod count_config_tests {
     use super::*;
-    const KEYS: [&str; 12] = [
+    const KEYS: [&str; 13] = [
         "VIGIL_MAX_BYTES",
         "VIGIL_MAX_SEGMENTS",
         "VIGIL_RETENTION_DAYS",
@@ -3763,6 +3783,7 @@ mod count_config_tests {
         "VIGIL_LOGS_RETENTION_DAYS",
         "VIGIL_METRICS_RETENTION_DAYS",
         "VIGIL_TRACES_RETENTION_DAYS",
+        "VIGIL_MAX_TOTAL_BYTES",
     ];
     fn empty_overrides() -> [SignalRotation; 3] {
         std::array::from_fn(|_| SignalRotation::new())
@@ -3807,22 +3828,22 @@ mod count_config_tests {
         }
         // Default, global environment, signal environment, global builder, signal builder.
         files(
-            resolve_rotation(None, None, Some(None), empty_overrides()),
+            resolve_rotation(None, None, None, Some(None), empty_overrides()),
             [1, 2, 3],
         );
         files(
-            resolve_rotation(None, Some(Some(4)), Some(None), empty_overrides()),
+            resolve_rotation(None, Some(Some(4)), None, Some(None), empty_overrides()),
             [4, 4, 4],
         );
         let mut overrides = empty_overrides();
         overrides[0] = SignalRotation::new().max_segments(Some(0));
         files(
-            resolve_rotation(None, Some(Some(4)), Some(None), overrides),
+            resolve_rotation(None, Some(Some(4)), None, Some(None), overrides),
             [0, 4, 4],
         );
         // Explicit None is a builder value, too.
         files(
-            resolve_rotation(None, Some(None), Some(None), empty_overrides()),
+            resolve_rotation(None, Some(None), None, Some(None), empty_overrides()),
             [5, 5, 5],
         );
     }
@@ -3831,7 +3852,7 @@ mod count_config_tests {
     fn precedence_applies_to_size_count_and_age() {
         let name = "init::count_config_tests::precedence_applies_to_size_count_and_age";
         let mut vars: Vec<_> = KEYS.iter().map(|key| (*key, "11")).collect();
-        for key in &KEYS[3..] {
+        for key in &KEYS[3..12] {
             vars.push((*key, "3"));
         }
         if crate::test_child_with_env(name, "VIGIL_COUNT_CONFIG_CHILD", &vars).is_some() {
@@ -3849,13 +3870,15 @@ mod count_config_tests {
             let actual = resolve_rotation(
                 builder.then_some(7),
                 builder.then_some(Some(7)),
+                None,
                 builder.then_some(days(7)),
                 overrides,
             );
             let mut expected = RotationConfig::default()
                 .max_bytes(globals)
                 .max_segments(Some(globals as usize))
-                .retention(days(globals));
+                .retention(days(globals))
+                .max_total_bytes(Some(11));
             expected = expected.signal(
                 Signal::Logs,
                 SignalRotation::new()
@@ -3873,6 +3896,31 @@ mod count_config_tests {
                 );
             }
             assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn total_builder_some_and_explicit_none_beat_environment() {
+        let name =
+            "init::count_config_tests::total_builder_some_and_explicit_none_beat_environment";
+        let mut vars: Vec<_> = KEYS.iter().map(|key| (*key, "")).collect();
+        vars.push(("VIGIL_MAX_TOTAL_BYTES", "7"));
+        if crate::test_child_with_env(name, "VIGIL_COUNT_CONFIG_CHILD", &vars).is_some() {
+            return;
+        }
+        for (value, expected) in [
+            (None, Some(7)),
+            (Some(None), None),
+            (Some(Some(0)), Some(0)),
+            (Some(Some(9)), Some(9)),
+        ] {
+            let builder = match value {
+                Some(value) => Config::new("total-config").max_total_bytes(value),
+                None => Config::new("total-config"),
+            };
+            let actual =
+                resolve_rotation(None, None, builder.max_total_bytes, None, empty_overrides());
+            assert_eq!(actual, RotationConfig::default().max_total_bytes(expected));
         }
     }
 
@@ -3910,7 +3958,7 @@ mod count_config_tests {
         }
         let key = env::var("VIGIL_COUNT_TEST_KEY").unwrap();
         let value = env::var("VIGIL_COUNT_TEST_VALUE").unwrap();
-        let resolved = resolve_rotation(None, None, None, empty_overrides());
+        let resolved = resolve_rotation(None, None, None, None, empty_overrides());
         // Compare full resolved configurations, including defaults, without parsing twice.
         let valid = value == "7" || (value == "0" && !key.ends_with("MAX_BYTES"));
         let mut expected = RotationConfig::default();
@@ -3918,6 +3966,8 @@ mod count_config_tests {
             let n = value.parse::<u64>().unwrap();
             if key == "VIGIL_MAX_SEGMENTS" {
                 expected = expected.max_segments(Some(n as usize));
+            } else if key == "VIGIL_MAX_TOTAL_BYTES" {
+                expected = expected.max_total_bytes(Some(n));
             } else {
                 let signal = if key.contains("LOGS") {
                     Signal::Logs
