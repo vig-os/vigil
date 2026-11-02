@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Audit `RecordSchema`, `RecordSchemaBuilder` and `ActionFields`, with canonical schema parsing and a domain-separated BLAKE3 digest (ADR-0005 amendment 13 §20.4–§20.5, #164 CP1b).
+
 - Audit `FieldKind` and `AttrValue`, with the shared canonical attribute block format (ADR-0005 amendment 13 §20.3–§20.5, #164 CP1a).
 - Per-signal size, count and age rotation overrides and an optional rotated-segment count cap, with environment equivalents and oldest-first pruning at open and after rotation ([#163](https://github.com/vig-os/vigil/issues/163), slice 163a).
 

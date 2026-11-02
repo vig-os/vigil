@@ -1,0 +1,3 @@
+{
+  "text": "vigil.schema.v1 sample\naction a object=id\nfield a required id\nfield b optional int:-1:1\nfield c required digest:sha256\naction b object=token\nfield x optional enum:no,yes\naction c object=int:-9223372036854775808:9223372036854775807"
+}

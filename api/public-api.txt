@@ -28,6 +28,13 @@ pub vigil::audit::Value::Digest([u8; 32])
 pub vigil::audit::Value::Text(alloc::string::String)
 impl vigil::audit::Value
 pub fn vigil::audit::Value::digest_of(bytes: &[u8]) -> Self
+pub struct vigil::audit::ActionFields
+impl vigil::audit::ActionFields
+pub fn vigil::audit::ActionFields::action(self, action: impl core::convert::Into<alloc::string::String>) -> vigil::audit::ActionFields
+pub fn vigil::audit::ActionFields::build(self) -> core::result::Result<vigil::audit::RecordSchema, vigil::audit::AuditError>
+pub fn vigil::audit::ActionFields::object(self, kind: vigil::audit::FieldKind) -> Self
+pub fn vigil::audit::ActionFields::optional(self, key: impl core::convert::Into<alloc::string::String>, kind: vigil::audit::FieldKind) -> Self
+pub fn vigil::audit::ActionFields::required(self, key: impl core::convert::Into<alloc::string::String>, kind: vigil::audit::FieldKind) -> Self
 pub struct vigil::audit::AuditConfig
 impl vigil::audit::AuditConfig
 pub fn vigil::audit::AuditConfig::checkpoint(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>, expect_head: (u64, [u8; 32])) -> core::result::Result<vigil::audit::Checkpoint, vigil::audit::AuditError>
@@ -96,6 +103,18 @@ pub fn vigil::audit::Receipt::hash_string(&self) -> alloc::string::String
 pub fn vigil::audit::Receipt::seq(&self) -> u64
 pub fn vigil::audit::Receipt::trail(&self) -> [u8; 16]
 pub fn vigil::audit::Receipt::unsigned_records(&self) -> u64
+pub struct vigil::audit::RecordSchema
+impl vigil::audit::RecordSchema
+pub fn vigil::audit::RecordSchema::builder(name: impl core::convert::Into<alloc::string::String>) -> vigil::audit::RecordSchemaBuilder
+pub fn vigil::audit::RecordSchema::digest(&self) -> [u8; 32]
+pub fn vigil::audit::RecordSchema::digest_string(&self) -> alloc::string::String
+pub fn vigil::audit::RecordSchema::name(&self) -> &str
+pub fn vigil::audit::RecordSchema::parse(text: &str) -> core::result::Result<Self, vigil::audit::AuditError>
+pub fn vigil::audit::RecordSchema::text(&self) -> &str
+pub struct vigil::audit::RecordSchemaBuilder
+impl vigil::audit::RecordSchemaBuilder
+pub fn vigil::audit::RecordSchemaBuilder::action(self, action: impl core::convert::Into<alloc::string::String>) -> vigil::audit::ActionFields
+pub fn vigil::audit::RecordSchemaBuilder::build(self) -> core::result::Result<vigil::audit::RecordSchema, vigil::audit::AuditError>
 pub struct vigil::audit::SignerError(_)
 impl vigil::audit::SignerError
 pub fn vigil::audit::SignerError::new(detail: impl core::convert::Into<alloc::string::String>) -> Self

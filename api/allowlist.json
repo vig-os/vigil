@@ -273,5 +273,33 @@
       "vigil::rotate::SignalRotation::max_segments": "fn",
       "vigil::rotate::SignalRotation::retention": "fn"
     }
+  },
+  {
+    "justification": "ADR-0005 amendment 13 \u00a720.5: validated record schema, canonical text, digest and builders (#164 CP1b)",
+    "items": {
+      "vigil::audit::RecordSchema": "struct",
+      "vigil::audit::RecordSchema::builder": "fn",
+      "vigil::audit::RecordSchema::parse": "fn",
+      "vigil::audit::RecordSchema::name": "fn",
+      "vigil::audit::RecordSchema::text": "fn",
+      "vigil::audit::RecordSchema::digest": "fn",
+      "vigil::audit::RecordSchema::digest_string": "fn",
+      "vigil::audit::RecordSchema::clone": "fn",
+      "vigil::audit::RecordSchema::fmt": "fn",
+      "vigil::audit::RecordSchema::eq": "fn",
+      "vigil::audit::RecordSchemaBuilder": "struct",
+      "vigil::audit::RecordSchemaBuilder::action": "fn",
+      "vigil::audit::RecordSchemaBuilder::build": "fn",
+      "vigil::audit::RecordSchemaBuilder::clone": "fn",
+      "vigil::audit::RecordSchemaBuilder::fmt": "fn",
+      "vigil::audit::ActionFields": "struct",
+      "vigil::audit::ActionFields::object": "fn",
+      "vigil::audit::ActionFields::required": "fn",
+      "vigil::audit::ActionFields::optional": "fn",
+      "vigil::audit::ActionFields::action": "fn",
+      "vigil::audit::ActionFields::build": "fn",
+      "vigil::audit::ActionFields::clone": "fn",
+      "vigil::audit::ActionFields::fmt": "fn"
+    }
   }
 ]
