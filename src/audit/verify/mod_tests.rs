@@ -129,3 +129,94 @@ fn adr_severity_table_and_validity() {
         }
     }
 }
+
+#[test]
+fn is_strict_valid_rejects_errors_warnings_uncovered_tail_and_unreconciled() {
+    use FindingKind::*;
+    // Pure info-only report with no UncoveredTail: strict valid.
+    let r = Report::new([0; 16], 0, None, None, None, vec![finding(ReceiptWaived)]);
+    assert!(r.is_strict_valid());
+    // Any error: not strict valid.
+    for k in [
+        ChainBroken,
+        SeqGap,
+        HashMismatch,
+        RepairMismatch,
+        SegmentStructure,
+        TrailMismatch,
+    ] {
+        let r = Report::new([0; 16], 0, None, None, None, vec![finding(k)]);
+        assert!(!r.is_strict_valid(), "{k:?} should fail strict");
+        assert!(!r.is_valid(), "{k:?} should fail is_valid too");
+    }
+    // Any warning: not strict valid.
+    for k in [TornWrite, Resumed, ClockWentBackwards, DuplicateRecord] {
+        let r = Report::new([0; 16], 0, None, None, None, vec![finding(k)]);
+        assert!(!r.is_strict_valid(), "{k:?} should fail strict");
+    }
+    // UncoveredTail without exemption fails; with exemption passes.
+    let r = Report::new([0; 16], 0, None, None, None, vec![finding(UncoveredTail)]);
+    assert!(!r.is_strict_valid());
+    assert!(r.clone().with_tail_exempt(true).is_strict_valid());
+    // Unreconciled is never exempted.
+    let r = Report::new([0; 16], 0, None, None, None, vec![finding(Unreconciled)])
+        .with_tail_exempt(true);
+    assert!(!r.is_strict_valid());
+    // An Accepted info plus a surviving warning: still not strict.
+    let r = Report::new(
+        [0; 16],
+        0,
+        None,
+        None,
+        None,
+        vec![finding(Accepted).accepted(TornWrite), finding(TornWrite)],
+    );
+    assert!(!r.is_strict_valid());
+}
+
+#[test]
+fn first_broken_link_returns_first_error_in_ruled_order() {
+    use FindingKind::*;
+    // Inserted later but earlier in iteration order wins (findings vector is
+    // the already-sorted result produced by engine::check).
+    let later_inserted_but_earlier = Finding::new(
+        ChainBroken,
+        Some(PathBuf::from("a")),
+        Some(1),
+        Some(0),
+        "earlier".into(),
+    );
+    let earlier_inserted_but_later = Finding::new(
+        HashMismatch,
+        Some(PathBuf::from("a")),
+        Some(5),
+        Some(10),
+        "later".into(),
+    );
+    // Simulate the engine's ruled order: by seq ascending.
+    let findings = vec![
+        later_inserted_but_earlier.clone(),
+        earlier_inserted_but_later.clone(),
+    ];
+    let r = Report::new([0; 16], 0, None, None, None, findings);
+    assert_eq!(
+        r.first_broken_link().unwrap().detail(),
+        "earlier",
+        "first_broken_link follows the vector's existing order"
+    );
+    // Warnings and infos are ignored.
+    let r = Report::new(
+        [0; 16],
+        0,
+        None,
+        None,
+        None,
+        vec![finding(TornWrite), finding(UncoveredTail), finding(Resumed)],
+    );
+    assert!(r.first_broken_link().is_none());
+    // Every error kind qualifies: SegmentStructure, SeqConflict, etc.
+    for k in [SegmentStructure, SeqConflict, RepairMismatch, TrailMismatch] {
+        let r = Report::new([0; 16], 0, None, None, None, vec![finding(k)]);
+        assert_eq!(r.first_broken_link().unwrap().kind(), k);
+    }
+}

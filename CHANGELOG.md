@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add verifier fragment-run context (condition 3 per run; a run whose "after" record does not link raises `Unparsable` per line while the gap bytes, lengths and digests stay V2-identical), the "no crash outcome" mark on a trailing `TornWrite` whose successor native input opens cleanly without a resume, a plain `Resumed` warning for every `vigil.audit.resume` record (once per `(seq, hash)`, attributed to the native copy; a malformed declaration leaves any `SeqGap`), an `UncoveredTail` info spanning every record until V5 trusts a checkpoint, and the `Report::is_strict_valid` and `Report::first_broken_link` predicates (ADR-0005 §19.3 Accepted). Refs #13.
 - Add collecting audit `verify` and `Verifier` entry points with pinned trail selection, basic chain checks and pessimistic gap reporting (native `TornWrite`/`RepairMismatch`/trailing `TornWrite`, shipped-fragment `Unparsable`, and `TornWriteRepaired` for an attestation with no preceding fragment); the verifier remains incomplete pending #13 V3b–V8/R10 and C1. Refs #13.
 
 - Add offline audit verifier result types and its internal line and span layer; the verifier itself follows in #13 V3. Refs #13.

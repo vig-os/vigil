@@ -168,7 +168,9 @@ pub struct vigil::audit::Report
 impl vigil::audit::Report
 pub fn vigil::audit::Report::covered_through(&self) -> core::option::Option<u64>
 pub fn vigil::audit::Report::findings(&self) -> &[vigil::audit::Finding]
+pub fn vigil::audit::Report::first_broken_link(&self) -> core::option::Option<&vigil::audit::Finding>
 pub fn vigil::audit::Report::first_seq(&self) -> core::option::Option<u64>
+pub fn vigil::audit::Report::is_strict_valid(&self) -> bool
 pub fn vigil::audit::Report::is_valid(&self) -> bool
 pub fn vigil::audit::Report::last_seq(&self) -> core::option::Option<u64>
 pub fn vigil::audit::Report::records(&self) -> u64
