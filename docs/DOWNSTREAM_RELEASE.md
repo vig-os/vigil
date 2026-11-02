@@ -69,7 +69,7 @@ A format is literal SemVer pre-release text (`[0-9A-Za-z.-]`) plus two optional 
 | `beta` | `1.2.3-beta` (no counter: one candidate per version) |
 | `nightly.{YYYYMMDD}.{N}` | `1.2.3-nightly.20260928.1`, … |
 
-The expansion must be a valid SemVer pre-release (non-empty dot-separated identifiers, no leading zeros), and `{N}` must not touch a digit or `{YYYYMMDD}` (`rc1{N}`, `{YYYYMMDD}{N}` run the counter into another number, so versions stop sorting), or the run fails before anything is written. A format without `{N}` yields **one candidate per version** (per day for a dated format): dispatching it again when that tag exists is refused. Add `{N}` to cut more. From the command line: `just publish-candidate 0.1.0 "" false -f 'pre-release-format=alpha.{N}'`.
+The expansion must be a valid SemVer pre-release (non-empty dot-separated identifiers, no leading zeros), and `{N}` must not touch a digit or `{YYYYMMDD}` (`rc1{N}`, `{YYYYMMDD}{N}` run the counter into another number, so versions stop sorting), or the run fails before anything is written. A format without `{N}` yields **one candidate per version** (per day for a dated format): dispatching it again when that tag exists is refused. Add `{N}` to cut more. From the command line: `just publish-candidate 0.2.0 "" false -f 'pre-release-format=alpha.{N}'`.
 
 **Prefer a dotted counter where SemVer tooling orders your versions** (Cargo/crates.io, PyPI, npm): SemVer compares alphanumeric identifiers lexically, so it ranks `rc10` **below** `rc9`, while `rc.10` sorts correctly above `rc.9`. The train itself orders a format's own tags by their counter, so `rc{N}` keeps working for the train either way.
 
