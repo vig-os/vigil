@@ -547,6 +547,11 @@ Decisions and their evidence are recorded as ADRs in [`docs/adr/`](docs/adr/): [
 
 ## Development
 
+The `just publish-candidate 0.1.0 …` command in the devkit-managed
+[release workflow guide](docs/DOWNSTREAM_RELEASE.md#pre-release-format)
+is a generic prerelease-format example. For this release, use `0.2.0` as the
+version argument. The guide's format examples do not select vigil's current version.
+
 Enter the pinned environment with `direnv allow` (or `nix develop`). `nix flake check` runs fmt, clippy, tests, doctests and docs. Changes enter through PRs to `dev`; `main` only takes release PRs.
 
 ### Supply chain
