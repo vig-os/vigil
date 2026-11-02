@@ -214,7 +214,9 @@ Each item exists because a named need requires it. Anything not listed is not pu
 | `FlushError`, `FlushErrorKind`, `Signal` | Matchable flush/shutdown failures and per-signal loss counts (R10, ADR-0003 decision 3). |
 | `VERSION` | Lets consumers print which vigil version wrote their telemetry in diagnostics and bug reports; a `&str` constant costs nothing to keep stable. |
 | `rotate::RotatingFile` (`open`, `append`, `Debug`) | The multi-process-safe rotating writer, which no other crate provides ([ADR-0002](0002-rotation-and-retention.md), Context); the audit sink (#11) and consumers with their own signal files use it. |
-| `rotate::RotationConfig` (`Default`, `max_bytes`, `retention`) | Configures `RotatingFile`. |
+| `rotate::RotationConfig` (`Default`, `max_bytes`, `retention`, `max_segments`, `signal`) | Configures `RotatingFile`; count caps and per-signal replacement overrides (ADR-0002 amendment 3, slice 163a). |
+| `rotate::SignalRotation` (`Default`, `new`, `max_bytes`, `max_segments`, `retention`) | Inherited versus explicit size, count and age overrides; private fields, `Debug + Clone + PartialEq + Eq`, `Send + Sync`, not `Copy` (ADR-0002 decision 18). |
+| `Config::max_segments`, `Config::signal_rotation` | Additive count caps and per-signal overrides, with builder-before-environment precedence (ADR-0002 decisions 16, 18 and 23). |
 | `rotate::segments`, `segments_since`, `read_since`, `find_newest` | Reading vigil's files back (ADR-0002 decision 15): flock's log tail, the audit verifier (#13). |
 | `metrics::{Counter, CounterF64, UpDownCounter, Histogram, Gauge, Value, Scope}`, `scope!` (feature `metrics`) | The only way to record metrics without naming an opentelemetry type (decision 8, probes M1/M2). |
 | `propagation::{inject, set_parent, trace_id, HeaderSet, HeaderGet, PropagationError, PropagationErrorKind}` (feature `traces`) | Cross-process trace context without `OpenTelemetrySpanExt` (decision 9, probe P1). |

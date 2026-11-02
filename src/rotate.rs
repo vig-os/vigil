@@ -1,4 +1,4 @@
-//! Multi-process-safe size rotation and age retention for JSON Lines files.
+//! Multi-process-safe size rotation, age retention and segment counts for JSON Lines files.
 //!
 //! [`RotatingFile`] appends whole lines to `<dir>/<signal>.jsonl`. Once a line
 //! would push the file past [`RotationConfig::max_bytes`], the file is renamed
@@ -54,8 +54,8 @@
 //! * Reaching the same directory through a bind mount (or any second path to
 //!   it) gives two lock handles in one process, which block each other; that
 //!   is unsupported. Use one canonical path.
-//! * Segments whose mtime is in the future are not pruned until that time has
-//!   passed.
+//! * Age pruning keeps segments whose mtime is in the future. A count cap
+//!   can still delete them; age runs before count.
 //! * Readers never lock. They retry when segment names or the live inode
 //!   change during a read, up to eight copies. On exhaustion, `read_since`
 //!   returns only its last rotated-file prefix, excluding the live tail;
@@ -103,6 +103,9 @@ const MIB: u64 = 1024 * 1024;
 const DAY: u64 = 86_400;
 
 /// When to rotate a [`RotatingFile`] and how long to keep rotated segments.
+/// Age pruning runs before the count cap at open and after rotation. Count zero
+/// keeps no rotated segments; size zero clamps to one; environment retention days
+/// zero keeps everything. See [`crate::Config::signal_rotation`] for precedence.
 ///
 /// ```
 /// use std::time::Duration;
@@ -120,9 +123,98 @@ pub struct RotationConfig {
     /// Delete rotated segments whose last write is older than this. `None`
     /// keeps every segment. Default: 90 days.
     retention: Option<Duration>,
+    max_segments: Option<usize>,
+    signals: [SignalRotation; 3],
+}
+
+/// Per-signal size, count and age overrides; unset fields inherit their global value.
+/// Explicit `None` disables an age or count limit. Age pruning precedes count pruning.
+/// Size zero clamps to one; count zero keeps no rotated segments. Environment
+/// retention days zero keeps everything, unlike `Some(Duration::ZERO)`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SignalRotation {
+    pub(crate) max_bytes: Option<u64>,
+    pub(crate) max_segments: Option<Option<usize>>,
+    pub(crate) retention: Option<Option<Duration>>,
+}
+
+impl SignalRotation {
+    /// Inherit every limit. Config builders take precedence over environment values.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override size; zero clamps to one. See [`Config::signal_rotation`](crate::Config::signal_rotation)
+    /// for environment names and precedence.
+    #[must_use]
+    pub fn max_bytes(mut self, bytes: u64) -> Self {
+        self.max_bytes = Some(bytes.max(1));
+        self
+    }
+
+    /// Override count; `None` is unlimited, `Some(0)` keeps no rotated segments.
+    /// Age runs first. Retention days zero in the environment instead keeps everything.
+    #[must_use]
+    pub fn max_segments(mut self, segments: Option<usize>) -> Self {
+        self.max_segments = Some(segments);
+        self
+    }
+
+    /// Override age; `None` disables age pruning, `Some(Duration::ZERO)` expires
+    /// past-mtime segments, before count pruning. Environment retention days zero
+    /// instead disables age pruning. Count zero also deletes future-mtime segments.
+    #[must_use]
+    pub fn retention(mut self, retention: Option<Duration>) -> Self {
+        self.retention = Some(retention);
+        self
+    }
+}
+
+pub(crate) fn signal_index(signal: crate::Signal) -> usize {
+    match signal {
+        crate::Signal::Logs => 0,
+        crate::Signal::Metrics => 1,
+        crate::Signal::Traces => 2,
+    }
 }
 
 impl RotationConfig {
+    /// Limit rotated segments per signal, after age pruning; `None` is unlimited
+    /// (default), `Some(0)` keeps none. Live and audit files survive. Environment
+    /// retention days zero instead keeps everything. Config builders beat environment.
+    #[must_use]
+    pub fn max_segments(mut self, segments: Option<usize>) -> Self {
+        self.max_segments = segments;
+        self
+    }
+
+    /// Replace one signal's overrides. Unset fields inherit global limits;
+    /// custom signal names always use globals. Age pruning precedes count pruning.
+    /// See [`crate::Config::signal_rotation`] for environment precedence and zero rules.
+    #[must_use]
+    pub fn signal(mut self, signal: crate::Signal, rotation: SignalRotation) -> Self {
+        self.signals[signal_index(signal)] = rotation;
+        self
+    }
+
+    // Shared resolution for writers and the future directory-wide budget.
+    fn resolved(mut self, signal: &str) -> Self {
+        let index = match signal {
+            "logs" => Some(signal_index(crate::Signal::Logs)),
+            "metrics" => Some(signal_index(crate::Signal::Metrics)),
+            "traces" => Some(signal_index(crate::Signal::Traces)),
+            _ => None,
+        };
+        if let Some(index) = index {
+            let overrides = &self.signals[index];
+            self.max_bytes = overrides.max_bytes.unwrap_or(self.max_bytes);
+            self.max_segments = overrides.max_segments.unwrap_or(self.max_segments);
+            self.retention = overrides.retention.unwrap_or(self.retention);
+        }
+        self
+    }
+
     /// Rotate before a write exceeds this many bytes (default 50 MiB).
     /// Zero clamps to one. A single larger line is written alone.
     #[must_use]
@@ -132,7 +224,8 @@ impl RotationConfig {
     }
 
     /// Keep rotated segments for this duration (default 90 days).
-    /// `None` keeps everything; `Some(Duration::ZERO)` prunes at the next prune.
+    /// `None` disables age pruning; `Some(Duration::ZERO)` expires past-mtime
+    /// segments at the next prune. Count pruning then applies independently.
     #[must_use]
     pub fn retention(mut self, retention: Option<Duration>) -> Self {
         self.retention = retention;
@@ -145,6 +238,8 @@ impl Default for RotationConfig {
         Self {
             max_bytes: 50 * MIB,
             retention: Some(Duration::from_secs(90 * DAY)),
+            max_segments: None,
+            signals: std::array::from_fn(|_| SignalRotation::default()),
         }
     }
 }
@@ -358,7 +453,7 @@ impl RotatingFile {
     }
 
     /// Open (creating as needed) the signal's directory (`0700`) and live file
-    /// (`0600`), and prune expired segments once.
+    /// (`0600`), and prune by age then count once.
     ///
     /// Opening the same directory again in this process (for this or another
     /// signal) shares the first open's directory lock instead of deadlocking on
@@ -382,13 +477,12 @@ impl RotatingFile {
         signal: &str,
         cfg: RotationConfig,
     ) -> io::Result<Self> {
+        let cfg = cfg.resolved(signal);
         let live_path = dir.join(format!("{signal}.jsonl"));
         let live = {
             let (handle, _unlock, _entered) = lock.lock_current(&dir)?;
             let live = Live::open(&handle, Path::new(&format!("{signal}.jsonl")), signal)?;
-            if let Some(keep) = cfg.retention {
-                prune_at(&handle, signal, keep);
-            }
+            prune_at(&handle, signal, &cfg, &dir);
             live
         };
         Ok(Self {
@@ -443,9 +537,7 @@ impl RotatingFile {
         if len > 0 && len.checked_add(need).is_none_or(|n| n > self.cfg.max_bytes) {
             rotate(&dir, &self.signal, &name)?;
             *live = Live::open(&dir, &name, &self.signal)?;
-            if let Some(keep) = self.cfg.retention {
-                prune_at(&dir, &self.signal, keep);
-            }
+            prune_at(&dir, &self.signal, &self.cfg, &self.dir);
         }
 
         let before = live.file.metadata()?.len();
@@ -823,7 +915,58 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 
 /// Delete rotated segments last written more than `keep` ago. Never touches
 /// the live or lock file; errors are ignored.
-fn prune_at(dir: &File, signal: &str, keep: Duration) {
+fn prune_at(dir: &File, signal: &str, cfg: &RotationConfig, path: &Path) {
+    prune_with(dir, signal, cfg, path, unlink_name);
+}
+
+static COUNT_WARNED: AtomicBool = AtomicBool::new(false);
+
+// Injection covers both age and count deletions, without changing production I/O.
+fn prune_with(
+    dir: &File,
+    signal: &str,
+    cfg: &RotationConfig,
+    path: &Path,
+    mut unlink: impl FnMut(&File, &Path) -> io::Result<()>,
+) {
+    if signal == "audit" || (cfg.retention.is_none() && cfg.max_segments.is_none()) {
+        return;
+    }
+    if let Some(keep) = cfg.retention {
+        prune_age(dir, signal, keep, &mut unlink);
+    }
+    let Some(limit) = cfg.max_segments else {
+        return;
+    };
+    let Ok(names) = rotated_names_at(dir, signal) else {
+        return;
+    };
+    let mut remaining = names.len();
+    for name in names {
+        if remaining <= limit {
+            break;
+        }
+        match unlink(dir, &name) {
+            Ok(()) => remaining -= 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => remaining -= 1,
+            Err(_) => {}
+        }
+    }
+    if remaining > limit && !COUNT_WARNED.swap(true, Ordering::Relaxed) {
+        let _ = writeln!(
+            io::stderr(),
+            "vigil: cannot meet max_segments={limit} in {}: {remaining} rotated segments remain",
+            path.display()
+        );
+    }
+}
+
+fn prune_age(
+    dir: &File,
+    signal: &str,
+    keep: Duration,
+    unlink: &mut impl FnMut(&File, &Path) -> io::Result<()>,
+) {
     let Ok(names) = rotated_names_at(dir, signal) else {
         return;
     };
@@ -843,7 +986,7 @@ fn prune_at(dir: &File, signal: &str, keep: Duration) {
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age > keep);
         if expired {
-            let _ = unlink_name(dir, &name);
+            let _ = unlink(dir, &name);
         }
     }
 }
@@ -1085,9 +1228,271 @@ mod tests {
         RotationConfig {
             max_bytes,
             retention: None,
+            ..RotationConfig::default()
         }
     }
 
+    fn count_fixture(label: &str) -> (PathBuf, Vec<PathBuf>) {
+        let dir = tmp(label);
+        fs::create_dir_all(&dir).unwrap();
+        let names = [
+            "20260101T000000.000000000Z",
+            "20260101T000000.000000000Z_000001",
+            "20260101T000000.000000000Z_1000000",
+        ];
+        let paths = names
+            .map(|stamp| dir.join(format!("logs-{stamp}.jsonl")))
+            .to_vec();
+        for path in &paths {
+            fs::write(path, "segment\n").unwrap();
+        }
+        (dir, paths)
+    }
+
+    #[test]
+    fn count_open_deletes_oldest_and_zero_preserves_live_and_audit() {
+        let (dir, paths) = count_fixture("count-open");
+        let protected = [
+            "audit.jsonl",
+            "audit-20260101T000000.000000000Z.jsonl",
+            ".audit-next.jsonl",
+            "foreign",
+            "metrics-20260101T000000.000000000Z.jsonl",
+        ];
+        for name in protected {
+            fs::write(dir.join(name), "protected").unwrap();
+        }
+        let base = RotationConfig::default().retention(None);
+        let writer = RotatingFile::open(&dir, "logs", base.clone().max_segments(Some(2))).unwrap();
+        assert!(!paths[0].exists());
+        assert!(paths[1].exists() && paths[2].exists());
+        writer.append(b"live").unwrap();
+        let _writer = RotatingFile::open(&dir, "logs", base.max_segments(Some(0))).unwrap();
+        assert!(paths.iter().all(|path| !path.exists()));
+        assert_eq!(fs::read(dir.join("logs.jsonl")).unwrap(), b"live\n");
+        for name in protected {
+            assert_eq!(fs::read(dir.join(name)).unwrap(), b"protected");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn count_runs_after_rotation() {
+        let dir = tmp("count-rotation");
+        let writer = RotatingFile::open(&dir, "logs", cfg(2).max_segments(Some(0))).unwrap();
+        writer.append(b"a").unwrap();
+        writer.append(b"b").unwrap();
+        assert_eq!(all_lines(&dir, "logs"), ["b"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn age_then_count_and_each_alone() {
+        for (age, count, survivors) in [
+            (true, true, vec![1]),
+            (true, false, vec![0, 1]),
+            (false, true, vec![2]),
+        ] {
+            let (dir, paths) = count_fixture("age-count");
+            // The newest name is old by mtime: age must remove it before count.
+            for (i, path) in paths.iter().enumerate() {
+                let mtime = if i == 2 {
+                    UNIX_EPOCH
+                } else {
+                    SystemTime::now() + Duration::from_secs(86_400)
+                };
+                File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_modified(mtime)
+                    .unwrap();
+            }
+            let cfg = cfg(100)
+                .retention(age.then_some(Duration::ZERO))
+                .max_segments(count.then_some(1));
+            let _writer = RotatingFile::open(&dir, "logs", cfg).unwrap();
+            let found: Vec<_> = paths
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| p.exists().then_some(i))
+                .collect();
+            assert_eq!(found, survivors);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn override_inheritance_replacement_equality_and_rotation_sizes() {
+        use crate::Signal::{Logs, Metrics};
+        fn send_sync<T: Send + Sync + Eq>() {}
+        send_sync::<RotationConfig>();
+        send_sync::<SignalRotation>();
+        // This inference becomes ambiguous if either type ever implements Copy.
+        trait NotCopy<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> NotCopy<()> for T {}
+        struct IfCopy;
+        impl<T: Copy> NotCopy<IfCopy> for T {}
+        let _ = <RotationConfig as NotCopy<_>>::check;
+        let _ = <SignalRotation as NotCopy<_>>::check;
+        let base = cfg(100).max_segments(Some(2));
+        let logs = SignalRotation::new()
+            .max_bytes(0)
+            .max_segments(None)
+            .retention(None);
+        let metrics = SignalRotation::new().max_bytes(10);
+        assert_eq!(
+            base.clone()
+                .signal(Logs, logs.clone())
+                .signal(Metrics, metrics.clone()),
+            base.clone()
+                .signal(Metrics, metrics)
+                .signal(Logs, logs.clone())
+        );
+        assert_eq!(
+            base.clone()
+                .signal(Logs, logs)
+                .signal(Logs, SignalRotation::new()),
+            base.clone().signal(Logs, SignalRotation::new())
+        );
+        let inherited = base
+            .clone()
+            .signal(Logs, SignalRotation::new())
+            .resolved("logs");
+        assert_eq!(inherited.max_segments, Some(2));
+        let explicit = base
+            .clone()
+            .signal(Logs, SignalRotation::new().max_segments(None))
+            .resolved("logs");
+        assert_eq!(explicit.max_segments, None);
+        assert_eq!(
+            base.clone()
+                .signal(Logs, SignalRotation::new().max_bytes(1))
+                .resolved("custom")
+                .max_bytes,
+            100
+        );
+        assert_eq!(cfg(100).max_bytes(0).max_bytes, 1);
+        assert_eq!(SignalRotation::new().max_bytes(0).max_bytes, Some(1));
+        let dir = tmp("signal-sizes");
+        let config = cfg(100).signal(Logs, SignalRotation::new().max_bytes(4));
+        for signal in ["logs", "metrics", "traces"] {
+            let writer = RotatingFile::open(&dir, signal, config.clone()).unwrap();
+            writer.append(b"aaa").unwrap();
+            writer.append(b"bbb").unwrap();
+            assert_eq!(
+                rotated_segments(&dir, signal).unwrap().len(),
+                usize::from(signal == "logs")
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn zero_age_keeps_future_but_zero_count_deletes_it() {
+        let (dir, paths) = count_fixture("future-count");
+        for path in &paths {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::now() + Duration::from_secs(86_400))
+                .unwrap();
+        }
+        let config = cfg(100).retention(Some(Duration::ZERO));
+        let _writer = RotatingFile::open(&dir, "logs", config.clone()).unwrap();
+        assert!(paths.iter().all(|p| p.exists()));
+        let _writer = RotatingFile::open(&dir, "logs", config.max_segments(Some(0))).unwrap();
+        assert!(paths.iter().all(|p| !p.exists()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn count_unlink_failure_compensates_silently_and_retries() {
+        let name = "rotate::tests::count_unlink_failure_compensates_silently_and_retries";
+        if let Some(output) = crate::test_child(name, "VIGIL_COUNT_CHILD") {
+            assert!(
+                output.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (dir, paths) = count_fixture("count-failure-met");
+        let handle = File::open(&dir).unwrap();
+        let config = cfg(100).max_segments(Some(1));
+        let mut attempted = Vec::new();
+        prune_with(&handle, "logs", &config, &dir, |fd, path| {
+            attempted.push(path.to_owned());
+            if path == paths[0].file_name().unwrap() {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                unlink_name(fd, path)
+            }
+        });
+        assert_eq!(attempted.len(), 3);
+        assert!(paths[0].exists());
+        assert!(!paths[1].exists() && !paths[2].exists());
+        prune_at(&handle, "logs", &config.max_segments(Some(0)), &dir);
+        assert!(!paths[0].exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn count_unmet_warns_once_and_retries() {
+        let name = "rotate::tests::count_unmet_warns_once_and_retries";
+        if let Some(output) = crate::test_child(name, "VIGIL_COUNT_CHILD") {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                stderr.matches("cannot meet max_segments=0").count(),
+                1,
+                "{stderr}"
+            );
+            assert!(stderr.contains("1 rotated segments remain"));
+            return;
+        }
+        let (dir, paths) = count_fixture("count-failure-unmet");
+        let handle = File::open(&dir).unwrap();
+        let config = cfg(100).max_segments(Some(0));
+        for _ in 0..2 {
+            prune_with(&handle, "logs", &config, &dir, |fd, path| {
+                if path == paths[0].file_name().unwrap() {
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                } else {
+                    unlink_name(fd, path)
+                }
+            });
+        }
+        assert!(paths[0].exists());
+        assert!(!paths[1].exists() && !paths[2].exists());
+        prune_at(&handle, "logs", &config, &dir);
+        assert!(!paths[0].exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn count_enoent_is_deleted() {
+        let (dir, paths) = count_fixture("count-enoent");
+        let handle = File::open(&dir).unwrap();
+        let mut attempts = 0;
+        prune_with(
+            &handle,
+            "logs",
+            &cfg(100).max_segments(Some(2)),
+            &dir,
+            |fd, path| {
+                attempts += 1;
+                unlink_name(fd, path).unwrap();
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            },
+        );
+        assert_eq!(attempts, 1);
+        assert!(!paths[0].exists());
+        assert!(paths[1].exists() && paths[2].exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
     fn all_lines(dir: &Path, signal: &str) -> Vec<String> {
         read_since(dir, signal, None).unwrap()
     }
@@ -1608,6 +2013,7 @@ mod tests {
         let old = RotationConfig {
             max_bytes: 1000,
             retention: Some(Duration::from_secs(90 * 86_400)),
+            ..RotationConfig::default()
         };
         let sigs = ["logs", "logs_2", "logs_2024"];
         let handles: Vec<_> = sigs
@@ -2501,6 +2907,7 @@ mod tests {
         let c = RotationConfig {
             max_bytes: 1000,
             retention: Some(Duration::from_secs(90 * 86_400)),
+            ..RotationConfig::default()
         };
         let _log = RotatingFile::open(&d, "s", c).unwrap();
         assert!(!old.exists());
@@ -2532,6 +2939,7 @@ mod tests {
         let c = RotationConfig {
             max_bytes: 10,
             retention: Some(Duration::from_secs(90 * 86_400)),
+            ..RotationConfig::default()
         };
         let log = RotatingFile::open(&d, "s", c).unwrap();
         let (old, fresh) = seed_old_and_fresh(&d);
