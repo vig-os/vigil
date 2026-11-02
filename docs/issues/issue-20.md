@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-10-09T14:07:47Z
-updated: 2026-10-16T15:08:21Z
+updated: 2026-11-02T05:22:26Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/vigil/issues/20
@@ -13,24 +13,21 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-18T00:53:40.556Z
+synced: 2026-11-02T13:59:42.688Z
 ---
 
 # [Issue 20]: [Dependency Dashboard](https://github.com/vig-os/vigil/issues/20)
 
 This issue lists Renovate updates and detected dependencies. Read the [Dependency Dashboard](https://docs.renovatebot.com/key-concepts/dashboard/) docs to learn more.<br>[View this repository on the Mend.io Web Portal](https://developer.mend.io/github/vig-os/vigil).
 
-## Awaiting Schedule
-
-The following updates are awaiting their schedule. To get an update now, click on a checkbox below.
-
- - [ ] <!-- unschedule-branch=renovate/actions-create-github-app-token-digest -->chore(deps): update actions/create-github-app-token digest to 64ab729
-
 ## Open
 
 The following updates have all been created. To force a retry/rebase of any, click on a checkbox below.
 
+ - [ ] <!-- rebase-branch=renovate/actions-create-github-app-token-digest -->[chore(deps): update actions/create-github-app-token digest to 64ab729](../pull/162)
  - [ ] <!-- rebase-branch=renovate/opentelemetry-rust-monorepo -->[build(cargo): update opentelemetry-rust monorepo to v0.33.1](../pull/94) (`opentelemetry`, `opentelemetry-appender-tracing`, `opentelemetry-proto`, `opentelemetry_sdk`)
+ - [ ] <!-- rebase-branch=renovate/log-0.x-lockfile -->[build(cargo): update rust crate log to v0.4.35](../pull/170)
+ - [ ] <!-- rebase-branch=renovate/rustix-1.x-lockfile -->[build(cargo): update rust crate rustix to v1.1.6](../pull/171)
  - [ ] <!-- rebase-branch=renovate/serde_json-1.x-lockfile -->[build(cargo): update rust crate serde_json to v1.0.154](../pull/95)
  - [ ] <!-- rebase-branch=renovate/base64-0.x -->[build(cargo): update rust crate base64 to 0.23](../pull/97)
  - [ ] <!-- rebase-branch=renovate/getrandom-0.x -->[build(cargo): update rust crate getrandom to 0.4](../pull/98)
@@ -56,19 +53,19 @@ The following updates have all been created. To force a retry/rebase of any, cli
  - `opentelemetry-proto 0.33` → [Updates: `0.33`]
  - `serde 1`
  - `serde_json 1` → [Updates: `1`]
- - `rustix 1.1.5`
+ - `rustix 1.1.5` → [Updates: `1.1.5`]
  - `opentelemetry-appender-tracing 0.33` → [Updates: `0.33`]
  - `tracing-opentelemetry 0.34`
  - `tracing 0.1`
  - `tracing-core 0.1`
  - `tracing-subscriber 0.3`
  - `tracing-log 0.2`
- - `rustix 1.1.5`
+ - `rustix 1.1.5` → [Updates: `1.1.5`]
  - `allocation-counter 0.8.1`
  - `flate2 1`
  - `criterion 0.8.2`
  - `proptest 1` → [Updates: `1`]
- - `log 0.4`
+ - `log 0.4` → [Updates: `0.4`]
 
 </details>
 
