@@ -271,7 +271,9 @@
       "vigil::rotate::SignalRotation::new": "fn",
       "vigil::rotate::SignalRotation::max_bytes": "fn",
       "vigil::rotate::SignalRotation::max_segments": "fn",
-      "vigil::rotate::SignalRotation::retention": "fn"
+      "vigil::rotate::SignalRotation::retention": "fn",
+      "vigil::Config::max_total_bytes": "fn",
+      "vigil::rotate::RotationConfig::max_total_bytes": "fn"
     }
   },
   {

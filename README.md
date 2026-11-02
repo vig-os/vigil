@@ -361,9 +361,17 @@ Rotation also supports `Config::max_segments(Some(k))` and
 `RotationConfig::max_segments(Some(k))`: at open and after rotation, age pruning
 runs first, then the oldest rotated segments of that signal are deleted until
 at most `k` remain. Live files, audit files and foreign files are preserved.
-The count cap defaults to `None` (unlimited); disk use is unbounded within the
+`Config::max_total_bytes(Some(t))` and `RotationConfig::max_total_bytes(Some(t))`
+then enforce one directory-wide telemetry budget, deleting by `(stamp, signal,
+integer counter)`. Clock steps can weaken chronological ordering across signals.
+Live files reserve `V_s = max(M_s, live_len + pending_len)` for the writing signal
+and `max(M_s, live_len)` for every other signal. Pending bytes include the newline
+and any repair byte. Pruning runs before an oversized write even into an empty
+live file. A total cap can evict all of a quiet signal's rotated history.
+Set both caps to bound directory size and the number of files listed per pass.
+Both caps default to `None` (unlimited); disk use is unbounded within the
 retention age by default. Failed deletions remain counted; pruning tries later
-segments and warns once per process if the count still exceeds the cap.
+segments and warns once per process per cap kind if a cap remains unmet, including when live reservations exceed the total cap.
 
 Use `Config::signal_rotation(Signal::Logs, SignalRotation::new().max_bytes(16 *
 1024 * 1024).max_segments(Some(4)))` (types in `vigil::rotate` and `vigil`) or
@@ -375,6 +383,7 @@ signal environment, global environment, default.
 | Setting | Global environment | Per-signal environment (`S` = `LOGS`, `METRICS`, `TRACES`) | Zero |
 |---|---|---|---|
 | Size | `VIGIL_MAX_BYTES` | `VIGIL_S_MAX_BYTES` | Builder clamps to 1; environment minimum is 1 |
+| Total bytes | `VIGIL_MAX_TOTAL_BYTES` | None | Prunes every rotated segment |
 | Rotated count | `VIGIL_MAX_SEGMENTS` | `VIGIL_S_MAX_SEGMENTS` | Keeps no rotated segments |
 | Age in days | `VIGIL_RETENTION_DAYS` | `VIGIL_S_RETENTION_DAYS` | Environment keeps everything; builder `Some(Duration::ZERO)` expires past-mtime segments |
 
@@ -387,15 +396,24 @@ build. Count zero deletes even future-mtime segments that age zero keeps.
 
 With a count cap `K_s` for every signal, visible telemetry lengths are bounded by
 `D_count = Σ_S (K_s + 1) · F_s`, where `F_s = max(M_s, l_s)` and `l_s` is the
-longest line including newline. Idle writer handles can retain unlinked segments:
+longest line including newline, and `S` contains telemetry signals with a live file.
+With a total cap `T`, `D_total = max(T, Σ_S V_s) ≤ max(T, Σ_S F_s)`;
+with both caps, `D = min(D_count, D_total)`. Without a count cap for every signal,
+only the total bound applies. With neither cap, visible bytes are unbounded
+within retention age. Idle writer handles can retain unlinked segments:
 `R = Σ_s W_s · max(M_s, l_s)` and `D_logical ≤ D + R`, counting writer instances
 across processes. For logs 16 MiB/4 segments, traces 32 MiB/4 and metrics 8 MiB/2
-(with lines below those sizes), visible bytes are at most 264 MiB and logical
+(with lines below those sizes), a 512 MiB total cap gives `D_total = max(512, 56) = 512 MiB`,
+so `D = min(264, 512) = 264 MiB`. Logical
 bytes at most `264 + 56·W` MiB for `W` processes using `init`. Insert your process
-count; additional writers each add their own allowance. These bounds assume
+count; additional writers each add their own allowance. Each cached handle retains at
+most one segment until that writer next appends, drops, or its process exits. These bounds assume
 consistent limits across writers and segments written under those size limits,
 and successful completed pruning. They count file lengths, excluding audit data,
-filesystem block rounding and metadata; see [ADR-0002 decision 22](docs/adr/0002-rotation-and-retention.md).
+filesystem block rounding and metadata. For volume sizing add `F · B`, where
+`F = |S| + Σ_S K_s + Σ_s W_s` is the live, rotated and retained file count and `B`
+is the filesystem block size, plus a metadata margin; preallocation and delayed
+allocation are not bounded. See [ADR-0002 decision 22](docs/adr/0002-rotation-and-retention.md).
 
 `Config::revision` or `VIGIL_VCS_REVISION` supplies the producer commit.
 Log storage initialization failures make logs fall back to stderr; metrics and traces
