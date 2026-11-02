@@ -670,13 +670,17 @@ for commands and exit codes, or `vigil-audit <command> --help` for command help.
 following synopsis (`verify` follows in #13 C1):
 
 ```text
+vigil-audit schema <file>
 vigil-audit keygen <keyfile>
 vigil-audit create --key <keyfile> --service <name> <dir>
 vigil-audit checkpoints <dir>
 vigil-audit checkpoint --key <keyfile> --expect-head <seq>:<hash> <dir>
-vigil-audit rotate --key <keyfile> --actor <who> --reason <why> --bound <seq>:<hash> --expect-head <seq>:<hash> <dir>
-vigil-audit resume --key <keyfile> --actor <who> --reason <why> --head <seq>:<hash> --lost-through <seq> <dir>
+vigil-audit rotate --key <keyfile> --actor <who> --reason <why> --bound <seq>:<hash> --expect-head <seq>:<hash> [--schema <file>] <dir>
+vigil-audit resume --key <keyfile> --actor <who> --reason <why> --head <seq>:<hash> --lost-through <seq> [--schema <file>] <dir>
 ```
+
+`schema` parses a canonical schema file and prints its `blake3:` digest line.
+Non-canonical or missing files exit 2.
 
 Hashes are `blake3:` followed by 64 lowercase hex digits. Keep expected heads
 outside the trail directory; use the highest sequence among all held receipts and
@@ -693,7 +697,8 @@ and close checkpoint, in sequence order. Receipts are `<seq> blake3:<hex>`;
 checkpoint lines preserve the on-disk JSON payload.
 
 `create` uses `--service`; records from `rotate`, `checkpoint` and `resume` use
-`service.name = "vigil-audit"`. `--actor` names the human. `create` and `resume`
+`service.name = "vigil-audit"`. `--actor` names the human; with `--schema` it must be an opaque operator id,
+and `--reason` a reference id (P8). `create` and `resume`
 explicitly close the handle before exit, so the printed close checkpoint is the
 clean-stop head. Successful outputs remain available if a later close fails.
 Exit codes are 0 for success, 2 for usage, `Io` or `InvalidConfig`, and 1 for other
@@ -1167,11 +1172,11 @@ A digest of erasable content must be a commitment: `H(salt ‖ content)` with a
 random salt of at least 128 bits, stored with the content in the erasable store
 and erased with it. A plain hash of guessable content permits dictionary attacks.
 
-Pass `--schema` on **every operator command of a typed trail**. In the library,
+Pass `--schema` to `vigil-audit rotate` and `vigil-audit resume` on every typed trail. In the library,
 set `AuditConfig::schema` for `rotate` and `resume`; their actor and reason must
 both be opaque ids (for example an operator id and a change-ticket id). Without
-a schema, operator free text is permitted and becomes permanent. The CLI's
-`--schema` support is planned for CP3, and verifier schema checks for CP4.
+a schema, operator free text is permitted and becomes permanent. The CLI supports `schema <file>` and `--schema <file>` on `rotate` and
+`resume`; verifier schema checks are planned for CP4.
 
 Erasing the external mapping, content and salts changes no trail bytes. Within
 trusted checkpoint coverage, externally held receipts and anchors, or verified

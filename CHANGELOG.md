@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `vigil-audit schema <file>` prints a canonical schema digest; optional `--schema <file>` on `rotate` and `resume` enforces opaque operator and reference ids (#164 CP3, #165).
+
 - Schema-checked audit writers with `Entry::attr`, `AuditConfig::schema`, fail-closed record and operator validation, and personal-data and erasure guidance (#164 CP2, #165).
 
 - Audit `RecordSchema`, `RecordSchemaBuilder` and `ActionFields`, with canonical schema parsing and a domain-separated BLAKE3 digest (ADR-0005 amendment 13 §20.4–§20.5, #164 CP1b).
