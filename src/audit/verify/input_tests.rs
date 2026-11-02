@@ -294,3 +294,64 @@ fn decoder_errors_and_fragments_remain_located() {
     assert_eq!(data.items[1].line, 2);
     assert_eq!(data.records[0].line, 3);
 }
+
+#[test]
+fn whole_batch_failure_is_one_located_decoder_item() {
+    let dir = Dir::new();
+    let bad = batch(&[line(9), line(2)]).replace("\"actor\"", "\"edited\"");
+    let path = dir.put("collector", format!("\n{bad}\n{}", line(10)));
+    let result = load(vec![path.clone()]);
+    assert_eq!(result.inputs[0].path, path);
+    let data = &result.inputs[0].data;
+    assert_eq!(data.items[1].line, 2);
+    let LineContent::Invalid(error) = &data.items[1].content else {
+        panic!("whole batch invalid")
+    };
+    assert_eq!(error.finding_kind(), Some(FindingKind::HashMismatch));
+    assert_eq!(data.records.len(), 1);
+    assert_eq!(data.records[0].seq, 10);
+    assert_eq!(data.records[0].line, 3);
+}
+
+#[test]
+fn checkpoint_operator_and_native_span_context_survives_compaction() {
+    let dir = Dir::new();
+    let fields = CheckpointFields::new(0, [6; 32], vec![], [7; 32], [8; 64]).unwrap();
+    let checkpoint = Record::checkpoint(
+        RecordContext::new([3; 16], 0, 55, "service", Record::genesis(&[3; 16])),
+        fields,
+    )
+    .unwrap();
+    let operator = Record::new_internal(
+        RecordContext::new([3; 16], 1, 56, "service", checkpoint.hash()),
+        Entry::new("operator", "vigil.audit.resume", "trail")
+            .reason("crash")
+            .details("pending resume context"),
+    )
+    .unwrap();
+    let bytes = [
+        crate::audit::sink::line(&checkpoint).unwrap(),
+        b"{\"seq\":\n".to_vec(),
+        crate::audit::sink::line(&operator).unwrap(),
+    ]
+    .concat();
+    dir.put(&format!("{STAMP}.jsonl"), &bytes);
+    dir.put("audit.jsonl", &bytes);
+    let result = load(vec![dir.0.clone()]);
+    for (index, input) in result.inputs.iter().enumerate() {
+        assert_eq!(input.data.spans[0].seg, index as u32);
+        assert_eq!(input.data.spans[0].after, 0);
+        let first = &input.data.records[0];
+        assert_eq!(first.hash, checkpoint.hash());
+        assert_eq!(first.checkpoint.as_ref().unwrap().key, [7; 32]);
+        assert_eq!(
+            input.data.records[1].operator.as_ref().unwrap(),
+            &(
+                "vigil.audit.resume".into(),
+                "operator".into(),
+                Some("crash".into()),
+                Some("pending resume context".into())
+            )
+        );
+    }
+}

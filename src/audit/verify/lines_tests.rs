@@ -204,3 +204,47 @@ fn ranges_digest_vectors() {
         run_digest(&[(9, 3), (4, 2)], &[])
     );
 }
+
+#[test]
+fn streaming_spans_ignore_buffer_boundaries_and_keep_over_cap_eof() {
+    use std::io::BufReader;
+    let record = GOLDEN.lines().next().unwrap();
+    let bytes = format!("{record}\n{{\"seq\":\nnot json\n{record}\n{{\"seq\":");
+    let expected = read(bytes.as_bytes(), 7).1;
+    for capacity in [1, 2, 7, 4096] {
+        let mut lines = Vec::new();
+        let spans = stream(
+            BufReader::with_capacity(capacity, bytes.as_bytes()),
+            7,
+            |item| lines.push(item.line),
+        )
+        .unwrap();
+        assert_eq!(spans, expected);
+        assert_eq!(lines, vec![1, 2, 3, 4, 5]);
+    }
+    for terminated in [false, true] {
+        let mut bytes = vec![b'{'; MAX_PAYLOAD_BYTES + 1];
+        if terminated {
+            bytes.push(b'\n');
+        }
+        let mut count = 0;
+        let spans = stream(BufReader::with_capacity(37, bytes.as_slice()), 2, |item| {
+            count += 1;
+            assert!(matches!(item.content, Content::Unparsable(_)));
+            assert_eq!(item.bytes, 0..bytes.len());
+        })
+        .unwrap();
+        assert_eq!(count, 1);
+        let mut hash = gap_hasher();
+        hash.update(&bytes);
+        assert_eq!(
+            spans,
+            vec![Span {
+                seg: 2,
+                after: u64::MAX,
+                len: bytes.len() as u64,
+                digest: *hash.finalize().as_bytes()
+            }]
+        );
+    }
+}
