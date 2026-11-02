@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.2.0] - TBD
+
+### Added
+
 - `vigil-audit schema <file>` prints a canonical schema digest; optional `--schema <file>` on `rotate` and `resume` enforces opaque operator and reference ids (#164 CP3, #165).
 
 - Schema-checked audit writers with `Entry::attr`, `AuditConfig::schema`, fail-closed record and operator validation, and personal-data and erasure guidance (#164 CP2, #165).
@@ -24,14 +38,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Audit record construction refuses caller-supplied `Entry::details` starting with the reserved `vigil.attrs.` prefix (`InvalidEntry`); decoding existing records is unchanged (#164 CP1a).
-
-### Deprecated
-
-### Removed
-
-### Fixed
-
-### Security
 
 ## [0.1.0](https://github.com/vig-os/vigil/releases/tag/0.1.0) - 2026-10-18
 
