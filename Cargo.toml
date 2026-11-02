@@ -28,7 +28,7 @@ audit = ["dep:blake3", "dep:ed25519-dalek", "dep:zeroize", "dep:base64", "rustix
 
 [dependencies]
 getrandom = { version = "0.3", default-features = false }
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 blake3 = { version = "1", optional = true, default-features = false, features = ["std", "pure"] }
 ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["std", "zeroize", "fast"] }
 zeroize = { version = "1", optional = true, default-features = false }
