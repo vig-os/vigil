@@ -308,9 +308,10 @@ fn mid_file_fragment_without_attestation_is_repair_mismatch_and_not_valid() {
         .unwrap()
         + first_lf
         + 1;
+    let junk: &[u8] = b"{\"resourceLogs\":[\n";
     let mut after = Vec::new();
     after.extend_from_slice(&before[..=second_lf]);
-    after.extend_from_slice(b"{\"resourceLogs\":[\n");
+    after.extend_from_slice(junk);
     after.extend_from_slice(&before[second_lf + 1..]);
     fx.write(&after);
     let report = verify(&fx.trail, &fx.trust).unwrap();
@@ -322,6 +323,56 @@ fn mid_file_fragment_without_attestation_is_repair_mismatch_and_not_valid() {
         "{:?}",
         report.findings()
     );
+    // The finding points at the gap's physical line, not the following record.
+    assert_eq!(rm[0].line(), Some(3));
+    let d = rm[0].detail();
+    assert!(d.contains("lines 3..=3"), "{d}");
+    assert!(d.contains(&format!("({} bytes)", junk.len())), "{d}");
+    assert!(d.contains("attested at line 4"), "{d}");
+}
+
+#[test]
+fn junk_as_first_line_attributes_gap_to_line_one() {
+    let dir = Dir::new();
+    let valid = entry();
+    let junk = "{\"resourceLogs\":[\n";
+    let native = dir.0.join("audit.jsonl");
+    fs::write(&native, format!("{junk}{valid}\n")).unwrap();
+    let report = verify(&dir.0, &policy()).unwrap();
+    let rm = kinds(&report, K::RepairMismatch);
+    assert_eq!(rm.len(), 1, "{:?}", report.findings());
+    assert_eq!(rm[0].line(), Some(1));
+    let d = rm[0].detail();
+    assert!(d.contains("lines 1..=1"), "{d}");
+    assert!(d.contains(&format!("({} bytes)", junk.len())), "{d}");
+    assert!(d.contains("attested at line 2"), "{d}");
+}
+
+#[test]
+fn multi_line_gap_covers_every_junk_line_in_the_range() {
+    let fx = Written::new(3);
+    let before = fx.read();
+    let first_lf = before.iter().position(|&b| b == b'\n').unwrap();
+    let second_lf = before[first_lf + 1..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap()
+        + first_lf
+        + 1;
+    let junk: &[u8] = b"{\"resourceLogs\":[\n{\"resourceLogs\":[\n";
+    let mut after = Vec::new();
+    after.extend_from_slice(&before[..=second_lf]);
+    after.extend_from_slice(junk);
+    after.extend_from_slice(&before[second_lf + 1..]);
+    fx.write(&after);
+    let report = verify(&fx.trail, &fx.trust).unwrap();
+    let rm = kinds(&report, K::RepairMismatch);
+    assert_eq!(rm.len(), 1, "{:?}", report.findings());
+    assert_eq!(rm[0].line(), Some(3));
+    let d = rm[0].detail();
+    assert!(d.contains("lines 3..=4"), "{d}");
+    assert!(d.contains(&format!("({} bytes)", junk.len())), "{d}");
+    assert!(d.contains("attested at line 5"), "{d}");
 }
 
 #[test]
@@ -332,16 +383,18 @@ fn trailing_fragment_is_torn_write_and_reports_prior_last_seq() {
     let last_lf = before.iter().rposition(|&b| b == b'\n').unwrap();
     let prev_lf = before[..last_lf].iter().rposition(|&b| b == b'\n').unwrap();
     let cut = prev_lf + 1 + (last_lf - prev_lf - 1) / 2;
+    let gap_bytes = (cut - (prev_lf + 1)) as u64;
     fx.write(&before[..cut]);
     let report = verify(&fx.trail, &fx.trust).unwrap();
     let tw = kinds(&report, K::TornWrite);
     assert_eq!(tw.len(), 1, "{:?}", report.findings());
-    assert!(
-        tw[0].detail().contains("trailing gap"),
-        "{}",
-        tw[0].detail()
-    );
-    assert!(tw[0].detail().contains("digest blake3:"));
+    let d = tw[0].detail();
+    assert!(d.contains("trailing gap"), "{d}");
+    assert!(d.contains("digest blake3:"), "{d}");
+    // Attribution points at the gap's own physical line, not past EOF.
+    assert_eq!(tw[0].line(), Some(4));
+    assert!(d.contains("lines 4..=4"), "{d}");
+    assert!(d.contains(&format!("({gap_bytes} bytes)")), "{d}");
     let penultimate = fx.seqs[fx.seqs.len() - 2];
     assert_eq!(report.last_seq(), Some(penultimate));
     assert!(kinds(&report, K::RepairMismatch).is_empty());
@@ -361,7 +414,7 @@ fn honest_crash_writer_attests_gap_and_mutating_a_byte_turns_it_into_repair_mism
         .dir(&fx.trail)
         .open(fx.signer())
         .unwrap();
-    reopened
+    let resumed = reopened
         .record(&Entry::new("a", "change", "resumed"))
         .unwrap();
     drop(reopened);
@@ -370,6 +423,15 @@ fn honest_crash_writer_attests_gap_and_mutating_a_byte_turns_it_into_repair_mism
     assert_eq!(tw.len(), 1, "{:?}", report.findings());
     assert!(kinds(&report, K::RepairMismatch).is_empty());
     assert!(kinds(&report, K::TornWriteRepaired).is_empty());
+    // The attested gap points at the gap line itself and names its byte length.
+    assert_eq!(tw[0].line(), Some(4));
+    let d = tw[0].detail();
+    assert!(d.contains("lines 4..=4"), "{d}");
+    assert!(d.contains("bytes)"), "{d}");
+    assert!(
+        d.contains(&format!("attested at line 5 seq {}", resumed.seq())),
+        "{d}"
+    );
     // Now flip one gap byte and re-verify: attestation no longer matches.
     let mut mutated = fs::read(fx.live()).unwrap();
     mutated[cut - 1] ^= 1; // flip a bit inside the torn fragment
@@ -380,7 +442,19 @@ fn honest_crash_writer_attests_gap_and_mutating_a_byte_turns_it_into_repair_mism
         "{:?}",
         report.findings()
     );
-    assert_eq!(kinds(&report, K::RepairMismatch).len(), 1);
+    let rm = kinds(&report, K::RepairMismatch);
+    assert_eq!(rm.len(), 1);
+    assert_eq!(rm[0].line(), Some(4));
+    let d = rm[0].detail();
+    assert!(d.contains("lines 4..=4"), "{d}");
+    assert!(
+        d.contains(&format!("attested at line 5 seq {}", resumed.seq())),
+        "{d}"
+    );
+    assert!(
+        d.contains("expected blake3:") && d.contains("got blake3:"),
+        "{d}"
+    );
 }
 
 #[test]
@@ -437,6 +511,51 @@ fn fragment_line_in_shipped_input_is_unparsable() {
     assert_eq!(bad[0].file(), Some(file.as_path()));
     assert_eq!(bad[0].line(), Some(1));
     assert_eq!(report.records(), 1); // The following valid record is still checked.
+}
+
+#[test]
+fn decoder_errors_after_seq_is_read_carry_the_seq_and_sort_by_it() {
+    let dir = Dir::new();
+    let valid = entry();
+    // Each of these reads audit.seq (= 0) before failing.
+    let missing = valid.replace(
+        "{\"key\":\"audit.actor\",\"value\":{\"stringValue\":\"α\"}},",
+        "",
+    );
+    assert_ne!(valid, missing);
+    // Inject a brand-new attribute key so UnknownField fires after seq is read.
+    let unknown = valid.replace(
+        "{\"key\":\"audit.hash\"",
+        "{\"key\":\"audit.unknownZ\",\"value\":{\"stringValue\":\"x\"}},{\"key\":\"audit.hash\"",
+    );
+    assert_ne!(valid, unknown);
+    // Non-hex prev_hash is InvalidField, raised after audit.seq is read.
+    let invalid = valid.replacen("blake3:a03c7c40", "blake3:zzzzzzzz", 1);
+    assert!(invalid.contains("blake3:zzzz"));
+    let not_json = "not json";
+    let bytes = format!("{missing}\n{unknown}\n{invalid}\n{not_json}\n{valid}\n");
+    let file = dir.put("copy", bytes);
+    let report = Verifier::new(policy()).verify_files([file]).unwrap();
+    for (kind, line) in [
+        (K::MissingField, 1u64),
+        (K::UnknownField, 2),
+        (K::InvalidField, 3),
+    ] {
+        let fs = kinds(&report, kind);
+        assert_eq!(fs.len(), 1, "{kind:?}: {:?}", report.findings());
+        assert_eq!(fs[0].line(), Some(line), "{kind:?}");
+        assert_eq!(fs[0].seq(), Some(0), "{kind:?}");
+    }
+    // Seqless Unparsable sorts after every seq-bearing finding.
+    let order: Vec<_> = report.findings().iter().map(|f| f.kind()).collect();
+    let unparsable = order.iter().position(|k| *k == K::Unparsable).unwrap();
+    for k in [K::MissingField, K::UnknownField, K::InvalidField] {
+        let pos = order.iter().position(|kk| *kk == k).unwrap();
+        assert!(
+            pos < unparsable,
+            "{k:?} must sort before Unparsable; order: {order:?}"
+        );
+    }
 }
 
 #[test]

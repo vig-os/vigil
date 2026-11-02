@@ -18,7 +18,7 @@ fn file_findings(input: &Input, findings: &mut Vec<Finding>) {
     let data = &input.data;
     let path = input.path.as_path();
     let mut spans = data.spans.iter();
-    let mut gap: Option<u64> = None;
+    let mut gap: Option<(u64, u64)> = None;
     let fragment_absent = |r: &Summary| {
         r.repaired.is_some().then(|| {
             let d = "fragment not present".into();
@@ -50,43 +50,55 @@ fn file_findings(input: &Input, findings: &mut Vec<Finding>) {
         }
         match &item.content {
             LineContent::Fragment | LineContent::Unparsable(_) => {
-                gap.get_or_insert(item.line);
+                let line = item.line;
+                gap = Some(gap.map_or((line, line), |(first, _)| (first, line)));
             }
             LineContent::Records(range) => {
                 let r = &data.records[range.start];
-                if gap.take().is_none() {
+                let Some((first, last)) = gap.take() else {
                     findings.extend(fragment_absent(r));
                     continue;
-                }
+                };
                 let s = spans.next().expect("span");
-                let got = r.repaired;
-                let (kind, detail) = if got == Some(s.digest) {
-                    (K::TornWrite, format!("{} gap bytes attested", s.len))
+                let at = format!(
+                    "lines {first}..={last} ({} bytes), attested at line {} seq {}",
+                    s.len, r.line, r.seq
+                );
+                let (kind, detail) = if r.repaired == Some(s.digest) {
+                    (K::TornWrite, at)
                 } else {
-                    let got = got.map_or_else(|| "none".into(), |d| digest_string(&d));
+                    let got = r
+                        .repaired
+                        .map_or_else(|| "none".into(), |d| digest_string(&d));
+                    let expected = digest_string(&s.digest);
                     (
                         K::RepairMismatch,
-                        format!("expected {}, got {}", digest_string(&s.digest), got),
+                        format!("{at}: expected {expected}, got {got}"),
                     )
                 };
-                findings.push(finding(kind, path, at, Some(r.seq), detail));
+                findings.push(finding(kind, path, Some(first), Some(r.seq), detail));
             }
-            LineContent::Invalid(_) if gap.take().is_some() => {
-                let s = spans.next().expect("span");
-                let d = format!("unattested gap digest {}", digest_string(&s.digest));
-                findings.push(finding(K::RepairMismatch, path, at, None, d));
+            LineContent::Invalid(_) => {
+                if let Some((first, last)) = gap.take() {
+                    let s = spans.next().expect("span");
+                    let d = format!(
+                        "lines {first}..={last} ({} bytes), unattested gap digest {}",
+                        s.len,
+                        digest_string(&s.digest)
+                    );
+                    findings.push(finding(K::RepairMismatch, path, Some(first), None, d));
+                }
             }
-            _ => {}
         }
     }
-    if let Some(line) = gap {
+    if let Some((first, last)) = gap {
         let s = spans.next().expect("trailing span");
         let d = format!(
-            "trailing gap of {} bytes, digest {}",
+            "trailing gap lines {first}..={last} ({} bytes), digest {}",
             s.len,
             digest_string(&s.digest)
         );
-        findings.push(finding(K::TornWrite, path, Some(line), None, d));
+        findings.push(finding(K::TornWrite, path, Some(first), None, d));
     }
 }
 
