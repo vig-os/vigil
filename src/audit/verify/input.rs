@@ -1,5 +1,6 @@
 //! Private, collecting input pipeline for #13 V3a-2.
-//! Snapshots are per directory, never globally atomic. No settlement or locks:
+//! Per ruling 13-V3-d2, each directory returns exactly its confirmed snapshot;
+//! discarded attempts leave no data or obligations. No global atomicity, settlement or locks:
 //! open or record once before reviewing a crashed trail; strict live review
 //! must target a stopped trail because an in-flight append can look torn.
 use super::lines::{self, Content, Span};
@@ -136,12 +137,18 @@ fn decode(file: File) -> io::Result<Data> {
 
 /// Reads each inode once within a successful snapshot. Failed attempts own all
 /// tentative data; none enters the cache until the retry protocol succeeds.
-fn copy(paths: &[PathBuf], cache: &BTreeMap<Inode, Rc<Data>>) -> io::Result<Vec<(Inode, Input)>> {
+fn copy(
+    paths: &[PathBuf],
+    cache: &BTreeMap<Inode, Rc<Data>>,
+    #[cfg(test)] mut before_open: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<Vec<(Inode, Input)>> {
     let mut local = cache.clone();
     let mut inputs = Vec::new();
     let mut paths = paths.to_vec();
     paths.sort_by_key(|p| key(p));
     for path in paths {
+        #[cfg(test)]
+        before_open(&path)?;
         let file = File::open(&path)?;
         let meta = file.metadata()?;
         let inode = (meta.dev(), meta.ino());
@@ -172,6 +179,8 @@ pub(super) fn collect(paths: impl IntoIterator<Item = PathBuf>) -> Result<Collec
         |_, _| Ok(()),
         #[cfg(test)]
         |_, _| Ok(()),
+        #[cfg(test)]
+        |_| Ok(()),
     )
 }
 
@@ -180,6 +189,7 @@ fn collect_with(
     paths: impl IntoIterator<Item = PathBuf>,
     #[cfg(test)] mut before_copy: impl FnMut(&Path, usize) -> io::Result<()>,
     #[cfg(test)] mut after_copy: impl FnMut(&Path, usize) -> io::Result<()>,
+    #[cfg(test)] mut before_open: impl FnMut(&Path) -> io::Result<()>,
 ) -> Result<Collection, AuditError> {
     let mut directories = BTreeSet::new();
     let mut files = BTreeSet::new();
@@ -195,7 +205,6 @@ fn collect_with(
     for directory in directories {
         #[cfg(test)]
         let mut attempt = 0;
-        let mut required = BTreeSet::new();
         let inputs = rotate::retry_snapshot(
             &directory,
             "audit",
@@ -207,17 +216,12 @@ fn collect_with(
                 }
                 // Native read errors are tentative until retry_snapshot confirms
                 // the listing. A rotation can move a listed inode before open.
-                let result = copy(paths, &cache).and_then(|result| {
-                    let present: BTreeSet<_> = result.iter().map(|(inode, _)| *inode).collect();
-                    if !required.is_subset(&present) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::NotFound,
-                            "selected audit input disappeared",
-                        ));
-                    }
-                    required.extend(present);
-                    Ok(result)
-                });
+                let result = copy(
+                    paths,
+                    &cache,
+                    #[cfg(test)]
+                    &mut before_open,
+                );
                 #[cfg(test)]
                 {
                     after_copy(&directory, attempt)?;
@@ -234,8 +238,13 @@ fn collect_with(
         .map_err(AuditError::from_io)?;
         merge(inputs, &mut cache, &mut selected);
     }
-    let explicit =
-        copy(&files.into_iter().collect::<Vec<_>>(), &cache).map_err(AuditError::from_io)?;
+    let explicit = copy(
+        &files.into_iter().collect::<Vec<_>>(),
+        &cache,
+        #[cfg(test)]
+        |_| Ok(()),
+    )
+    .map_err(AuditError::from_io)?;
     merge(explicit, &mut cache, &mut selected);
     drop(cache);
     let mut inputs: Vec<_> = selected.into_values().collect();

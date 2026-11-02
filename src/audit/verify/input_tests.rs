@@ -134,6 +134,7 @@ fn retry_discards_old_decode_items_and_reads_live_tail() {
             }
             Ok(())
         },
+        |_| Ok(()),
     )
     .unwrap();
     assert_eq!(attempts, 2);
@@ -161,25 +162,50 @@ fn eight_races_are_io_not_success() {
             )?;
             fs::write(path.join("audit.jsonl"), b"")
         },
+        |_| Ok(()),
     );
     assert_eq!(attempts, 8);
     error(result, AuditErrorKind::Io);
 }
 #[test]
-fn disappearing_selected_input_is_not_silently_omitted() {
+fn retention_after_copy_returns_only_confirmed_snapshot() {
     let dir = Dir::new();
-    let segment = dir.put(&format!("{STAMP}.jsonl"), b"");
+    let segment = dir.put(&format!("{STAMP}.jsonl"), line(1));
+    let live = dir.put("audit.jsonl", line(2));
+    let mut attempts = 0;
     let result = collect_with(
         vec![dir.0.clone()],
-        |_, _| Ok(()),
+        |_, attempt| {
+            attempts = attempt;
+            Ok(())
+        },
         |_, attempt| {
             if attempt == 1 {
                 fs::remove_file(&segment)?;
             }
             Ok(())
         },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(attempts, 2);
+    assert_eq!(
+        result
+            .inputs
+            .iter()
+            .map(|i| i.path.clone())
+            .collect::<Vec<_>>(),
+        vec![live]
     );
-    error(result, AuditErrorKind::Io);
+    assert_eq!(
+        result
+            .inputs
+            .iter()
+            .flat_map(|i| &i.data.records)
+            .map(|r| r.seq)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
 }
 #[test]
 fn ignores_control_files_without_mutating_or_locking() {
@@ -385,6 +411,7 @@ fn rotation_between_listing_and_open_retries() {
             Ok(())
         },
         |_, _| Ok(()),
+        |_| Ok(()),
     )
     .unwrap_or_else(|e| {
         panic!("rotation retained the inode under its segment name, but collect returned {e:?}")
@@ -412,6 +439,7 @@ fn deletion_between_listing_and_open_retries() {
             Ok(())
         },
         |_, _| Ok(()),
+        |_| Ok(()),
     )
     .unwrap();
     assert_eq!(attempts, 2);
@@ -434,6 +462,7 @@ fn stable_unreadable_listing_keeps_original_source() {
             tentative_copies += 1;
             Ok(())
         },
+        |_| Ok(()),
     );
     let Err(error) = result else {
         panic!("unreadable file succeeded")
@@ -464,7 +493,62 @@ fn open_races_exhaust_after_eight_attempts() {
             fs::write(path.join(format!("{STAMP}_{attempt:06}.jsonl")), line(4))
         },
         |_, _| Ok(()),
+        |_| Ok(()),
     );
     assert_eq!(attempts, 8);
     error(result, AuditErrorKind::Io);
+}
+
+#[test]
+fn pruning_already_read_segment_during_later_open_error() {
+    let dir = Dir::new();
+    let first = dir.put(&format!("{STAMP}.jsonl"), line(1));
+    let live = dir.put("audit.jsonl", line(2));
+    let rotated = dir.0.join(format!("{STAMP}_000001.jsonl"));
+    let mut attempts = 0;
+    let mut listings = Vec::new();
+    let mut opened = Vec::new();
+    let result = collect_with(
+        vec![dir.0.clone()],
+        |path, attempt| {
+            attempts = attempt;
+            let mut listing: Vec<_> = fs::read_dir(path)?
+                .map(|e| e.map(|e| e.path()))
+                .collect::<io::Result<_>>()?;
+            listing.sort_by_key(|p| key(p));
+            listings.push(listing);
+            Ok(())
+        },
+        |_, _| Ok(()),
+        |path| {
+            opened.push(path.to_owned());
+            if path == live {
+                // Numeric segment order means seq 1 was already decoded.
+                fs::remove_file(&first)?;
+                fs::rename(&live, &rotated)?;
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(attempts, 2);
+    assert_eq!(opened, vec![first, live, rotated.clone()]);
+    assert_eq!(listings[1], vec![rotated]);
+    assert_eq!(
+        result
+            .inputs
+            .iter()
+            .map(|i| i.path.clone())
+            .collect::<Vec<_>>(),
+        listings[1]
+    );
+    assert_eq!(
+        result
+            .inputs
+            .iter()
+            .flat_map(|i| &i.data.records)
+            .map(|r| r.seq)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
 }
