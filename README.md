@@ -2,12 +2,79 @@
 
 *Verifiable Integrity-Guarded Instrumentation & Logging* (V·I·G·I·L): the opinionated observability crate for vig-os Rust projects.
 
-> **Pre-alpha.** The design is settled; the code is being built. Logs, metrics, traces and the audit writer (behind the `audit` feature) are implemented; the audit operator commands are implemented; the audit verifier (#13 C1) and trace propagation (#8 8e) are being built. Track progress in the milestones.
+> **Early release (v0.1.0).** The first GitHub release; the API follows the [Stability](#stability) policy. It ships logs, metrics and traces as OTLP/JSON Lines files, the opt-in `audit` writer with its operator commands (the `vigil-audit` binary), and the testing helpers. Still open: the offline audit verifier (#13 C1) and trace propagation and the tracer globals (#8 8e, 8f). Open spans at shutdown (#8 8d) also remain. See the [known issues](#known-issues).
 
 **Pre-1.0 caveats.** Logs, metrics and traces export today, but open spans at
 shutdown (#8 8d), propagation (#8 8e), and the tracer globals opt-in (#8 8f)
 remain open. End root spans before shutdown. Review the [known issues](#known-issues)
 before adopting an early release.
+
+## Install
+
+The package is `vigil-telemetry`; the library is imported as `vigil`. v0.1.0 is a
+[GitHub release](https://github.com/vig-os/vigil/releases/tag/0.1.0) (git tag `0.1.0`);
+crates.io publication comes later. Add it to `Cargo.toml` together with `tracing`,
+which your code uses to emit logs and spans:
+
+```toml
+[dependencies]
+vigil-telemetry = { git = "https://github.com/vig-os/vigil", tag = "0.1.0" }
+tracing = "0.1"
+```
+
+Default features are `metrics` and `traces`. Logs are always on. Add `audit` for the
+lossless audit trail, or turn the defaults off:
+
+```toml
+vigil-telemetry = { git = "https://github.com/vig-os/vigil", tag = "0.1.0", features = ["audit"] }
+# only logs: default-features = false
+```
+
+Pin the exact `tag = "0.1.0"`: before 1.0 a minor bump may break stable items, and
+a git dependency does not resolve version ranges, so a newer release is a deliberate
+change of the tag (see [Stability](#stability): `~0.N` once it is on crates.io, `=0.N.M` for
+applications using `--cfg vigil_unstable`).
+
+The audit operator tool is a separate binary, `vigil-audit`:
+
+```sh
+cargo install --git https://github.com/vig-os/vigil --tag 0.1.0 --features audit --bin vigil-audit vigil-telemetry
+```
+
+## Quick start
+
+Initialise at the top of `main`, keep the guard until the end, and `tracing` events,
+spans and vigil metrics are written to disk:
+
+```rust,no_run
+use vigil::metrics::Counter;
+
+static REQUESTS: Counter = Counter::new(vigil::scope!(), "app.requests").with_unit("{request}");
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let guard = vigil::Config::new("my-service")
+        .version(env!("CARGO_PKG_VERSION"))
+        .init()?;
+
+    tracing::info!(user = "alice", "opened study"); // a log record
+    REQUESTS.add(1, &[("route", "/study".into())]); // a metric
+    {
+        let span = tracing::info_span!("load_study", id = 42); // a span
+        let _entered = span.enter(); // logs inside carry its trace and span ids
+        tracing::info!("loading");
+    } // end spans before shutdown
+
+    guard.shutdown()?; // flush; dropping the guard also flushes
+    Ok(())
+}
+```
+
+The files appear in `$XDG_STATE_HOME/my-service` (or `$HOME/.local/state/my-service`;
+`VIGIL_DIR` or `Config::dir` selects another directory): `logs.jsonl`, `metrics.jsonl`
+(after the first collection or at shutdown) and `traces.jsonl`, one OTLP/JSON document
+per line. `Guard::dir()` reports the actual directory. Do not write
+`let _ = vigil::init(..)`: that drops the guard at once and stops the export.
+Configuration and environment variables are described below.
 
 ## Stability
 
