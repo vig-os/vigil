@@ -47,6 +47,65 @@ impl Fixture {
             .map(str::to_owned)
             .collect()
     }
+    fn schema(&self) -> String {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/audit/schema.json")).unwrap();
+        let text = fixture["text"].as_str().unwrap().to_owned();
+        fs::write(self.path("schema"), &text).unwrap();
+        text
+    }
+    fn operator_args(
+        &self,
+        command: &str,
+        cp: &Checkpoint,
+        actor: &str,
+        reason: &str,
+        schema: Option<&str>,
+    ) -> Vec<String> {
+        let key = if command == "rotate" {
+            if !self.path("new.key").exists() {
+                self.success(&["keygen", "new.key"]);
+            }
+            "new.key"
+        } else {
+            "old.key"
+        };
+        let mut args = vec![
+            command.into(),
+            "--key".into(),
+            key.into(),
+            "--actor".into(),
+            actor.into(),
+            "--reason".into(),
+            reason.into(),
+        ];
+        if command == "rotate" {
+            args.extend(["--bound".into(), arg(cp), "--expect-head".into(), arg(cp)]);
+        } else {
+            args.extend([
+                "--head".into(),
+                arg(cp),
+                "--lost-through".into(),
+                (cp.seq() + 5).to_string(),
+            ]);
+        }
+        if let Some(path) = schema {
+            args.extend(["--schema".into(), path.into()]);
+        }
+        args.push("trail".into());
+        args
+    }
+    fn operator(
+        &self,
+        command: &str,
+        cp: &Checkpoint,
+        actor: &str,
+        reason: &str,
+        schema: Option<&str>,
+    ) -> Vec<String> {
+        let args = self.operator_args(command, cp, actor, reason, schema);
+        self.success(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    }
     fn create(&self) -> Checkpoint {
         self.success(&["keygen", "old.key"]);
         let lines = self.success(&["create", "--key", "old.key", "--service", "svc", "trail"]);
@@ -168,20 +227,7 @@ fn resume_prints_opening_receipt_and_explicit_close() {
     let f = Fixture::new();
     let cp = f.create();
     let lost = cp.seq() + 5;
-    let lines = f.success(&[
-        "resume",
-        "--key",
-        "old.key",
-        "--actor",
-        "operator",
-        "--reason",
-        "loss",
-        "--head",
-        &arg(&cp),
-        "--lost-through",
-        &lost.to_string(),
-        "trail",
-    ]);
+    let lines = f.operator("resume", &cp, "operator", "loss", None);
     assert_eq!(lines.len(), 3);
     let records = disk(&f.path("trail"));
     let tail = &records[records.len() - 3..];
@@ -584,5 +630,128 @@ fn command_help_matches_parser_commands() {
         assert!(output.stderr.is_empty());
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(text.starts_with(&format!("Usage: vigil-audit {command} ")));
+    }
+}
+
+#[test]
+fn schema_digest_matches_library() {
+    let f = Fixture::new();
+    let text = f.schema();
+    let output = f.cli(&["schema", "schema"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        format!(
+            "{}\n",
+            vigil::audit::RecordSchema::parse(&text)
+                .unwrap()
+                .digest_string()
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
+fn schema_rejects_noncanonical_missing_and_bad_arguments() {
+    let f = Fixture::new();
+    let text = f.schema();
+    fs::write(f.path("bad"), format!("{text}\n")).unwrap();
+    for args in [
+        vec!["schema", "bad"],
+        vec!["schema", "missing"],
+        vec!["schema"],
+        vec!["schema", "schema", "extra"],
+    ] {
+        let output = f.cli(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+fn operator_schema_rejections(command: &str) {
+    let f = Fixture::new();
+    let cp = f.create();
+    let text = f.schema();
+    fs::write(f.path("bad"), format!("{text}\n")).unwrap();
+    for (actor, reason, schema, code, kind) in [
+        ("Jane Doe", "ref:123", "schema", 1, "InvalidEntry"),
+        (
+            "op:123",
+            "a sentence as reason",
+            "schema",
+            1,
+            "InvalidEntry",
+        ),
+        ("op:123", "ref:123", "bad", 2, "InvalidConfig"),
+        ("op:123", "ref:123", "missing", 2, "Io"),
+    ] {
+        let before = tree(&f.path("trail"));
+        let args = f.operator_args(command, &cp, actor, reason, Some(schema));
+        let output = f.cli(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .starts_with(&format!("error: {kind}:"))
+        );
+        assert!(output.stdout.is_empty());
+        assert_eq!(tree(&f.path("trail")), before);
+    }
+}
+#[test]
+fn rotate_schema_rejections_write_nothing() {
+    operator_schema_rejections("rotate");
+}
+#[test]
+fn resume_schema_rejections_write_nothing() {
+    operator_schema_rejections("resume");
+}
+
+#[test]
+fn operator_schema_ids_and_legacy_free_text_succeed() {
+    for command in ["rotate", "resume"] {
+        for schema in [Some("schema"), None] {
+            let f = Fixture::new();
+            let cp = f.create();
+            f.schema();
+            let (actor, reason) = if schema.is_some() {
+                ("op:123", "ref:123")
+            } else {
+                ("Jane Doe", "scheduled change today")
+            };
+            f.operator(command, &cp, actor, reason, schema);
+        }
+    }
+}
+
+#[test]
+fn schema_synopsis_in_help_and_usage() {
+    let f = Fixture::new();
+    for args in [vec!["--help"], vec!["unknown"]] {
+        let output = f.cli(&args);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(text.contains("vigil-audit schema <file>"));
+        assert!(text.contains("verify: not yet available (#13)"));
+        for command in ["rotate", "resume"] {
+            assert!(
+                text.lines()
+                    .find(|l| l.contains(&format!("vigil-audit {command} ")))
+                    .unwrap()
+                    .contains("[--schema <file>] <dir>")
+            );
+        }
+    }
+    for command in ["rotate", "resume"] {
+        assert!(f.success(&[command, "--help"])[0].contains("[--schema <file>] <dir>"));
     }
 }
