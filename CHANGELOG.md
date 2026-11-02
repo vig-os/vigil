@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Schema-checked audit writers with `Entry::attr`, `AuditConfig::schema`, fail-closed record and operator validation, and personal-data and erasure guidance (#164 CP2, #165).
+
 - Audit `RecordSchema`, `RecordSchemaBuilder` and `ActionFields`, with canonical schema parsing and a domain-separated BLAKE3 digest (ADR-0005 amendment 13 §20.4–§20.5, #164 CP1b).
 - Optional directory-wide telemetry byte cap with live-file and pending-write reservations, oldest-first pruning after age and count, and a documented logical-byte bound including retained writer handles ([#163](https://github.com/vig-os/vigil/issues/163), slice 163b).
 

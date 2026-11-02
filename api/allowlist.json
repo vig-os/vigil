@@ -303,5 +303,12 @@
       "vigil::audit::ActionFields::clone": "fn",
       "vigil::audit::ActionFields::fmt": "fn"
     }
+  },
+  {
+    "justification": "ADR-0005 amendment 13 \u00a720.5: CP2 schema-checked writer and typed entry attributes",
+    "items": {
+      "vigil::audit::Entry::attr": "fn",
+      "vigil::audit::AuditConfig::schema": "fn"
+    }
   }
 ]

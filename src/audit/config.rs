@@ -31,6 +31,13 @@ impl AuditConfig {
             expected: None,
         }
     }
+    /// Checks every record and the actor and reason of rotate and resume
+    /// against this schema (ADR-0005 §20.4–20.6). Without a schema, personal
+    /// data shapes are unrestricted and the trail is not erasure-ready.
+    pub fn schema(mut self, schema: super::RecordSchema) -> Self {
+        self.config.schema = Some(schema);
+        self
+    }
     /// Overrides the audit directory itself, rather than the service state directory.
     pub fn dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.dir = Some(dir.into());
@@ -121,7 +128,8 @@ impl AuditConfig {
     /// rotation record's receipt and the new-key checkpoint covering it.
     /// `bound` names a present checkpoint whose key is being revoked; restore
     /// an archived segment first, or choose a bound that remains present.
-    /// Actor and reason must be nonempty and contain no NUL.
+    /// Actor and reason must be nonempty and contain no NUL. With a schema,
+    /// both must be opaque ids; without one, free text is permitted.
     ///
     /// `expect_head` must come from the application's newest receipt or an
     /// anchor, never from the disk (one exception: the crash outcome (ii) of
@@ -167,13 +175,15 @@ impl AuditConfig {
             seq: expect_head.0,
             hash: expect_head.1,
         };
+        let (actor, reason) = (actor.into(), reason.into());
+        super::schema_validation::operator(self.config.schema.as_ref(), &actor, &reason)?;
         let op = sink::OperatorOp::Rotate {
             bound: Head {
                 seq: bound.0,
                 hash: bound.1,
             },
-            actor: actor.into(),
-            reason: reason.into(),
+            actor,
+            reason,
         };
         op.validate(expect)?;
         let sink = sink::Sink::open(&dir, signer, self.config, None)?;
@@ -271,7 +281,8 @@ impl AuditConfig {
     ///
     /// # Errors
     /// Returns `InvalidConfig` for invalid policy, builder `expect_head` or loss
-    /// bounds; `InvalidEntry` for empty/NUL actor or reason; `TooLarge` for an
+    /// bounds; `InvalidEntry` for empty/NUL actor or reason, or a non-id
+    /// actor/reason under a schema (without a schema, free text is permitted); `TooLarge` for an
     /// oversized record; `HeadMismatch` for a different found head; `MissingTrail`
     /// for a missing marker (a missing directory is created first); `CorruptTrail`
     /// for a noncanonical marker or rejected predecessor fold; `Poisoned` when
@@ -294,6 +305,7 @@ impl AuditConfig {
             ));
         }
         let (actor, reason) = (actor.into(), reason.into());
+        super::schema_validation::operator(self.config.schema.as_ref(), &actor, &reason)?;
         sink::validate_actor_reason(&actor, &reason)?;
         let (sink, record, opening) = sink::Sink::resume(
             &dir,

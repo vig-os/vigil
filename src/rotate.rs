@@ -326,6 +326,8 @@ impl DirLock {
     }
 
     fn lock_current(&self, path: &Path) -> io::Result<(MutexGuard<'_, File>, Unlock, Entered)> {
+        #[cfg(test)]
+        LOCK_ACQUISITIONS.with(|count| count.set(count.get() + 1));
         let entered = Entered::new(self as *const Self as usize)?;
         let start = Instant::now();
         let mut dir = lock_ignore_poison(&self.gate);
@@ -1364,6 +1366,12 @@ pub fn find_newest<T>(
         },
         |result| result,
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Private per-thread acquisition counter for fail-closed validation tests.
+    pub(crate) static LOCK_ACQUISITIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
