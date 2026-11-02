@@ -548,7 +548,7 @@ Decisions and their evidence are recorded as ADRs in [`docs/adr/`](docs/adr/): [
 ## Development
 
 The `just publish-candidate 0.1.0 …` command in the devkit-managed
-[release workflow guide](docs/DOWNSTREAM_RELEASE.md#pre-release-format)
+[release workflow guide](https://github.com/vig-os/vigil/blob/release/0.2.0/docs/DOWNSTREAM_RELEASE.md#pre-release-format)
 is a generic prerelease-format example. For this release, use `0.2.0` as the
 version argument. The guide's format examples do not select vigil's current version.
 
