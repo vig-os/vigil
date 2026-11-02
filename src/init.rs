@@ -31,7 +31,7 @@ use tracing_subscriber::{
 use crate::{
     lifecycle::{AfterShutdown, FlushError, Losses, ReportingProcessor, ShutdownCapture},
     logs::OtlpJsonLogExporter,
-    rotate::{RotatingFile, RotationConfig},
+    rotate::{RotatingFile, RotationConfig, SignalRotation, signal_index},
 };
 
 /// A mistake the caller can correct in code. Environmental failures degrade
@@ -686,7 +686,11 @@ pub fn init(service: impl Into<String>) -> Result<Guard, InitError> {
     Config::new(service).init()
 }
 
-/// Logging configuration. Explicit builder values win over environment values;
+/// Logging configuration. Age pruning precedes count pruning. Count zero keeps
+/// no rotated segments; size zero clamps to one; environment retention days zero
+/// keeps everything. Per-option precedence is signal builder, global builder,
+/// signal environment, global environment, default.
+/// Explicit builder values win over environment values;
 /// environment values win over defaults. Invalid numeric environment values warn on
 /// stderr and use defaults. `filter_env` selects the filter variable (default
 /// `RUST_LOG`); `default_filter` selects its fallback (default `info`). Unset or
@@ -700,6 +704,8 @@ pub struct Config {
     max_bytes: Option<u64>,
     queue_size: Option<usize>,
     retention: Option<Option<Duration>>,
+    max_segments: Option<Option<usize>>,
+    signal_rotations: [SignalRotation; 3],
     version: Option<String>,
     revision: Option<String>,
     filter_env: String,
@@ -725,6 +731,8 @@ impl Config {
             max_bytes: None,
             queue_size: None,
             retention: None,
+            max_segments: None,
+            signal_rotations: std::array::from_fn(|_| SignalRotation::new()),
             version: None,
             revision: None,
             filter_env: "RUST_LOG".into(),
@@ -823,6 +831,29 @@ impl Config {
         self.retention = Some(retention);
         self
     }
+    /// Cap rotated segments per signal after age pruning; `None` is unlimited,
+    /// `Some(0)` keeps none. Overrides `VIGIL_MAX_SEGMENTS` and per-signal
+    /// count variables; environment retention days zero instead keeps everything.
+    #[must_use]
+    pub fn max_segments(mut self, segments: Option<usize>) -> Self {
+        self.max_segments = Some(segments);
+        self
+    }
+
+    /// Replace overrides for one signal. Precedence per field: this value,
+    /// global builder, `VIGIL_<SIGNAL>_*`, `VIGIL_*`, default. Variables are
+    /// `VIGIL_LOGS_MAX_BYTES`, `VIGIL_METRICS_MAX_BYTES`, `VIGIL_TRACES_MAX_BYTES`,
+    /// `VIGIL_LOGS_MAX_SEGMENTS`, `VIGIL_METRICS_MAX_SEGMENTS`,
+    /// `VIGIL_TRACES_MAX_SEGMENTS`, `VIGIL_LOGS_RETENTION_DAYS`,
+    /// `VIGIL_METRICS_RETENTION_DAYS`, and `VIGIL_TRACES_RETENTION_DAYS`.
+    /// Size zero clamps to one; count zero keeps no rotated segments; environment
+    /// retention days zero disables age pruning. Age runs before count at each prune.
+    #[must_use]
+    pub fn signal_rotation(mut self, signal: Signal, rotation: SignalRotation) -> Self {
+        self.signal_rotations[signal_index(signal)] = rotation;
+        self
+    }
+
     /// Producer version, for example `env!("CARGO_PKG_VERSION")` in the caller.
     #[must_use]
     pub fn version(mut self, version: impl Into<String>) -> Self {
@@ -1021,16 +1052,12 @@ impl Config {
                 })
             })
             .or_else(|| state_directory(&self.service));
-        let mut rotation = RotationConfig::default();
-        if let Some(bytes) = self.max_bytes.or_else(|| number("VIGIL_MAX_BYTES", 1)) {
-            rotation = rotation.max_bytes(bytes);
-        }
-        if let Some(retention) = self.retention.or_else(|| {
-            number("VIGIL_RETENTION_DAYS", 0)
-                .map(|days| (days != 0).then(|| Duration::from_secs(days.saturating_mul(86_400))))
-        }) {
-            rotation = rotation.retention(retention);
-        }
+        let rotation = resolve_rotation(
+            self.max_bytes,
+            self.max_segments,
+            self.retention,
+            self.signal_rotations,
+        );
         let queue_size = self
             .queue_size
             .or_else(|| number("VIGIL_QUEUE_SIZE", 1).map(|n| {
@@ -1403,6 +1430,51 @@ impl LoggerProvider for NamedProvider {
         self.0.logger("vigil")
     }
 }
+fn resolve_rotation(
+    max_bytes: Option<u64>,
+    max_segments: Option<Option<usize>>,
+    retention: Option<Option<Duration>>,
+    overrides: [SignalRotation; 3],
+) -> RotationConfig {
+    let bytes = max_bytes.or_else(|| number("VIGIL_MAX_BYTES", 1));
+    let count = max_segments.or_else(|| number("VIGIL_MAX_SEGMENTS", 0).map(|n| Some(n as usize)));
+    let age = retention.or_else(|| retention_days("VIGIL_RETENTION_DAYS"));
+    let mut rotation = RotationConfig::default();
+    if let Some(value) = bytes {
+        rotation = rotation.max_bytes(value);
+    }
+    if let Some(value) = count {
+        rotation = rotation.max_segments(value);
+    }
+    if let Some(value) = age {
+        rotation = rotation.retention(value);
+    }
+    for (signal, prefix) in [
+        (Signal::Logs, "LOGS"),
+        (Signal::Metrics, "METRICS"),
+        (Signal::Traces, "TRACES"),
+    ] {
+        let mut value = overrides[signal_index(signal)].clone();
+        value.max_bytes = value
+            .max_bytes
+            .or(max_bytes)
+            .or_else(|| number(&format!("VIGIL_{prefix}_MAX_BYTES"), 1));
+        value.max_segments = value.max_segments.or(max_segments).or_else(|| {
+            number(&format!("VIGIL_{prefix}_MAX_SEGMENTS"), 0).map(|n| Some(n as usize))
+        });
+        value.retention = value
+            .retention
+            .or(retention)
+            .or_else(|| retention_days(&format!("VIGIL_{prefix}_RETENTION_DAYS")));
+        rotation = rotation.signal(signal, value);
+    }
+    rotation
+}
+
+fn retention_days(key: &str) -> Option<Option<Duration>> {
+    number(key, 0).map(|days| (days != 0).then(|| Duration::from_secs(days.saturating_mul(86_400))))
+}
+
 fn number(key: &str, minimum: u64) -> Option<u64> {
     let value = env::var_os(key).filter(|s| !s.is_empty())?;
     if let Some(number) = value
@@ -3665,5 +3737,198 @@ mod traces_wiring_tests {
             Err(OTelSdkError::AlreadyShutdown)
         ));
         assert_eq!(records(&dir.0, "traces", "Spans").len(), 1);
+    }
+}
+#[cfg(test)]
+mod count_config_tests {
+    use super::*;
+    const KEYS: [&str; 12] = [
+        "VIGIL_MAX_BYTES",
+        "VIGIL_MAX_SEGMENTS",
+        "VIGIL_RETENTION_DAYS",
+        "VIGIL_LOGS_MAX_BYTES",
+        "VIGIL_METRICS_MAX_BYTES",
+        "VIGIL_TRACES_MAX_BYTES",
+        "VIGIL_LOGS_MAX_SEGMENTS",
+        "VIGIL_METRICS_MAX_SEGMENTS",
+        "VIGIL_TRACES_MAX_SEGMENTS",
+        "VIGIL_LOGS_RETENTION_DAYS",
+        "VIGIL_METRICS_RETENTION_DAYS",
+        "VIGIL_TRACES_RETENTION_DAYS",
+    ];
+    fn empty_overrides() -> [SignalRotation; 3] {
+        std::array::from_fn(|_| SignalRotation::new())
+    }
+    fn files(config: RotationConfig, expected: [usize; 3]) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = env::temp_dir().join(format!(
+            "vigil-count-config-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (signal, count) in ["logs", "metrics", "traces"].into_iter().zip(expected) {
+            for n in 0..5 {
+                std::fs::write(
+                    dir.join(format!("{signal}-20260101T000000.00000000{n}Z.jsonl")),
+                    "x\n",
+                )
+                .unwrap();
+            }
+            let _writer = RotatingFile::open(&dir, signal, config.clone()).unwrap();
+            assert_eq!(
+                crate::rotate::segments(&dir, signal).unwrap().len(),
+                count + 1,
+                "{signal}"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn five_level_precedence_and_signal_mapping() {
+        let name = "init::count_config_tests::five_level_precedence_and_signal_mapping";
+        let mut vars: Vec<_> = KEYS.iter().map(|key| (*key, "")).collect();
+        vars.extend([
+            ("VIGIL_MAX_SEGMENTS", "4"),
+            ("VIGIL_LOGS_MAX_SEGMENTS", "1"),
+            ("VIGIL_METRICS_MAX_SEGMENTS", "2"),
+            ("VIGIL_TRACES_MAX_SEGMENTS", "3"),
+        ]);
+        if crate::test_child_with_env(name, "VIGIL_COUNT_CONFIG_CHILD", &vars).is_some() {
+            return;
+        }
+        // Default, global environment, signal environment, global builder, signal builder.
+        files(
+            resolve_rotation(None, None, Some(None), empty_overrides()),
+            [1, 2, 3],
+        );
+        files(
+            resolve_rotation(None, Some(Some(4)), Some(None), empty_overrides()),
+            [4, 4, 4],
+        );
+        let mut overrides = empty_overrides();
+        overrides[0] = SignalRotation::new().max_segments(Some(0));
+        files(
+            resolve_rotation(None, Some(Some(4)), Some(None), overrides),
+            [0, 4, 4],
+        );
+        // Explicit None is a builder value, too.
+        files(
+            resolve_rotation(None, Some(None), Some(None), empty_overrides()),
+            [5, 5, 5],
+        );
+    }
+
+    #[test]
+    fn precedence_applies_to_size_count_and_age() {
+        let name = "init::count_config_tests::precedence_applies_to_size_count_and_age";
+        let mut vars: Vec<_> = KEYS.iter().map(|key| (*key, "11")).collect();
+        for key in &KEYS[3..] {
+            vars.push((*key, "3"));
+        }
+        if crate::test_child_with_env(name, "VIGIL_COUNT_CONFIG_CHILD", &vars).is_some() {
+            return;
+        }
+        let days = |n| Some(Duration::from_secs(n * 86_400));
+        for builder in [false, true] {
+            let globals = if builder { 7 } else { 11 };
+            let signals = if builder { 7 } else { 3 };
+            let mut overrides = empty_overrides();
+            overrides[0] = SignalRotation::new()
+                .max_bytes(2)
+                .max_segments(None)
+                .retention(None);
+            let actual = resolve_rotation(
+                builder.then_some(7),
+                builder.then_some(Some(7)),
+                builder.then_some(days(7)),
+                overrides,
+            );
+            let mut expected = RotationConfig::default()
+                .max_bytes(globals)
+                .max_segments(Some(globals as usize))
+                .retention(days(globals));
+            expected = expected.signal(
+                Signal::Logs,
+                SignalRotation::new()
+                    .max_bytes(2)
+                    .max_segments(None)
+                    .retention(None),
+            );
+            for signal in [Signal::Metrics, Signal::Traces] {
+                expected = expected.signal(
+                    signal,
+                    SignalRotation::new()
+                        .max_bytes(signals)
+                        .max_segments(Some(signals as usize))
+                        .retention(days(signals)),
+                );
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn every_count_and_override_variable_grammar_and_warning() {
+        let name =
+            "init::count_config_tests::every_count_and_override_variable_grammar_and_warning";
+        if env::var("VIGIL_COUNT_CONFIG_CHILD").as_deref() != Ok(name) {
+            for key in &KEYS[1..] {
+                if *key == "VIGIL_RETENTION_DAYS" {
+                    continue;
+                }
+                for value in ["7", "", "invalid", "-1", "0"] {
+                    let mut vars: Vec<_> = KEYS.iter().map(|key| (*key, "")).collect();
+                    vars.extend([
+                        (*key, value),
+                        ("VIGIL_COUNT_TEST_KEY", *key),
+                        ("VIGIL_COUNT_TEST_VALUE", value),
+                    ]);
+                    let output =
+                        crate::test_child_with_env(name, "VIGIL_COUNT_CONFIG_CHILD", &vars)
+                            .unwrap();
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let invalid = matches!(value, "invalid" | "-1")
+                        || (value == "0" && key.ends_with("MAX_BYTES"));
+                    assert_eq!(
+                        stderr.matches(&format!("invalid {key}=")).count(),
+                        usize::from(invalid),
+                        "{stderr}"
+                    );
+                    assert_eq!(stderr.lines().count(), usize::from(invalid), "{stderr}");
+                }
+            }
+            return;
+        }
+        let key = env::var("VIGIL_COUNT_TEST_KEY").unwrap();
+        let value = env::var("VIGIL_COUNT_TEST_VALUE").unwrap();
+        let resolved = resolve_rotation(None, None, None, empty_overrides());
+        // Compare full resolved configurations, including defaults, without parsing twice.
+        let valid = value == "7" || (value == "0" && !key.ends_with("MAX_BYTES"));
+        let mut expected = RotationConfig::default();
+        if valid {
+            let n = value.parse::<u64>().unwrap();
+            if key == "VIGIL_MAX_SEGMENTS" {
+                expected = expected.max_segments(Some(n as usize));
+            } else {
+                let signal = if key.contains("LOGS") {
+                    Signal::Logs
+                } else if key.contains("METRICS") {
+                    Signal::Metrics
+                } else {
+                    Signal::Traces
+                };
+                let override_ = if key.ends_with("MAX_BYTES") {
+                    SignalRotation::new().max_bytes(n)
+                } else if key.ends_with("MAX_SEGMENTS") {
+                    SignalRotation::new().max_segments(Some(n as usize))
+                } else {
+                    SignalRotation::new()
+                        .retention((n != 0).then(|| Duration::from_secs(n * 86_400)))
+                };
+                expected = expected.signal(signal, override_);
+            }
+        }
+        assert_eq!(resolved, expected);
     }
 }

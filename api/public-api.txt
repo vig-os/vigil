@@ -190,9 +190,17 @@ pub fn vigil::rotate::RotatingFile::fmt(&self, f: &mut core::fmt::Formatter<'_>)
 pub struct vigil::rotate::RotationConfig
 impl vigil::rotate::RotationConfig
 pub fn vigil::rotate::RotationConfig::max_bytes(self, bytes: u64) -> Self
+pub fn vigil::rotate::RotationConfig::max_segments(self, segments: core::option::Option<usize>) -> Self
 pub fn vigil::rotate::RotationConfig::retention(self, retention: core::option::Option<core::time::Duration>) -> Self
+pub fn vigil::rotate::RotationConfig::signal(self, signal: vigil::Signal, rotation: vigil::rotate::SignalRotation) -> Self
 impl core::default::Default for vigil::rotate::RotationConfig
 pub fn vigil::rotate::RotationConfig::default() -> Self
+pub struct vigil::rotate::SignalRotation
+impl vigil::rotate::SignalRotation
+pub fn vigil::rotate::SignalRotation::max_bytes(self, bytes: u64) -> Self
+pub fn vigil::rotate::SignalRotation::max_segments(self, segments: core::option::Option<usize>) -> Self
+pub fn vigil::rotate::SignalRotation::new() -> Self
+pub fn vigil::rotate::SignalRotation::retention(self, retention: core::option::Option<core::time::Duration>) -> Self
 pub fn vigil::rotate::find_newest<T>(dir: &std::path::Path, signal: &str, pick: impl core::ops::function::FnMut(&str) -> core::option::Option<T>) -> std::io::error::Result<core::option::Option<T>>
 pub fn vigil::rotate::read_since(dir: &std::path::Path, signal: &str, since: core::option::Option<std::time::SystemTime>) -> std::io::error::Result<alloc::vec::Vec<alloc::string::String>>
 pub fn vigil::rotate::segments(dir: &std::path::Path, signal: &str) -> std::io::error::Result<alloc::vec::Vec<std::path::PathBuf>>
@@ -223,12 +231,14 @@ pub fn vigil::Config::filter_env(self, name: impl core::convert::Into<alloc::str
 pub fn vigil::Config::init(self) -> core::result::Result<vigil::Guard, vigil::InitError>
 pub fn vigil::Config::layer<S>(self) -> core::result::Result<(alloc::boxed::Box<(dyn tracing_subscriber::layer::Layer<S> + core::marker::Send + core::marker::Sync + 'static)>, vigil::Guard), vigil::InitError> where S: tracing_core::subscriber::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + core::marker::Send + core::marker::Sync + 'static
 pub fn vigil::Config::max_bytes(self, bytes: u64) -> Self
+pub fn vigil::Config::max_segments(self, segments: core::option::Option<usize>) -> Self
 pub fn vigil::Config::metrics(self, enabled: bool) -> Self
 pub fn vigil::Config::metrics_interval(self, interval: core::time::Duration) -> Self
 pub fn vigil::Config::new(service: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn vigil::Config::queue_size(self, size: usize) -> Self
 pub fn vigil::Config::retention(self, retention: core::option::Option<core::time::Duration>) -> Self
 pub fn vigil::Config::revision(self, revision: impl core::convert::Into<alloc::string::String>) -> Self
+pub fn vigil::Config::signal_rotation(self, signal: vigil::Signal, rotation: vigil::rotate::SignalRotation) -> Self
 pub fn vigil::Config::traces(self, enabled: bool) -> Self
 pub fn vigil::Config::version(self, version: impl core::convert::Into<alloc::string::String>) -> Self
 pub struct vigil::FlushError

@@ -357,6 +357,46 @@ and `HOME` are ignored, with rejected values explained if no path is available. 
 `None` keeps everything, while `Some(Duration::ZERO)` prunes rotated segments
 at the next prune. Explicit `retention(None)` overrides the environment.
 Explicit `Config` values override environment values.
+Rotation also supports `Config::max_segments(Some(k))` and
+`RotationConfig::max_segments(Some(k))`: at open and after rotation, age pruning
+runs first, then the oldest rotated segments of that signal are deleted until
+at most `k` remain. Live files, audit files and foreign files are preserved.
+The count cap defaults to `None` (unlimited); disk use is unbounded within the
+retention age by default. Failed deletions remain counted; pruning tries later
+segments and warns once per process if the count still exceeds the cap.
+
+Use `Config::signal_rotation(Signal::Logs, SignalRotation::new().max_bytes(16 *
+1024 * 1024).max_segments(Some(4)))` (types in `vigil::rotate` and `vigil`) or
+`RotationConfig::signal` to replace one signal's overrides. Unset fields inherit;
+an explicit `None` disables a count or age limit. Custom `RotatingFile` signal
+names use global values. Per-option precedence is signal builder, global builder,
+signal environment, global environment, default.
+
+| Setting | Global environment | Per-signal environment (`S` = `LOGS`, `METRICS`, `TRACES`) | Zero |
+|---|---|---|---|
+| Size | `VIGIL_MAX_BYTES` | `VIGIL_S_MAX_BYTES` | Builder clamps to 1; environment minimum is 1 |
+| Rotated count | `VIGIL_MAX_SEGMENTS` | `VIGIL_S_MAX_SEGMENTS` | Keeps no rotated segments |
+| Age in days | `VIGIL_RETENTION_DAYS` | `VIGIL_S_RETENTION_DAYS` | Environment keeps everything; builder `Some(Duration::ZERO)` expires past-mtime segments |
+
+The per-signal names are `VIGIL_LOGS_MAX_BYTES`, `VIGIL_METRICS_MAX_BYTES`,
+`VIGIL_TRACES_MAX_BYTES`, `VIGIL_LOGS_MAX_SEGMENTS`, `VIGIL_METRICS_MAX_SEGMENTS`,
+`VIGIL_TRACES_MAX_SEGMENTS`, `VIGIL_LOGS_RETENTION_DAYS`,
+`VIGIL_METRICS_RETENTION_DAYS`, and `VIGIL_TRACES_RETENTION_DAYS`.
+Empty values are unset; invalid numbers warn once per variable per configuration
+build. Count zero deletes even future-mtime segments that age zero keeps.
+
+With a count cap `K_s` for every signal, visible telemetry lengths are bounded by
+`D_count = Σ_S (K_s + 1) · F_s`, where `F_s = max(M_s, l_s)` and `l_s` is the
+longest line including newline. Idle writer handles can retain unlinked segments:
+`R = Σ_s W_s · max(M_s, l_s)` and `D_logical ≤ D + R`, counting writer instances
+across processes. For logs 16 MiB/4 segments, traces 32 MiB/4 and metrics 8 MiB/2
+(with lines below those sizes), visible bytes are at most 264 MiB and logical
+bytes at most `264 + 56·W` MiB for `W` processes using `init`. Insert your process
+count; additional writers each add their own allowance. These bounds assume
+consistent limits across writers and segments written under those size limits,
+and successful completed pruning. They count file lengths, excluding audit data,
+filesystem block rounding and metadata; see [ADR-0002 decision 22](docs/adr/0002-rotation-and-retention.md).
+
 `Config::revision` or `VIGIL_VCS_REVISION` supplies the producer commit.
 Log storage initialization failures make logs fall back to stderr; metrics and traces
 storage initialization failures disable their signal with its own warning.

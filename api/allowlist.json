@@ -259,5 +259,19 @@
       "vigil::audit::AttrValue::Int": "variant",
       "vigil::audit::AttrValue::Digest": "variant"
     }
+  },
+  {
+    "justification": "ADR-0002 amendment 3 decisions 16, 18 and 23; ADR-0004 decision 5: additive count and per-signal configuration",
+    "items": {
+      "vigil::Config::max_segments": "fn",
+      "vigil::Config::signal_rotation": "fn",
+      "vigil::rotate::RotationConfig::max_segments": "fn",
+      "vigil::rotate::RotationConfig::signal": "fn",
+      "vigil::rotate::SignalRotation": "struct",
+      "vigil::rotate::SignalRotation::new": "fn",
+      "vigil::rotate::SignalRotation::max_bytes": "fn",
+      "vigil::rotate::SignalRotation::max_segments": "fn",
+      "vigil::rotate::SignalRotation::retention": "fn"
+    }
   }
 ]
