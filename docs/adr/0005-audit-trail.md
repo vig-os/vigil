@@ -1265,7 +1265,7 @@ Source: architect rulings 13-d1 (the #13 plan's open questions OQ1 to OQ15; the 
 |---|---|---|---|
 | [19.1](#191-the-trustpolicy-builder-oq1) | `TrustPolicy::builder()`; only a validated policy exists | V1 | Accepted (#13 V1) |
 | [19.2](#192-fallible-verifier-configuration-and-the-error-channel-oq2-d) | fallible `Verifier` configuration; every verify entry point returns `Result<Report, AuditError>` | V3 and later | Proposed |
-| [19.3](#193-report-and-finding-extras-oq6-c) | `is_strict_valid`, `first_broken_link`, `first_seq`, `accepted_kind`, `run_digest` | V3 and later | Proposed |
+| [19.3](#193-report-and-finding-extras-oq6-c) | `is_strict_valid`, `first_broken_link`, `first_seq`, `accepted_kind`, `run_digest` | V3 and later | Proposed (accessors declared in V2, #13; V3 implements and accepts) |
 | [19.4](#194-json-and-text-output-oq7) | the JSON schema and the text header | C1 | Proposed |
 | [19.5](#195-what-is-unparsable-oq9-b) | one classification of `Unparsable` for the reader and the verifier | 13-R ([#143](https://github.com/vig-os/vigil/issues/143)) | Accepted (PR #148) |
 | [19.6](#196-a-genesis-resume-and-r10-oq10-a) | genesis-resume gap `0..=lost_through`; R10 is `ChainBroken` | V3 and the R10 slice | Proposed |

@@ -17,12 +17,48 @@ pub vigil::audit::AuditErrorKind::Signer
 pub vigil::audit::AuditErrorKind::TooLarge
 pub vigil::audit::AuditErrorKind::TrailExists
 #[non_exhaustive] pub enum vigil::audit::FindingKind
+pub vigil::audit::FindingKind::AcceptMismatch
+pub vigil::audit::FindingKind::AcceptUnused
+pub vigil::audit::FindingKind::Accepted
+pub vigil::audit::FindingKind::AnchorMismatch
+pub vigil::audit::FindingKind::BadSignature
+pub vigil::audit::FindingKind::ChainBroken
+pub vigil::audit::FindingKind::ClockWentBackwards
+pub vigil::audit::FindingKind::DuplicateRecord
 pub vigil::audit::FindingKind::HashMismatch
 pub vigil::audit::FindingKind::InvalidField
+pub vigil::audit::FindingKind::LostRecord
 pub vigil::audit::FindingKind::MissingField
+pub vigil::audit::FindingKind::MmrMismatch
+pub vigil::audit::FindingKind::NoReceipt
+pub vigil::audit::FindingKind::OutOfRange
+pub vigil::audit::FindingKind::ReceiptMismatch
+pub vigil::audit::FindingKind::ReceiptWaived
+pub vigil::audit::FindingKind::RepairMismatch
+pub vigil::audit::FindingKind::Resumed
+pub vigil::audit::FindingKind::RevocationMismatch
+pub vigil::audit::FindingKind::RevocationUnconfirmed
+pub vigil::audit::FindingKind::SegmentStructure
+pub vigil::audit::FindingKind::SeqConflict
+pub vigil::audit::FindingKind::SeqGap
+pub vigil::audit::FindingKind::StaleHead
+pub vigil::audit::FindingKind::StartMismatch
+pub vigil::audit::FindingKind::TornWrite
+pub vigil::audit::FindingKind::TornWriteRepaired
+pub vigil::audit::FindingKind::TrailEnded
+pub vigil::audit::FindingKind::TrailMismatch
+pub vigil::audit::FindingKind::UnanchoredEnd
+pub vigil::audit::FindingKind::UnanchoredStart
+pub vigil::audit::FindingKind::UncoveredTail
 pub vigil::audit::FindingKind::UnknownField
 pub vigil::audit::FindingKind::UnknownVersion
 pub vigil::audit::FindingKind::Unparsable
+pub vigil::audit::FindingKind::Unreconciled
+pub vigil::audit::FindingKind::UntrustedKey
+#[non_exhaustive] pub enum vigil::audit::Severity
+pub vigil::audit::Severity::Error
+pub vigil::audit::Severity::Info
+pub vigil::audit::Severity::Warning
 #[non_exhaustive] pub enum vigil::audit::Value
 pub vigil::audit::Value::Digest([u8; 32])
 pub vigil::audit::Value::Text(alloc::string::String)
@@ -91,6 +127,16 @@ pub fn vigil::audit::FieldKind::id() -> Self
 pub fn vigil::audit::FieldKind::int(min: i64, max: i64) -> Self
 pub fn vigil::audit::FieldKind::one_of<I, S>(values: I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn vigil::audit::FieldKind::token() -> Self
+pub struct vigil::audit::Finding
+impl vigil::audit::Finding
+pub fn vigil::audit::Finding::accepted_kind(&self) -> core::option::Option<vigil::audit::FindingKind>
+pub fn vigil::audit::Finding::detail(&self) -> &str
+pub fn vigil::audit::Finding::file(&self) -> core::option::Option<&std::path::Path>
+pub fn vigil::audit::Finding::kind(&self) -> vigil::audit::FindingKind
+pub fn vigil::audit::Finding::line(&self) -> core::option::Option<u64>
+pub fn vigil::audit::Finding::run_digest(&self) -> core::option::Option<[u8; 32]>
+pub fn vigil::audit::Finding::seq(&self) -> core::option::Option<u64>
+pub fn vigil::audit::Finding::severity(&self) -> vigil::audit::Severity
 pub struct vigil::audit::KeyFileSigner(_)
 impl vigil::audit::KeyFileSigner
 pub fn vigil::audit::KeyFileSigner::load(path: impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, vigil::audit::SignerError>
@@ -118,6 +164,15 @@ pub struct vigil::audit::RecordSchemaBuilder
 impl vigil::audit::RecordSchemaBuilder
 pub fn vigil::audit::RecordSchemaBuilder::action(self, action: impl core::convert::Into<alloc::string::String>) -> vigil::audit::ActionFields
 pub fn vigil::audit::RecordSchemaBuilder::build(self) -> core::result::Result<vigil::audit::RecordSchema, vigil::audit::AuditError>
+pub struct vigil::audit::Report
+impl vigil::audit::Report
+pub fn vigil::audit::Report::covered_through(&self) -> core::option::Option<u64>
+pub fn vigil::audit::Report::findings(&self) -> &[vigil::audit::Finding]
+pub fn vigil::audit::Report::first_seq(&self) -> core::option::Option<u64>
+pub fn vigil::audit::Report::is_valid(&self) -> bool
+pub fn vigil::audit::Report::last_seq(&self) -> core::option::Option<u64>
+pub fn vigil::audit::Report::records(&self) -> u64
+pub fn vigil::audit::Report::trail(&self) -> [u8; 16]
 pub struct vigil::audit::SignerError(_)
 impl vigil::audit::SignerError
 pub fn vigil::audit::SignerError::new(detail: impl core::convert::Into<alloc::string::String>) -> Self
