@@ -49,6 +49,7 @@ pub fn vigil::audit::AuditConfig::new(service: impl core::convert::Into<alloc::s
 pub fn vigil::audit::AuditConfig::open(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>) -> core::result::Result<vigil::audit::AuditTrail, vigil::audit::AuditError>
 pub fn vigil::audit::AuditConfig::resume(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>, head: (u64, [u8; 32]), lost_through: u64, actor: impl core::convert::Into<alloc::string::String>, reason: impl core::convert::Into<alloc::string::String>) -> core::result::Result<(vigil::audit::AuditTrail, vigil::audit::Receipt, vigil::audit::Checkpoint), vigil::audit::AuditError>
 pub fn vigil::audit::AuditConfig::rotate(self, signer: alloc::sync::Arc<dyn vigil::audit::Signer>, bound: (u64, [u8; 32]), expect_head: (u64, [u8; 32]), actor: impl core::convert::Into<alloc::string::String>, reason: impl core::convert::Into<alloc::string::String>) -> core::result::Result<(vigil::audit::Receipt, vigil::audit::Checkpoint), vigil::audit::AuditError>
+pub fn vigil::audit::AuditConfig::schema(self, schema: vigil::audit::RecordSchema) -> Self
 pub struct vigil::audit::AuditError
 impl vigil::audit::AuditError
 pub fn vigil::audit::AuditError::finding_kind(&self) -> core::option::Option<vigil::audit::FindingKind>
@@ -77,6 +78,7 @@ pub fn vigil::audit::Checkpoint::seq(&self) -> u64
 pub struct vigil::audit::Entry
 impl vigil::audit::Entry
 pub fn vigil::audit::Entry::after(self, value: vigil::audit::Value) -> Self
+pub fn vigil::audit::Entry::attr(self, key: impl core::convert::Into<alloc::string::String>, value: vigil::audit::AttrValue) -> Self
 pub fn vigil::audit::Entry::before(self, value: vigil::audit::Value) -> Self
 pub fn vigil::audit::Entry::details(self, value: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn vigil::audit::Entry::new(actor: impl core::convert::Into<alloc::string::String>, action: impl core::convert::Into<alloc::string::String>, object: impl core::convert::Into<alloc::string::String>) -> Self
