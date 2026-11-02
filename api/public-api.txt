@@ -1,5 +1,10 @@
 pub mod vigil
 pub mod vigil::audit
+#[non_exhaustive] pub enum vigil::audit::AttrValue
+pub vigil::audit::AttrValue::Digest([u8; 32])
+pub vigil::audit::AttrValue::Id(alloc::string::String)
+pub vigil::audit::AttrValue::Int(i64)
+pub vigil::audit::AttrValue::Token(alloc::string::String)
 #[non_exhaustive] pub enum vigil::audit::AuditErrorKind
 pub vigil::audit::AuditErrorKind::CorruptTrail
 pub vigil::audit::AuditErrorKind::HeadMismatch
@@ -69,6 +74,13 @@ pub fn vigil::audit::Entry::before(self, value: vigil::audit::Value) -> Self
 pub fn vigil::audit::Entry::details(self, value: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn vigil::audit::Entry::new(actor: impl core::convert::Into<alloc::string::String>, action: impl core::convert::Into<alloc::string::String>, object: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn vigil::audit::Entry::reason(self, value: impl core::convert::Into<alloc::string::String>) -> Self
+pub struct vigil::audit::FieldKind(_)
+impl vigil::audit::FieldKind
+pub fn vigil::audit::FieldKind::digest(algorithm: impl core::convert::Into<alloc::string::String>) -> Self
+pub fn vigil::audit::FieldKind::id() -> Self
+pub fn vigil::audit::FieldKind::int(min: i64, max: i64) -> Self
+pub fn vigil::audit::FieldKind::one_of<I, S>(values: I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn vigil::audit::FieldKind::token() -> Self
 pub struct vigil::audit::KeyFileSigner(_)
 impl vigil::audit::KeyFileSigner
 pub fn vigil::audit::KeyFileSigner::load(path: impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, vigil::audit::SignerError>

@@ -14,6 +14,9 @@
 //! Applications should pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 //! Before 1.0 they may change in any release; from 1.0, in any minor.
 
+#[cfg_attr(not(test), allow(dead_code))] // CP1b and CP2 wire the shared schema/block helpers.
+mod attributes;
+pub use attributes::{AttrValue, FieldKind};
 mod checkpoints;
 mod config;
 mod format;

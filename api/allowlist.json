@@ -243,5 +243,21 @@
     "items": {
       "vigil::audit::checkpoints": "fn"
     }
+  },
+  {
+    "justification": "ADR-0005 amendment 13 \u00a720.5: typed attribute kinds and values (#164 CP1a)",
+    "items": {
+      "vigil::audit::FieldKind": "struct",
+      "vigil::audit::FieldKind::id": "fn",
+      "vigil::audit::FieldKind::token": "fn",
+      "vigil::audit::FieldKind::one_of": "fn",
+      "vigil::audit::FieldKind::int": "fn",
+      "vigil::audit::FieldKind::digest": "fn",
+      "vigil::audit::AttrValue": "enum",
+      "vigil::audit::AttrValue::Id": "variant",
+      "vigil::audit::AttrValue::Token": "variant",
+      "vigil::audit::AttrValue::Int": "variant",
+      "vigil::audit::AttrValue::Digest": "variant"
+    }
   }
 ]

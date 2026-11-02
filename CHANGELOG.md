@@ -9,9 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Audit `FieldKind` and `AttrValue`, with the shared canonical attribute block format (ADR-0005 amendment 13 §20.3–§20.5, #164 CP1a).
+
 - ADR-0005 amendment 13 (Proposed): a consumer audit profile with no v1 byte-format change. Typed attributes (`id`, `token`, `enum`, `int`, 32-byte `digest`) ride in `audit.details` as a canonical attribute block naming its schema's digest; a per-trail `RecordSchema` set with `AuditConfig::schema` is checked fail-closed at `record()`; schema texts are pinned in the trust policy and the verifier reports `SchemaUnknown` and `SchemaViolation` (errors) and `OperatorText` (an acceptable warning for free text in an operator record); under a schema a record carries no free text (pseudonymous references), and the ADR states what that rule cannot catch and what an erasure outside the trail leaves provable. Open questions decided by architect ruling 164-d1; CP1 will refuse `Entry::details` text starting with `vigil.attrs.` and is marked breaking. Docs only; slices CP1 to CP4 implement it ([#164](https://github.com/vig-os/vigil/issues/164), [#165](https://github.com/vig-os/vigil/issues/165)).
 
 ### Changed
+
+- Audit record construction refuses caller-supplied `Entry::details` starting with the reserved `vigil.attrs.` prefix (`InvalidEntry`); decoding existing records is unchanged (#164 CP1a).
 
 ### Deprecated
 
