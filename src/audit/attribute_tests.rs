@@ -36,6 +36,13 @@ fn token_enum_and_integer_boundaries() {
     for text in ["".into(), "x".repeat(65), "A".into(), ":".into()] {
         assert!(kind.parse(&text).is_err());
     }
+    assert!(
+        FieldKind::one_of(["x".repeat(64)])
+            .parse(&"x".repeat(64))
+            .is_ok()
+    );
+    assert!(FieldKind::one_of(["x".repeat(65)]).validate().is_err());
+    assert!(FieldKind::one_of([""]).validate().is_err());
     let kind = FieldKind::one_of(["yes", "no"]);
     assert!(kind.parse("yes").is_ok());
     assert!(kind.parse("no").is_ok());
@@ -108,6 +115,7 @@ fn attribute_key_boundaries() {
         "x".repeat(65),
         "A".into(),
         "vigil.x".into(),
+        "aB".into(),
         "1x".into(),
         "a-b".into(),
     ] {
@@ -270,4 +278,8 @@ fn typed_record_golden_and_v010_encoding() {
     assert_eq!(block.as_bytes(), crate::audit::tests::vector("typed_block"));
     let line = crate::audit::sink::line(&record).unwrap();
     assert_eq!(Record::parse_line(&line).unwrap()[0].canonical(), legacy);
+    // Committed output of the released 0.1.0 encoder for these same details.
+    let v010 = include_bytes!("../../tests/fixtures/audit/typed-v010.jsonl");
+    assert_eq!(line.as_slice(), v010);
+    assert_eq!(Record::parse_line(v010).unwrap()[0].canonical(), legacy);
 }
