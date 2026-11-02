@@ -17,6 +17,8 @@
 #[cfg_attr(not(test), allow(dead_code))] // CP1b and CP2 wire the shared schema/block helpers.
 mod attributes;
 pub use attributes::{AttrValue, FieldKind};
+mod schema;
+pub use schema::{ActionFields, RecordSchema, RecordSchemaBuilder};
 mod checkpoints;
 mod config;
 mod format;

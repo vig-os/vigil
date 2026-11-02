@@ -74,6 +74,39 @@ impl FieldKind {
         }
     }
 
+    pub(super) fn schema_text(&self) -> String {
+        match &self.0 {
+            Kind::Id => "id".into(),
+            Kind::Token => "token".into(),
+            Kind::Enum(values) => format!("enum:{}", values.join(",")),
+            Kind::Int(min, max) => format!("int:{min}:{max}"),
+            Kind::Digest(alg) => format!("digest:{alg}"),
+        }
+    }
+
+    pub(super) fn parse_schema(text: &str) -> Result<Self, AuditError> {
+        let bad = || invalid(AuditErrorKind::InvalidConfig);
+        let kind = if text == "id" {
+            Self::id()
+        } else if text == "token" {
+            Self::token()
+        } else if let Some(values) = text.strip_prefix("enum:") {
+            Self::one_of(values.split(','))
+        } else if let Some(range) = text.strip_prefix("int:") {
+            let (min, max) = range.split_once(':').ok_or_else(bad)?;
+            Self::int(
+                min.parse().map_err(|_| bad())?,
+                max.parse().map_err(|_| bad())?,
+            )
+        } else if let Some(alg) = text.strip_prefix("digest:") {
+            Self::digest(alg)
+        } else {
+            return Err(bad());
+        };
+        kind.validate()?;
+        Ok(kind)
+    }
+
     fn render(&self, value: &AttrValue) -> Result<String, AuditError> {
         self.validate()?;
         let text = match (&self.0, value) {
@@ -130,7 +163,7 @@ pub enum AttrValue {
 fn invalid(kind: AuditErrorKind) -> AuditError {
     AuditError::new(kind, "invalid typed attribute kind, key, value or block")
 }
-fn token(value: &str) -> bool {
+pub(super) fn token(value: &str) -> bool {
     (1..=64).contains(&value.len())
         && value
             .bytes()
