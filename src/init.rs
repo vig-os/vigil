@@ -686,7 +686,8 @@ pub fn init(service: impl Into<String>) -> Result<Guard, InitError> {
     Config::new(service).init()
 }
 
-/// Logging configuration. Age pruning precedes count pruning. Count zero keeps
+/// Logging configuration. Pruning runs in age, count, then total-byte order.
+/// Count and total zero keep
 /// no rotated segments; size zero clamps to one; environment retention days zero
 /// keeps everything. Per-option precedence is signal builder, global builder,
 /// signal environment, global environment, default.

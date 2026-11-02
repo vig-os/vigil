@@ -368,6 +368,7 @@ Live files reserve `V_s = max(M_s, live_len + pending_len)` for the writing sign
 and `max(M_s, live_len)` for every other signal. Pending bytes include the newline
 and any repair byte. Pruning runs before an oversized write even into an empty
 live file. A total cap can evict all of a quiet signal's rotated history.
+Set both caps to bound directory size and the number of files listed per pass.
 Both caps default to `None` (unlimited); disk use is unbounded within the
 retention age by default. Failed deletions remain counted; pruning tries later
 segments and warns once per process per cap kind if a cap remains unmet, including when live reservations exceed the total cap.
