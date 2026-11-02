@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Audit `TrustPolicy`, built in code or parsed from a trust file, with validated trail pins and revocation bounds. Refs #13.
+
 ### Changed
 
 ### Deprecated
