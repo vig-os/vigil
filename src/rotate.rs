@@ -224,7 +224,8 @@ impl RotationConfig {
     }
 
     /// Keep rotated segments for this duration (default 90 days).
-    /// `None` keeps everything; `Some(Duration::ZERO)` prunes at the next prune.
+    /// `None` disables age pruning; `Some(Duration::ZERO)` expires past-mtime
+    /// segments at the next prune. Count pruning then applies independently.
     #[must_use]
     pub fn retention(mut self, retention: Option<Duration>) -> Self {
         self.retention = retention;

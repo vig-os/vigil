@@ -799,7 +799,10 @@ impl Config {
         self.dir = Some(dir.into());
         self
     }
-    /// Rotation limit in bytes (minimum 1; builder zero clamps to 1); overrides `VIGIL_MAX_BYTES` (default 50 MiB).
+    /// Rotation limit in bytes (minimum 1; builder zero clamps to 1; default 50 MiB).
+    /// Overrides `VIGIL_MAX_BYTES`, `VIGIL_LOGS_MAX_BYTES`,
+    /// `VIGIL_METRICS_MAX_BYTES`, and `VIGIL_TRACES_MAX_BYTES`.
+    /// A signal builder override takes precedence over this global builder.
     #[must_use]
     pub fn max_bytes(mut self, bytes: u64) -> Self {
         self.max_bytes = Some(bytes.max(1));
@@ -822,10 +825,13 @@ impl Config {
         self.queue_size = Some(size.clamp(1, MAX_QUEUE_SIZE));
         self
     }
-    /// Retention duration; `None` keeps everything and `Some(Duration::ZERO)`
+    /// Retention duration; `None` disables age pruning and `Some(Duration::ZERO)`
     /// prunes rotated segments at the next prune. Overrides
     /// `VIGIL_RETENTION_DAYS` (whole days, where zero instead keeps everything).
-    /// An explicit `retention(None)` overrides the environment too.
+    /// An explicit `retention(None)` overrides the environment too, including
+    /// `VIGIL_LOGS_RETENTION_DAYS`, `VIGIL_METRICS_RETENTION_DAYS`, and
+    /// `VIGIL_TRACES_RETENTION_DAYS`. A signal builder takes precedence.
+    /// Age pruning precedes count pruning; count limits still apply.
     #[must_use]
     pub fn retention(mut self, retention: Option<Duration>) -> Self {
         self.retention = Some(retention);
@@ -833,7 +839,9 @@ impl Config {
     }
     /// Cap rotated segments per signal after age pruning; `None` is unlimited,
     /// `Some(0)` keeps none. Overrides `VIGIL_MAX_SEGMENTS` and per-signal
-    /// count variables; environment retention days zero instead keeps everything.
+    /// variables `VIGIL_LOGS_MAX_SEGMENTS`, `VIGIL_METRICS_MAX_SEGMENTS`, and
+    /// `VIGIL_TRACES_MAX_SEGMENTS`; environment retention days zero instead keeps
+    /// everything. A signal builder override takes precedence.
     #[must_use]
     pub fn max_segments(mut self, segments: Option<usize>) -> Self {
         self.max_segments = Some(segments);
