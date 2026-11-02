@@ -31,6 +31,7 @@ pub(super) struct Summary {
     pub(super) repaired: Option<[u8; 32]>,
     pub(super) checkpoint: Option<CheckpointFields>,
     // Only reserved records need text for #13 V3b resume/fragment context.
+    #[cfg_attr(not(test), expect(dead_code, reason = "located context for #13 V3b"))]
     pub(super) operator: Option<Operator>,
     pub(super) line: u64,
 }
@@ -72,6 +73,7 @@ pub(super) enum LineContent {
     Fragment,
 }
 pub(super) struct LineItem {
+    #[cfg_attr(not(test), expect(dead_code, reason = "located context for #13 V3b"))]
     pub(super) bytes: Range<usize>,
     pub(super) line: u64,
     pub(super) content: LineContent,

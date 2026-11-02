@@ -1,0 +1,584 @@
+//! Public collecting verifier acceptance tests.
+#![cfg(feature = "audit")]
+use std::{
+    error::Error,
+    fs,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+use vigil::audit::{
+    AuditConfig, AuditErrorKind, Entry, FindingKind as K, KeyFileSigner, Report, TrustPolicy,
+    Verifier, keygen, verify,
+};
+const GOLDEN: &str = include_str!("fixtures/audit/codec.jsonl");
+const TRAIL: [u8; 16] = [0x11; 16];
+struct Dir(PathBuf);
+impl Dir {
+    fn new() -> Self {
+        static ID: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "vigil-verify-engine-{}-{}",
+            std::process::id(),
+            ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+    fn put(&self, name: &str, bytes: impl AsRef<[u8]>) -> PathBuf {
+        let path = self.0.join(name);
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+}
+impl Drop for Dir {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+fn policy() -> TrustPolicy {
+    TrustPolicy::builder().trail(TRAIL).build().unwrap()
+}
+fn entry() -> &'static str {
+    GOLDEN.lines().next().unwrap()
+}
+fn kinds(report: &Report, kind: K) -> Vec<&vigil::audit::Finding> {
+    report
+        .findings()
+        .iter()
+        .filter(|f| f.kind() == kind)
+        .collect()
+}
+#[test]
+fn pinned_empty_selection_and_narrowing_precede_reads() {
+    let dir = Dir::new();
+    let report = verify(&dir.0, &policy()).unwrap();
+    assert_eq!(report.trail(), TRAIL);
+    assert_eq!(report.records(), 0);
+    assert_eq!(
+        (
+            report.first_seq(),
+            report.last_seq(),
+            report.covered_through()
+        ),
+        (None, None, None)
+    );
+    assert!(report.findings().is_empty());
+    let multi = TrustPolicy::builder()
+        .trail(TRAIL)
+        .trail([2; 16])
+        .build()
+        .unwrap();
+    let verifier = Verifier::new(multi);
+    assert_eq!(
+        verifier.verify_files([]).unwrap_err().kind(),
+        AuditErrorKind::InvalidConfig
+    );
+    assert_eq!(
+        verifier
+            .verify_files([dir.0.join("missing")])
+            .unwrap_err()
+            .kind(),
+        AuditErrorKind::InvalidConfig
+    );
+    assert_eq!(
+        verifier.clone().trail([3; 16]).unwrap_err().kind(),
+        AuditErrorKind::InvalidConfig
+    );
+    assert_eq!(
+        verifier
+            .trail([2; 16])
+            .unwrap()
+            .verify_files([])
+            .unwrap()
+            .trail(),
+        [2; 16]
+    );
+}
+#[test]
+fn foreign_first_and_only_record_cannot_select_the_report_id() {
+    let dir = Dir::new();
+    let file = dir.put("copy", entry());
+    let trust = TrustPolicy::builder().trail([2; 16]).build().unwrap();
+    let report = Verifier::new(trust).verify_files([file.clone()]).unwrap();
+    assert_eq!(report.trail(), [2; 16]);
+    assert_eq!(report.records(), 0);
+    assert_eq!((report.first_seq(), report.last_seq()), (None, None));
+    let mismatch = kinds(&report, K::TrailMismatch);
+    assert_eq!(mismatch.len(), 1);
+    assert_eq!(mismatch[0].file(), Some(file.as_path()));
+    assert_eq!(mismatch[0].line(), Some(1));
+    assert!(mismatch[0].detail().contains("expected trail"));
+    let multi = TrustPolicy::builder()
+        .trail(TRAIL)
+        .trail([2; 16])
+        .build()
+        .unwrap();
+    let report = Verifier::new(multi)
+        .trail([2; 16])
+        .unwrap()
+        .verify_files([file])
+        .unwrap();
+    assert_eq!(report.trail(), [2; 16]);
+    assert_eq!(kinds(&report, K::TrailMismatch).len(), 1);
+    assert_eq!(report.records(), 0);
+}
+#[test]
+fn missing_explicit_file_is_io_with_source() {
+    let dir = Dir::new();
+    let error = Verifier::new(policy())
+        .verify_files([dir.0.join("missing")])
+        .unwrap_err();
+    assert_eq!(error.kind(), AuditErrorKind::Io);
+    assert!(error.source().is_some());
+}
+#[test]
+fn decoder_kinds_collect_and_attribute_then_check_following_valid_line() {
+    let valid = entry();
+    let cases = [
+        ("not json".to_owned(), K::Unparsable),
+        (
+            valid.replace("\"intValue\":\"1\"", "\"intValue\":\"2\""),
+            K::UnknownVersion,
+        ),
+        ("{}".to_owned(), K::MissingField),
+        (
+            "{\"resourceLogs\":[],\"unknown\":1}".to_owned(),
+            K::UnknownField,
+        ),
+        ("{\"a\":1,\"a\":1}".to_owned(), K::InvalidField),
+        (
+            valid.replace("sample.modify", "sample.forged"),
+            K::HashMismatch,
+        ),
+    ];
+    let dir = Dir::new();
+    for (index, (bad, kind)) in cases.into_iter().enumerate() {
+        let file = dir.put(&format!("copy-{index}"), format!("{bad}\n{valid}\n"));
+        let report = Verifier::new(policy())
+            .verify_files([file.clone()])
+            .unwrap();
+        assert_eq!(report.records(), 1, "{kind:?}");
+        assert_eq!(report.first_seq(), Some(0));
+        let findings = kinds(&report, kind);
+        assert_eq!(findings.len(), 1, "{kind:?}: {:?}", report.findings());
+        assert_eq!(findings[0].file(), Some(file.as_path()));
+        assert_eq!(findings[0].line(), Some(1));
+        assert!(kinds(&report, K::SegmentStructure).is_empty());
+    }
+}
+#[test]
+fn display_only_changes_are_one_authenticated_record_and_one_warning() {
+    let dir = Dir::new();
+    let edited = entry().replace("\"version\":\"0.0.0\"", "\"version\":\"9.0.0\"");
+    assert_ne!(entry(), edited);
+    let file = dir.put("copy", format!("{}\n{edited}\n{edited}\n", entry()));
+    let report = Verifier::new(policy()).verify_files([file]).unwrap();
+    assert!(report.is_valid(), "{:?}", report.findings());
+    assert_eq!(report.records(), 1);
+    assert_eq!(kinds(&report, K::DuplicateRecord).len(), 1);
+    assert!(kinds(&report, K::SeqConflict).is_empty());
+}
+#[test]
+fn native_boundaries_cannot_be_repaired_by_shipped_checkpoint() {
+    let dir = Dir::new();
+    let native = dir.put("audit.jsonl", entry());
+    let shipped = dir.put("copy", GOLDEN.lines().nth(1).unwrap());
+    let report = Verifier::new(policy())
+        .verify_files([shipped, native.clone()])
+        .unwrap();
+    let structure = kinds(&report, K::SegmentStructure);
+    assert_eq!(structure.len(), 1);
+    assert_eq!(structure[0].file(), Some(native.as_path()));
+    assert_eq!(structure[0].run_digest(), None);
+    let empty = dir.put("audit-20261102T010203.000000000Z.jsonl", "");
+    let report = Verifier::new(policy()).verify_files([empty]).unwrap();
+    assert_eq!(kinds(&report, K::SegmentStructure).len(), 1);
+}
+#[test]
+fn oversized_line_is_one_finding_and_following_record_survives() {
+    let dir = Dir::new();
+    let file = dir.put("copy", format!("{}\n{}\n", "x".repeat(1_100_000), entry()));
+    let report = Verifier::new(policy()).verify_files([file]).unwrap();
+    assert_eq!(report.records(), 1);
+    assert_eq!(kinds(&report, K::Unparsable).len(), 1);
+}
+#[test]
+fn reversed_shipped_files_and_batches_have_same_findings_and_physical_lines() {
+    let dir = Dir::new();
+    let mut batch: serde_json::Value = serde_json::from_str(entry()).unwrap();
+    let logs = batch["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+        .as_array_mut()
+        .unwrap();
+    logs.push(logs[0].clone());
+    let a = dir.put("a", format!("!\n{batch}\n"));
+    let b = dir.put("b", entry());
+    let verifier = Verifier::new(policy());
+    let forward = verifier.verify_files([a.clone(), b.clone()]).unwrap();
+    let reverse = verifier.verify_files([b, a.clone()]).unwrap();
+    assert_eq!(forward.findings(), reverse.findings());
+    assert_eq!(forward.records(), 1);
+    assert_eq!(kinds(&forward, K::DuplicateRecord).len(), 1);
+    assert_eq!(kinds(&forward, K::DuplicateRecord)[0].line(), Some(2));
+    let bad = kinds(&forward, K::Unparsable);
+    assert_eq!(bad[0].file(), Some(a.as_path()));
+    assert_eq!(bad[0].line(), Some(1));
+    batch["resourceLogs"][0]["scopeLogs"][0]["logRecords"][1]["attributes"][0]["value"]["intValue"] =
+        "2".into();
+    let invalid = dir.put("invalid-batch", format!("!\n{batch}\n{}\n", entry()));
+    let report = verifier.verify_files([invalid]).unwrap();
+    assert_eq!(kinds(&report, K::UnknownVersion)[0].line(), Some(2));
+    assert_eq!(report.records(), 1); // The valid member in the failed batch never leaks.
+    assert_eq!(kinds(&report, K::DuplicateRecord).len(), 0);
+}
+
+struct Written {
+    dir: PathBuf,
+    trail: PathBuf,
+    key: PathBuf,
+    trust: TrustPolicy,
+    seqs: Vec<u64>,
+}
+impl Written {
+    fn new(records: usize) -> Self {
+        static ID: AtomicU64 = AtomicU64::new(1 << 20);
+        let dir = std::env::temp_dir().join(format!(
+            "vigil-verify-writer-{}-{}",
+            std::process::id(),
+            ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let key = dir.join("key");
+        keygen(&key).unwrap();
+        let trail_dir = dir.join("trail");
+        let signer = Arc::new(KeyFileSigner::load(&key).unwrap());
+        let writer = AuditConfig::new("svc")
+            .dir(&trail_dir)
+            .create(signer)
+            .unwrap();
+        let trail_id = writer.trail();
+        let mut seqs = Vec::new();
+        for i in 0..records {
+            let r = writer
+                .record(&Entry::new("a", "change", format!("o{i}")))
+                .unwrap();
+            seqs.push(r.seq());
+        }
+        let head = writer.close().unwrap();
+        seqs.push(head.seq());
+        let trust = TrustPolicy::builder().trail(trail_id).build().unwrap();
+        Self {
+            dir,
+            trail: trail_dir,
+            key,
+            trust,
+            seqs,
+        }
+    }
+    fn signer(&self) -> Arc<KeyFileSigner> {
+        Arc::new(KeyFileSigner::load(&self.key).unwrap())
+    }
+    fn live(&self) -> PathBuf {
+        self.trail.join("audit.jsonl")
+    }
+    fn read(&self) -> Vec<u8> {
+        fs::read(self.live()).unwrap()
+    }
+    fn write(&self, bytes: &[u8]) {
+        fs::write(self.live(), bytes).unwrap();
+    }
+}
+impl Drop for Written {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[test]
+fn mid_file_fragment_without_attestation_is_repair_mismatch_and_not_valid() {
+    let fx = Written::new(3);
+    let before = fx.read();
+    // Insert a fragment line between the first record line and the second.
+    let first_lf = before.iter().position(|&b| b == b'\n').unwrap();
+    let second_lf = before[first_lf + 1..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap()
+        + first_lf
+        + 1;
+    let junk: &[u8] = b"{\"resourceLogs\":[\n";
+    let mut after = Vec::new();
+    after.extend_from_slice(&before[..=second_lf]);
+    after.extend_from_slice(junk);
+    after.extend_from_slice(&before[second_lf + 1..]);
+    fx.write(&after);
+    let report = verify(&fx.trail, &fx.trust).unwrap();
+    assert!(!report.is_valid(), "{:?}", report.findings());
+    let rm = kinds(&report, K::RepairMismatch);
+    assert_eq!(rm.len(), 1, "{:?}", report.findings());
+    assert!(
+        kinds(&report, K::TornWrite).is_empty(),
+        "{:?}",
+        report.findings()
+    );
+    // The finding points at the gap's physical line, not the following record.
+    assert_eq!(rm[0].line(), Some(3));
+    let d = rm[0].detail();
+    assert!(d.contains("lines 3..=3"), "{d}");
+    assert!(d.contains(&format!("({} bytes)", junk.len())), "{d}");
+    assert!(d.contains("attested at line 4"), "{d}");
+}
+
+#[test]
+fn junk_as_first_line_attributes_gap_to_line_one() {
+    let dir = Dir::new();
+    let valid = entry();
+    let junk = "{\"resourceLogs\":[\n";
+    let native = dir.0.join("audit.jsonl");
+    fs::write(&native, format!("{junk}{valid}\n")).unwrap();
+    let report = verify(&dir.0, &policy()).unwrap();
+    let rm = kinds(&report, K::RepairMismatch);
+    assert_eq!(rm.len(), 1, "{:?}", report.findings());
+    assert_eq!(rm[0].line(), Some(1));
+    let d = rm[0].detail();
+    assert!(d.contains("lines 1..=1"), "{d}");
+    assert!(d.contains(&format!("({} bytes)", junk.len())), "{d}");
+    assert!(d.contains("attested at line 2"), "{d}");
+}
+
+#[test]
+fn multi_line_gap_covers_every_junk_line_in_the_range() {
+    let fx = Written::new(3);
+    let before = fx.read();
+    let first_lf = before.iter().position(|&b| b == b'\n').unwrap();
+    let second_lf = before[first_lf + 1..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap()
+        + first_lf
+        + 1;
+    let junk: &[u8] = b"{\"resourceLogs\":[\n{\"resourceLogs\":[\n";
+    let mut after = Vec::new();
+    after.extend_from_slice(&before[..=second_lf]);
+    after.extend_from_slice(junk);
+    after.extend_from_slice(&before[second_lf + 1..]);
+    fx.write(&after);
+    let report = verify(&fx.trail, &fx.trust).unwrap();
+    let rm = kinds(&report, K::RepairMismatch);
+    assert_eq!(rm.len(), 1, "{:?}", report.findings());
+    assert_eq!(rm[0].line(), Some(3));
+    let d = rm[0].detail();
+    assert!(d.contains("lines 3..=4"), "{d}");
+    assert!(d.contains(&format!("({} bytes)", junk.len())), "{d}");
+    assert!(d.contains("attested at line 5"), "{d}");
+}
+
+#[test]
+fn trailing_fragment_is_torn_write_and_reports_prior_last_seq() {
+    let fx = Written::new(2);
+    let before = fx.read();
+    // Cut the final line (the close checkpoint) in half.
+    let last_lf = before.iter().rposition(|&b| b == b'\n').unwrap();
+    let prev_lf = before[..last_lf].iter().rposition(|&b| b == b'\n').unwrap();
+    let cut = prev_lf + 1 + (last_lf - prev_lf - 1) / 2;
+    let gap_bytes = (cut - (prev_lf + 1)) as u64;
+    fx.write(&before[..cut]);
+    let report = verify(&fx.trail, &fx.trust).unwrap();
+    let tw = kinds(&report, K::TornWrite);
+    assert_eq!(tw.len(), 1, "{:?}", report.findings());
+    let d = tw[0].detail();
+    assert!(d.contains("trailing gap"), "{d}");
+    assert!(d.contains("digest blake3:"), "{d}");
+    // Attribution points at the gap's own physical line, not past EOF.
+    assert_eq!(tw[0].line(), Some(4));
+    assert!(d.contains("lines 4..=4"), "{d}");
+    assert!(d.contains(&format!("({gap_bytes} bytes)")), "{d}");
+    let penultimate = fx.seqs[fx.seqs.len() - 2];
+    assert_eq!(report.last_seq(), Some(penultimate));
+    assert!(kinds(&report, K::RepairMismatch).is_empty());
+}
+
+#[test]
+fn honest_crash_writer_attests_gap_and_mutating_a_byte_turns_it_into_repair_mismatch() {
+    let fx = Written::new(2);
+    let before = fx.read();
+    // Truncate the closing checkpoint mid-line to simulate a crash.
+    let last_lf = before.iter().rposition(|&b| b == b'\n').unwrap();
+    let prev_lf = before[..last_lf].iter().rposition(|&b| b == b'\n').unwrap();
+    let cut = prev_lf + 1 + (last_lf - prev_lf - 1) / 2;
+    fx.write(&before[..cut]);
+    // The writer reopens, settles the torn tail, and attests the gap on the next record.
+    let reopened = AuditConfig::new("svc")
+        .dir(&fx.trail)
+        .open(fx.signer())
+        .unwrap();
+    let resumed = reopened
+        .record(&Entry::new("a", "change", "resumed"))
+        .unwrap();
+    drop(reopened);
+    let report = verify(&fx.trail, &fx.trust).unwrap();
+    let tw = kinds(&report, K::TornWrite);
+    assert_eq!(tw.len(), 1, "{:?}", report.findings());
+    assert!(kinds(&report, K::RepairMismatch).is_empty());
+    assert!(kinds(&report, K::TornWriteRepaired).is_empty());
+    // The attested gap points at the gap line itself and names its byte length.
+    assert_eq!(tw[0].line(), Some(4));
+    let d = tw[0].detail();
+    assert!(d.contains("lines 4..=4"), "{d}");
+    assert!(d.contains("bytes)"), "{d}");
+    assert!(
+        d.contains(&format!("attested at line 5 seq {}", resumed.seq())),
+        "{d}"
+    );
+    // Now flip one gap byte and re-verify: attestation no longer matches.
+    let mut mutated = fs::read(fx.live()).unwrap();
+    mutated[cut - 1] ^= 1; // flip a bit inside the torn fragment
+    fx.write(&mutated);
+    let report = verify(&fx.trail, &fx.trust).unwrap();
+    assert!(
+        kinds(&report, K::TornWrite).is_empty(),
+        "{:?}",
+        report.findings()
+    );
+    let rm = kinds(&report, K::RepairMismatch);
+    assert_eq!(rm.len(), 1);
+    assert_eq!(rm[0].line(), Some(4));
+    let d = rm[0].detail();
+    assert!(d.contains("lines 4..=4"), "{d}");
+    assert!(
+        d.contains(&format!("attested at line 5 seq {}", resumed.seq())),
+        "{d}"
+    );
+    assert!(
+        d.contains("expected blake3:") && d.contains("got blake3:"),
+        "{d}"
+    );
+}
+
+#[test]
+fn shipped_repaired_record_without_preceding_gap_is_torn_write_repaired() {
+    let fx = Written::new(2);
+    let before = fx.read();
+    // Produce an authentic torn-and-repaired native file.
+    let last_lf = before.iter().rposition(|&b| b == b'\n').unwrap();
+    let prev_lf = before[..last_lf].iter().rposition(|&b| b == b'\n').unwrap();
+    let cut = prev_lf + 1 + (last_lf - prev_lf - 1) / 2;
+    fx.write(&before[..cut]);
+    let reopened = AuditConfig::new("svc")
+        .dir(&fx.trail)
+        .open(fx.signer())
+        .unwrap();
+    let receipt = reopened
+        .record(&Entry::new("a", "change", "resumed"))
+        .unwrap();
+    drop(reopened);
+    // Extract only the attesting record line into a shipped copy.
+    let full = fx.read();
+    let lines: Vec<&[u8]> = full
+        .split_inclusive(|&b| b == b'\n')
+        .filter(|l| {
+            serde_json::from_slice::<serde_json::Value>(l.strip_suffix(b"\n").unwrap_or(l)).is_ok()
+        })
+        .collect();
+    let repaired_line = lines
+        .iter()
+        .find(|l| l.windows(14).any(|w| w == b"audit.repaired"))
+        .expect("the resumed record carries audit.repaired");
+    let shipped_dir = Dir::new();
+    let shipped = shipped_dir.put("copy", repaired_line);
+    let report = Verifier::new(fx.trust.clone())
+        .verify_files([shipped.clone()])
+        .unwrap();
+    let twr = kinds(&report, K::TornWriteRepaired);
+    assert_eq!(twr.len(), 1, "{:?}", report.findings());
+    assert_eq!(twr[0].file(), Some(shipped.as_path()));
+    assert_eq!(twr[0].detail(), "fragment not present");
+    assert_eq!(twr[0].seq(), Some(receipt.seq()));
+}
+
+#[test]
+fn fragment_line_in_shipped_input_is_unparsable() {
+    let dir = Dir::new();
+    let valid = entry();
+    let file = dir.put("copy", format!("{{\"resourceLogs\":[\n{valid}\n"));
+    let report = Verifier::new(policy())
+        .verify_files([file.clone()])
+        .unwrap();
+    let bad = kinds(&report, K::Unparsable);
+    assert_eq!(bad.len(), 1, "{:?}", report.findings());
+    assert_eq!(bad[0].file(), Some(file.as_path()));
+    assert_eq!(bad[0].line(), Some(1));
+    assert_eq!(report.records(), 1); // The following valid record is still checked.
+}
+
+#[test]
+fn decoder_errors_after_seq_is_read_carry_the_seq_and_sort_by_it() {
+    let dir = Dir::new();
+    let valid = entry();
+    // Each of these reads audit.seq (= 0) before failing.
+    let missing = valid.replace(
+        "{\"key\":\"audit.actor\",\"value\":{\"stringValue\":\"α\"}},",
+        "",
+    );
+    assert_ne!(valid, missing);
+    // Inject a brand-new attribute key so UnknownField fires after seq is read.
+    let unknown = valid.replace(
+        "{\"key\":\"audit.hash\"",
+        "{\"key\":\"audit.unknownZ\",\"value\":{\"stringValue\":\"x\"}},{\"key\":\"audit.hash\"",
+    );
+    assert_ne!(valid, unknown);
+    // Non-hex prev_hash is InvalidField, raised after audit.seq is read.
+    let invalid = valid.replacen("blake3:a03c7c40", "blake3:zzzzzzzz", 1);
+    assert!(invalid.contains("blake3:zzzz"));
+    let not_json = "not json";
+    let bytes = format!("{missing}\n{unknown}\n{invalid}\n{not_json}\n{valid}\n");
+    let file = dir.put("copy", bytes);
+    let report = Verifier::new(policy()).verify_files([file]).unwrap();
+    for (kind, line) in [
+        (K::MissingField, 1u64),
+        (K::UnknownField, 2),
+        (K::InvalidField, 3),
+    ] {
+        let fs = kinds(&report, kind);
+        assert_eq!(fs.len(), 1, "{kind:?}: {:?}", report.findings());
+        assert_eq!(fs[0].line(), Some(line), "{kind:?}");
+        assert_eq!(fs[0].seq(), Some(0), "{kind:?}");
+    }
+    // Seqless Unparsable sorts after every seq-bearing finding.
+    let order: Vec<_> = report.findings().iter().map(|f| f.kind()).collect();
+    let unparsable = order.iter().position(|k| *k == K::Unparsable).unwrap();
+    for k in [K::MissingField, K::UnknownField, K::InvalidField] {
+        let pos = order.iter().position(|kk| *kk == k).unwrap();
+        assert!(
+            pos < unparsable,
+            "{k:?} must sort before Unparsable; order: {order:?}"
+        );
+    }
+}
+
+#[test]
+fn hash_mismatch_carries_seq_and_sorts_before_seqless_findings() {
+    let dir = Dir::new();
+    let valid = entry();
+    let edited = valid.replace("sample.modify", "sample.forged");
+    assert_ne!(valid, edited);
+    let not_json = "not json";
+    // Edited (HashMismatch, seq=0) must sort before the unparsable (no seq).
+    let file = dir.put("copy", format!("{edited}\n{not_json}\n"));
+    let report = Verifier::new(policy())
+        .verify_files([file.clone()])
+        .unwrap();
+    let mismatches = kinds(&report, K::HashMismatch);
+    assert_eq!(mismatches.len(), 1, "{:?}", report.findings());
+    assert_eq!(mismatches[0].seq(), Some(0));
+    let unparsable = kinds(&report, K::Unparsable);
+    assert_eq!(unparsable.len(), 1);
+    assert_eq!(unparsable[0].seq(), None);
+    // Seq-bearing finding comes first.
+    let order: Vec<_> = report.findings().iter().map(|f| f.kind()).collect();
+    let hash_pos = order.iter().position(|k| *k == K::HashMismatch).unwrap();
+    let unp_pos = order.iter().position(|k| *k == K::Unparsable).unwrap();
+    assert!(hash_pos < unp_pos, "ordering: {order:?}");
+}

@@ -15,7 +15,7 @@
 //! Before 1.0 they may change in any release; from 1.0, in any minor.
 
 mod verify;
-pub use verify::{Finding, Report, Severity};
+pub use verify::{Finding, Report, Severity, Verifier, verify};
 mod trust;
 pub use trust::{TrailTrust, TrustPolicy, TrustPolicyBuilder};
 mod attributes;
@@ -185,6 +185,7 @@ pub struct AuditError {
     kind: AuditErrorKind,
     detail: String,
     finding: Option<FindingKind>,
+    seq: Option<u64>,
     // The source is an immutable diagnostic: unwinding cannot interrupt a
     // mutation of AuditError's state. Preserve its existing unwind-safety traits.
     source:
@@ -196,6 +197,7 @@ impl AuditError {
             kind,
             detail: detail.into(),
             finding: None,
+            seq: None,
             source: None,
         }
     }
@@ -209,9 +211,19 @@ impl AuditError {
         Self {
             kind,
             finding: Some(finding),
+            seq: None,
             source: None,
             detail: format!("{finding:?}: invalid audit v1 OTLP line"),
         }
+    }
+    /// Attaches a decoded sequence number so #13 V3 can sort findings in seq order.
+    pub(crate) fn with_seq(mut self, seq: u64) -> Self {
+        self.seq = Some(seq);
+        self
+    }
+    /// Returns the decoded sequence number when the decoder read it before failing.
+    pub(crate) fn seq(&self) -> Option<u64> {
+        self.seq
     }
     /// Returns the decoder's verifier finding, when this is a parsing failure.
     /// Writers may continue to handle these as CorruptTrail; size violations

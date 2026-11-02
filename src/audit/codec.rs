@@ -175,100 +175,107 @@ fn parse_record(log: &Json, resource: &Attributes<'_>) -> Result<Record, AuditEr
         return Err(corrupt());
     }
     let mut attrs = attributes(required(log, "attributes")?)?;
-    if attrs.keys().any(|key| {
-        ![
-            "audit.v",
-            "audit.trail",
-            "audit.seq",
-            "audit.repaired",
-            "audit.prev_hash",
-            "audit.hash",
-            "audit.actor",
-            "audit.action",
-            "audit.object",
-            "audit.reason",
-            "audit.details",
-            "audit.before",
-            "audit.before_digest",
-            "audit.after",
-            "audit.after_digest",
-            "audit.mmr_size",
-            "audit.mmr_root",
-            "audit.mmr_peaks",
-            "audit.key_id",
-            "audit.sig",
-        ]
-        .contains(key)
-    }) {
-        return Err(finding(FindingKind::UnknownField));
-    }
     if integer(scalar(take(&mut attrs, "audit.v")?, "intValue")?)? != 1 {
         return Err(finding(FindingKind::UnknownVersion));
     }
     let trail = hex_array(string(take(&mut attrs, "audit.trail")?)?)?;
     let seq = integer(scalar(take(&mut attrs, "audit.seq")?, "intValue")?)?;
-    let previous = digest(take(&mut attrs, "audit.prev_hash")?)?;
-    let claimed = digest(take(&mut attrs, "audit.hash")?)?;
-    let service = string(
-        resource
-            .get("service.name")
-            .ok_or_else(|| finding(FindingKind::MissingField))?,
-    )?;
-    let mut context = RecordContext::new(trail, seq, time, service, previous);
-    if let Some(host) = resource.get("host.name") {
-        context = context.host(string(host)?);
-    }
-    if let Some(repaired) = attrs.remove("audit.repaired") {
-        context = context.repaired(digest(repaired)?);
-    }
-    let record = match required(log, "eventName")?.as_str() {
-        Some("audit.record") => {
-            let mut entry = Entry::new(
-                string(take(&mut attrs, "audit.actor")?)?,
-                string(take(&mut attrs, "audit.action")?)?,
-                string(take(&mut attrs, "audit.object")?)?,
-            );
-            if let Some(v) = attrs.remove("audit.reason") {
-                entry = entry.reason(string(v)?);
-            }
-            if let Some(v) = attrs.remove("audit.details") {
-                entry = entry.details(string(v)?);
-            }
-            if let Some(v) = value(&mut attrs, "audit.before", "audit.before_digest")? {
-                entry = entry.before(v);
-            }
-            if let Some(v) = value(&mut attrs, "audit.after", "audit.after_digest")? {
-                entry = entry.after(v);
-            }
-            mapped(Record::new_internal(context, entry))?
+    // After the seq is read, every error path through this function carries it.
+    let rest: Result<Record, AuditError> = (|| {
+        if attrs.keys().any(|key| {
+            ![
+                "audit.repaired",
+                "audit.prev_hash",
+                "audit.hash",
+                "audit.actor",
+                "audit.action",
+                "audit.object",
+                "audit.reason",
+                "audit.details",
+                "audit.before",
+                "audit.before_digest",
+                "audit.after",
+                "audit.after_digest",
+                "audit.mmr_size",
+                "audit.mmr_root",
+                "audit.mmr_peaks",
+                "audit.key_id",
+                "audit.sig",
+            ]
+            .contains(key)
+        }) {
+            return Err(finding(FindingKind::UnknownField));
         }
-        Some("audit.checkpoint") => {
-            let size = integer(scalar(take(&mut attrs, "audit.mmr_size")?, "intValue")?)?;
-            let root = digest(take(&mut attrs, "audit.mmr_root")?)?;
-            let key = hex_array(string(take(&mut attrs, "audit.key_id")?)?)?;
-            let sig = hex_array(string(take(&mut attrs, "audit.sig")?)?)?;
-            let peaks = match attrs.remove("audit.mmr_peaks") {
-                Some(v) if size != 0 => array(scalar(scalar(v, "arrayValue")?, "values")?)?
-                    .iter()
-                    .map(digest)
-                    .collect::<Result<Vec<_>, _>>()?,
-                None if size == 0 => Vec::new(),
-                _ => return Err(corrupt()),
-            };
-            mapped(Record::checkpoint(
-                context,
-                mapped(CheckpointFields::new(size, root, peaks, key, sig))?,
-            ))?
+        let previous = digest(take(&mut attrs, "audit.prev_hash")?)?;
+        let claimed = digest(take(&mut attrs, "audit.hash")?)?;
+        let service = string(
+            resource
+                .get("service.name")
+                .ok_or_else(|| finding(FindingKind::MissingField))?,
+        )?;
+        let mut context = RecordContext::new(trail, seq, time, service, previous);
+        if let Some(host) = resource.get("host.name") {
+            context = context.host(string(host)?);
         }
-        _ => return Err(corrupt()),
-    };
-    if !attrs.is_empty() {
-        return Err(corrupt());
-    }
-    if record.hash() != claimed {
-        return Err(finding(FindingKind::HashMismatch));
-    }
-    Ok(record)
+        if let Some(repaired) = attrs.remove("audit.repaired") {
+            context = context.repaired(digest(repaired)?);
+        }
+        let record = match required(log, "eventName")?.as_str() {
+            Some("audit.record") => {
+                let mut entry = Entry::new(
+                    string(take(&mut attrs, "audit.actor")?)?,
+                    string(take(&mut attrs, "audit.action")?)?,
+                    string(take(&mut attrs, "audit.object")?)?,
+                );
+                if let Some(v) = attrs.remove("audit.reason") {
+                    entry = entry.reason(string(v)?);
+                }
+                if let Some(v) = attrs.remove("audit.details") {
+                    entry = entry.details(string(v)?);
+                }
+                if let Some(v) = value(&mut attrs, "audit.before", "audit.before_digest")? {
+                    entry = entry.before(v);
+                }
+                if let Some(v) = value(&mut attrs, "audit.after", "audit.after_digest")? {
+                    entry = entry.after(v);
+                }
+                mapped(Record::new_internal(context, entry))?
+            }
+            Some("audit.checkpoint") => {
+                let size = integer(scalar(take(&mut attrs, "audit.mmr_size")?, "intValue")?)?;
+                let root = digest(take(&mut attrs, "audit.mmr_root")?)?;
+                let key = hex_array(string(take(&mut attrs, "audit.key_id")?)?)?;
+                let sig = hex_array(string(take(&mut attrs, "audit.sig")?)?)?;
+                let peaks = match attrs.remove("audit.mmr_peaks") {
+                    Some(v) if size != 0 => array(scalar(scalar(v, "arrayValue")?, "values")?)?
+                        .iter()
+                        .map(digest)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    None if size == 0 => Vec::new(),
+                    _ => return Err(corrupt()),
+                };
+                mapped(Record::checkpoint(
+                    context,
+                    mapped(CheckpointFields::new(size, root, peaks, key, sig))?,
+                ))?
+            }
+            _ => return Err(corrupt()),
+        };
+        if !attrs.is_empty() {
+            return Err(corrupt());
+        }
+        if record.hash() != claimed {
+            return Err(finding(FindingKind::HashMismatch));
+        }
+        Ok(record)
+    })();
+    rest.map_err(|e| {
+        if e.seq().is_none() {
+            e.with_seq(seq)
+        } else {
+            e
+        }
+    })
 }
 impl Record {
     /// **Unstable:** enable `--cfg vigil_unstable` and pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
