@@ -400,12 +400,7 @@ pub(crate) fn history_segment(
                 // to fragments between complete records in the same segment.
                 if matches!(classification, super::lines::Line::Fragment) {
                     if !first {
-                        gap.get_or_insert_with(|| {
-                            let mut hash = blake3::Hasher::new();
-                            hash.update(b"vigil.audit.v1.repaired\0");
-                            hash
-                        })
-                        .update(&line);
+                        gap.get_or_insert_with(super::gap_hasher).update(&line);
                     }
                 } else {
                     damaged = true;
@@ -884,12 +879,7 @@ fn scan_inner(
         let records = match super::lines::classify(payload) {
             super::lines::Line::Record(Ok(records)) => records,
             super::lines::Line::Fragment if !first && !boundary_resume => {
-                gap.get_or_insert_with(|| {
-                    let mut h = blake3::Hasher::new();
-                    h.update(b"vigil.audit.v1.repaired\0");
-                    h
-                })
-                .update(&line);
+                gap.get_or_insert_with(super::gap_hasher).update(&line);
                 if let Some(s) = &mut state {
                     s.newline = newline;
                 }

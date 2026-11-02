@@ -14,6 +14,8 @@
 //! Applications should pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 //! Before 1.0 they may change in any release; from 1.0, in any minor.
 
+mod verify;
+pub use verify::{Finding, Report, Severity};
 mod trust;
 pub use trust::{TrailTrust, TrustPolicy, TrustPolicyBuilder};
 mod attributes;
@@ -92,8 +94,7 @@ pub enum AuditErrorKind {
     InvalidConfig,
 }
 
-/// Decoder findings shared with the ADR-0005 verifier (#13).
-/// These describe individual lines, not signature trust or trail history.
+/// Findings produced by the offline verifier (#13), including decoder failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FindingKind {
@@ -110,6 +111,70 @@ pub enum FindingKind {
     InvalidField,
     /// The declared record hash differs from the canonical hash.
     HashMismatch,
+    /// Error: A record does not link to its predecessor.
+    ChainBroken,
+    /// Error: A required sequence number is absent.
+    SeqGap,
+    /// Error: Different records claim the same sequence number.
+    SeqConflict,
+    /// Error: A record belongs to a trail outside the pinned policy.
+    TrailMismatch,
+    /// Error: A checkpoint has an incorrect MMR root.
+    MmrMismatch,
+    /// Error: A checkpoint signature is invalid.
+    BadSignature,
+    /// Error: A signing key is not trusted for this trail.
+    UntrustedKey,
+    /// Error: A revoked key conflicts with its trusted bound.
+    RevocationMismatch,
+    /// Error: A revocation bound lacks confirmation.
+    RevocationUnconfirmed,
+    /// Error: A segment or run violates the required structure.
+    SegmentStructure,
+    /// Error: An anchor does not match the verified history.
+    AnchorMismatch,
+    /// Error: The requested start does not match the history.
+    StartMismatch,
+    /// Error: An input below the start lacks an anchor.
+    UnanchoredStart,
+    /// Error: The batch start does not anchor the requested end.
+    UnanchoredEnd,
+    /// Error: A record violates the trail retirement or batch end bound.
+    TrailEnded,
+    /// Error: The head exceeds the permitted age.
+    StaleHead,
+    /// Error: A required receipt is absent.
+    NoReceipt,
+    /// Error: A receipt conflicts with the history.
+    ReceiptMismatch,
+    /// Error: The following record does not attest the fragment gap.
+    RepairMismatch,
+    /// Error: A review does not match its record, gap or run digest.
+    AcceptMismatch,
+    /// Warning: A fragment gap is trailing or not yet covered by a trusted checkpoint.
+    TornWrite,
+    /// Warning: An operator resumed the trail after a loss.
+    Resumed,
+    /// Warning: Record time moved backwards.
+    ClockWentBackwards,
+    /// Warning: The same record appears more than once.
+    DuplicateRecord,
+    /// Info: Records follow the last trusted checkpoint.
+    UncoveredTail,
+    /// Info: An input lies outside anchored verification bounds.
+    OutOfRange,
+    /// Info: Records follow the reconciled receipts prefix.
+    Unreconciled,
+    /// Info: An operator waived a receipt or supplied a receipt prefix.
+    ReceiptWaived,
+    /// Info: A fragment gap is attested and covered.
+    TornWriteRepaired,
+    /// Info: A reviewer accepted a warning or a run finding.
+    Accepted,
+    /// Info: A review matched no warning.
+    AcceptUnused,
+    /// Info: An input names a sequence inside a confirmed resume gap.
+    LostRecord,
 }
 
 /// An audit failure with a matchable category and diagnostic context.
@@ -212,3 +277,10 @@ mod trail_tests;
 
 #[cfg(test)]
 mod schema_writer_tests;
+
+/// Starts the decision-5 gap digest shared by storage and verifier spans.
+pub(crate) fn gap_hasher() -> blake3::Hasher {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"vigil.audit.v1.repaired\0");
+    hash
+}
