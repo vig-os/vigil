@@ -2,7 +2,7 @@
 
 *Verifiable Integrity-Guarded Instrumentation & Logging* (V·I·G·I·L): the opinionated observability crate for vig-os Rust projects.
 
-> **Early release (v0.1.0).** The first GitHub release; the API follows the [Stability](#stability) policy. It ships logs, metrics and traces as OTLP/JSON Lines files, the opt-in `audit` writer with its operator commands (the `vigil-audit` binary), and the testing helpers. Still open: the offline audit verifier (#13 C1) and trace propagation and the tracer globals (#8 8e, 8f). Open spans at shutdown (#8 8d) also remain. See the [known issues](#known-issues).
+> **Early release (v0.2.0).** Ships logs, metrics and traces as OTLP/JSON Lines files, the opt-in `audit` writer and `vigil-audit` operator commands, and testing helpers. Adds optional count and directory byte caps with per-signal rotation overrides, plus typed audit attributes, record schemas and schema-checked writers and operator commands. The offline verifier ([#13](https://github.com/vig-os/vigil/issues/13)), inclusion proofs ([#173](https://github.com/vig-os/vigil/issues/173)) and remaining trace lifecycle and propagation work ([#8](https://github.com/vig-os/vigil/issues/8), 8d–8f) remain open; see [known issues](#known-issues) and [upgrading from 0.1.0](#upgrading-from-010).
 
 **Pre-1.0 caveats.** Logs, metrics and traces export today, but open spans at
 shutdown (#8 8d), propagation (#8 8e), and the tracer globals opt-in (#8 8f)
@@ -11,14 +11,14 @@ before adopting an early release.
 
 ## Install
 
-The package is `vigil-telemetry`; the library is imported as `vigil`. v0.1.0 is a
-[GitHub release](https://github.com/vig-os/vigil/releases/tag/0.1.0) (git tag `0.1.0`);
+The package is `vigil-telemetry`; the library is imported as `vigil`. v0.2.0 is a
+[GitHub release](https://github.com/vig-os/vigil/releases/tag/0.2.0) (git tag `0.2.0`);
 crates.io publication comes later. Add it to `Cargo.toml` together with `tracing`,
 which your code uses to emit logs and spans:
 
 ```toml
 [dependencies]
-vigil-telemetry = { git = "https://github.com/vig-os/vigil", tag = "0.1.0" }
+vigil-telemetry = { git = "https://github.com/vig-os/vigil", tag = "0.2.0" }
 tracing = "0.1"
 ```
 
@@ -26,11 +26,11 @@ Default features are `metrics` and `traces`. Logs are always on. Add `audit` for
 lossless audit trail, or turn the defaults off:
 
 ```toml
-vigil-telemetry = { git = "https://github.com/vig-os/vigil", tag = "0.1.0", features = ["audit"] }
+vigil-telemetry = { git = "https://github.com/vig-os/vigil", tag = "0.2.0", features = ["audit"] }
 # only logs: default-features = false
 ```
 
-Pin the exact `tag = "0.1.0"`: before 1.0 a minor bump may break stable items, and
+Pin the exact `tag = "0.2.0"`: before 1.0 a minor bump may break stable items, and
 a git dependency does not resolve version ranges, so a newer release is a deliberate
 change of the tag (see [Stability](#stability): `~0.N` once it is on crates.io, `=0.N.M` for
 applications using `--cfg vigil_unstable`).
@@ -38,7 +38,7 @@ applications using `--cfg vigil_unstable`).
 The audit operator tool is a separate binary, `vigil-audit`:
 
 ```sh
-cargo install --git https://github.com/vig-os/vigil --tag 0.1.0 --features audit --bin vigil-audit vigil-telemetry
+cargo install --git https://github.com/vig-os/vigil --tag 0.2.0 --features audit --bin vigil-audit vigil-telemetry
 ```
 
 ## Quick start
@@ -75,6 +75,25 @@ The files appear in `$XDG_STATE_HOME/my-service` (or `$HOME/.local/state/my-serv
 per line. `Guard::dir()` reports the actual directory. Do not write
 `let _ = vigil::init(..)`: that drops the guard at once and stops the export.
 Configuration and environment variables are described below.
+
+## Upgrading from 0.1.0
+
+**Breaking:** caller-supplied `Entry::details` starting with `vigil.attrs.` is
+reserved for the canonical typed attribute block. `Entry::details` only sets the
+text; constructing the record rejects that prefix with `AuditErrorKind::InvalidEntry`,
+with or without a schema. Change the caller's text to avoid the reserved prefix,
+or configure `AuditConfig::schema` and use `Entry::attr` for typed attributes. Already-written records remain decodable.
+
+The rotated-segment count cap, directory byte cap and record schema are off by
+default. Size and age defaults remain 50 MiB and 90 days when no rotation
+environment override is set. An unchanged builder still reads `VIGIL_MAX_BYTES`,
+`VIGIL_RETENTION_DAYS`, `VIGIL_MAX_SEGMENTS`, `VIGIL_MAX_TOTAL_BYTES`, and
+`VIGIL_LOGS_MAX_BYTES`, `VIGIL_METRICS_MAX_BYTES`, `VIGIL_TRACES_MAX_BYTES`,
+`VIGIL_LOGS_MAX_SEGMENTS`, `VIGIL_METRICS_MAX_SEGMENTS`, `VIGIL_TRACES_MAX_SEGMENTS`,
+`VIGIL_LOGS_RETENTION_DAYS`, `VIGIL_METRICS_RETENTION_DAYS` and
+`VIGIL_TRACES_RETENTION_DAYS`. Setting a valid override changes the corresponding
+behavior unless an explicit builder value takes precedence; see the
+[rotation settings](#what-it-is) below for precedence and zero values.
 
 ## Stability
 
@@ -140,6 +159,10 @@ promise below applies from 1.0.0. Version changes are managed by the release tra
 - [#13](https://github.com/vig-os/vigil/issues/13): no offline audit verifier yet; `open` and operator commands do not verify a trail.
 - [#89](https://github.com/vig-os/vigil/issues/89): crash guarantees remain unproven.
 - [#46](https://github.com/vig-os/vigil/issues/46): no macOS CI test lane yet.
+- [#164](https://github.com/vig-os/vigil/issues/164) and [#13](https://github.com/vig-os/vigil/issues/13): verifier schema checks (`verify --schema`, `SchemaUnknown`, `SchemaViolation` and `OperatorText`) are not implemented.
+- [#173](https://github.com/vig-os/vigil/issues/173): no single-record inclusion proofs yet.
+- [#168](https://github.com/vig-os/vigil/issues/168): default disk caps remain undecided; count and directory byte caps are unlimited by default.
+- [#8](https://github.com/vig-os/vigil/issues/8), 8d–8f: open spans at shutdown, trace propagation and tracer globals opt-in remain open. End root spans before shutdown.
 
 ## Traces
 
@@ -524,6 +547,11 @@ Decisions and their evidence are recorded as ADRs in [`docs/adr/`](docs/adr/): [
 
 ## Development
 
+The `just publish-candidate 0.1.0 …` command in the devkit-managed
+[release workflow guide](https://github.com/vig-os/vigil/blob/release/0.2.0/docs/DOWNSTREAM_RELEASE.md#pre-release-format)
+is a generic prerelease-format example. For this release, use `0.2.0` as the
+version argument. The guide's format examples do not select vigil's current version.
+
 Enter the pinned environment with `direnv allow` (or `nix develop`). `nix flake check` runs fmt, clippy, tests, doctests and docs. Changes enter through PRs to `dev`; `main` only takes release PRs.
 
 ### Supply chain
@@ -540,12 +568,11 @@ skips recorded in `deny.toml`.
 `nix flake check` includes only the offline cargo-deny subset: bans, licenses
 and sources. The CI extension and `.github/workflows/supply-chain.yml` run the
 full gate, including advisories and the OpenTelemetry compatibility rule.
-The consumer-owned workflow checks `dev` weekly (Monday 06:23 UTC) and supports
-manual dispatch. Failures remain visible as red Actions runs; maintainers should
-subscribe to workflow failure notifications. Neither scheduled runs nor manual
-`workflow_dispatch` runs work until this workflow file reaches the default branch,
-`main`, in the 1.0 release ([GitHub trigger requirements](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)).
-PR CI is the supply-chain gate until then. Once enabled, both triggers check `dev`.
+The consumer-owned workflow is present on the default branch, `main`, so its
+weekly schedule (Monday 06:23 UTC) and manual dispatch are available today.
+Both triggers check out and check `dev`; PR CI also runs the supply-chain gate.
+Failures remain visible as red Actions runs; maintainers should subscribe to
+workflow failure notifications.
 
 The gate explicitly fetches RustSec and registry data, then checks with
 `--disable-fetch`. The wrapper enforces a seven-day limit on the actual DB HEAD
@@ -1176,7 +1203,8 @@ Pass `--schema` to `vigil-audit rotate` and `vigil-audit resume` on every typed 
 set `AuditConfig::schema` for `rotate` and `resume`; their actor and reason must
 both be opaque ids (for example an operator id and a change-ticket id). Without
 a schema, operator free text is permitted and becomes permanent. The CLI supports `schema <file>` and `--schema <file>` on `rotate` and
-`resume`; verifier schema checks are planned for CP4.
+`resume`; verifier schema checks (`verify --schema` and schema findings) remain open in
+[#164](https://github.com/vig-os/vigil/issues/164) and [#13](https://github.com/vig-os/vigil/issues/13).
 
 Erasing the external mapping, content and salts changes no trail bytes. Within
 trusted checkpoint coverage, externally held receipts and anchors, or verified
