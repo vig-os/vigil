@@ -71,6 +71,7 @@ impl Entry {
         self
     }
     /// Sets additional authenticated text, such as application JSON.
+    /// Text starting with `vigil.attrs.` is refused when constructing a record.
     pub fn details(mut self, value: impl Into<String>) -> Self {
         self.details = Some(value.into());
         self
@@ -265,13 +266,19 @@ impl Record {
     /// `i64::MAX` (the OTLP int64 bound), or [`AuditErrorKind::InvalidEntry`]
     /// if any supplied text (including
     /// service, host, or before/after text) is empty or contains NUL, or the
-    /// action starts with the reserved `vigil.audit.` prefix, or
+    /// action starts with the reserved `vigil.audit.` prefix, details start with
+    /// the reserved `vigil.attrs.` prefix, or
     /// [`AuditErrorKind::TooLarge`] if a canonical field exceeds `u32::MAX` bytes.
     pub fn new(context: RecordContext, entry: Entry) -> Result<Self, AuditError> {
-        if entry.action.starts_with("vigil.audit.") {
+        if entry.action.starts_with("vigil.audit.")
+            || entry
+                .details
+                .as_deref()
+                .is_some_and(|text| text.starts_with("vigil.attrs."))
+        {
             return Err(AuditError::new(
                 AuditErrorKind::InvalidEntry,
-                "reserved action prefix",
+                "reserved action or details prefix",
             ));
         }
         Self::new_internal(context, entry)

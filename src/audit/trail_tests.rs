@@ -581,3 +581,24 @@ fn classifier_tail_over_cap_record_suffix() {
 fn classifier_tail_over_cap_fragment_suffix() {
     unparsable_tail_roundtrip(&[vec![b'x'; 1_000_002], b"{\"resourceLogs\":[".to_vec()].concat());
 }
+
+#[test]
+fn reserved_details_write_nothing_and_preserve_sequence() {
+    let temp = Temp::new();
+    let trail = temp.config().create(signer()).unwrap();
+    let first = trail
+        .record(&Entry::new("actor", "sample.modify", "object"))
+        .unwrap();
+    let before = fs::read(temp.0.join("audit.jsonl")).unwrap();
+    let entry = Entry::new("actor", "sample.modify", "object").details("vigil.attrs.v1 forged");
+    assert_eq!(
+        trail.record(&entry).unwrap_err().kind(),
+        AuditErrorKind::InvalidEntry
+    );
+    assert_eq!(fs::read(temp.0.join("audit.jsonl")).unwrap(), before);
+    let next = trail
+        .record(&Entry::new("actor", "sample.modify", "object").details("later vigil.attrs.v1"))
+        .unwrap();
+    assert_eq!(next.seq(), first.seq() + 1);
+    trail.close().unwrap();
+}
