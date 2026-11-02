@@ -192,9 +192,9 @@ fn trust_accepted_and_queries() {
 #[test]
 fn trust_io_source_and_traits() {
     fn traits<T: std::fmt::Debug + Clone + Send + Sync>() {}
-    fn send_sync<T: Send + Sync>() {}
+    fn error_traits<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
     traits::<TrustPolicy>();
-    send_sync::<AuditError>();
+    error_traits::<AuditError>();
     let path = std::env::temp_dir()
         .join(format!("vigil-missing-{}", hex(&getrandom_id())))
         .join("trust");

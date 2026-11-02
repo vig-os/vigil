@@ -120,7 +120,10 @@ pub struct AuditError {
     kind: AuditErrorKind,
     detail: String,
     finding: Option<FindingKind>,
-    source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    // The source is an immutable diagnostic: unwinding cannot interrupt a
+    // mutation of AuditError's state. Preserve its existing unwind-safety traits.
+    source:
+        Option<std::panic::AssertUnwindSafe<Box<dyn std::error::Error + Send + Sync + 'static>>>,
 }
 impl AuditError {
     pub(crate) fn new(kind: AuditErrorKind, detail: impl Into<String>) -> Self {
@@ -133,7 +136,7 @@ impl AuditError {
     }
     pub(crate) fn from_io(source: std::io::Error) -> Self {
         Self {
-            source: Some(Box::new(source)),
+            source: Some(std::panic::AssertUnwindSafe(Box::new(source))),
             ..Self::new(AuditErrorKind::Io, "cannot read trust file")
         }
     }
@@ -163,7 +166,7 @@ impl std::fmt::Display for AuditError {
 }
 impl std::error::Error for AuditError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_deref().map(|source| source as _)
+        self.source.as_ref().map(|source| source.0.as_ref() as _)
     }
 }
 pub(crate) fn parse_hex<const N: usize>(text: &str) -> Result<[u8; N], AuditError> {
