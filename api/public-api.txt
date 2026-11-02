@@ -55,6 +55,7 @@ impl vigil::audit::AuditError
 pub fn vigil::audit::AuditError::finding_kind(&self) -> core::option::Option<vigil::audit::FindingKind>
 pub fn vigil::audit::AuditError::kind(&self) -> vigil::audit::AuditErrorKind
 impl core::error::Error for vigil::audit::AuditError
+pub fn vigil::audit::AuditError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for vigil::audit::AuditError
 pub fn vigil::audit::AuditError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct vigil::audit::AuditTrail
@@ -123,6 +124,21 @@ pub fn vigil::audit::SignerError::new(detail: impl core::convert::Into<alloc::st
 impl core::error::Error for vigil::audit::SignerError
 impl core::fmt::Display for vigil::audit::SignerError
 pub fn vigil::audit::SignerError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct vigil::audit::TrailTrust
+impl vigil::audit::TrailTrust
+pub fn vigil::audit::TrailTrust::build(self) -> core::result::Result<vigil::audit::TrustPolicy, vigil::audit::AuditError>
+pub fn vigil::audit::TrailTrust::end(self, seq: u64, hash: [u8; 32]) -> Self
+pub fn vigil::audit::TrailTrust::key(self, public_key: [u8; 32]) -> Self
+pub fn vigil::audit::TrailTrust::key_through(self, public_key: [u8; 32], seq: u64, hash: [u8; 32]) -> Self
+pub fn vigil::audit::TrailTrust::trail(self, id: [u8; 16]) -> vigil::audit::TrailTrust
+pub struct vigil::audit::TrustPolicy
+impl vigil::audit::TrustPolicy
+pub fn vigil::audit::TrustPolicy::builder() -> vigil::audit::TrustPolicyBuilder
+pub fn vigil::audit::TrustPolicy::from_file(path: impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, vigil::audit::AuditError>
+pub struct vigil::audit::TrustPolicyBuilder
+impl vigil::audit::TrustPolicyBuilder
+pub fn vigil::audit::TrustPolicyBuilder::build(self) -> core::result::Result<vigil::audit::TrustPolicy, vigil::audit::AuditError>
+pub fn vigil::audit::TrustPolicyBuilder::trail(self, id: [u8; 16]) -> vigil::audit::TrailTrust
 pub trait vigil::audit::Signer: core::marker::Send + core::marker::Sync + core::fmt::Debug
 pub fn vigil::audit::Signer::public_key(&self) -> [u8; 32]
 pub fn vigil::audit::Signer::sign(&self, message: &[u8]) -> core::result::Result<[u8; 64], vigil::audit::SignerError>

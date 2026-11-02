@@ -1,5 +1,5 @@
 //! Typed attribute shapes and the canonical details block (ADR-0005 §20.3).
-use super::{AuditError, AuditErrorKind, hex};
+use super::{AuditError, AuditErrorKind, hex, parse_hex};
 use std::collections::BTreeMap;
 
 /// The kind of one typed attribute. Arguments are validated when a schema is built.
@@ -182,22 +182,6 @@ pub(super) fn validate_key(key: &str) -> Result<(), AuditError> {
         return Err(invalid(AuditErrorKind::InvalidConfig));
     }
     Ok(())
-}
-
-fn parse_hex(text: &str) -> Result<[u8; 32], AuditError> {
-    if text.len() != 64
-        || !text
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(invalid(AuditErrorKind::InvalidEntry));
-    }
-    let mut bytes = [0; 32];
-    for (out, pair) in bytes.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
-        let digit = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
-        *out = digit(pair[0]) * 16 + digit(pair[1]);
-    }
-    Ok(bytes)
 }
 
 /// Renders independently of insertion order; duplicate keys are always refused.

@@ -8,12 +8,14 @@
 //! `(0, genesis digest)`, plus `lost_through`, the highest `seq` the deployment
 //! holds any evidence of outside the trail directory (all processes' receipts,
 //! close checkpoints, anchors and pins). Builder `expect_head` is `InvalidConfig`
-//! for it. Offline verification follows in #13.
+//! for it. `TrustPolicy` supplies the verifier's trust input; the verifier itself follows in #13.
 //!
 //! Format primitives require `--cfg vigil_unstable` and are provisional.
 //! Applications should pin `=0.N.M` before 1.0; pin `~1.N` from 1.0.
 //! Before 1.0 they may change in any release; from 1.0, in any minor.
 
+mod trust;
+pub use trust::{TrailTrust, TrustPolicy, TrustPolicyBuilder};
 mod attributes;
 pub use attributes::{AttrValue, FieldKind};
 mod schema;
@@ -111,12 +113,17 @@ pub enum FindingKind {
 }
 
 /// An audit failure with a matchable category and diagnostic context.
+/// Trust-file read failures retain their underlying `io::Error` as the source.
 /// The `Display` text is for people; it is not part of the stability promise. Match on `kind()`.
 #[derive(Debug)]
 pub struct AuditError {
     kind: AuditErrorKind,
     detail: String,
     finding: Option<FindingKind>,
+    // The source is an immutable diagnostic: unwinding cannot interrupt a
+    // mutation of AuditError's state. Preserve its existing unwind-safety traits.
+    source:
+        Option<std::panic::AssertUnwindSafe<Box<dyn std::error::Error + Send + Sync + 'static>>>,
 }
 impl AuditError {
     pub(crate) fn new(kind: AuditErrorKind, detail: impl Into<String>) -> Self {
@@ -124,12 +131,20 @@ impl AuditError {
             kind,
             detail: detail.into(),
             finding: None,
+            source: None,
+        }
+    }
+    pub(crate) fn from_io(source: std::io::Error) -> Self {
+        Self {
+            source: Some(std::panic::AssertUnwindSafe(Box::new(source))),
+            ..Self::new(AuditErrorKind::Io, "cannot read trust file")
         }
     }
     pub(crate) fn decoding(kind: AuditErrorKind, finding: FindingKind) -> Self {
         Self {
             kind,
             finding: Some(finding),
+            source: None,
             detail: format!("{finding:?}: invalid audit v1 OTLP line"),
         }
     }
@@ -149,7 +164,29 @@ impl std::fmt::Display for AuditError {
         write!(f, "{:?}: {}", self.kind, self.detail)
     }
 }
-impl std::error::Error for AuditError {}
+impl std::error::Error for AuditError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|source| source.0.as_ref() as _)
+    }
+}
+pub(crate) fn parse_hex<const N: usize>(text: &str) -> Result<[u8; N], AuditError> {
+    if text.len() != N * 2
+        || !text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(AuditError::new(
+            AuditErrorKind::InvalidEntry,
+            "invalid lowercase hex",
+        ));
+    }
+    let mut bytes = [0; N];
+    for (out, pair) in bytes.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+        let digit = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+        *out = digit(pair[0]) * 16 + digit(pair[1]);
+    }
+    Ok(bytes)
+}
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8] = b"0123456789abcdef";

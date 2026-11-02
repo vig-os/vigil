@@ -310,5 +310,27 @@
       "vigil::audit::Entry::attr": "fn",
       "vigil::audit::AuditConfig::schema": "fn"
     }
+  },
+  {
+    "justification": "ADR-0005 decision 9/13, amendment 12 \u00a719.1 (#13 V1)",
+    "items": {
+      "vigil::audit::TrustPolicy": "struct",
+      "vigil::audit::TrustPolicy::builder": "fn",
+      "vigil::audit::TrustPolicy::from_file": "fn",
+      "vigil::audit::TrustPolicy::fmt": "fn",
+      "vigil::audit::TrustPolicy::clone": "fn",
+      "vigil::audit::TrustPolicyBuilder": "struct",
+      "vigil::audit::TrustPolicyBuilder::trail": "fn",
+      "vigil::audit::TrustPolicyBuilder::build": "fn",
+      "vigil::audit::TrustPolicyBuilder::fmt": "fn",
+      "vigil::audit::TrailTrust": "struct",
+      "vigil::audit::TrailTrust::key": "fn",
+      "vigil::audit::TrailTrust::key_through": "fn",
+      "vigil::audit::TrailTrust::end": "fn",
+      "vigil::audit::TrailTrust::trail": "fn",
+      "vigil::audit::TrailTrust::build": "fn",
+      "vigil::audit::TrailTrust::fmt": "fn",
+      "vigil::audit::AuditError::source": "fn"
+    }
   }
 ]
