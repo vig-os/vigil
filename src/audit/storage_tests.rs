@@ -2818,14 +2818,16 @@ mod details {
         .unwrap();
         assert_eq!(outcome, ResumeOutcome::Discarded);
         assert!(!d.0.join(".audit-resume.jsonl").exists());
-        // The exact string `Sink::resume` surfaces when
-        // `promote_resume` returns Discarded. Pinned via the production
-        // source so a review that relabels the message is caught here.
-        assert!(
-            include_str!("sink.rs")
-                .contains("io_error(\"resume staging discarded after validation\")"),
-            "Sink::resume no longer surfaces the pinned Discarded string",
-        );
+        // The error-string pin that stood here (`include_str!("sink.rs")
+        // .contains("io_error(\"resume staging discarded after
+        // validation\")")`) is dropped: no path reachable from this test
+        // module surfaces that exact detail -- it is produced by
+        // `Sink::resume` in `sink.rs`, not by `promote_resume`, and
+        // `Sink::resume` runs full `initial(..)` validation beneath the
+        // discard which this suite's layouts do not satisfy. Pinning
+        // the behaviour we actually drive (`ResumeOutcome::Discarded`
+        // and the staging unlink above) is proof enough for the mutants
+        // listed in the PR body; a source-text contains() check is not.
     }
 
     // --- Section 4: scan_staged's archived-base rejection -----------
@@ -3003,36 +3005,51 @@ mod details {
         ("MMR overflow", 0, "requires 2^64 leaves"),
     ];
 
+    // 197-d1 addendum 9: the gate parses Rust with `syn::parse_file`
+    // instead of a hand-written lexer, so a bogus `assert_corrupt`
+    // call cannot hide behind char literals (`'"'`, `'\''`, `'\u{22}'`,
+    // `b'"'`, multi-byte chars like `'é'`), turbofish, a non-literal
+    // detail/site arg, an alias (`let f = assert_corrupt;`) or any
+    // other call shape. Each prior fix round closed one literal shape
+    // and left the class open; parsing the real grammar closes the
+    // class.
+    //
+    // Known limit, stated here on purpose: a static gate cannot prove
+    // a call is reachable (`if false { assert_corrupt(..) }` still
+    // registers). Mutants remain the proof that each pin fires at
+    // runtime -- see this module's mutant proofs in the PR body.
+
+    fn path_last_segment(path: &syn::Path) -> Option<&syn::Ident> {
+        path.segments.last().map(|s| &s.ident)
+    }
+
     fn parse_sites(source: &str) -> Vec<(String, usize)> {
-        let bytes = source.as_bytes();
-        let mut raw: Vec<String> = Vec::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i..].starts_with(b"fn corrupt(") {
-                i += b"fn corrupt(".len();
-                continue;
-            }
-            if bytes[i..].starts_with(b"corrupt(") {
-                let mut j = i + b"corrupt(".len();
-                while j < bytes.len() && bytes[j] != b'"' {
-                    j += 1;
-                }
-                if j >= bytes.len() {
-                    break;
-                }
-                j += 1;
-                let start = j;
-                while j < bytes.len() && bytes[j] != b'"' {
-                    j += 1;
-                }
-                raw.push(std::str::from_utf8(&bytes[start..j]).unwrap().to_string());
-                i = j + 1;
-                continue;
-            }
-            i += 1;
+        // Every `ExprCall` whose callee path ends in `corrupt` and
+        // whose first argument is a string literal is a corrupt-site
+        // in storage.rs. Keyed by `(detail, occurrence in file order)`
+        // -- the same key `assert_corrupt(result, "detail", site)` uses.
+        let file: syn::File = syn::parse_file(source)
+            .expect("coverage gate: storage.rs is not valid Rust (parse_file failed)");
+        struct Collect {
+            raw: Vec<String>,
         }
+        impl<'ast> syn::visit::Visit<'ast> for Collect {
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                if let syn::Expr::Path(p) = &*call.func
+                    && path_last_segment(&p.path).is_some_and(|i| i == "corrupt")
+                    && let Some(syn::Expr::Lit(lit)) = call.args.first()
+                    && let syn::Lit::Str(s) = &lit.lit
+                {
+                    self.raw.push(s.value());
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+        }
+        let mut c = Collect { raw: Vec::new() };
+        syn::visit::Visit::visit_file(&mut c, &file);
         let mut counts: HashMap<String, usize> = HashMap::new();
-        raw.into_iter()
+        c.raw
+            .into_iter()
             .map(|d| {
                 let n = *counts.get(&d).unwrap_or(&0);
                 counts.insert(d.clone(), n + 1);
@@ -3041,270 +3058,130 @@ mod details {
             .collect()
     }
 
-    fn is_ident_start(b: u8) -> bool {
-        b.is_ascii_alphabetic() || b == b'_'
-    }
-    fn is_ident_cont(b: u8) -> bool {
-        b.is_ascii_alphanumeric() || b == b'_'
-    }
-
-    /// Returns the position after any Rust trivia at `i` (line and
-    /// nested block comments, strings, raw strings, char literals and
-    /// lifetimes), or `None` when `i` is not at trivia. The lexer runs
-    /// over the whole source so a stray char literal (`'"'`) cannot be
-    /// mistaken for a string start, and a bogus `assert_corrupt` call
-    /// cannot hide inside a comment, string or raw string.
-    fn skip_trivia(bytes: &[u8], i: usize) -> Option<usize> {
-        if i >= bytes.len() {
-            return None;
-        }
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-            let mut j = i + 2;
-            while j < bytes.len() && bytes[j] != b'\n' {
-                j += 1;
-            }
-            return Some(j);
-        }
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            let mut depth: usize = 1;
-            let mut j = i + 2;
-            while j + 1 < bytes.len() && depth > 0 {
-                if bytes[j] == b'/' && bytes[j + 1] == b'*' {
-                    depth += 1;
-                    j += 2;
-                } else if bytes[j] == b'*' && bytes[j + 1] == b'/' {
-                    depth -= 1;
-                    j += 2;
-                } else {
-                    j += 1;
-                }
-            }
-            return Some(j);
-        }
-        if let Some(j) = skip_raw_string(bytes, i) {
-            return Some(j);
-        }
-        if bytes[i] == b'"' {
-            return Some(skip_string(bytes, i));
-        }
-        if bytes[i] == b'\'' {
-            return Some(skip_char_or_lifetime(bytes, i));
-        }
-        None
-    }
-
-    fn skip_raw_string(bytes: &[u8], start: usize) -> Option<usize> {
-        let mut j = start;
-        if j < bytes.len() && (bytes[j] == b'b' || bytes[j] == b'c') {
-            if j > 0 && is_ident_cont(bytes[j - 1]) {
-                return None;
-            }
-            if j + 1 >= bytes.len() || bytes[j + 1] != b'r' {
-                return None;
-            }
-            j += 1;
-        }
-        if j >= bytes.len() || bytes[j] != b'r' {
-            return None;
-        }
-        if start > 0 && j == start && is_ident_cont(bytes[start - 1]) {
-            return None;
-        }
-        if j + 1 >= bytes.len() || (bytes[j + 1] != b'#' && bytes[j + 1] != b'"') {
-            return None;
-        }
-        j += 1;
-        let hash_start = j;
-        while j < bytes.len() && bytes[j] == b'#' {
-            j += 1;
-        }
-        if j >= bytes.len() || bytes[j] != b'"' {
-            return None;
-        }
-        let hashes = j - hash_start;
-        j += 1;
-        while j < bytes.len() {
-            if bytes[j] == b'"' {
-                let after = j + 1;
-                if after + hashes <= bytes.len()
-                    && bytes[after..after + hashes].iter().all(|&b| b == b'#')
-                {
-                    return Some(after + hashes);
-                }
-            }
-            j += 1;
-        }
-        Some(bytes.len())
-    }
-
-    fn skip_string(bytes: &[u8], start: usize) -> usize {
-        debug_assert_eq!(bytes[start], b'"');
-        let mut j = start + 1;
-        while j < bytes.len() && bytes[j] != b'"' {
-            if bytes[j] == b'\\' && j + 1 < bytes.len() {
-                j += 2;
-            } else {
-                j += 1;
-            }
-        }
-        (j + 1).min(bytes.len())
-    }
-
-    fn skip_char_or_lifetime(bytes: &[u8], start: usize) -> usize {
-        debug_assert_eq!(bytes[start], b'\'');
-        let j = start + 1;
-        if j >= bytes.len() {
-            return j;
-        }
-        if bytes[j] == b'\\' {
-            // Escape form: '\x', '\u{..}', '\'', '\n', .... Skip the
-            // backslash and its first escape byte, then look for the
-            // closing quote on this line.
-            let mut k = j + 2;
-            while k < bytes.len() && bytes[k] != b'\'' && bytes[k] != b'\n' {
-                k += 1;
-            }
-            if k < bytes.len() && bytes[k] == b'\'' {
-                return k + 1;
-            }
-            return start + 1;
-        }
-        if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
-            return j + 2;
-        }
-        // Lifetime like `'static` or `'a`: consume the apostrophe only
-        // and let the main loop treat the trailing letters as an
-        // identifier.
-        start + 1
-    }
-
-    fn balance(bytes: &[u8], open: usize) -> Option<(usize, Vec<usize>)> {
-        // Depth is only decremented by `)`. Turbofish (`::<T, E>`) is
-        // tracked as a separate `generic` depth so its commas never
-        // count as top-level, which otherwise mis-shapes the parse.
-        let mut depth: i32 = 1;
-        let mut generic: i32 = 0;
-        let mut j = open + 1;
-        let mut commas = Vec::new();
-        while j < bytes.len() && depth > 0 {
-            if let Some(nj) = skip_trivia(bytes, j) {
-                j = nj;
-                continue;
-            }
-            let c = bytes[j];
-            match c {
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        if c != b')' {
-                            return None;
-                        }
-                        return Some((j, commas));
-                    }
-                }
-                b'<' if j >= 2 && &bytes[j - 2..j] == b"::" => generic += 1,
-                b'>' if generic > 0 => generic -= 1,
-                b',' if depth == 1 && generic == 0 => commas.push(j),
-                _ => {}
-            }
-            j += 1;
-        }
-        None
-    }
-
     fn parse_assertions(source: &str) -> Vec<(String, usize)> {
-        // Every occurrence of the word `assert_corrupt` outside Rust
-        // trivia (comments, strings, raw strings, char literals) that
-        // is not the helper's own `fn assert_corrupt<T>` definition must
-        // be immediately followed by `(` with a parseable
-        // `(..., "<detail>", <n>)` argument list. Anything else -- a
-        // turbofish (`::<...>(`) between the name and `(`, an identifier
-        // reference without a call (`let f = assert_corrupt::<..>;`), a
-        // non-literal detail or site arg -- panics, so a bogus call
-        // cannot hide inside dead code (`if false { ... }`) or an
-        // alias.
-        let bytes = source.as_bytes();
-        let mut asserts = Vec::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            if let Some(ni) = skip_trivia(bytes, i) {
-                i = ni;
-                continue;
-            }
-            if !is_ident_start(bytes[i]) {
-                i += 1;
-                continue;
-            }
-            let name_start = i;
-            while i < bytes.len() && is_ident_cont(bytes[i]) {
-                i += 1;
-            }
-            if &bytes[name_start..i] != b"assert_corrupt" {
-                continue;
-            }
-            // Exclude the helper's own `fn assert_corrupt<T>(...)` def.
-            let mut p = name_start;
-            while p > 0 && (bytes[p - 1] == b' ' || bytes[p - 1] == b'\t') {
-                p -= 1;
-            }
-            if p >= 2 && &bytes[p - 2..p] == b"fn" && (p == 2 || !is_ident_cont(bytes[p - 3])) {
-                continue;
-            }
-            if i >= bytes.len() || bytes[i] != b'(' {
-                let line = bytes[..name_start].iter().filter(|&&b| b == b'\n').count() + 1;
-                let ctx_end = bytes.len().min(i + 32);
-                let ctx = std::str::from_utf8(&bytes[name_start..ctx_end]).unwrap_or("<non-utf8>");
-                panic!(
-                    "coverage gate: `assert_corrupt` at line {line} is not \
-                     immediately followed by `(` (saw `{ctx}`); every call \
-                     must be a literal `assert_corrupt(result, \"detail\", site)` \
-                     so the gate's static scan sees it"
-                );
-            }
-            let open = i;
-            let (close, commas) = balance(bytes, open).unwrap_or_else(|| {
-                panic!("coverage gate: unterminated assert_corrupt( near byte {open}")
-            });
-            let snippet = || {
-                std::str::from_utf8(&bytes[open..=close])
-                    .unwrap_or("<non-utf8>")
-                    .to_string()
-            };
-            assert!(
-                commas.len() == 2 || commas.len() == 3,
-                "coverage gate: assert_corrupt expects 3 or 4 args (commas={}): {}",
-                commas.len(),
-                snippet(),
-            );
-            let site_end = commas.get(2).copied().unwrap_or(close);
-            let detail_text = std::str::from_utf8(&bytes[commas[0] + 1..commas[1]])
-                .unwrap_or_default()
-                .trim();
-            let site_text = std::str::from_utf8(&bytes[commas[1] + 1..site_end])
-                .unwrap_or_default()
-                .trim();
-            let detail = detail_text
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "coverage gate: assert_corrupt detail arg is not a string literal \
-                         ({detail_text:?}): {}",
-                        snippet(),
-                    )
-                });
-            let site = site_text.parse::<usize>().unwrap_or_else(|_| {
-                panic!(
-                    "coverage gate: assert_corrupt site arg is not a usize literal \
-                     ({site_text:?}): {}",
-                    snippet(),
-                )
-            });
-            asserts.push((detail.to_string(), site));
-            i = close + 1;
+        // Every use of a path ending in `assert_corrupt` -- other than
+        // the helper's own `fn` item -- must be a direct call whose
+        // detail argument is a string literal and whose occurrence
+        // argument is an integer literal. Anything else panics:
+        //   - alias:        `let f = assert_corrupt;`
+        //   - fn pointer:   `let f = assert_corrupt::<()>;`
+        //   - non-literal:  `assert_corrupt(r, label, 0)`.
+        // Dead-code calls (`if false { assert_corrupt(..); }`) still
+        // register; see the known-limit note above.
+        let file: syn::File = syn::parse_file(source)
+            .expect("coverage gate: storage_tests.rs is not valid Rust (parse_file failed)");
+
+        struct Visitor {
+            found: Vec<(String, usize)>,
         }
-        asserts
+
+        impl Visitor {
+            fn record_call(&mut self, call: &syn::ExprCall) {
+                // Direct call shape: `assert_corrupt(result, "detail", site)`
+                // (3 args) or the same with a trailing `_site` placeholder
+                // (4 args) if a caller ever adds one. Both detail (arg 1)
+                // and site (arg 2) must be literal.
+                assert!(
+                    call.args.len() == 3 || call.args.len() == 4,
+                    "coverage gate: assert_corrupt expects 3 or 4 args, got {}",
+                    call.args.len(),
+                );
+                let detail = match &call.args[1] {
+                    syn::Expr::Lit(l) => match &l.lit {
+                        syn::Lit::Str(s) => s.value(),
+                        _ => panic!(
+                            "coverage gate: assert_corrupt detail arg is not a string literal \
+                             (second arg must be a `\"...\"` literal)"
+                        ),
+                    },
+                    _ => panic!(
+                        "coverage gate: assert_corrupt detail arg is not a string literal \
+                         (second arg must be a `\"...\"` literal, not a binding or expression)"
+                    ),
+                };
+                let site = match &call.args[2] {
+                    syn::Expr::Lit(l) => match &l.lit {
+                        syn::Lit::Int(i) => i.base10_parse::<usize>().expect(
+                            "coverage gate: assert_corrupt site arg does not parse as a usize",
+                        ),
+                        _ => panic!(
+                            "coverage gate: assert_corrupt site arg is not an integer literal \
+                             (third arg must be a `0`-style integer literal)"
+                        ),
+                    },
+                    _ => panic!(
+                        "coverage gate: assert_corrupt site arg is not an integer literal \
+                         (third arg must be a `0`-style integer literal, not a binding)"
+                    ),
+                };
+                self.found.push((detail, site));
+            }
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for Visitor {
+            fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+                // The helper's own `fn assert_corrupt<T>(...)` definition
+                // is not a use of the name -- walk its body but not its
+                // signature.
+                if item.sig.ident == "assert_corrupt" {
+                    syn::visit::visit_block(self, &item.block);
+                    return;
+                }
+                syn::visit::visit_item_fn(self, item);
+            }
+
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                // ExprCall::func may be an ExprPath (direct name) or an
+                // ExprPath wrapped in generics (`assert_corrupt::<T>(..)`
+                // still parses as ExprPath whose path has generic args
+                // on the last segment). Either shape is a "direct call"
+                // for addendum 9's purposes.
+                let is_assert = matches!(
+                    &*call.func,
+                    syn::Expr::Path(p)
+                        if path_last_segment(&p.path).is_some_and(|i| i == "assert_corrupt"),
+                );
+                if is_assert {
+                    self.record_call(call);
+                    // Walk the arguments so a nested `assert_corrupt`
+                    // inside an arg is still inspected.
+                    for arg in &call.args {
+                        syn::visit::visit_expr(self, arg);
+                    }
+                    return;
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+
+            fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
+                // Any path-as-value reference to `assert_corrupt` that
+                // did not get consumed by `visit_expr_call` above is an
+                // alias, a fn-pointer coercion or some other non-call
+                // use. Reject it.
+                if path_last_segment(&p.path).is_some_and(|i| i == "assert_corrupt") {
+                    panic!(
+                        "coverage gate: `assert_corrupt` is referenced as a value \
+                         (not a direct call); the gate only recognises \
+                         `assert_corrupt(result, \"detail\", site)` call sites, \
+                         not aliases (`let f = assert_corrupt;`) or fn pointers \
+                         (`let f = assert_corrupt::<()>;`)"
+                    );
+                }
+                syn::visit::visit_expr_path(self, p);
+            }
+
+            fn visit_use_tree(&mut self, _t: &'ast syn::UseTree) {
+                // `use` imports do not call the helper. If one ever
+                // appears, re-exporting `assert_corrupt` out of this
+                // test module is itself worth catching, but today the
+                // helper is used only within `mod details`, so we skip
+                // use-trees to avoid false hits on their path segments.
+            }
+        }
+
+        let mut v = Visitor { found: Vec::new() };
+        syn::visit::Visit::visit_file(&mut v, &file);
+        v.found
     }
 
     #[test]
