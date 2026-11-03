@@ -101,6 +101,9 @@ pub struct Report {
     last_seq: Option<u64>,
     covered_through: Option<u64>,
     findings: Vec<Finding>,
+    // `--strict` exempts `UncoveredTail` under a validated `end=` (#13 V5);
+    // every V3b-1 report leaves this `false`.
+    tail_exempt: bool,
 }
 impl Report {
     pub(crate) fn new(
@@ -118,7 +121,15 @@ impl Report {
             last_seq,
             covered_through,
             findings,
+            tail_exempt: false,
         }
+    }
+    /// Marks the uncovered tail as exempt (consumed by `is_strict_valid`).
+    /// `end=` validation sets this; V3b-1 reports always leave it `false`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "end= exemption, #13 V5"))]
+    pub(crate) fn with_tail_exempt(mut self, exempt: bool) -> Self {
+        self.tail_exempt = exempt;
+        self
     }
     /// Returns the pinned trail identifier verified by this report.
     pub fn trail(&self) -> [u8; 16] {
@@ -149,6 +160,30 @@ impl Report {
         self.findings
             .iter()
             .all(|f| f.severity() != Severity::Error)
+    }
+    /// Returns true when `--strict` would exit 0 for this report.
+    ///
+    /// No `Error`, no `Warning`, no `UncoveredTail` without `tail_exempt`,
+    /// no `Unreconciled`. V3b-1 never sets `tail_exempt`; V5 does under
+    /// `end=`. An `Accepted` info does not suppress a separate warning of
+    /// the same kind.
+    pub fn is_strict_valid(&self) -> bool {
+        self.findings.iter().all(|f| match f.severity() {
+            Severity::Error | Severity::Warning => false,
+            Severity::Info => match f.kind() {
+                FindingKind::UncoveredTail => self.tail_exempt,
+                FindingKind::Unreconciled => false,
+                _ => true,
+            },
+        })
+    }
+    /// Returns the first error-severity finding in V3a-2's ruled order,
+    /// or `None` when no finding has severity `Error`. Every error kind
+    /// qualifies, not only `ChainBroken`.
+    pub fn first_broken_link(&self) -> Option<&Finding> {
+        self.findings
+            .iter()
+            .find(|f| f.severity() == Severity::Error)
     }
 }
 
@@ -192,14 +227,31 @@ mod mod_tests;
 
 /// Verifies a directory using a cloned, validated trust policy.
 ///
-/// **Incomplete (#13):** V3b supplies fragment/resume context and report
-/// predicates; V4–V8/R10 supply folds, signatures, coverage, anchors, receipts,
-/// review and archive rules. Native gaps are reported, never excused, until V5
-/// supplies trusted coverage: a matching `audit.repaired` is a `TornWrite`, a
-/// missing or different one is `RepairMismatch`, and a trailing gap is
-/// `TornWrite` with the bytes-to-EOF digest. V5 then promotes a covered
-/// `TornWrite` to `TornWriteRepaired`. No release from dev carries this
-/// partial verifier before #13 through C1.
+/// **Incomplete (#13):** V3b-1 adds fragment-run context (condition 3 per
+/// run), the "no crash outcome" mark on a trailing `TornWrite`, a plain
+/// `Resumed` warning for every `vigil.audit.resume` record (once per
+/// `(seq, hash)`, attributed to the native copy when present), an
+/// `UncoveredTail` info spanning every record until V5 trusts a checkpoint,
+/// and the `is_strict_valid` / `first_broken_link` predicates. Structural
+/// resume validation (head, `lost_through`, link, genesis checks) lands in
+/// V3b-2; V4–V8/R10 supply folds, signatures, coverage, anchors, receipts,
+/// review and archive rules. Native gaps are reported, never excused, until
+/// V5 supplies trusted coverage: a matching `audit.repaired` is a
+/// `TornWrite`, a missing or different one is `RepairMismatch`, and a
+/// trailing gap is `TornWrite` with the bytes-to-EOF digest. V5 then promotes
+/// a covered `TornWrite` to `TornWriteRepaired`. A line that classifies as a
+/// `Fragment` whose enclosing run cannot link to the next complete record
+/// (file-start run, non-`Records` line after, or a mismatched `previous`)
+/// becomes `Unparsable` per line; the gap bytes, lengths and digests stay
+/// V2-identical. No release from dev carries this partial verifier before
+/// #13 through C1.
+///
+/// A native line carrying several records is accepted (ADR §3): each record
+/// chain-checks, and `audit.repaired` is read from the first record only;
+/// a later record's `audit.repaired` is a deliberate silence (ruling
+/// 13-V3-d4 point 4), because the writer's own `open` refuses such a line
+/// (`storage.rs:892`).
+///
 /// Open, or record once, before reviewing a crashed trail to settle staging.
 /// Strict live review must target a stopped trail: an in-flight append can look
 /// torn. Reads take no locks and offer per-directory snapshots, not global atomicity.

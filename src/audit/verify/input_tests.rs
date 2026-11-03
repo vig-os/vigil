@@ -288,7 +288,6 @@ fn shipped_unordered_batches_sort_by_seq_keep_physical_lines() {
             assert!(record.checkpoint.is_none());
             assert!(record.operator.is_none());
         }
-        assert_eq!(input.data.items[0].bytes, 0..9);
         assert_eq!(input.data.items[0].line, 1);
         let LineContent::Unparsable(e) = &input.data.items[0].content else {
             panic!("unparsable")
@@ -306,7 +305,6 @@ fn oversized_line_is_one_item_then_valid_line() {
     let result = load(vec![path]);
     let data = &result.inputs[0].data;
     assert_eq!(data.items.len(), 2);
-    assert_eq!(data.items[0].bytes, 0..3_000_001);
     assert_eq!(data.records.len(), 1);
     assert_eq!(data.records[0].line, 2);
     let LineContent::Unparsable(e) = &data.items[0].content else {

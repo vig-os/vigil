@@ -346,6 +346,13 @@ fn junk_as_first_line_attributes_gap_to_line_one() {
     assert!(d.contains("lines 1..=1"), "{d}");
     assert!(d.contains(&format!("({} bytes)", junk.len())), "{d}");
     assert!(d.contains("attested at line 2"), "{d}");
+    // V3b-1: a file-start fragment run also raises Unparsable per fragment line.
+    let unparsable: Vec<_> = kinds(&report, K::Unparsable)
+        .into_iter()
+        .filter(|f| f.detail() == "fragment line failed context")
+        .collect();
+    assert_eq!(unparsable.len(), 1);
+    assert_eq!(unparsable[0].line(), Some(1));
 }
 
 #[test]
@@ -581,4 +588,115 @@ fn hash_mismatch_carries_seq_and_sorts_before_seqless_findings() {
     let hash_pos = order.iter().position(|k| *k == K::HashMismatch).unwrap();
     let unp_pos = order.iter().position(|k| *k == K::Unparsable).unwrap();
     assert!(hash_pos < unp_pos, "ordering: {order:?}");
+}
+
+/// V3b-1: uncovered tail (addendum 7).
+#[test]
+fn clean_writer_trail_emits_uncovered_tail_and_strict_is_false() {
+    let fx = Written::new(2);
+    let report = verify(&fx.trail, &fx.trust).unwrap();
+    assert!(report.is_valid(), "{:?}", report.findings());
+    assert!(!report.is_strict_valid());
+    let tails = kinds(&report, K::UncoveredTail);
+    assert_eq!(tails.len(), 1, "{:?}", report.findings());
+    assert!(tails[0].detail().contains("records seq"));
+    assert!(
+        tails[0]
+            .detail()
+            .contains("signatures are checked in #13 V5")
+    );
+}
+
+#[test]
+fn empty_trail_emits_no_uncovered_tail() {
+    let dir = Dir::new();
+    let report = verify(&dir.0, &policy()).unwrap();
+    assert!(kinds(&report, K::UncoveredTail).is_empty());
+    assert_eq!(report.records(), 0);
+}
+
+/// V3b-1: honest crash with fragment run condition 3 holding (regression over base).
+#[test]
+fn consecutive_crashes_from_honest_writer_give_one_gap_no_unparsable() {
+    let fx = Written::new(2);
+    let before = fx.read();
+    // Simulate two consecutive torn tails: cut the closing checkpoint in half,
+    // then append another junk fragment that the writer later repairs.
+    let last_lf = before.iter().rposition(|&b| b == b'\n').unwrap();
+    let prev_lf = before[..last_lf].iter().rposition(|&b| b == b'\n').unwrap();
+    let cut = prev_lf + 1 + (last_lf - prev_lf - 1) / 2;
+    let mut after = before[..cut].to_vec();
+    after.extend_from_slice(b"\n{\"resourceLogs\":[");
+    fx.write(&after);
+    let reopened = AuditConfig::new("svc")
+        .dir(&fx.trail)
+        .open(fx.signer())
+        .unwrap();
+    reopened
+        .record(&Entry::new("a", "change", "resumed"))
+        .unwrap();
+    drop(reopened);
+    let report = verify(&fx.trail, &fx.trust).unwrap();
+    let tw = kinds(&report, K::TornWrite);
+    assert_eq!(tw.len(), 1, "{:?}", report.findings());
+    // No Unparsable "fragment line failed context": the run links.
+    for u in kinds(&report, K::Unparsable) {
+        assert!(
+            !u.detail().contains("failed context"),
+            "unexpected unparsable: {}",
+            u.detail()
+        );
+    }
+}
+
+/// V3b-1: a file-start fragment run fails condition 3 (no "before" record):
+/// each line is `Unparsable` AND V3a-2's gap finding stays.
+#[test]
+fn file_start_fragment_run_is_unparsable_with_unchanged_gap_digest() {
+    let dir = Dir::new();
+    let valid = entry();
+    let junk = "{\"resourceLogs\":[\n{\"resourceLogs\":[\n";
+    let native = dir.0.join("audit.jsonl");
+    fs::write(&native, format!("{junk}{valid}\n")).unwrap();
+    let report = verify(&dir.0, &policy()).unwrap();
+    // V3a-2's gap finding is still a RepairMismatch.
+    let rm = kinds(&report, K::RepairMismatch);
+    assert_eq!(rm.len(), 1);
+    // Each fragment line is now Unparsable with "fragment line failed context".
+    let failed: Vec<_> = kinds(&report, K::Unparsable)
+        .into_iter()
+        .filter(|f| f.detail() == "fragment line failed context")
+        .collect();
+    assert_eq!(failed.len(), 2, "{:?}", report.findings());
+    assert_eq!(failed[0].line(), Some(1));
+    assert_eq!(failed[1].line(), Some(2));
+    // Gap length unchanged (byte-for-byte V2 parity).
+    assert!(rm[0].detail().contains(&format!("({} bytes)", junk.len())));
+}
+
+/// V3b-1: every resume record raises a Resumed warning via the public API.
+#[test]
+fn resume_record_from_writer_emits_one_resumed_with_parsed_detail() {
+    use vigil::audit::{AuditConfig, checkpoints};
+    let fx = Written::new(1); // Trail with the opening + one record + closing checkpoint.
+    // Use the closing checkpoint as the resume head: nothing-lost resume.
+    let cps = checkpoints(&fx.trail).unwrap();
+    let closing = cps
+        .iter()
+        .max_by_key(|c| c.seq())
+        .expect("closing checkpoint");
+    let head = (closing.seq(), closing.hash());
+    let (trail, _receipt, _opening) = AuditConfig::new("svc")
+        .dir(&fx.trail)
+        .resume(fx.signer(), head, head.0, "operator", "reviewed")
+        .unwrap();
+    drop(trail);
+    let report = verify(&fx.trail, &fx.trust).unwrap();
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1, "{:?}", report.findings());
+    assert!(resumed[0].detail().contains("operator=operator"));
+    assert!(resumed[0].detail().contains("reason=reviewed"));
+    assert!(resumed[0].detail().contains("gap=none"));
+    assert!(resumed[0].detail().contains("lost_records=0"));
+    assert!(!report.is_strict_valid());
 }

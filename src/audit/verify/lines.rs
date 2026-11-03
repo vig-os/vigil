@@ -4,10 +4,9 @@ use super::super::{
     AuditError, Record, gap_hasher,
     lines::{Line, classify},
 };
-use std::{
-    io::{self, BufRead},
-    ops::Range,
-};
+use std::io::{self, BufRead};
+#[cfg(test)]
+use std::ops::Range;
 
 pub(crate) enum Content {
     Records(Vec<Record>),
@@ -16,7 +15,6 @@ pub(crate) enum Content {
     Fragment,
 }
 pub(crate) struct Item {
-    pub(crate) bytes: Range<usize>,
     pub(crate) line: u64,
     pub(crate) content: Content,
 }
@@ -41,8 +39,8 @@ pub(crate) fn stream(
     let mut gap = gap_hasher();
     let mut gap_len = 0;
     loop {
-        let start = offset;
         let mut bytes = Vec::new();
+        let line_start = offset;
         let mut line_hash = gap.clone();
         loop {
             let available = reader.fill_buf()?;
@@ -64,7 +62,7 @@ pub(crate) fn stream(
                 break;
             }
         }
-        if start == offset {
+        if line_start == offset {
             break;
         }
         line += 1;
@@ -94,13 +92,9 @@ pub(crate) fn stream(
             }
         } else {
             gap = line_hash;
-            gap_len += (offset - start) as u64;
+            gap_len += (offset - line_start) as u64;
         }
-        visit(Item {
-            bytes: start..offset,
-            line,
-            content,
-        });
+        visit(Item { line, content });
     }
     if gap_len != 0 {
         spans.push(Span {

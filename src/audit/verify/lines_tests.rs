@@ -70,7 +70,6 @@ fn classifier_integration() {
         items.iter().map(|i| i.line).collect::<Vec<_>>(),
         vec![1, 2, 3, 4, 5]
     );
-    assert_eq!(items[0].bytes, 0..record.len() + 1);
     assert!(matches!(items[0].content, Content::Records(_)));
     assert!(matches!(items[1].content, Content::Fragment));
     let Content::Unparsable(error) = &items[2].content else {
@@ -231,7 +230,6 @@ fn streaming_spans_ignore_buffer_boundaries_and_keep_over_cap_eof() {
         let spans = stream(BufReader::with_capacity(37, bytes.as_slice()), 2, |item| {
             count += 1;
             assert!(matches!(item.content, Content::Unparsable(_)));
-            assert_eq!(item.bytes, 0..bytes.len());
         })
         .unwrap();
         assert_eq!(count, 1);
