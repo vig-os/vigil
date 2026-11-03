@@ -1423,28 +1423,19 @@ fn v3b2_foreign_trail_resume_does_not_affect_own_trail_candidate() {
     // at the SAME declared shape and the same resume `seq`, whose
     // trail differs, so the mutant "remove the trail check in
     // `declarations::is_resume`" would promote it to a Valid candidate.
-    // Mutant observability (brief point 3):
+    //
+    // Mutant observability (brief point 3). Both mutants are killed by
+    // this one row, which pins `on_trail` with a foreign-trail record
+    // at `seq=3` ∈ (h=1, k=5):
     //   M-f1  remove `is_resume` trail check   → candidates.len() == 2
     //                                            (both own and foreign
     //                                            resumes become Valid).
-    //   M-f2  remove `on_trail` in
-    //         `structural_check`                → unobservable here: the
-    //                                            trail filter in
-    //                                            `declarations` runs
-    //                                            first and never passes
-    //                                            a foreign resume to
-    //                                            `structural_check`, so
-    //                                            removing `on_trail` in
-    //                                            isolation changes no
-    //                                            observable outcome at
-    //                                            the declaration level.
-    //                                            `on_trail`'s correctness
-    //                                            on the own-trail
-    //                                            declaration is proven
-    //                                            by A10 and the k−1 row
-    //                                            below (`r.seq < k`,
-    //                                            `r.seq > head_seq`
-    //                                            boundary mutants).
+    //   M-f2  remove `.filter(|r| r.trail ==
+    //         trail)` in `structural_check`     → S2b
+    //         (`on_trail().any(|r| r.seq > head_seq && r.seq < k)`)
+    //         sees the foreign record at `seq=3`, so the own-trail
+    //         declaration flips from `structural=valid` to
+    //         `structural=invalid(head-not-last)`.
     use ctx::*;
     let g = GENESIS();
     let resume_text = format!(
@@ -1458,9 +1449,16 @@ fn v3b2_foreign_trail_resume_does_not_affect_own_trail_candidate() {
     // reach `Outcome::Valid` on the same records as the own one.
     let mut foreign_resume = resume_record(6, 9, [3; 32], &resume_text);
     foreign_resume.trail = [2; 16];
+    // Foreign-trail record at a seq inside (h=1, k=5). Not a
+    // checkpoint, so S1a (opening at k) is unaffected; its only effect
+    // is through `on_trail`'s S2b (`head-not-last`), which the trail
+    // filter must exclude.
+    let mut foreign_mid = record(3, 10, [50; 32], 3);
+    foreign_mid.trail = [2; 16];
     let records = vec![
         checkpoint(0, 1, g),
         record(1, 2, [1; 32], 1),
+        foreign_mid,
         checkpoint(5, 3, [2; 32]),
         resume_record(6, 4, [3; 32], &resume_text),
         foreign_resume,
@@ -1469,8 +1467,9 @@ fn v3b2_foreign_trail_resume_does_not_affect_own_trail_candidate() {
     let collection = one_native(records);
     let candidates = resume::collect_candidates(&collection, TRAIL);
     let report = check(collection, TRAIL);
-    // The foreign resume is TrailMismatch, as any foreign record is.
-    assert_eq!(kinds(&report, K::TrailMismatch).len(), 1);
+    // Both foreign records (mid-interval record and foreign resume)
+    // are TrailMismatch, as any foreign record is.
+    assert_eq!(kinds(&report, K::TrailMismatch).len(), 2);
     // Exactly one Resumed warning: the own-trail resume, structural=valid.
     let resumed = kinds(&report, K::Resumed);
     assert_eq!(resumed.len(), 1, "{:?}", report.findings());
@@ -1479,7 +1478,8 @@ fn v3b2_foreign_trail_resume_does_not_affect_own_trail_candidate() {
         "{}",
         resumed[0].detail()
     );
-    // Exactly one candidate — the own-trail resume. M-f1 flips this to 2.
+    // Exactly one candidate — the own-trail resume. M-f1 flips this to 2;
+    // M-f2 flips the detail suffix and drops this to 0.
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].resume_seq, 6);
     assert_eq!(candidates[0].resume_hash, [4; 32]);

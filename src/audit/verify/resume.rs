@@ -93,7 +93,7 @@ pub(super) fn hex_to_bytes(text: &str) -> [u8; 32] {
 /// and a shipped copy always show the same suffix.
 pub(super) struct Declaration<'a> {
     /// Path of the input that produced the kept copy (native first, then
-    /// shipped, dedupeded by `(seq, hash)` per d5 point 10 / addendum 8).
+    /// shipped, deduped by `(seq, hash)` per d5 point 10 / addendum 8).
     pub(super) path: &'a Path,
     /// Summary of the kept copy; its `line`, `operator` and record-level
     /// fields feed the `Resumed` finding.

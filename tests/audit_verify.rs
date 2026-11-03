@@ -765,32 +765,32 @@ fn v3b2_writer_resume_detail_matches_structural_valid_grammar() {
     assert_eq!(resumed[0].detail(), expected);
 }
 
-/// #193: integration test for `mark_no_crash` on a real writer trail.
-/// Rotate so the live file becomes a sealed archive, then append a
-/// trailing fragment to the archive. The verifier must mark the
-/// archive's trailing TornWrite with "no crash outcome" because the
-/// successor native (new live file) starts with an opening checkpoint
-/// linked to the archive's closing, and no `vigil.audit.resume` record
-/// follows. Kills the mutant `.find(|i| i.native)` → `.next()` only
-/// when the archive is followed by a NEXT NATIVE input in disk order.
+/// #193: integration test for `mark_no_crash` on a real writer trail
+/// that pins the NATIVE-successor condition against the mutant
+/// `.find(|i| i.native)` → `.next()`. `verify::input::collect` orders
+/// inputs by `(rank, segment_key, path)` with rank 0 for sealed native
+/// segments, 1 for `audit.jsonl` and 2 for every non-native filename
+/// (`src/audit/verify/input.rs:100-108`), so a shipped copy always
+/// sorts AFTER every native input. The only layout at integration
+/// level in which the mutant observably diverges from the production
+/// code is therefore: a sealed native archive with a trailing fragment,
+/// followed in `inputs` by a non-native shipped copy whose first
+/// record happens to be the opening checkpoint the real successor
+/// would carry (because it is a verbatim copy of the live file), and
+/// NO native successor among the explicit inputs. Production code
+/// returns `None` from `.find(|i| i.native)` → the archive's trailing
+/// TornWrite stays unmarked (ADR-0005 §19.6: "An archive verified
+/// alone, without the file after it, cannot set the mark"). The
+/// mutant's `.next()` picks the shipped copy as the "successor"; its
+/// opening checkpoint satisfies every structural condition
+/// (`seq == closing.seq + 1`, `previous == closing.hash`, second
+/// record not resume), so the mutant would incorrectly SET the mark.
 #[test]
-fn no_crash_mark_set_on_real_writer_archive_with_trailing_fragment() {
-    // Build a trail with `max_bytes` low enough that each record triggers
-    // physical sealing. The sink's seal path renames `audit.jsonl` to a
-    // sealed archive `audit-<stamp>.jsonl` and opens a new live file
-    // whose first record is an opening checkpoint linked to the sealed
-    // segment's closing. We then append a trailing fragment to the
-    // archive and verify: the archive's trailing TornWrite carries the
-    // "no crash outcome" mark, because the successor native starts with
-    // an opening checkpoint at `closing.seq + 1` with no resume as its
-    // second record. The mutant `.find(|i| i.native)` → `.next()` would
-    // still find the native successor in this layout, so the key
-    // observation this test adds over the unit-level `_takes_next_native_
-    // input_not_a_shipped_copy` is: real writer segments, real sealing.
+fn no_crash_mark_absent_when_only_successor_is_a_shipped_copy() {
     let dir = std::env::temp_dir().join(format!(
-        "vigil-verify-rotate-{}-{}",
+        "vigil-verify-mark-shipped-{}-{}",
         std::process::id(),
-        std::sync::atomic::AtomicU64::new(1).fetch_add(1, Ordering::Relaxed) + 2048,
+        std::sync::atomic::AtomicU64::new(1).fetch_add(1, Ordering::Relaxed) + 4096,
     ));
     fs::create_dir(&dir).unwrap();
     let key = dir.join("key");
@@ -801,43 +801,61 @@ fn no_crash_mark_set_on_real_writer_archive_with_trailing_fragment() {
     let writer = config.clone().create(signer.clone()).unwrap();
     let trail_id = writer.trail();
     // Each `record()` with max_bytes=1 forces the sink to seal and open
-    // a new segment; the sealed segment's filename starts with `audit-`.
+    // a new segment; sealed segment filenames start with `audit-`.
     writer.record(&Entry::new("a", "change", "o1")).unwrap();
     writer.record(&Entry::new("a", "change", "o2")).unwrap();
     writer.close().unwrap();
     let trust = TrustPolicy::builder().trail(trail_id).build().unwrap();
-    // Locate the sealed archive segment (filename starts with `audit-`).
-    let entries: Vec<_> = fs::read_dir(&trail_dir)
+    // Pick the LATEST sealed archive: its closing checkpoint links
+    // forward to the live file's opening checkpoint, which is what the
+    // shipped copy will hold. The sealed-segment timestamp in the
+    // filename sorts lexicographically with physical seal order.
+    let live_path = trail_dir.join("audit.jsonl");
+    let mut archives: Vec<_> = fs::read_dir(&trail_dir)
         .unwrap()
         .filter_map(Result::ok)
-        .collect();
-    let names: Vec<_> = entries
-        .iter()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    let archive = entries
-        .iter()
-        .find(|e| {
+        .filter(|e| {
             e.file_name()
                 .to_str()
                 .is_some_and(|n| n.starts_with("audit-") && n.ends_with(".jsonl"))
         })
-        .unwrap_or_else(|| panic!("sealed archive segment missing; dir={names:?}"))
-        .path();
+        .collect();
+    assert!(
+        !archives.is_empty(),
+        "sealed archive segment missing; dir={:?}",
+        fs::read_dir(&trail_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    );
+    archives.sort_by_key(|e| e.file_name());
+    let archive = archives.last().unwrap().path();
+    // Copy the live file verbatim to a non-native filename (rank 2 in
+    // `input::collect`), so that in `inputs` order it sits AFTER the
+    // archive and no native successor exists. The copy's first record
+    // is the live's opening checkpoint, which links back to `archive`'s
+    // closing: every mutant-side structural check would therefore pass.
+    let shipped_copy = dir.join("live-copy.audit");
+    fs::copy(&live_path, &shipped_copy).unwrap();
     // Append a trailing fragment (incomplete JSON) to the archive.
     let before = fs::read(&archive).unwrap();
     let mut after = before.clone();
     after.extend_from_slice(b"{\"resourceLogs\":[");
     fs::write(&archive, &after).unwrap();
-    let report = verify(&trail_dir, &trust).unwrap();
-    // The archive's trailing TornWrite carries the "no crash outcome" mark.
+    // Verify ONLY [archive, shipped-copy] — explicitly NOT the trail
+    // directory, so the live `audit.jsonl` is not picked up as a
+    // native successor.
+    let report = Verifier::new(trust)
+        .verify_files([archive.clone(), shipped_copy.clone()])
+        .unwrap();
     let archive_tw: Vec<_> = kinds(&report, K::TornWrite)
         .into_iter()
         .filter(|f| f.file() == Some(archive.as_path()))
         .collect();
     assert_eq!(archive_tw.len(), 1, "{:?}", report.findings());
     assert!(
-        archive_tw[0].detail().contains("; no crash outcome"),
+        !archive_tw[0].detail().contains("no crash outcome"),
         "{}",
         archive_tw[0].detail()
     );

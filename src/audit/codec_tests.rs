@@ -682,11 +682,34 @@ fn codec_shuffled_keys_preserve_canonical_hash() {
 // One test per multi-defect combination named in #191 and the d1
 // addendum, pinning the exact `FindingKind` and the `seq` carried on
 // the error. `AuditError` carries no field name (191-d1 addendum 7),
-// so trail-before-seq is pinned by kind only. The pre-dispatch order
-// in `parse_record` on dev is: OTLP envelope (including duplicate
-// attribute keys) → `audit.v` presence/parse → `UnknownVersion` → the
-// `audit.trail` / `audit.seq` identity fields → the record attribute
-// whitelist → `audit.prev_hash` / `audit.hash` / … → `HashMismatch`.
+// so trail-before-seq is pinned by kind only. The real decoder order
+// (191-d1 addendum 6 as implemented on dev, `src/audit/codec.rs` and
+// `src/audit/validation.rs`) is:
+//   decode_complete_json  → JSON duplicate object keys (InvalidField)
+//   from_json → contexts()
+//                        → required resourceLogs (MissingField)
+//                        → context_message resource/scope (UnknownField)
+//                        → correlation_ids per log (InvalidField)
+//                        → attributes per log: missing attributes
+//                          (MissingField), missing attribute value
+//                          (MissingField), unknown field inside an
+//                          attribute (UnknownField), duplicate attribute
+//                          keys (InvalidField)
+//   from_json message()  → top-level/resource/scope whitelist
+//                          (UnknownField), schema_url (InvalidField)
+//   parse_record         → body (InvalidField)
+//                        → log-record whitelist (UnknownField)
+//                        → timeUnixNano (MissingField, InvalidField)
+//                        → fixed-value checks (InvalidField)
+//                        → droppedAttributesCount != 0 (UnknownField)
+//                        → correlation_ids redundant (InvalidField)
+//                        → flags range (InvalidField)
+//                        → audit.v: MissingField, InvalidField,
+//                          UnknownVersion
+//                        → audit.trail, audit.seq
+//                        → record attribute whitelist (UnknownField)
+//                        → audit.prev_hash / audit.hash / …
+//                        → HashMismatch
 // A mutant that moves the whitelist before the identity fields swaps
 // MissingField/InvalidField for UnknownField on cases 2–4; one swapped
 // kind suffices for the mutant to exit 101.
@@ -733,9 +756,16 @@ fn precedence_missing_trail_and_missing_seq_is_missing_field() {
 
 #[test]
 fn precedence_malformed_seq_and_unknown_attribute_key_is_invalid_field() {
+    // `audit.seq` is parsed by `integer`, which rejects a leading sign
+    // in step 2 (identity). `"-1"` is a decimal-string value with a
+    // sign and so fails identity parsing (`InvalidField`), kept
+    // observably distinct from the step-0 attribute-list `InvalidField`
+    // (duplicate keys, unknown attribute fields): a mutant that moves
+    // the record whitelist in front of identity would swap this to
+    // `UnknownField`, exiting 101.
     use serde_json::json;
     let mut v = fixture(false);
-    attr(&mut v, "audit.seq")["intValue"] = json!("not-a-number");
+    attr(&mut v, "audit.seq")["intValue"] = json!("-1");
     attrs(&mut v).push(json!({"key":"forged.key","value":{"stringValue":"x"}}));
     assert_eq!(
         kind_and_seq(v.to_string().as_bytes()),
@@ -788,5 +818,61 @@ fn precedence_v2_and_dropped_attributes_count_one_is_unknown_field() {
     assert_eq!(
         kind_and_seq(v.to_string().as_bytes()),
         (Some(FindingKind::UnknownField), None),
+    );
+}
+
+#[test]
+fn precedence_duplicate_attribute_key_and_dropped_attributes_count_one_is_invalid_field() {
+    // 191-d1 addendum 6 (verdict blocker #1): the attribute-list decode
+    // runs in `contexts()` BEFORE `parse_record`, so a duplicate
+    // attribute key (`InvalidField` in step 0.2) is seen before
+    // `droppedAttributesCount != 0` (`UnknownField` in step 0.4). A
+    // mutant that reorders `parse_record`'s envelope ahead of
+    // `contexts()`'s attribute decode would flip this to
+    // `UnknownField`.
+    let v = fixture(false);
+    let raw = v.to_string();
+    let bad = raw.replacen(
+        r#""stringValue":"α""#,
+        r#""stringValue":"mallory","stringValue":"α""#,
+        1,
+    );
+    assert_ne!(bad, raw);
+    // Inject the dropped-attributes-count envelope defect too.
+    let bad = bad.replacen(
+        r#""attributes":"#,
+        r#""droppedAttributesCount":1,"attributes":"#,
+        1,
+    );
+    assert!(bad.contains(r#""droppedAttributesCount":1"#));
+    assert_eq!(
+        kind_and_seq(bad.as_bytes()),
+        (Some(FindingKind::InvalidField), None),
+    );
+}
+
+#[test]
+fn precedence_unknown_log_key_and_attribute_without_value_is_missing_field() {
+    // 191-d1 addendum 6 (verdict blocker #1): the per-log attribute
+    // list decoded in `contexts()` catches a missing attribute `value`
+    // (`MissingField` in step 0.2) BEFORE `parse_record`'s log-record
+    // whitelist (`UnknownField` in step 0.4) sees an unknown log key.
+    // A mutant that reorders the two would flip this to `UnknownField`.
+    use serde_json::json;
+    let mut v = fixture(false);
+    // Add an unknown log-record envelope key.
+    log(&mut v)["forgedLogKey"] = json!("x");
+    // Drop `value` on the `audit.seq` attribute, keeping its `key`.
+    let logs = log(&mut v);
+    let seq_entry = logs["attributes"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|a| a["key"] == "audit.seq")
+        .unwrap();
+    seq_entry.as_object_mut().unwrap().remove("value");
+    assert_eq!(
+        kind_and_seq(v.to_string().as_bytes()),
+        (Some(FindingKind::MissingField), None),
     );
 }
