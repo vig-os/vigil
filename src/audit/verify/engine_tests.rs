@@ -792,6 +792,77 @@ fn no_crash_mark_absent_for_archive_verified_alone() {
 }
 
 #[test]
+fn no_crash_mark_takes_next_native_input_not_a_shipped_copy() {
+    // #193: a shipped copy sits in `collection.inputs` **between** the
+    // archive and its native successor. `mark_no_crash` must look at
+    // the next NATIVE input, not merely the next input in order; the
+    // mutant `.find(|i| i.native)` → `.next()` would attribute the mark
+    // against the shipped copy and either set or omit it incorrectly.
+    // Here the shipped copy has NO opening checkpoint at seq=6, so the
+    // mutant turns the mark OFF (the shipped `data.items.first()` is a
+    // `Records(0..1)` whose record is the plain seq-6 copy with no
+    // checkpoint; the branch `opening.checkpoint.is_none()` returns
+    // false). The real next native does meet the condition.
+    use ctx::*;
+    let closing = checkpoint(5, 7, [6; 32]);
+    let closing_hash = closing.hash;
+    let archive = Input {
+        path: "audit-0.jsonl".into(),
+        native: true,
+        data: Rc::new(Data {
+            records: vec![closing],
+            items: vec![item_records(0..1, 1), fragment(2)],
+            spans: vec![span(4, [1; 32])],
+        }),
+    };
+    // Shipped copy inserted between archive and successor native. Its
+    // first (and only) record is a non-checkpoint, so the mutant would
+    // fail `opening.checkpoint.is_none()` and omit the mark.
+    let shipped_record = record(6, 8, closing_hash, 6);
+    let shipped = Input {
+        path: "copy".into(),
+        native: false,
+        data: Rc::new(Data {
+            records: vec![shipped_record],
+            items: vec![item_records(0..1, 1)],
+            spans: vec![],
+        }),
+    };
+    // Next NATIVE input: starts with an opening checkpoint linking back.
+    let opening = checkpoint(6, 9, closing_hash);
+    let next_record = record(7, 10, opening.hash, 7);
+    let successor = Input {
+        path: "audit.jsonl".into(),
+        native: true,
+        data: Rc::new(Data {
+            records: vec![opening, next_record],
+            items: vec![item_records(0..1, 1), item_records(1..2, 2)],
+            spans: vec![],
+        }),
+    };
+    let report = check(
+        Collection {
+            inputs: vec![archive, shipped, successor],
+            // Shipped list enumerates the shipped record at inputs[1].
+            shipped: vec![(1, 0)],
+        },
+        TRAIL,
+    );
+    // The archive's trailing TornWrite must carry the mark; a mutant
+    // taking the shipped copy would omit it.
+    let archive_tw: Vec<_> = kinds(&report, K::TornWrite)
+        .into_iter()
+        .filter(|f| f.file() == Some(Path::new("audit-0.jsonl")))
+        .collect();
+    assert_eq!(archive_tw.len(), 1, "{:?}", report.findings());
+    assert!(
+        archive_tw[0].detail().contains("; no crash outcome"),
+        "{}",
+        archive_tw[0].detail()
+    );
+}
+
+#[test]
 fn no_crash_mark_absent_when_successor_starts_with_fragment() {
     use ctx::*;
     let closing = checkpoint(5, 7, [6; 32]);
@@ -1249,6 +1320,42 @@ fn v3b2_head_not_last_marks_structural_invalid() {
 }
 
 #[test]
+fn v3b2_head_not_last_at_k_minus_1_marks_structural_invalid() {
+    // A10 extension (#195): the extra record sits at **exactly** k−1=4,
+    // so a mutant that changes `r.seq < k` to `r.seq + 1 < k` would
+    // silently miss it (4+1=5 is NOT < 5) and the row would flip to
+    // `structural=valid`. A10 already covers seq=3 (far from the
+    // boundary); this row isolates the boundary.
+    use ctx::*;
+    let g = GENESIS();
+    let records = vec![
+        checkpoint(0, 1, g),
+        record(1, 2, [1; 32], 1),
+        record(4, 3, [2; 32], 4),
+        checkpoint(5, 4, [2; 32]),
+        resume_record(
+            6,
+            5,
+            [4; 32],
+            &format!(
+                "head=1:{} lost_through=4 file=sealed.jsonl",
+                digest_string(&[2; 32])
+            ),
+        ),
+    ];
+    let report = check(one_native(records), TRAIL);
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0]
+            .detail()
+            .ends_with(" structural=invalid(head-not-last)"),
+        "{}",
+        resumed[0].detail()
+    );
+}
+
+#[test]
 fn v3b2_genesis_not_first_marks_structural_invalid() {
     // A11: a record at seq 0 is present, so a genesis resume is not the
     // first of the verified set (S3b fails).
@@ -1277,76 +1384,105 @@ fn v3b2_genesis_not_first_marks_structural_invalid() {
 }
 
 #[test]
-fn v3b2_foreign_trail_resume_does_not_affect_own_trail_candidate() {
-    // A13: an own-trail valid jump plus a foreign-trail resume. The
-    // foreign resume raises TrailMismatch and no own-trail Resumed, and
-    // leaves no candidate (collect_candidates filters by trail).
+fn v3b2_genesis_not_first_at_k_minus_1_marks_structural_invalid() {
+    // A11 extension (#195): the extra record sits at **exactly** k−1=2
+    // (declared lost_through=2 → k=3), so a mutant that changes
+    // `r.seq < k` to `r.seq + 1 < k` would silently miss it (2+1=3 is
+    // NOT < 3) and the row would flip to `structural=valid`. A11 covers
+    // seq=0 (far from the boundary); this row isolates it.
     use ctx::*;
     let g = GENESIS();
-    let mut foreign = resume_record(
-        10,
-        9,
-        [0; 32],
-        "head=5:blake3:0000000000000000000000000000000000000000000000000000000000000000 lost_through=5 file=-",
-    );
-    foreign.trail = [2; 16];
     let records = vec![
-        checkpoint(0, 1, g),
-        checkpoint(1, 2, [1; 32]),
-        checkpoint(5, 3, [2; 32]),
+        record(2, 7, [8; 32], 2),
+        checkpoint(3, 2, g),
         resume_record(
-            6,
             4,
-            [3; 32],
-            &format!(
-                "head=1:{} lost_through=4 file=sealed.jsonl",
-                digest_string(&[2; 32])
-            ),
+            3,
+            [2; 32],
+            &format!("head=0:{} lost_through=2 file=-", digest_string(&g)),
         ),
-        foreign,
     ];
     let report = check(one_native(records), TRAIL);
-    assert_eq!(kinds(&report, K::TrailMismatch).len(), 1);
     let resumed = kinds(&report, K::Resumed);
     assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0]
+            .detail()
+            .ends_with(" structural=invalid(genesis-not-first)"),
+        "{}",
+        resumed[0].detail()
+    );
+}
+
+#[test]
+fn v3b2_foreign_trail_resume_does_not_affect_own_trail_candidate() {
+    // A13 (#195): a foreign-trail resume whose declaration *would* be
+    // structurally valid on the selected trail must still be excluded
+    // by the trail filter in `declarations`. Shape: a valid own-trail
+    // jump (head=1:[2;32], lost_through=4, k=5), plus a foreign resume
+    // at the SAME declared shape and the same resume `seq`, whose
+    // trail differs, so the mutant "remove the trail check in
+    // `declarations::is_resume`" would promote it to a Valid candidate.
+    // Mutant observability (brief point 3):
+    //   M-f1  remove `is_resume` trail check   → candidates.len() == 2
+    //                                            (both own and foreign
+    //                                            resumes become Valid).
+    //   M-f2  remove `on_trail` in
+    //         `structural_check`                → unobservable here: the
+    //                                            trail filter in
+    //                                            `declarations` runs
+    //                                            first and never passes
+    //                                            a foreign resume to
+    //                                            `structural_check`, so
+    //                                            removing `on_trail` in
+    //                                            isolation changes no
+    //                                            observable outcome at
+    //                                            the declaration level.
+    //                                            `on_trail`'s correctness
+    //                                            on the own-trail
+    //                                            declaration is proven
+    //                                            by A10 and the k−1 row
+    //                                            below (`r.seq < k`,
+    //                                            `r.seq > head_seq`
+    //                                            boundary mutants).
+    use ctx::*;
+    let g = GENESIS();
+    let resume_text = format!(
+        "head=1:{} lost_through=4 file=sealed.jsonl",
+        digest_string(&[2; 32])
+    );
+    // Same (resume_seq, declaration) as the own-trail resume, but a
+    // DIFFERENT resume_hash and a foreign trail. Without the trail
+    // filter in `declarations::is_resume`, dedup by (seq, hash) keeps
+    // both: the foreign would then run through `structural_check` and
+    // reach `Outcome::Valid` on the same records as the own one.
+    let mut foreign_resume = resume_record(6, 9, [3; 32], &resume_text);
+    foreign_resume.trail = [2; 16];
+    let records = vec![
+        checkpoint(0, 1, g),
+        record(1, 2, [1; 32], 1),
+        checkpoint(5, 3, [2; 32]),
+        resume_record(6, 4, [3; 32], &resume_text),
+        foreign_resume,
+    ];
+    // Gather candidates BEFORE moving the collection into `check`.
+    let collection = one_native(records);
+    let candidates = resume::collect_candidates(&collection, TRAIL);
+    let report = check(collection, TRAIL);
+    // The foreign resume is TrailMismatch, as any foreign record is.
+    assert_eq!(kinds(&report, K::TrailMismatch).len(), 1);
+    // Exactly one Resumed warning: the own-trail resume, structural=valid.
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1, "{:?}", report.findings());
     assert!(
         resumed[0].detail().ends_with(" structural=valid"),
         "{}",
         resumed[0].detail()
     );
-    let input = &check_as_collection_input();
-    let candidates = resume::collect_candidates(input, TRAIL);
+    // Exactly one candidate — the own-trail resume. M-f1 flips this to 2.
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].resume_seq, 6);
-}
-
-/// Rebuilds the A13 collection for the candidate check (collect_candidates
-/// consumes a `Collection`, which `check` moves).
-fn check_as_collection_input() -> Collection {
-    use ctx::*;
-    let g = GENESIS();
-    let mut foreign = resume_record(
-        10,
-        9,
-        [0; 32],
-        "head=5:blake3:0000000000000000000000000000000000000000000000000000000000000000 lost_through=5 file=-",
-    );
-    foreign.trail = [2; 16];
-    one_native(vec![
-        checkpoint(0, 1, g),
-        checkpoint(1, 2, [1; 32]),
-        checkpoint(5, 3, [2; 32]),
-        resume_record(
-            6,
-            4,
-            [3; 32],
-            &format!(
-                "head=1:{} lost_through=4 file=sealed.jsonl",
-                digest_string(&[2; 32])
-            ),
-        ),
-        foreign,
-    ])
+    assert_eq!(candidates[0].resume_hash, [4; 32]);
 }
 
 #[test]
@@ -1461,19 +1597,32 @@ fn v3b2_several_candidates_at_k_valid_regardless_of_order() {
             resume_record(6, 4, [3; 32], &resume_text),
         ]
     };
-    for records in [forward(), reversed()] {
-        let report = check(one_native(records), TRAIL);
-        let resumed = kinds(&report, K::Resumed);
-        assert_eq!(resumed.len(), 1);
-        assert!(
-            resumed[0].detail().ends_with(" structural=valid"),
-            "{}",
-            resumed[0].detail()
-        );
-        let conflicts = kinds(&report, K::SeqConflict);
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].seq(), Some(5));
-    }
+    let fwd_report = check(one_native(forward()), TRAIL);
+    let rev_report = check(one_native(reversed()), TRAIL);
+    // #195 A16: byte-identical findings across the two input orders.
+    // The engine's final `sort_by_key` normalises every finding's
+    // position, and the per-declaration outcome is shared (d5 point 10),
+    // so Finding's `(kind, file, line, seq, detail, accepted_kind,
+    // run_digest)` tuple must be identical. `Finding: PartialEq` compares
+    // every field.
+    assert_eq!(
+        fwd_report.findings(),
+        rev_report.findings(),
+        "forward: {:?}\nreversed: {:?}",
+        fwd_report.findings(),
+        rev_report.findings()
+    );
+    // Preserved sanity checks on either run.
+    let resumed = kinds(&fwd_report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0].detail().ends_with(" structural=valid"),
+        "{}",
+        resumed[0].detail()
+    );
+    let conflicts = kinds(&fwd_report, K::SeqConflict);
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].seq(), Some(5));
 }
 
 #[test]

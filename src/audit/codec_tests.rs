@@ -676,3 +676,117 @@ fn codec_shuffled_keys_preserve_canonical_hash() {
         }
     }
 }
+
+// -------- #13 V3b-2 / #191 decode-precedence tests (ruling 191-d1) --------
+//
+// One test per multi-defect combination named in #191 and the d1
+// addendum, pinning the exact `FindingKind` and the `seq` carried on
+// the error. `AuditError` carries no field name (191-d1 addendum 7),
+// so trail-before-seq is pinned by kind only. The pre-dispatch order
+// in `parse_record` on dev is: OTLP envelope (including duplicate
+// attribute keys) → `audit.v` presence/parse → `UnknownVersion` → the
+// `audit.trail` / `audit.seq` identity fields → the record attribute
+// whitelist → `audit.prev_hash` / `audit.hash` / … → `HashMismatch`.
+// A mutant that moves the whitelist before the identity fields swaps
+// MissingField/InvalidField for UnknownField on cases 2–4; one swapped
+// kind suffices for the mutant to exit 101.
+fn kind_and_seq(bytes: &[u8]) -> (Option<FindingKind>, Option<u64>) {
+    let err = Record::parse_line(bytes).unwrap_err();
+    (err.finding_kind(), err.seq())
+}
+
+#[test]
+fn precedence_unknown_attribute_key_and_v2_is_unknown_version() {
+    use serde_json::json;
+    let mut v = fixture(false);
+    attr(&mut v, "audit.v")["intValue"] = json!("2");
+    attrs(&mut v).push(json!({"key":"forged.key","value":{"stringValue":"x"}}));
+    assert_eq!(
+        kind_and_seq(v.to_string().as_bytes()),
+        (Some(FindingKind::UnknownVersion), None),
+    );
+}
+
+#[test]
+fn precedence_unknown_attribute_key_and_missing_seq_is_missing_field() {
+    use serde_json::json;
+    let mut v = fixture(false);
+    attrs(&mut v).retain(|a| a["key"] != "audit.seq");
+    attrs(&mut v).push(json!({"key":"forged.key","value":{"stringValue":"x"}}));
+    assert_eq!(
+        kind_and_seq(v.to_string().as_bytes()),
+        (Some(FindingKind::MissingField), None),
+    );
+}
+
+#[test]
+fn precedence_missing_trail_and_missing_seq_is_missing_field() {
+    // 191-d1 addendum 7: `AuditError` carries no field name, so only
+    // the kind and the (None) seq pin the trail-before-seq order.
+    let mut v = fixture(false);
+    attrs(&mut v).retain(|a| a["key"] != "audit.trail" && a["key"] != "audit.seq");
+    assert_eq!(
+        kind_and_seq(v.to_string().as_bytes()),
+        (Some(FindingKind::MissingField), None),
+    );
+}
+
+#[test]
+fn precedence_malformed_seq_and_unknown_attribute_key_is_invalid_field() {
+    use serde_json::json;
+    let mut v = fixture(false);
+    attr(&mut v, "audit.seq")["intValue"] = json!("not-a-number");
+    attrs(&mut v).push(json!({"key":"forged.key","value":{"stringValue":"x"}}));
+    assert_eq!(
+        kind_and_seq(v.to_string().as_bytes()),
+        (Some(FindingKind::InvalidField), None),
+    );
+}
+
+#[test]
+fn precedence_missing_v_and_unknown_attribute_key_is_missing_field() {
+    use serde_json::json;
+    let mut v = fixture(false);
+    attrs(&mut v).retain(|a| a["key"] != "audit.v");
+    attrs(&mut v).push(json!({"key":"forged.key","value":{"stringValue":"x"}}));
+    assert_eq!(
+        kind_and_seq(v.to_string().as_bytes()),
+        (Some(FindingKind::MissingField), None),
+    );
+}
+
+#[test]
+fn precedence_v2_and_duplicate_attribute_key_is_invalid_field() {
+    // 191-d1 addendum 6: envelope (attribute decode, incl. duplicate
+    // keys) runs before `audit.v`, so v=2 does not win here.
+    use serde_json::json;
+    let mut v = fixture(false);
+    attr(&mut v, "audit.v")["intValue"] = json!("2");
+    let raw = v.to_string();
+    let bad = raw.replacen(
+        r#""stringValue":"α""#,
+        r#""stringValue":"mallory","stringValue":"α""#,
+        1,
+    );
+    assert_ne!(bad, raw);
+    assert_eq!(
+        kind_and_seq(bad.as_bytes()),
+        (Some(FindingKind::InvalidField), None),
+    );
+}
+
+#[test]
+fn precedence_v2_and_dropped_attributes_count_one_is_unknown_field() {
+    // 191-d1 addendum 6: `droppedAttributesCount` is an envelope check
+    // that runs before `audit.v`, so v=2 still reports the envelope
+    // kind. Same as #194's "codec_rejects_display_fields_and_duplicates"
+    // but with v=2 to prove the ordering, not just the rejection.
+    use serde_json::json;
+    let mut v = fixture(false);
+    attr(&mut v, "audit.v")["intValue"] = json!("2");
+    log(&mut v)["droppedAttributesCount"] = json!(1);
+    assert_eq!(
+        kind_and_seq(v.to_string().as_bytes()),
+        (Some(FindingKind::UnknownField), None),
+    );
+}

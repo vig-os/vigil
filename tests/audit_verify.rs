@@ -415,6 +415,11 @@ fn honest_crash_writer_attests_gap_and_mutating_a_byte_turns_it_into_repair_mism
     let last_lf = before.iter().rposition(|&b| b == b'\n').unwrap();
     let prev_lf = before[..last_lf].iter().rposition(|&b| b == b'\n').unwrap();
     let cut = prev_lf + 1 + (last_lf - prev_lf - 1) / 2;
+    // The fragment on disk is `before[prev_lf + 1 .. cut]`; on reopen the
+    // writer prepends a leading LF to its next record (`needs_newline`),
+    // so the verifier's stream classifies the fragment line as
+    // `<fragment_bytes> \n`. Hence the attested gap is one byte longer.
+    let gap_bytes = (cut - (prev_lf + 1)) as u64 + 1;
     fx.write(&before[..cut]);
     // The writer reopens, settles the torn tail, and attests the gap on the next record.
     let reopened = AuditConfig::new("svc")
@@ -430,11 +435,12 @@ fn honest_crash_writer_attests_gap_and_mutating_a_byte_turns_it_into_repair_mism
     assert_eq!(tw.len(), 1, "{:?}", report.findings());
     assert!(kinds(&report, K::RepairMismatch).is_empty());
     assert!(kinds(&report, K::TornWriteRepaired).is_empty());
-    // The attested gap points at the gap line itself and names its byte length.
+    // The attested gap points at the gap line itself and names its exact byte
+    // length (#193 / 191-d1 tightening: previously only `"bytes)"` was checked).
     assert_eq!(tw[0].line(), Some(4));
     let d = tw[0].detail();
     assert!(d.contains("lines 4..=4"), "{d}");
-    assert!(d.contains("bytes)"), "{d}");
+    assert!(d.contains(&format!("({gap_bytes} bytes)")), "{d}");
     assert!(
         d.contains(&format!("attested at line 5 seq {}", resumed.seq())),
         "{d}"
@@ -454,6 +460,7 @@ fn honest_crash_writer_attests_gap_and_mutating_a_byte_turns_it_into_repair_mism
     assert_eq!(rm[0].line(), Some(4));
     let d = rm[0].detail();
     assert!(d.contains("lines 4..=4"), "{d}");
+    assert!(d.contains(&format!("({gap_bytes} bytes)")), "{d}");
     assert!(
         d.contains(&format!("attested at line 5 seq {}", resumed.seq())),
         "{d}"
@@ -758,6 +765,85 @@ fn v3b2_writer_resume_detail_matches_structural_valid_grammar() {
     assert_eq!(resumed[0].detail(), expected);
 }
 
+/// #193: integration test for `mark_no_crash` on a real writer trail.
+/// Rotate so the live file becomes a sealed archive, then append a
+/// trailing fragment to the archive. The verifier must mark the
+/// archive's trailing TornWrite with "no crash outcome" because the
+/// successor native (new live file) starts with an opening checkpoint
+/// linked to the archive's closing, and no `vigil.audit.resume` record
+/// follows. Kills the mutant `.find(|i| i.native)` → `.next()` only
+/// when the archive is followed by a NEXT NATIVE input in disk order.
+#[test]
+fn no_crash_mark_set_on_real_writer_archive_with_trailing_fragment() {
+    // Build a trail with `max_bytes` low enough that each record triggers
+    // physical sealing. The sink's seal path renames `audit.jsonl` to a
+    // sealed archive `audit-<stamp>.jsonl` and opens a new live file
+    // whose first record is an opening checkpoint linked to the sealed
+    // segment's closing. We then append a trailing fragment to the
+    // archive and verify: the archive's trailing TornWrite carries the
+    // "no crash outcome" mark, because the successor native starts with
+    // an opening checkpoint at `closing.seq + 1` with no resume as its
+    // second record. The mutant `.find(|i| i.native)` → `.next()` would
+    // still find the native successor in this layout, so the key
+    // observation this test adds over the unit-level `_takes_next_native_
+    // input_not_a_shipped_copy` is: real writer segments, real sealing.
+    let dir = std::env::temp_dir().join(format!(
+        "vigil-verify-rotate-{}-{}",
+        std::process::id(),
+        std::sync::atomic::AtomicU64::new(1).fetch_add(1, Ordering::Relaxed) + 2048,
+    ));
+    fs::create_dir(&dir).unwrap();
+    let key = dir.join("key");
+    keygen(&key).unwrap();
+    let signer = Arc::new(KeyFileSigner::load(&key).unwrap());
+    let trail_dir = dir.join("trail");
+    let config = AuditConfig::new("svc").dir(&trail_dir).max_bytes(1);
+    let writer = config.clone().create(signer.clone()).unwrap();
+    let trail_id = writer.trail();
+    // Each `record()` with max_bytes=1 forces the sink to seal and open
+    // a new segment; the sealed segment's filename starts with `audit-`.
+    writer.record(&Entry::new("a", "change", "o1")).unwrap();
+    writer.record(&Entry::new("a", "change", "o2")).unwrap();
+    writer.close().unwrap();
+    let trust = TrustPolicy::builder().trail(trail_id).build().unwrap();
+    // Locate the sealed archive segment (filename starts with `audit-`).
+    let entries: Vec<_> = fs::read_dir(&trail_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    let names: Vec<_> = entries
+        .iter()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let archive = entries
+        .iter()
+        .find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("audit-") && n.ends_with(".jsonl"))
+        })
+        .unwrap_or_else(|| panic!("sealed archive segment missing; dir={names:?}"))
+        .path();
+    // Append a trailing fragment (incomplete JSON) to the archive.
+    let before = fs::read(&archive).unwrap();
+    let mut after = before.clone();
+    after.extend_from_slice(b"{\"resourceLogs\":[");
+    fs::write(&archive, &after).unwrap();
+    let report = verify(&trail_dir, &trust).unwrap();
+    // The archive's trailing TornWrite carries the "no crash outcome" mark.
+    let archive_tw: Vec<_> = kinds(&report, K::TornWrite)
+        .into_iter()
+        .filter(|f| f.file() == Some(archive.as_path()))
+        .collect();
+    assert_eq!(archive_tw.len(), 1, "{:?}", report.findings());
+    assert!(
+        archive_tw[0].detail().contains("; no crash outcome"),
+        "{}",
+        archive_tw[0].detail()
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A7w: delete the live file after `Written::new(1)`, then resume with a
 /// genesis-shaped declaration. Under d5 S3 with no record present below
 /// `k=3` → `structural=valid`; if the writer rotated a segment below `k`
@@ -794,10 +880,15 @@ fn v3b2_writer_genesis_resume_after_live_delete_emits_genesis_gap_and_pinned_suf
     let report = verify(&fx.trail, &fx.trust).unwrap();
     let resumed = kinds(&report, K::Resumed);
     assert_eq!(resumed.len(), 1, "{:?}", report.findings());
-    let detail = resumed[0].detail();
-    // Under d5 S3 with no record present below k=3 → structural=valid,
-    // confirmed by running the test; if a sealed segment is observed,
-    // S3b fires `genesis-not-first` instead.
-    assert!(detail.contains("gap=0..=2"), "{detail}");
-    assert!(detail.ends_with(" structural=valid"), "{detail}");
+    // #195 A7w: full-string equality on the detail. Under d5 S3 with no
+    // record present below k=3 → `structural=valid`; `Written::new(1)`
+    // rotates nothing (one `record()` plus a `close()` keep everything
+    // in the single live file), so after `remove_file(live)` no record
+    // below `k=3` survives on disk and S3b passes.
+    let hex: String = genesis.iter().map(|b| format!("{b:02x}")).collect();
+    let expected = format!(
+        "operator=operator reason=reviewed head=0:blake3:{hex} \
+         gap=0..=2 lost_records=0 structural=valid"
+    );
+    assert_eq!(resumed[0].detail(), expected);
 }

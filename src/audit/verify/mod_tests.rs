@@ -176,38 +176,96 @@ fn is_strict_valid_rejects_errors_warnings_uncovered_tail_and_unreconciled() {
 
 #[test]
 fn first_broken_link_returns_first_error_in_ruled_order() {
-    use FindingKind::*;
-    // Lower seq ends up first in ruled order even though it is inserted last.
-    let later_inserted_but_earlier = Finding::new(
-        ChainBroken,
-        Some(PathBuf::from("a")),
-        Some(1),
-        Some(0),
-        "earlier".into(),
-    );
-    let earlier_inserted_but_later = Finding::new(
-        HashMismatch,
-        Some(PathBuf::from("a")),
-        Some(5),
-        Some(10),
-        "later".into(),
-    );
-    // Insert OUT of ruled order: the higher-seq finding comes first; sorting
-    // by seq (the engine's ruled order) is what moves "earlier" to the front.
-    let mut findings = vec![
-        earlier_inserted_but_later.clone(),
-        later_inserted_but_earlier.clone(),
+    // #193: feed `engine::check` records plus a decoder-finding `LineItem`
+    // whose natural emission order puts the higher-seq error first (file-
+    // findings loop before chain loop). The engine's final `sort_by_key`
+    // in `engine::check` is what moves the lower-seq ChainBroken to the
+    // front, so `first_broken_link()` returns the seq-0 one. The in-test
+    // sort has been dropped (#193); disabling the engine's sort makes
+    // this test fail by returning the seq-10 InvalidField instead.
+    use crate::audit::AuditError;
+    use crate::audit::verify::input::{Collection, Data, Input, LineContent, LineItem, Summary};
+    use std::rc::Rc;
+    const TRAIL: [u8; 16] = [0x11; 16];
+    fn located(seq: u64, hash: u8, previous: [u8; 32]) -> Summary {
+        Summary {
+            trail: TRAIL,
+            seq,
+            hash: [hash; 32],
+            previous,
+            time: seq,
+            repaired: None,
+            checkpoint: None,
+            operator: None,
+            line: seq + 1,
+        }
+    }
+    // The chain loop emits one ChainBroken for the seq-0 record (its
+    // `previous` is not genesis). The file-findings loop emits an
+    // InvalidField at line 11, carrying seq=10 via `AuditError::with_seq`.
+    // Natural insertion is [InvalidField(seq=10), ChainBroken(seq=0), …];
+    // the engine's final sort reorders them by seq.
+    let broken_record = located(0, 1, [8; 32]);
+    let seq10_error = AuditError::decoding(
+        crate::audit::AuditErrorKind::CorruptTrail,
+        FindingKind::InvalidField,
+    )
+    .with_seq(10);
+    let items = vec![
+        LineItem {
+            line: 11,
+            content: LineContent::Invalid(seq10_error),
+        },
+        LineItem {
+            line: 1,
+            content: LineContent::Records(0..1),
+        },
     ];
-    // Without this sort, first_broken_link would return "later". It is the
-    // sort that proves the predicate honours ruled order, not insertion order.
-    findings.sort_by_key(|f| f.seq());
-    let r = Report::new([0; 16], 0, None, None, None, findings);
+    let input = Input {
+        path: PathBuf::from("copy"),
+        native: false,
+        data: Rc::new(Data {
+            records: vec![broken_record],
+            items,
+            spans: vec![],
+        }),
+    };
+    let collection = Collection {
+        inputs: vec![input],
+        shipped: vec![(0, 0)],
+    };
+    let report = super::engine::check(collection, TRAIL);
+    // Confirm both error findings are present before asserting the order.
+    let errors: Vec<_> = report
+        .findings()
+        .iter()
+        .filter(|f| f.severity() == Severity::Error)
+        .collect();
+    assert!(
+        errors
+            .iter()
+            .any(|f| f.kind() == FindingKind::ChainBroken && f.seq() == Some(0)),
+        "{:?}",
+        report.findings()
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|f| f.kind() == FindingKind::InvalidField && f.seq() == Some(10)),
+        "{:?}",
+        report.findings()
+    );
+    // Engine's `findings.sort_by_key` moves seq-0 to the front; the
+    // predicate reports that one.
+    let bl = report.first_broken_link().unwrap();
+    assert_eq!(bl.kind(), FindingKind::ChainBroken);
     assert_eq!(
-        r.first_broken_link().unwrap().detail(),
-        "earlier",
-        "first_broken_link follows ruled order after sorting by seq"
+        bl.seq(),
+        Some(0),
+        "first_broken_link must return seq-0 ChainBroken after engine::check's sort"
     );
     // Warnings and infos are ignored.
+    use FindingKind::*;
     let r = Report::new(
         [0; 16],
         0,
