@@ -385,7 +385,12 @@ fn fragment_run_followed_by_invalid_line_is_unparsable() {
 }
 
 #[test]
-fn resume_nothing_lost_emits_resumed_with_gap_none_and_strict_fails() {
+fn resume_at_genesis_with_no_opening_marks_structural_invalid_and_strict_fails() {
+    // V3b-2 (ruling 13-V3-d5): with `L=0` and head=(0, genesis), `k=L+1=1`
+    // and the record at seq 1 is the resume itself (not a checkpoint), so
+    // S1a fails and the detail ends with `structural=invalid(no-opening)`.
+    // The gap text is the fixed genesis form `gap=0..=0` (d5 point 3), not
+    // the base's `gap=none`.
     use ctx::*;
     let g = GENESIS();
     let open = checkpoint(0, 1, g);
@@ -411,8 +416,13 @@ fn resume_nothing_lost_emits_resumed_with_gap_none_and_strict_fails() {
     );
     let resumed = kinds(&report, K::Resumed);
     assert_eq!(resumed.len(), 1);
-    assert!(resumed[0].detail().contains("gap=none"));
-    assert!(resumed[0].detail().contains("lost_records=0"));
+    assert!(
+        resumed[0]
+            .detail()
+            .contains("gap=0..=0 lost_records=0 structural=invalid(no-opening)"),
+        "{}",
+        resumed[0].detail()
+    );
     assert_eq!(resumed[0].seq(), Some(1));
     assert!(!report.is_strict_valid());
     assert!(report.is_valid());
@@ -922,4 +932,669 @@ fn foreign_trail_resume_is_trail_mismatch_without_resumed() {
         "{:?}",
         report.findings()
     );
+}
+
+// ---------- #13 V3b-2 structural resume validation (ruling 13-V3-d5) ----------
+
+/// Helper for V3b-2 rows: builds a single-input native `Collection`.
+fn one_native(records: Vec<Summary>) -> Collection {
+    Collection {
+        inputs: vec![Input {
+            path: "audit.jsonl".into(),
+            native: true,
+            data: Rc::new(Data {
+                records,
+                items: vec![],
+                spans: vec![],
+            }),
+        }],
+        shipped: vec![],
+    }
+}
+
+#[test]
+fn v3b2_hand_built_jump_marks_structural_valid_and_keeps_seq_gap() {
+    // A2: non-genesis valid jump; the SeqGap for 2..=4 stays (d5 point 1
+    // S2b: `SeqGap` and `Resumed` stay).
+    use ctx::*;
+    let g = GENESIS();
+    let records = vec![
+        checkpoint(0, 1, g),
+        checkpoint(1, 2, [1; 32]),
+        checkpoint(5, 3, [2; 32]),
+        resume_record(
+            6,
+            4,
+            [3; 32],
+            &format!(
+                "head=1:{} lost_through=4 file=sealed.jsonl",
+                digest_string(&[2; 32])
+            ),
+        ),
+    ];
+    let report = check(one_native(records), TRAIL);
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0]
+            .detail()
+            .ends_with(" gap=2..=4 lost_records=0 structural=valid"),
+        "{}",
+        resumed[0].detail()
+    );
+    let gaps = kinds(&report, K::SeqGap);
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].detail(), "missing seq 2..=4");
+}
+
+#[test]
+fn v3b2_head_not_present_non_genesis_marks_structural_invalid() {
+    // A3: drop the record at seq 1; S2a fails. SeqGap for `1..=4` stays.
+    use ctx::*;
+    let g = GENESIS();
+    let records = vec![
+        checkpoint(0, 1, g),
+        checkpoint(5, 3, [2; 32]),
+        resume_record(
+            6,
+            4,
+            [3; 32],
+            &format!(
+                "head=1:{} lost_through=4 file=sealed.jsonl",
+                digest_string(&[2; 32])
+            ),
+        ),
+    ];
+    let report = check(one_native(records), TRAIL);
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0]
+            .detail()
+            .ends_with(" structural=invalid(head-not-present)"),
+        "{}",
+        resumed[0].detail()
+    );
+    assert_eq!(kinds(&report, K::SeqGap).len(), 1);
+}
+
+#[test]
+fn v3b2_head_present_wrong_hash_marks_structural_invalid() {
+    // A4: record at seq 1 has hash [7;32]; declaration names a different
+    // head hash. S2a (`head-not-present`) fires because no candidate at
+    // seq=h matches `head_hash` (13-V1-d1 point 1: match with any
+    // candidate).
+    use ctx::*;
+    let g = GENESIS();
+    let records = vec![
+        checkpoint(0, 1, g),
+        record(1, 7, [1; 32], 1),
+        checkpoint(5, 3, [8; 32]),
+        resume_record(
+            6,
+            4,
+            [3; 32],
+            &format!(
+                "head=1:{} lost_through=4 file=sealed.jsonl",
+                digest_string(&[8; 32])
+            ),
+        ),
+    ];
+    let report = check(one_native(records), TRAIL);
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0]
+            .detail()
+            .ends_with(" structural=invalid(head-not-present)"),
+        "{}",
+        resumed[0].detail()
+    );
+}
+
+#[test]
+fn v3b2_opening_not_checkpoint_marks_structural_invalid_no_opening() {
+    // A5: the only candidate at k=5 is a plain record. S1a fails. Avoid
+    // `ctx::resume_record` for the opening-slot record (that would add a
+    // second `Resumed` finding and break the length check).
+    use ctx::*;
+    let g = GENESIS();
+    let records = vec![
+        checkpoint(0, 1, g),
+        record(1, 2, [1; 32], 1),
+        record(5, 3, [2; 32], 5),
+        resume_record(
+            6,
+            4,
+            [3; 32],
+            &format!(
+                "head=1:{} lost_through=4 file=sealed.jsonl",
+                digest_string(&[2; 32])
+            ),
+        ),
+    ];
+    let report = check(one_native(records), TRAIL);
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0]
+            .detail()
+            .ends_with(" structural=invalid(no-opening)"),
+        "{}",
+        resumed[0].detail()
+    );
+}
+
+#[test]
+fn v3b2_link_mismatch_non_genesis_marks_structural_invalid() {
+    // A6: head and non-head records present and in order, but the opening
+    // checkpoint's `previous` points at an unrelated hash. S2c fires.
+    use ctx::*;
+    let g = GENESIS();
+    let records = vec![
+        checkpoint(0, 1, g),
+        record(1, 2, [1; 32], 1),
+        checkpoint(5, 3, [9; 32]), // prev != head's hash
+        resume_record(
+            6,
+            4,
+            [3; 32],
+            &format!(
+                "head=1:{} lost_through=4 file=sealed.jsonl",
+                digest_string(&[2; 32])
+            ),
+        ),
+    ];
+    let report = check(one_native(records), TRAIL);
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0]
+            .detail()
+            .ends_with(" structural=invalid(link-mismatch)"),
+        "{}",
+        resumed[0].detail()
+    );
+}
+
+#[test]
+fn v3b2_genesis_valid_marks_structural_valid_and_emits_genesis_gap() {
+    // A7: genesis-shaped resume. Opening at seq 3 whose `previous` is the
+    // genesis value; nothing below seq 3 present. V3a-2's SeqGap for
+    // 0..=2 still fires (§19.6 stays Proposed; 13-V3-d1 point 3).
+    use ctx::*;
+    let g = GENESIS();
+    let records = vec![
+        checkpoint(3, 1, g),
+        resume_record(
+            4,
+            2,
+            [1; 32],
+            &format!("head=0:{} lost_through=2 file=-", digest_string(&g)),
+        ),
+    ];
+    let report = check(one_native(records), TRAIL);
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0]
+            .detail()
+            .ends_with(" gap=0..=2 lost_records=0 structural=valid"),
+        "{}",
+        resumed[0].detail()
+    );
+    let gaps = kinds(&report, K::SeqGap);
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].detail(), "missing seq 0..=2");
+}
+
+#[test]
+fn v3b2_link_mismatch_genesis_marks_structural_invalid() {
+    // A8: declaration says genesis head but opening's `previous` is not
+    // the genesis value. S3 "O.prev == genesis" fails → `link-mismatch`.
+    use ctx::*;
+    let g = GENESIS();
+    let records = vec![
+        checkpoint(3, 1, [1; 32]), // prev != genesis
+        resume_record(
+            4,
+            2,
+            [1; 32],
+            &format!("head=0:{} lost_through=2 file=-", digest_string(&g)),
+        ),
+    ];
+    let report = check(one_native(records), TRAIL);
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0]
+            .detail()
+            .ends_with(" structural=invalid(link-mismatch)"),
+        "{}",
+        resumed[0].detail()
+    );
+}
+
+#[test]
+fn v3b2_resume_not_at_k_plus_1_marks_structural_invalid() {
+    // A9: opening at seq 5 (prev = genesis), a second record at seq 6,
+    // and the resume at seq 7 (declared L=4 → k=5, expected k+1=6).
+    // d5 point 4 priority: S1a passes (checkpoint at k=5), S1b fails.
+    // The l.388 shape (opening at seq 0, resume at seq 1, L=0) resolves
+    // to `no-opening`, not `resume-not-at-k+1`, so this row uses a
+    // different shape to isolate the reason.
+    use ctx::*;
+    let g = GENESIS();
+    let records = vec![
+        checkpoint(5, 1, g),
+        checkpoint(6, 6, [1; 32]),
+        resume_record(
+            7,
+            2,
+            [6; 32],
+            &format!("head=0:{} lost_through=4 file=-", digest_string(&g)),
+        ),
+    ];
+    let report = check(one_native(records), TRAIL);
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0]
+            .detail()
+            .ends_with(" structural=invalid(resume-not-at-k+1)"),
+        "{}",
+        resumed[0].detail()
+    );
+}
+
+#[test]
+fn v3b2_head_not_last_marks_structural_invalid() {
+    // A10: a plain record at seq 3 sits between the head (seq 1) and
+    // the opening (seq 5). S2b fails → `head-not-last`.
+    use ctx::*;
+    let g = GENESIS();
+    let records = vec![
+        checkpoint(0, 1, g),
+        record(1, 2, [1; 32], 1),
+        record(3, 3, [2; 32], 3),
+        checkpoint(5, 4, [2; 32]),
+        resume_record(
+            6,
+            5,
+            [4; 32],
+            &format!(
+                "head=1:{} lost_through=4 file=sealed.jsonl",
+                digest_string(&[2; 32])
+            ),
+        ),
+    ];
+    let report = check(one_native(records), TRAIL);
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0]
+            .detail()
+            .ends_with(" structural=invalid(head-not-last)"),
+        "{}",
+        resumed[0].detail()
+    );
+    // Chain [0, 1, 3, 5, 6] gives SeqGaps missing seq 2..=2 and 4..=4;
+    // f91e714 emits two gaps here, kept on top of the structural suffix.
+    let mut gaps: Vec<_> = kinds(&report, K::SeqGap)
+        .into_iter()
+        .map(|f| f.detail().to_owned())
+        .collect();
+    gaps.sort();
+    assert_eq!(gaps, vec!["missing seq 2..=2", "missing seq 4..=4"]);
+}
+
+#[test]
+fn v3b2_genesis_not_first_marks_structural_invalid() {
+    // A11: a record at seq 0 is present, so a genesis resume is not the
+    // first of the verified set (S3b fails).
+    use ctx::*;
+    let g = GENESIS();
+    let records = vec![
+        record(0, 1, [9; 32], 0),
+        checkpoint(3, 2, g),
+        resume_record(
+            4,
+            3,
+            [2; 32],
+            &format!("head=0:{} lost_through=2 file=-", digest_string(&g)),
+        ),
+    ];
+    let report = check(one_native(records), TRAIL);
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0]
+            .detail()
+            .ends_with(" structural=invalid(genesis-not-first)"),
+        "{}",
+        resumed[0].detail()
+    );
+}
+
+#[test]
+fn v3b2_foreign_trail_resume_does_not_affect_own_trail_candidate() {
+    // A13: an own-trail valid jump plus a foreign-trail resume. The
+    // foreign resume raises TrailMismatch and no own-trail Resumed, and
+    // leaves no candidate (collect_candidates filters by trail).
+    use ctx::*;
+    let g = GENESIS();
+    let mut foreign = resume_record(
+        10,
+        9,
+        [0; 32],
+        "head=5:blake3:0000000000000000000000000000000000000000000000000000000000000000 lost_through=5 file=-",
+    );
+    foreign.trail = [2; 16];
+    let records = vec![
+        checkpoint(0, 1, g),
+        checkpoint(1, 2, [1; 32]),
+        checkpoint(5, 3, [2; 32]),
+        resume_record(
+            6,
+            4,
+            [3; 32],
+            &format!(
+                "head=1:{} lost_through=4 file=sealed.jsonl",
+                digest_string(&[2; 32])
+            ),
+        ),
+        foreign,
+    ];
+    let report = check(one_native(records), TRAIL);
+    assert_eq!(kinds(&report, K::TrailMismatch).len(), 1);
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0].detail().ends_with(" structural=valid"),
+        "{}",
+        resumed[0].detail()
+    );
+    let input = &check_as_collection_input();
+    let candidates = resume::collect_candidates(input, TRAIL);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].resume_seq, 6);
+}
+
+/// Rebuilds the A13 collection for the candidate check (collect_candidates
+/// consumes a `Collection`, which `check` moves).
+fn check_as_collection_input() -> Collection {
+    use ctx::*;
+    let g = GENESIS();
+    let mut foreign = resume_record(
+        10,
+        9,
+        [0; 32],
+        "head=5:blake3:0000000000000000000000000000000000000000000000000000000000000000 lost_through=5 file=-",
+    );
+    foreign.trail = [2; 16];
+    one_native(vec![
+        checkpoint(0, 1, g),
+        checkpoint(1, 2, [1; 32]),
+        checkpoint(5, 3, [2; 32]),
+        resume_record(
+            6,
+            4,
+            [3; 32],
+            &format!(
+                "head=1:{} lost_through=4 file=sealed.jsonl",
+                digest_string(&[2; 32])
+            ),
+        ),
+        foreign,
+    ])
+}
+
+#[test]
+fn v3b2_native_and_shipped_same_resume_show_same_suffix_once() {
+    // A14: native and shipped copies of the same (seq, hash) must share
+    // one suffix (d5 point 10). Shape adapted to be structurally valid
+    // (genesis resume at seq 4, opening at seq 3).
+    use ctx::*;
+    let g = GENESIS();
+    let open = checkpoint(3, 1, g);
+    let resume_text = format!("head=0:{} lost_through=2 file=-", digest_string(&g));
+    let r = resume_record(4, 2, open.hash, &resume_text);
+    let open2 = checkpoint(3, 1, g);
+    let r2 = resume_record(4, 2, open.hash, &resume_text);
+    let native_input = Input {
+        path: "audit.jsonl".into(),
+        native: true,
+        data: Rc::new(Data {
+            records: vec![open, r],
+            items: vec![],
+            spans: vec![],
+        }),
+    };
+    let shipped_input = Input {
+        path: "copy".into(),
+        native: false,
+        data: Rc::new(Data {
+            records: vec![open2, r2],
+            items: vec![],
+            spans: vec![],
+        }),
+    };
+    let collection = Collection {
+        inputs: vec![native_input, shipped_input],
+        shipped: vec![(1, 0), (1, 1)],
+    };
+    let report = check(collection, TRAIL);
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0].detail().contains("gap=0..=2"),
+        "{}",
+        resumed[0].detail()
+    );
+    assert!(
+        resumed[0].detail().ends_with(" structural=valid"),
+        "{}",
+        resumed[0].detail()
+    );
+}
+
+#[test]
+fn v3b2_non_genesis_head_with_genesis_hash_marks_head_not_present() {
+    // A15: `h = 2` (not 0) with the genesis hash. d5 addendum 9: this is
+    // a non-genesis declaration, so S2a fires because no candidate at
+    // seq=2 exists. Non-genesis `lost == head_seq` → `gap=none`. This
+    // also kills M12 (dropping the `h == 0` guard would route this to
+    // the genesis path and return `structural=valid` with `gap=0..=2`).
+    use ctx::*;
+    let g = GENESIS();
+    let records = vec![
+        checkpoint(3, 1, g),
+        resume_record(
+            4,
+            2,
+            [1; 32],
+            &format!("head=2:{} lost_through=2 file=-", digest_string(&g)),
+        ),
+    ];
+    let report = check(one_native(records), TRAIL);
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1);
+    assert!(
+        resumed[0]
+            .detail()
+            .ends_with(" gap=none lost_records=0 structural=invalid(head-not-present)"),
+        "{}",
+        resumed[0].detail()
+    );
+}
+
+#[test]
+fn v3b2_several_candidates_at_k_valid_regardless_of_order() {
+    // A16: two candidates at seq 5 — a plain non-checkpoint and a
+    // qualifying checkpoint. Run `check` twice with the two in opposite
+    // order; both must mark `structural=valid` (d5 addendum 8). This
+    // kills M11 ("first candidate at k only"), which the native-first
+    // run alone cannot catch.
+    use ctx::*;
+    let g = GENESIS();
+    let resume_text = format!(
+        "head=1:{} lost_through=4 file=sealed.jsonl",
+        digest_string(&[2; 32])
+    );
+    // Build the full record set in both orderings; the two candidates at
+    // seq 5 (plain, checkpoint) swap places.
+    let forward = || {
+        vec![
+            checkpoint(0, 1, g),
+            record(1, 2, [1; 32], 1),
+            record(5, 7, [2; 32], 5),  // plain first
+            checkpoint(5, 3, [2; 32]), // checkpoint second
+            resume_record(6, 4, [3; 32], &resume_text),
+        ]
+    };
+    let reversed = || {
+        vec![
+            checkpoint(0, 1, g),
+            record(1, 2, [1; 32], 1),
+            checkpoint(5, 3, [2; 32]), // checkpoint first
+            record(5, 7, [2; 32], 5),  // plain second
+            resume_record(6, 4, [3; 32], &resume_text),
+        ]
+    };
+    for records in [forward(), reversed()] {
+        let report = check(one_native(records), TRAIL);
+        let resumed = kinds(&report, K::Resumed);
+        assert_eq!(resumed.len(), 1);
+        assert!(
+            resumed[0].detail().ends_with(" structural=valid"),
+            "{}",
+            resumed[0].detail()
+        );
+        let conflicts = kinds(&report, K::SeqConflict);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].seq(), Some(5));
+    }
+}
+
+#[test]
+fn v3b2_collect_candidates_records_validated_tuple() {
+    // A17: collect_candidates emits a candidate for each structurally
+    // valid resume, deduped per (resume_seq, resume_hash). Reads every
+    // field so the per-field `#[cfg_attr(not(test), expect(dead_code))]`
+    // is fulfilled under `clippy --all-targets -- -D warnings`. Also
+    // kills M13 ("candidate pushed for invalid outcome"): the invalid
+    // shape yields no candidate.
+    use ctx::*;
+    let g = GENESIS();
+    // A1-like non-genesis valid.
+    let valid_non_genesis = one_native(vec![
+        checkpoint(0, 1, g),
+        checkpoint(1, 2, [1; 32]),
+        checkpoint(5, 3, [2; 32]),
+        resume_record(
+            6,
+            4,
+            [3; 32],
+            &format!(
+                "head=1:{} lost_through=4 file=sealed.jsonl",
+                digest_string(&[2; 32])
+            ),
+        ),
+    ]);
+    let c = resume::collect_candidates(&valid_non_genesis, TRAIL);
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].resume_seq, 6);
+    assert_eq!(c[0].resume_hash, [4; 32]);
+    assert_eq!(c[0].opening_seq, 5);
+    assert_eq!(c[0].opening_hash, [3; 32]);
+    assert_eq!(c[0].head_seq, 1);
+    assert_eq!(c[0].head_hash, [2; 32]);
+    assert_eq!(c[0].lost_through, 4);
+    assert!(!c[0].is_genesis);
+
+    // A7-like genesis valid.
+    let valid_genesis = one_native(vec![
+        checkpoint(3, 1, g),
+        resume_record(
+            4,
+            2,
+            [1; 32],
+            &format!("head=0:{} lost_through=2 file=-", digest_string(&g)),
+        ),
+    ]);
+    let c = resume::collect_candidates(&valid_genesis, TRAIL);
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].resume_seq, 4);
+    assert_eq!(c[0].resume_hash, [2; 32]);
+    assert_eq!(c[0].opening_seq, 3);
+    assert_eq!(c[0].opening_hash, [1; 32]);
+    assert_eq!(c[0].head_seq, 0);
+    assert_eq!(c[0].head_hash, g);
+    assert_eq!(c[0].lost_through, 2);
+    assert!(c[0].is_genesis);
+
+    // A6-like invalid (link-mismatch) — no candidate.
+    let invalid = one_native(vec![
+        checkpoint(0, 1, g),
+        record(1, 2, [1; 32], 1),
+        checkpoint(5, 3, [9; 32]),
+        resume_record(
+            6,
+            4,
+            [3; 32],
+            &format!(
+                "head=1:{} lost_through=4 file=sealed.jsonl",
+                digest_string(&[2; 32])
+            ),
+        ),
+    ]);
+    assert!(resume::collect_candidates(&invalid, TRAIL).is_empty());
+
+    // Native plus a shipped copy of the valid non-genesis resume: one
+    // candidate (d5 point 10, deduped by (resume_seq, resume_hash)).
+    let native_copy = Input {
+        path: "audit.jsonl".into(),
+        native: true,
+        data: Rc::new(Data {
+            records: vec![
+                checkpoint(0, 1, g),
+                checkpoint(1, 2, [1; 32]),
+                checkpoint(5, 3, [2; 32]),
+                resume_record(
+                    6,
+                    4,
+                    [3; 32],
+                    &format!(
+                        "head=1:{} lost_through=4 file=sealed.jsonl",
+                        digest_string(&[2; 32])
+                    ),
+                ),
+            ],
+            items: vec![],
+            spans: vec![],
+        }),
+    };
+    let shipped_copy = Input {
+        path: "copy".into(),
+        native: false,
+        data: Rc::new(Data {
+            records: vec![resume_record(
+                6,
+                4,
+                [3; 32],
+                &format!(
+                    "head=1:{} lost_through=4 file=sealed.jsonl",
+                    digest_string(&[2; 32])
+                ),
+            )],
+            items: vec![],
+            spans: vec![],
+        }),
+    };
+    let collection = Collection {
+        inputs: vec![native_copy, shipped_copy],
+        shipped: vec![(1, 0)],
+    };
+    let c = resume::collect_candidates(&collection, TRAIL);
+    assert_eq!(c.len(), 1);
 }

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 mod engine;
 mod input;
 mod lines;
+mod resume;
 
 /// Severity of a finding produced by the offline verifier (#13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -232,10 +233,20 @@ mod mod_tests;
 /// `Resumed` warning for every `vigil.audit.resume` record (once per
 /// `(seq, hash)`, attributed to the native copy when present), an
 /// `UncoveredTail` info spanning every record until V5 trusts a checkpoint,
-/// and the `is_strict_valid` / `first_broken_link` predicates. Structural
-/// resume validation (head, `lost_through`, link, genesis checks) lands in
-/// V3b-2; V4–V8/R10 supply folds, signatures, coverage, anchors, receipts,
-/// review and archive rules. Native gaps are reported, never excused, until
+/// and the `is_strict_valid` / `first_broken_link` predicates. V3b-2 adds
+/// structural resume validation per ruling 13-V3-d5 (rules 1 and 3): every
+/// parseable `Resumed` detail ends with exactly one suffix,
+/// ` structural=valid` or ` structural=invalid(<reason>)`, where `<reason>`
+/// is the first failing condition token in this exact order: `no-opening`,
+/// `resume-not-at-k+1`, `head-not-present`, `head-not-last`,
+/// `link-mismatch`, `genesis-not-first`. The suffix changes no severity
+/// and removes no finding; every `SeqGap`, `ChainBroken` and `Resumed`
+/// stays. A malformed declaration keeps its `malformed declaration`
+/// detail and gets no suffix. The genesis gap text is `gap=0..=<L>`
+/// (ADR l.407), never `none`. An archived head is indistinguishable from
+/// a deleted one and resolves to `head-not-present`; a start checkpoint
+/// covering an archived head is V6's. V4–V8/R10 supply folds, signatures,
+/// coverage, anchors, receipts, review and archive rules. Native gaps are reported, never excused, until
 /// V5 supplies trusted coverage: a matching `audit.repaired` is a
 /// `TornWrite`, a missing or different one is `RepairMismatch`, and a
 /// trailing gap is `TornWrite` with the bytes-to-EOF digest. V5 then promotes

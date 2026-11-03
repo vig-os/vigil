@@ -700,3 +700,104 @@ fn resume_record_from_writer_emits_one_resumed_with_parsed_detail() {
     assert!(resumed[0].detail().contains("lost_records=0"));
     assert!(!report.is_strict_valid());
 }
+
+// ---------- #13 V3b-2 writer-driven acceptance (ruling 13-V3-d5) ----------
+
+/// A1: a writer-produced nothing-lost resume marks `structural=valid`.
+#[test]
+fn v3b2_writer_nothing_lost_resume_marks_structural_valid() {
+    use vigil::audit::checkpoints;
+    let fx = Written::new(1);
+    let cps = checkpoints(&fx.trail).unwrap();
+    let closing = cps
+        .iter()
+        .max_by_key(|c| c.seq())
+        .expect("closing checkpoint");
+    let head = (closing.seq(), closing.hash());
+    let (trail, _receipt, _opening) = AuditConfig::new("svc")
+        .dir(&fx.trail)
+        .resume(fx.signer(), head, head.0, "operator", "reviewed")
+        .unwrap();
+    drop(trail);
+    let report = verify(&fx.trail, &fx.trust).unwrap();
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1, "{:?}", report.findings());
+    let detail = resumed[0].detail();
+    assert!(
+        detail.ends_with(" gap=none lost_records=0 structural=valid"),
+        "{detail}"
+    );
+}
+
+/// A12: the full detail string matches V3b-2's grammar byte-for-byte (the
+/// head form is `head=<seq>:blake3:<hex>`, from `parse_resume`).
+#[test]
+fn v3b2_writer_resume_detail_matches_structural_valid_grammar() {
+    use vigil::audit::checkpoints;
+    let fx = Written::new(1);
+    let cps = checkpoints(&fx.trail).unwrap();
+    let closing = cps
+        .iter()
+        .max_by_key(|c| c.seq())
+        .expect("closing checkpoint");
+    let head = (closing.seq(), closing.hash());
+    let (trail, _receipt, _opening) = AuditConfig::new("svc")
+        .dir(&fx.trail)
+        .resume(fx.signer(), head, head.0, "operator", "reviewed")
+        .unwrap();
+    drop(trail);
+    let report = verify(&fx.trail, &fx.trust).unwrap();
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1, "{:?}", report.findings());
+    let hex: String = closing.hash().iter().map(|b| format!("{b:02x}")).collect();
+    let expected = format!(
+        "operator=operator reason=reviewed head={}:blake3:{} gap=none lost_records=0 structural=valid",
+        closing.seq(),
+        hex
+    );
+    assert_eq!(resumed[0].detail(), expected);
+}
+
+/// A7w: delete the live file after `Written::new(1)`, then resume with a
+/// genesis-shaped declaration. Under d5 S3 with no record present below
+/// `k=3` → `structural=valid`; if the writer rotated a segment below `k`
+/// (not expected for Written::new(1) on origin/dev f91e714), S3b fires
+/// `genesis-not-first` instead. The suffix is pinned from a real run.
+#[test]
+fn v3b2_writer_genesis_resume_after_live_delete_emits_genesis_gap_and_pinned_suffix() {
+    let fx = Written::new(1);
+    // Recover the trail's genesis value from the seq-0 line's
+    // `audit.prev_hash` attribute, which the writer emits as
+    // `"stringValue":"blake3:<hex>"` right after `"key":"audit.prev_hash"`.
+    let bytes = fs::read(fx.live()).unwrap();
+    let first_lf = bytes.iter().position(|&b| b == b'\n').unwrap();
+    let line0 = std::str::from_utf8(&bytes[..first_lf]).unwrap();
+    let key_marker = "\"key\":\"audit.prev_hash\"";
+    let value_marker = "\"stringValue\":\"blake3:";
+    let key_pos = line0.find(key_marker).unwrap();
+    let after_key = &line0[key_pos..];
+    let value_pos = after_key.find(value_marker).unwrap() + value_marker.len();
+    let hex_start = key_pos + value_pos;
+    let mut genesis = [0u8; 32];
+    for i in 0..32 {
+        genesis[i] =
+            u8::from_str_radix(&line0[hex_start + 2 * i..hex_start + 2 * i + 2], 16).unwrap();
+    }
+    // Delete the live file so no records with seq < 3 remain visible.
+    fs::remove_file(fx.live()).unwrap();
+    let head = (0u64, genesis);
+    let (trail, _receipt, _opening) = AuditConfig::new("svc")
+        .dir(&fx.trail)
+        .resume(fx.signer(), head, 2, "operator", "reviewed")
+        .unwrap();
+    drop(trail);
+    let report = verify(&fx.trail, &fx.trust).unwrap();
+    let resumed = kinds(&report, K::Resumed);
+    assert_eq!(resumed.len(), 1, "{:?}", report.findings());
+    let detail = resumed[0].detail();
+    // Under d5 S3 with no record present below k=3 → structural=valid,
+    // confirmed by running the test; if a sealed segment is observed,
+    // S3b fires `genesis-not-first` instead.
+    assert!(detail.contains("gap=0..=2"), "{detail}");
+    assert!(detail.ends_with(" structural=valid"), "{detail}");
+}
