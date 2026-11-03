@@ -788,19 +788,24 @@ fn precedence_missing_v_and_unknown_attribute_key_is_missing_field() {
 #[test]
 fn precedence_v2_and_duplicate_attribute_key_is_invalid_field() {
     // 191-d1 addendum 6: envelope (attribute decode, incl. duplicate
-    // keys) runs before `audit.v`, so v=2 does not win here.
+    // keys) runs before `audit.v`, so v=2 does not win here. The
+    // duplicate is a real second scope-attribute entry with a
+    // non-`audit.*` key (valid JSON, no duplicate JSON keys), caught
+    // by `context_message(scope, false)` in `contexts()` via
+    // `attributes_at(_, _, context=true)`. `Record::from_json`'s own
+    // resource/scope `message()` walk and `parse_record` do not
+    // decode the scope attribute list, so the mutant "move
+    // `contexts(&json)?` to after the `parse_record` loop" flips
+    // this to `UnknownVersion`.
     use serde_json::json;
     let mut v = fixture(false);
     attr(&mut v, "audit.v")["intValue"] = json!("2");
-    let raw = v.to_string();
-    let bad = raw.replacen(
-        r#""stringValue":"α""#,
-        r#""stringValue":"mallory","stringValue":"α""#,
-        1,
-    );
-    assert_ne!(bad, raw);
+    v["resourceLogs"][0]["scopeLogs"][0]["scope"]["attributes"] = json!([
+        {"key": "component", "value": {"stringValue": "a"}},
+        {"key": "component", "value": {"stringValue": "b"}},
+    ]);
     assert_eq!(
-        kind_and_seq(bad.as_bytes()),
+        kind_and_seq(v.to_string().as_bytes()),
         (Some(FindingKind::InvalidField), None),
     );
 }
@@ -826,27 +831,22 @@ fn precedence_duplicate_attribute_key_and_dropped_attributes_count_one_is_invali
     // 191-d1 addendum 6 (verdict blocker #1): the attribute-list decode
     // runs in `contexts()` BEFORE `parse_record`, so a duplicate
     // attribute key (`InvalidField` in step 0.2) is seen before
-    // `droppedAttributesCount != 0` (`UnknownField` in step 0.4). A
-    // mutant that reorders `parse_record`'s envelope ahead of
-    // `contexts()`'s attribute decode would flip this to
-    // `UnknownField`.
-    let v = fixture(false);
-    let raw = v.to_string();
-    let bad = raw.replacen(
-        r#""stringValue":"α""#,
-        r#""stringValue":"mallory","stringValue":"α""#,
-        1,
-    );
-    assert_ne!(bad, raw);
-    // Inject the dropped-attributes-count envelope defect too.
-    let bad = bad.replacen(
-        r#""attributes":"#,
-        r#""droppedAttributesCount":1,"attributes":"#,
-        1,
-    );
-    assert!(bad.contains(r#""droppedAttributesCount":1"#));
+    // `droppedAttributesCount != 0` (`UnknownField` in step 0.4). The
+    // duplicate is a real second `audit.actor` entry in the log's
+    // attributes array; the mutant "move `contexts(&json)?` to after
+    // the `parse_record` loop in `Record::from_json`" flips this to
+    // `UnknownField` because `parse_record`'s log-level
+    // `droppedAttributesCount != 0` check at `codec.rs:166` runs
+    // before its own attribute-list decode at `codec.rs:178`.
+    use serde_json::json;
+    let mut v = fixture(false);
+    log(&mut v)["droppedAttributesCount"] = json!(1);
+    attrs(&mut v).push(json!({
+        "key": "audit.actor",
+        "value": {"stringValue": "mallory"},
+    }));
     assert_eq!(
-        kind_and_seq(bad.as_bytes()),
+        kind_and_seq(v.to_string().as_bytes()),
         (Some(FindingKind::InvalidField), None),
     );
 }
