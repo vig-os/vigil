@@ -2778,26 +2778,54 @@ mod details {
     }
     #[test]
     fn settle_discards_bogus_resume_staging() {
-        use crate::audit::sink::{Config, Sink};
-        use std::sync::Arc;
+        use crate::audit::sink::{ResumeOutcome, promote_resume};
+        use std::sync::atomic::AtomicBool;
+        // Staging that actually reaches `scan_staged`: two records,
+        // Checkpoint + Entry with " file=-", so `valid_file` is true
+        // and the short-circuit in
+        //   `let valid = valid_file && scan_staged(..).is_ok();`
+        // does invoke `scan_staged`. The opening is the Section 4
+        // archived-base `cp(7, [42;32], genesis_fold)`, which
+        // `scan_staged` rejects as "initial checkpoint does not link
+        // genesis" (see `scan_staged_rejects_archived_base_without_root_link`).
+        // `promote_resume` therefore takes the Discarded branch and
+        // unlinks the staging. Dropping `scan_staged` from `valid`
+        // leaves `valid = valid_file = true`, which flips `outcome`
+        // to Promoted and renames the staging in place; swapping
+        // Promoted/Discarded in the return flips the outcome without
+        // the file-system side effect. Either mutant makes
+        // `assert_eq!(outcome, Discarded)` or the staging-removal
+        // assertion fail (exit 101).
         let d = Temp::new();
-        let first = fixture(&d.0);
         trail_marker(&d);
-        // Not two Checkpoint+Entry records: `file` resolves to None in
-        // promote_resume, `valid_file` stays false, scan_staged is not
-        // reached, and the Discarded branch unlinks the staging.
-        fs::write(d.0.join(".audit-resume.jsonl"), b"not a resume\n").unwrap();
-        let sink = Sink::open(
-            &d.0,
-            Arc::new(crate::audit::KeyFileSigner::from_hex(&"27".repeat(32)).unwrap()),
-            Config::default(),
-            None,
+        let archived = cp(7, [42; 32], &genesis_fold());
+        let r = declaration(&archived, 0, [42; 32], 6, None);
+        fs::write(
+            d.0.join(".audit-resume.jsonl"),
+            concat(&[&archived, &r], &[]),
         )
         .unwrap();
+        let dir_f = File::open(&d.0).unwrap();
+        let staged = File::open(d.0.join(".audit-resume.jsonl")).unwrap();
+        let outcome = promote_resume(
+            &staged,
+            &dir_f,
+            (None, false),
+            TRAIL,
+            &AtomicBool::new(false),
+            false,
+        )
+        .unwrap();
+        assert_eq!(outcome, ResumeOutcome::Discarded);
         assert!(!d.0.join(".audit-resume.jsonl").exists());
-        assert_eq!(fs::read(d.0.join("audit.jsonl")).unwrap(), line(&first));
-        assert_eq!(head(&open(&d.0)), Head::of(&first));
-        sink.close().unwrap();
+        // The exact string `Sink::resume` surfaces when
+        // `promote_resume` returns Discarded. Pinned via the production
+        // source so a review that relabels the message is caught here.
+        assert!(
+            include_str!("sink.rs")
+                .contains("io_error(\"resume staging discarded after validation\")"),
+            "Sink::resume no longer surfaces the pinned Discarded string",
+        );
     }
 
     // --- Section 4: scan_staged's archived-base rejection -----------
@@ -2921,6 +2949,32 @@ mod details {
             0,
         );
     }
+    #[test]
+    fn genesis_closer_accepted_after_fragment_only_first_segment() {
+        // Section 5 named layout, accepted outcome: a fragment-only
+        // first segment is closed by a genesis closer -- a cp that
+        // links genesis plus an immediate resume declaration -- in the
+        // live file. `TrailReader::open` accepts the trail, and
+        // `history_segment` reports the fragment-only seg0 as a run
+        // through its `&mut run` out parameter (the API that exposes
+        // run membership to the readers).
+        let d = Temp::new();
+        fs::write(segment(&d.0, 0), b"{\"torn\":").unwrap();
+        let opening = cp_root(5);
+        let resume = declaration(&opening, 0, Record::genesis(&TRAIL), 4, None);
+        write_records(&d.0, &[&opening, &resume]);
+        let reader = TrailReader::open(&d.0, TRAIL, None).unwrap();
+        assert_eq!(head(&reader), Head::of(&resume));
+        // Which segments are runs: history_segment reports run=true on
+        // the fragment-only seg0 (its unparsable tail cannot close the
+        // chain). scan_closing then accepts the live file, so the
+        // outer open succeeds.
+        let seg0 = File::open(segment(&d.0, 0)).unwrap();
+        let mut run = false;
+        let state = history_segment(&seg0, TRAIL, None, true, None, &mut None, &mut run).unwrap();
+        assert!(run, "fragment-only seg0 belongs to a run");
+        assert!(state.is_none(), "no complete record in seg0 to carry state");
+    }
 
     // ---- Coverage gate --------------------------------------------------
 
@@ -2987,6 +3041,143 @@ mod details {
             .collect()
     }
 
+    fn is_ident_start(b: u8) -> bool {
+        b.is_ascii_alphabetic() || b == b'_'
+    }
+    fn is_ident_cont(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    /// Returns the position after any Rust trivia at `i` (line and
+    /// nested block comments, strings, raw strings, char literals and
+    /// lifetimes), or `None` when `i` is not at trivia. The lexer runs
+    /// over the whole source so a stray char literal (`'"'`) cannot be
+    /// mistaken for a string start, and a bogus `assert_corrupt` call
+    /// cannot hide inside a comment, string or raw string.
+    fn skip_trivia(bytes: &[u8], i: usize) -> Option<usize> {
+        if i >= bytes.len() {
+            return None;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            return Some(j);
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            let mut depth: usize = 1;
+            let mut j = i + 2;
+            while j + 1 < bytes.len() && depth > 0 {
+                if bytes[j] == b'/' && bytes[j + 1] == b'*' {
+                    depth += 1;
+                    j += 2;
+                } else if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+                    depth -= 1;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            return Some(j);
+        }
+        if let Some(j) = skip_raw_string(bytes, i) {
+            return Some(j);
+        }
+        if bytes[i] == b'"' {
+            return Some(skip_string(bytes, i));
+        }
+        if bytes[i] == b'\'' {
+            return Some(skip_char_or_lifetime(bytes, i));
+        }
+        None
+    }
+
+    fn skip_raw_string(bytes: &[u8], start: usize) -> Option<usize> {
+        let mut j = start;
+        if j < bytes.len() && (bytes[j] == b'b' || bytes[j] == b'c') {
+            if j > 0 && is_ident_cont(bytes[j - 1]) {
+                return None;
+            }
+            if j + 1 >= bytes.len() || bytes[j + 1] != b'r' {
+                return None;
+            }
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'r' {
+            return None;
+        }
+        if start > 0 && j == start && is_ident_cont(bytes[start - 1]) {
+            return None;
+        }
+        if j + 1 >= bytes.len() || (bytes[j + 1] != b'#' && bytes[j + 1] != b'"') {
+            return None;
+        }
+        j += 1;
+        let hash_start = j;
+        while j < bytes.len() && bytes[j] == b'#' {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'"' {
+            return None;
+        }
+        let hashes = j - hash_start;
+        j += 1;
+        while j < bytes.len() {
+            if bytes[j] == b'"' {
+                let after = j + 1;
+                if after + hashes <= bytes.len()
+                    && bytes[after..after + hashes].iter().all(|&b| b == b'#')
+                {
+                    return Some(after + hashes);
+                }
+            }
+            j += 1;
+        }
+        Some(bytes.len())
+    }
+
+    fn skip_string(bytes: &[u8], start: usize) -> usize {
+        debug_assert_eq!(bytes[start], b'"');
+        let mut j = start + 1;
+        while j < bytes.len() && bytes[j] != b'"' {
+            if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                j += 2;
+            } else {
+                j += 1;
+            }
+        }
+        (j + 1).min(bytes.len())
+    }
+
+    fn skip_char_or_lifetime(bytes: &[u8], start: usize) -> usize {
+        debug_assert_eq!(bytes[start], b'\'');
+        let j = start + 1;
+        if j >= bytes.len() {
+            return j;
+        }
+        if bytes[j] == b'\\' {
+            // Escape form: '\x', '\u{..}', '\'', '\n', .... Skip the
+            // backslash and its first escape byte, then look for the
+            // closing quote on this line.
+            let mut k = j + 2;
+            while k < bytes.len() && bytes[k] != b'\'' && bytes[k] != b'\n' {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'\'' {
+                return k + 1;
+            }
+            return start + 1;
+        }
+        if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
+            return j + 2;
+        }
+        // Lifetime like `'static` or `'a`: consume the apostrophe only
+        // and let the main loop treat the trailing letters as an
+        // identifier.
+        start + 1
+    }
+
     fn balance(bytes: &[u8], open: usize) -> Option<(usize, Vec<usize>)> {
         // Depth is only decremented by `)`. Turbofish (`::<T, E>`) is
         // tracked as a separate `generic` depth so its commas never
@@ -2995,33 +3186,27 @@ mod details {
         let mut generic: i32 = 0;
         let mut j = open + 1;
         let mut commas = Vec::new();
-        let mut in_str = false;
-        let mut escape = false;
         while j < bytes.len() && depth > 0 {
+            if let Some(nj) = skip_trivia(bytes, j) {
+                j = nj;
+                continue;
+            }
             let c = bytes[j];
-            if in_str {
-                if escape {
-                    escape = false;
-                } else if c == b'\\' {
-                    escape = true;
-                } else if c == b'"' {
-                    in_str = false;
+            match c {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if c != b')' {
+                            return None;
+                        }
+                        return Some((j, commas));
+                    }
                 }
-            } else if c == b'"' {
-                in_str = true;
-            } else if c == b'(' {
-                depth += 1;
-            } else if c == b')' {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((j, commas));
-                }
-            } else if c == b'<' && j >= 2 && &bytes[j - 2..j] == b"::" {
-                generic += 1;
-            } else if c == b'>' && generic > 0 {
-                generic -= 1;
-            } else if c == b',' && depth == 1 && generic == 0 {
-                commas.push(j);
+                b'<' if j >= 2 && &bytes[j - 2..j] == b"::" => generic += 1,
+                b'>' if generic > 0 => generic -= 1,
+                b',' if depth == 1 && generic == 0 => commas.push(j),
+                _ => {}
             }
             j += 1;
         }
@@ -3029,63 +3214,55 @@ mod details {
     }
 
     fn parse_assertions(source: &str) -> Vec<(String, usize)> {
-        // Every `assert_corrupt(` found outside comments and strings
-        // must parse to a literal detail and a literal usize site index.
-        // Anything else panics, so the gate catches silently-skipped
-        // calls (such as a turbofish-shaped first arg that used to
-        // mis-shape the old comma count).
+        // Every occurrence of the word `assert_corrupt` outside Rust
+        // trivia (comments, strings, raw strings, char literals) that
+        // is not the helper's own `fn assert_corrupt<T>` definition must
+        // be immediately followed by `(` with a parseable
+        // `(..., "<detail>", <n>)` argument list. Anything else -- a
+        // turbofish (`::<...>(`) between the name and `(`, an identifier
+        // reference without a call (`let f = assert_corrupt::<..>;`), a
+        // non-literal detail or site arg -- panics, so a bogus call
+        // cannot hide inside dead code (`if false { ... }`) or an
+        // alias.
         let bytes = source.as_bytes();
-        let needle = b"assert_corrupt(";
         let mut asserts = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
-            // Line comments.
-            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
+            if let Some(ni) = skip_trivia(bytes, i) {
+                i = ni;
                 continue;
             }
-            // Block comments.
-            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(bytes.len());
-                continue;
-            }
-            // String literals (including the raw contents around the
-            // detail arg itself; we restart the scan at the closing
-            // paren after a real match).
-            if bytes[i] == b'"' {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                i = (i + 1).min(bytes.len());
-                continue;
-            }
-            if i + needle.len() > bytes.len() || &bytes[i..i + needle.len()] != needle {
+            if !is_ident_start(bytes[i]) {
                 i += 1;
                 continue;
             }
-            if i > 0 {
-                let p = bytes[i - 1];
-                if p.is_ascii_alphanumeric() || p == b'_' {
-                    i += 1;
-                    continue;
-                }
+            let name_start = i;
+            while i < bytes.len() && is_ident_cont(bytes[i]) {
+                i += 1;
             }
-            if i >= 3 && &bytes[i - 3..i] == b"fn " {
-                i += needle.len();
+            if &bytes[name_start..i] != b"assert_corrupt" {
                 continue;
             }
-            let open = i + needle.len() - 1;
+            // Exclude the helper's own `fn assert_corrupt<T>(...)` def.
+            let mut p = name_start;
+            while p > 0 && (bytes[p - 1] == b' ' || bytes[p - 1] == b'\t') {
+                p -= 1;
+            }
+            if p >= 2 && &bytes[p - 2..p] == b"fn" && (p == 2 || !is_ident_cont(bytes[p - 3])) {
+                continue;
+            }
+            if i >= bytes.len() || bytes[i] != b'(' {
+                let line = bytes[..name_start].iter().filter(|&&b| b == b'\n').count() + 1;
+                let ctx_end = bytes.len().min(i + 32);
+                let ctx = std::str::from_utf8(&bytes[name_start..ctx_end]).unwrap_or("<non-utf8>");
+                panic!(
+                    "coverage gate: `assert_corrupt` at line {line} is not \
+                     immediately followed by `(` (saw `{ctx}`); every call \
+                     must be a literal `assert_corrupt(result, \"detail\", site)` \
+                     so the gate's static scan sees it"
+                );
+            }
+            let open = i;
             let (close, commas) = balance(bytes, open).unwrap_or_else(|| {
                 panic!("coverage gate: unterminated assert_corrupt( near byte {open}")
             });
