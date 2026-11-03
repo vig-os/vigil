@@ -2434,21 +2434,496 @@ mod details {
         assert_eq!(head(&open(&d.0)), Head::of(&r));
     }
 
-    // ---- Coverage gate --------------------------------------------------
+    // ------------------------------------------------------------
+    // #197 R0b: pin the paths and layouts R0a left out. Tests only.
+    //
+    // Section 1 covers the fallback rescan through `TrailReader::open`
+    // for each fallback-reachable site (history_segment's post-strict
+    // body). Section 2 pins the three refresh() sites, replacing the
+    // R0a `PENDING_R0B` stubs (now empty). Section 3 pins the resume
+    // path: predecessor_run errors surface through Sink::resume, and
+    // Sink::open through settle() discards a bogus `.audit-resume.jsonl`
+    // staging. Section 4 pins the path-dependent archived base
+    // (`cp(7, [42;32], genesis_fold)`): `scan` is Ok but `scan_staged`
+    // gives `initial checkpoint does not link genesis`. Section 5 pins
+    // the named layouts: boundary_resume (sealed-run and fragment-only,
+    // rotated and live), the opening MMR mismatch (closing opening),
+    // the genesis closer after a fragment-only first segment, and the
+    // hash-link boundary (197-d1 point 8) on live `open`, strict `scan`
+    // and refresh. The gate hardening (stale-label check, strict
+    // parsing with turbofish and non-literal guard) lives in
+    // `parse_assertions` and `coverage_gate_pins_every_corrupt_site`.
+    // ------------------------------------------------------------
 
-    const PENDING_R0B: &[(&str, usize, &str)] = &[
-        ("missing live file", 0, "refresh() statat on live - R0b"),
-        (
+    fn trail_marker(d: &Temp) {
+        fs::write(
+            d.0.join("audit.trail"),
+            format!("{}\n", crate::audit::hex(&TRAIL)),
+        )
+        .unwrap();
+    }
+
+    // --- Section 1: fallback through TrailReader::open ----------------
+    // Each test puts a rotated segment that fails the strict scan then
+    // trips a specific fallback-body site. The live file is empty so if
+    // the fallback did not fire we would still error on the live scan,
+    // but each case here errors inside the rotated segment first.
+
+    fn alt_cp0() -> Record {
+        // Seq 0, prev != genesis: a different-hash duplicate opening.
+        cp(0, [42; 32], &Mmr::new())
+    }
+    fn seg_only(bytes: Vec<u8>) -> Temp {
+        let d = Temp::new();
+        fs::write(segment(&d.0, 0), bytes).unwrap();
+        fs::write(d.0.join("audit.jsonl"), b"").unwrap();
+        d
+    }
+    fn two_segs(seg0: Vec<u8>, seg1: Vec<u8>) -> Temp {
+        let d = Temp::new();
+        fs::write(segment(&d.0, 0), seg0).unwrap();
+        fs::write(segment(&d.0, 1), seg1).unwrap();
+        fs::write(d.0.join("audit.jsonl"), b"").unwrap();
+        d
+    }
+
+    #[test]
+    fn pin_open_fallback_invalid_record_in_sealed_run() {
+        let d = seg_only(concat(&[&cp0()], b"{}\n"));
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "invalid audit record in sealed run",
+            0,
+        );
+    }
+    #[test]
+    fn pin_open_fallback_multiple_records_sealed_run() {
+        let d = seg_only([line(&cp0()), multi_record_line(&entry(&cp0()))].concat());
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "multiple records in native audit line",
+            0,
+        );
+    }
+    #[test]
+    fn pin_open_fallback_trail_identity_sealed_run() {
+        let d = seg_only([line(&cp0()), line(&cp0_other_trail())].concat());
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "trail identity differs from marker",
+            0,
+        );
+    }
+    #[test]
+    fn pin_open_fallback_unparsable_before_complete_record() {
+        let f = cp0();
+        let d = seg_only([line(&f), b"not json\n".to_vec(), line(&entry(&f))].concat());
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "unparsable line before complete record",
+            0,
+        );
+    }
+    #[test]
+    fn pin_open_fallback_attestation_duplicate_branch() {
+        // [cp0, fragment, cp0] on a sealed segment: the duplicate head
+        // reaches the duplicate-branch attestation check (L440).
+        let f = cp0();
+        let d = seg_only([line(&f), b"{\"torn\":\n".to_vec(), line(&f)].concat());
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "missing or mismatched repair attestation",
+            0,
+        );
+    }
+    #[test]
+    fn pin_open_fallback_sequence_did_not_increase_rotated_duplicate_opening() {
+        // Brief's example: a rotated duplicate opening (different hash,
+        // same seq=0) hits L448 inside the fallback body.
+        let d = seg_only(concat(&[&cp0(), &alt_cp0()], &[]));
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "record sequence did not increase inside sealed run",
+            0,
+        );
+    }
+    #[test]
+    fn pin_open_fallback_missing_initial_checkpoint() {
+        // A rotated segment whose first record is a non-Checkpoint
+        // fires L462 in the fallback body (strict fires L903 above).
+        let d = seg_only(line(&entry(&cp0())));
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "missing initial checkpoint",
+            0,
+        );
+    }
+    #[test]
+    fn pin_open_fallback_sequence_gap_inside_sealed_run_segment() {
+        let f = cp0();
+        let jumped = Record::new(context(5, f.hash()), Entry::new("a", "b", "c")).unwrap();
+        let d = seg_only(concat(&[&f, &jumped], &[]));
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "sequence gap inside sealed run segment",
+            0,
+        );
+    }
+    #[test]
+    fn pin_open_fallback_attestation_general_branch_broken_link_pair() {
+        // Two rotated segments: seg0 seals state at cp0; seg1 opens with
+        // h5 (seq=5), then a fragment, then a broken-link seq=6. The
+        // fragment+broken pair reaches the general-branch attestation
+        // check (L476) in the fallback body on seg1.
+        let f = cp0();
+        let h5 = Record::new(context(5, [0; 32]), Entry::new("actor", "change", "object")).unwrap();
+        let broken = Record::new(
+            context(6, [42; 32]),
+            Entry::new("actor", "change", "object"),
+        )
+        .unwrap();
+        let d = two_segs(
+            line(&f),
+            [line(&h5), b"{\"torn\":\n".to_vec(), line(&broken)].concat(),
+        );
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "missing or mismatched repair attestation",
+            1,
+        );
+    }
+    #[test]
+    fn pin_open_fallback_first_successor_does_not_close() {
+        // seg0 ends with a trailing fragment (unsealed); seg1 opens with
+        // a Checkpoint that correctly links cp0 but with the wrong fold.
+        // The fallback trial fails on MMR mismatch → closing=false,
+        // broken=false, Checkpoint → L488.
+        let f = cp0();
+        let wrong_opening = cp(1, f.hash(), &alt_fold());
+        let d = two_segs(
+            [line(&f), b"{\"torn\":".to_vec()].concat(),
+            line(&wrong_opening),
+        );
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "first successor does not close sealed run",
+            0,
+        );
+    }
+    #[test]
+    fn boundary_resume_sealed_run_rotated_successor_lacks_immediate_resume() {
+        // seg0 is a sealed-run segment (cp0 + trailing fragment); seg1
+        // opens with a correct closing cp1, then a non-resume entry.
+        // Fallback's count==1 && closing && !is_resume fires L498.
+        let f = cp0();
+        let close = cp(1, f.hash(), &seeded(&f));
+        let d = two_segs(
+            [line(&f), b"{\"torn\":".to_vec()].concat(),
+            concat(&[&close, &entry(&close)], &[]),
+        );
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "first successor lacks immediate resume",
+            0,
+        );
+    }
+    #[test]
+    fn boundary_resume_fragment_only_rotated_successor_lacks_immediate_resume() {
+        // seg0 is fragment-only (no records); seg1 opens with a
+        // root-linked cp5 (closing the inherited run), then a non-resume
+        // entry. Fallback's count==1 && closing && !is_resume fires L498.
+        let close = cp_root(5);
+        let d = two_segs(
+            b"{\"torn\":".to_vec(),
+            concat(&[&close, &entry(&close)], &[]),
+        );
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "first successor lacks immediate resume",
+            0,
+        );
+    }
+    #[test]
+    fn pin_open_fallback_first_successor_lacks_resume_eof() {
+        // seg0 unsealed; seg1 is just a correct closing cp (no second
+        // record), so must_close && *run at end-of-loop fires L523.
+        let f = cp0();
+        let close = cp(1, f.hash(), &seeded(&f));
+        let d = two_segs([line(&f), b"{\"torn\":".to_vec()].concat(), line(&close));
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "first successor lacks resume",
+            0,
+        );
+    }
+    #[test]
+    fn pin_open_fallback_invalid_undamaged_segment() {
+        // A rotated segment with a single root-linked cp(7) (prev==genesis
+        // but seq>0) parses cleanly through the fallback body but is
+        // neither damaged nor inside an inherited run, so L529 fires at
+        // end-of-loop before the pending-resume check.
+        let d = seg_only(line(&cp_root(7)));
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "invalid undamaged segment",
+            0,
+        );
+    }
+    #[test]
+    fn pin_open_fallback_resume_checkpoint_lacks_declaration() {
+        // cp(7) root-linked sets pending_resume; the trailing "not json\n"
+        // marks the segment damaged (so L529 is skipped) and the state's
+        // pending_resume=true then fires L536 at the end of the fallback.
+        let d = seg_only([line(&cp_root(7)), b"not json\n".to_vec()].concat());
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "resume checkpoint lacks its declaration",
+            0,
+        );
+    }
+
+    // --- Section 2: refresh() with opening=false ---------------------
+    // The three sites previously held in `PENDING_R0B` are refresh's
+    // own guards: the live file must exist, must not shrink below the
+    // cached length, and the retained old descriptor must not have
+    // been truncated below the cached length after a rotation.
+
+    fn held_reader() -> (Temp, TrailReader, Record) {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        // Populate cache.state.length by reading the current head.
+        assert_eq!(head(&reader), Head::of(&first));
+        (d, reader, first)
+    }
+
+    #[test]
+    fn refresh_missing_live_file() {
+        let (d, reader, _) = held_reader();
+        fs::remove_file(d.0.join("audit.jsonl")).unwrap();
+        assert_corrupt(
+            reader.with_current(|_| Ok(()), |_, _, _| Ok(())),
+            "missing live file",
+            0,
+        );
+    }
+    #[test]
+    fn refresh_live_file_shrank_below_cached_length() {
+        let (d, reader, _) = held_reader();
+        // Truncate in place: the inode is unchanged, so refresh takes
+        // the same-inode branch and the cached-length guard fires.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(d.0.join("audit.jsonl"))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert_corrupt(
+            reader.with_current(|_| Ok(()), |_, _, _| Ok(())),
             "live file shrank below cached length",
             0,
-            "refresh() cached-length guard - R0b",
-        ),
-        (
+        );
+    }
+    #[test]
+    fn refresh_old_live_descriptor_was_truncated_after_rotation() {
+        let (d, reader, first) = held_reader();
+        let mut mmr = seeded(&first);
+        rotated(&d.0, &first, &mut mmr, 0);
+        // The reader still holds the fd of the renamed segment; truncate
+        // that inode so refresh's different-inode branch sees old.len=0.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(segment(&d.0, 0))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert_corrupt(
+            reader.with_current(|_| Ok(()), |_, _, _| Ok(())),
             "old live descriptor was truncated",
             0,
-            "refresh() post-rotation guard - R0b",
-        ),
-    ];
+        );
+    }
+
+    // --- Section 3: resume paths ------------------------------------
+    // `predecessor_run` errors surface through `Sink::resume`; a bogus
+    // `.audit-resume.jsonl` staging seen by `Sink::open` triggers the
+    // Discarded outcome inside `promote_resume`, which unlinks the
+    // staging without clobbering the live file.
+
+    #[test]
+    fn resume_surfaces_corrupt_predecessor_fallback() {
+        use crate::audit::sink::{Config, Sink};
+        use std::sync::Arc;
+        let d = Temp::new();
+        let first = cp0();
+        // Rotated segment that fails strict scan and trips the fallback
+        // body's "invalid audit record in sealed run" guard (L421).
+        fs::write(segment(&d.0, 0), [line(&first), b"{}\n".to_vec()].concat()).unwrap();
+        fs::write(d.0.join("audit.jsonl"), line(&first)).unwrap();
+        trail_marker(&d);
+        assert_corrupt(
+            Sink::resume(
+                &d.0,
+                Arc::new(crate::audit::KeyFileSigner::from_hex(&"27".repeat(32)).unwrap()),
+                Config::default(),
+                Head::of(&first),
+                0,
+                "operator".into(),
+                "incident".into(),
+            )
+            .map(|(sink, _, _)| drop(sink)),
+            "invalid audit record in sealed run",
+            0,
+        );
+    }
+    #[test]
+    fn settle_discards_bogus_resume_staging() {
+        use crate::audit::sink::{Config, Sink};
+        use std::sync::Arc;
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        trail_marker(&d);
+        // Not two Checkpoint+Entry records: `file` resolves to None in
+        // promote_resume, `valid_file` stays false, scan_staged is not
+        // reached, and the Discarded branch unlinks the staging.
+        fs::write(d.0.join(".audit-resume.jsonl"), b"not a resume\n").unwrap();
+        let sink = Sink::open(
+            &d.0,
+            Arc::new(crate::audit::KeyFileSigner::from_hex(&"27".repeat(32)).unwrap()),
+            Config::default(),
+            None,
+        )
+        .unwrap();
+        assert!(!d.0.join(".audit-resume.jsonl").exists());
+        assert_eq!(fs::read(d.0.join("audit.jsonl")).unwrap(), line(&first));
+        assert_eq!(head(&open(&d.0)), Head::of(&first));
+        sink.close().unwrap();
+    }
+
+    // --- Section 4: scan_staged's archived-base rejection -----------
+    // `cp(7, [42;32], genesis_fold)` is an archived prefix: ordinary
+    // `scan` accepts it (see `accepted_archived_base`), but `scan_staged`
+    // runs with genesis=true so the first checkpoint must link genesis.
+
+    #[test]
+    fn scan_staged_rejects_archived_base_without_root_link() {
+        let d = Temp::new();
+        let archived = cp(7, [42; 32], &genesis_fold());
+        let r = declaration(&archived, 0, [42; 32], 6, None);
+        w(&d, &concat(&[&archived, &r], &[]));
+        // `scan` is Ok on this file (R0a's accepted_archived_base).
+        assert!(scc(&o(&d), None, true).is_ok());
+        assert_corrupt(
+            scan_staged(&o(&d), TRAIL, None, false),
+            "initial checkpoint does not link genesis",
+            0,
+        );
+    }
+
+    // --- Section 5: named layouts -----------------------------------
+
+    #[test]
+    fn boundary_resume_sealed_run_live_lacks_matching_immediate_resume() {
+        // seg0 unsealed; the live file opens with a correct cp1, then
+        // a non-resume entry. scan_inner's live-path L914 fires before
+        // apply, which is a different site from the rotated-successor
+        // L498 pin above.
+        let d = Temp::new();
+        let first = cp0();
+        let close = cp(1, first.hash(), &seeded(&first));
+        fs::write(
+            segment(&d.0, 0),
+            [line(&first), b"{\"torn\":".to_vec()].concat(),
+        )
+        .unwrap();
+        write_records(&d.0, &[&close, &entry(&close)]);
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "unclosed segment lacks matching immediate resume",
+            0,
+        );
+    }
+    #[test]
+    fn boundary_resume_fragment_only_live_lacks_matching_immediate_resume() {
+        // seg0 fragment-only; live opens with a root-linked cp5 then a
+        // non-resume entry. scan_inner's L914 fires before apply.
+        let d = Temp::new();
+        let close = cp_root(5);
+        fs::write(segment(&d.0, 0), b"{\"torn\":").unwrap();
+        write_records(&d.0, &[&close, &entry(&close)]);
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "unclosed segment lacks matching immediate resume",
+            0,
+        );
+    }
+    #[test]
+    fn opening_mmr_mismatch_closing_opening() {
+        // Live-file layout where the second record is a sealed-run
+        // close+open opening whose claimed MMR disagrees with the fold.
+        // apply_checked's MMR comparison fires L1006, before any
+        // boundary-handling branch.
+        let d = Temp::new();
+        let first = cp0();
+        let wrong_close = cp(1, first.hash(), &alt_fold());
+        w(&d, &concat(&[&first, &wrong_close], &[]));
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "checkpoint MMR differs from preceding records",
+            0,
+        );
+    }
+    #[test]
+    fn hash_link_boundary_rejected_on_live_open_strict_scan_and_refresh() {
+        // 197-d1 point 8: [cp0, e1, x(seq=1, prev=e1.hash, other
+        // content)]. The surviving `<=` → `<` mutant on the hash-link
+        // check turns this into "sequence gap without checkpoint", so
+        // detail-equality kills it. Pinned on live open, direct scan
+        // and refresh.
+        let first = cp0();
+        let e1 = Record::new(
+            context(1, first.hash()),
+            Entry::new("actor", "change", "object"),
+        )
+        .unwrap();
+        let x = Record::new(
+            context(1, e1.hash()),
+            Entry::new("other", "content", "here"),
+        )
+        .unwrap();
+
+        // Live open: scan_closing hits apply_checked's L985.
+        let d_open = Temp::new();
+        write_records(&d_open.0, &[&first, &e1, &x]);
+        assert_corrupt(
+            TrailReader::open(&d_open.0, TRAIL, None),
+            "record rolled back, changed or broke its hash link",
+            0,
+        );
+
+        // Direct strict scan: same bytes, same site through scc.
+        assert_corrupt(
+            scc(&o(&d_open), None, true),
+            "record rolled back, changed or broke its hash link",
+            0,
+        );
+
+        // Refresh: open on [cp0, e1], append x, with_current refreshes
+        // through `scan` with opening=false and hits the same site.
+        let d_refresh = Temp::new();
+        write_records(&d_refresh.0, &[&first, &e1]);
+        let reader = open(&d_refresh.0);
+        assert_eq!(head(&reader), Head::of(&e1));
+        append(&d_refresh.0.join("audit.jsonl"), &x);
+        assert_corrupt(
+            reader.with_current(|_| Ok(()), |_, _, _| Ok(())),
+            "record rolled back, changed or broke its hash link",
+            0,
+        );
+    }
+
+    // ---- Coverage gate --------------------------------------------------
+
     const UNREACHABLE: &[(&str, usize, &str)] = &[
         (
             "missing written state",
@@ -2513,7 +2988,11 @@ mod details {
     }
 
     fn balance(bytes: &[u8], open: usize) -> Option<(usize, Vec<usize>)> {
+        // Depth is only decremented by `)`. Turbofish (`::<T, E>`) is
+        // tracked as a separate `generic` depth so its commas never
+        // count as top-level, which otherwise mis-shapes the parse.
         let mut depth: i32 = 1;
+        let mut generic: i32 = 0;
         let mut j = open + 1;
         let mut commas = Vec::new();
         let mut in_str = false;
@@ -2537,7 +3016,11 @@ mod details {
                 if depth == 0 {
                     return Some((j, commas));
                 }
-            } else if c == b',' && depth == 1 {
+            } else if c == b'<' && j >= 2 && &bytes[j - 2..j] == b"::" {
+                generic += 1;
+            } else if c == b'>' && generic > 0 {
+                generic -= 1;
+            } else if c == b',' && depth == 1 && generic == 0 {
                 commas.push(j);
             }
             j += 1;
@@ -2546,18 +3029,54 @@ mod details {
     }
 
     fn parse_assertions(source: &str) -> Vec<(String, usize)> {
+        // Every `assert_corrupt(` found outside comments and strings
+        // must parse to a literal detail and a literal usize site index.
+        // Anything else panics, so the gate catches silently-skipped
+        // calls (such as a turbofish-shaped first arg that used to
+        // mis-shape the old comma count).
         let bytes = source.as_bytes();
         let needle = b"assert_corrupt(";
         let mut asserts = Vec::new();
         let mut i = 0;
-        while i + needle.len() <= bytes.len() {
-            if &bytes[i..i + needle.len()] != needle {
+        while i < bytes.len() {
+            // Line comments.
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            // Block comments.
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            // String literals (including the raw contents around the
+            // detail arg itself; we restart the scan at the closing
+            // paren after a real match).
+            if bytes[i] == b'"' {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                i = (i + 1).min(bytes.len());
+                continue;
+            }
+            if i + needle.len() > bytes.len() || &bytes[i..i + needle.len()] != needle {
                 i += 1;
                 continue;
             }
             if i > 0 {
                 let p = bytes[i - 1];
-                if p.is_ascii_alphanumeric() || p == b'_' || p == b'"' {
+                if p.is_ascii_alphanumeric() || p == b'_' {
                     i += 1;
                     continue;
                 }
@@ -2567,17 +3086,20 @@ mod details {
                 continue;
             }
             let open = i + needle.len() - 1;
-            let (close, commas) = match balance(bytes, open) {
-                Some(x) => x,
-                None => {
-                    i += 1;
-                    continue;
-                }
+            let (close, commas) = balance(bytes, open).unwrap_or_else(|| {
+                panic!("coverage gate: unterminated assert_corrupt( near byte {open}")
+            });
+            let snippet = || {
+                std::str::from_utf8(&bytes[open..=close])
+                    .unwrap_or("<non-utf8>")
+                    .to_string()
             };
-            if commas.len() < 2 || commas.len() > 3 {
-                i = close + 1;
-                continue;
-            }
+            assert!(
+                commas.len() == 2 || commas.len() == 3,
+                "coverage gate: assert_corrupt expects 3 or 4 args (commas={}): {}",
+                commas.len(),
+                snippet(),
+            );
             let site_end = commas.get(2).copied().unwrap_or(close);
             let detail_text = std::str::from_utf8(&bytes[commas[0] + 1..commas[1]])
                 .unwrap_or_default()
@@ -2585,16 +3107,24 @@ mod details {
             let site_text = std::str::from_utf8(&bytes[commas[1] + 1..site_end])
                 .unwrap_or_default()
                 .trim();
-            // Skip calls whose args are not literal (forwarded helper
-            // parameters). The gate pairs tests with concrete constants only.
-            if let (Some(detail), Ok(site)) = (
-                detail_text
-                    .strip_prefix('"')
-                    .and_then(|s| s.strip_suffix('"')),
-                site_text.parse::<usize>(),
-            ) {
-                asserts.push((detail.to_string(), site));
-            }
+            let detail = detail_text
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "coverage gate: assert_corrupt detail arg is not a string literal \
+                         ({detail_text:?}): {}",
+                        snippet(),
+                    )
+                });
+            let site = site_text.parse::<usize>().unwrap_or_else(|_| {
+                panic!(
+                    "coverage gate: assert_corrupt site arg is not a usize literal \
+                     ({site_text:?}): {}",
+                    snippet(),
+                )
+            });
+            asserts.push((detail.to_string(), site));
             i = close + 1;
         }
         asserts
@@ -2606,25 +3136,23 @@ mod details {
         let site_set: HashSet<(String, usize)> = sites.iter().cloned().collect();
         let asserted: HashSet<(String, usize)> =
             parse_assertions(STORAGE_TESTS_SRC).into_iter().collect();
-        let pending: HashSet<(String, usize)> = PENDING_R0B
-            .iter()
-            .map(|(d, i, _)| ((*d).to_string(), *i))
-            .collect();
         let unreach: HashSet<(String, usize)> = UNREACHABLE
             .iter()
             .map(|(d, i, _)| ((*d).to_string(), *i))
             .collect();
         let mut missing = Vec::new();
         for key in &sites {
-            if !asserted.contains(key) && !pending.contains(key) && !unreach.contains(key) {
+            if !asserted.contains(key) && !unreach.contains(key) {
                 missing.push(key.clone());
             }
         }
         assert!(missing.is_empty(), "uncovered corrupt sites: {missing:?}");
-        for key in &pending {
-            assert!(site_set.contains(key), "stale PENDING_R0B {key:?}");
-            assert!(!unreach.contains(key), "duplicated classification: {key:?}");
-        }
+        // Stale-label check (new in R0b): any (detail, occurrence) pair
+        // that an assert_corrupt names must exist in storage.rs, so a
+        // pin left behind after a reader change cannot silently hide.
+        let mut stale: Vec<(String, usize)> = asserted.difference(&site_set).cloned().collect();
+        stale.sort();
+        assert!(stale.is_empty(), "stale assert_corrupt labels: {stale:?}");
         for key in &unreach {
             assert!(site_set.contains(key), "stale UNREACHABLE {key:?}");
             assert!(
