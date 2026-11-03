@@ -1735,3 +1735,876 @@ fn inherited_run_reaches_first_strict_scan_of_later_history() {
         AuditErrorKind::CorruptTrail,
     );
 }
+
+// ------------------------------------------------------------
+// #197 R0a: pin every reader CorruptTrail detail per site, with a
+// coverage gate keyed per call site in storage.rs. Tests only.
+// Each test body has a literal `assert_corrupt(result, "detail", site)`
+// call so the gate's static scan of storage_tests.rs sees every pin.
+// ------------------------------------------------------------
+mod details {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    const STORAGE_SRC: &str = include_str!("storage.rs");
+    const STORAGE_TESTS_SRC: &str = include_str!("storage_tests.rs");
+
+    fn assert_corrupt<T>(result: Result<T, AuditError>, detail: &str, _site: usize) {
+        let err = match result {
+            Ok(_) => panic!("expected CorruptTrail, got Ok"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            AuditErrorKind::CorruptTrail,
+            "wrong kind: {err}"
+        );
+        assert_eq!(
+            format!("{err}")
+                .strip_prefix("CorruptTrail: ")
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            detail,
+            "detail mismatch",
+        );
+    }
+    fn w(d: &Temp, bytes: &[u8]) {
+        fs::write(d.0.join("audit.jsonl"), bytes).unwrap();
+    }
+    fn o(d: &Temp) -> File {
+        File::open(d.0.join("audit.jsonl")).unwrap()
+    }
+    fn cp0() -> Record {
+        cp(0, Record::genesis(&TRAIL), &Mmr::new())
+    }
+    fn genesis_fold() -> Mmr {
+        let mut fold = Mmr::new();
+        fold.push(Record::genesis(&TRAIL)).unwrap();
+        fold
+    }
+    fn cp_root(seq: u64) -> Record {
+        cp(seq, Record::genesis(&TRAIL), &genesis_fold())
+    }
+    fn alt_fold() -> Mmr {
+        let mut m = Mmr::new();
+        m.push([42; 32]).unwrap();
+        m
+    }
+    fn resume_rec(prev: &Record, seq: u64, details: &str) -> Record {
+        Record::new_internal(
+            context(seq, prev.hash()),
+            Entry::new("operator", "vigil.audit.resume", "trail")
+                .reason("incident")
+                .details(details.to_string()),
+        )
+        .unwrap()
+    }
+    fn multi_record_line(record: &Record) -> Vec<u8> {
+        let b = line(record);
+        let s = std::str::from_utf8(b.strip_suffix(b"\n").unwrap()).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(s).unwrap();
+        let log = v["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0].clone();
+        v["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+            .as_array_mut()
+            .unwrap()
+            .push(log);
+        let mut out = v.to_string().into_bytes();
+        out.push(b'\n');
+        out
+    }
+    fn cp0_other_trail() -> Record {
+        let other = [5u8; 16];
+        let fields =
+            CheckpointFields::new(0, Mmr::new().root(), Vec::new(), [1; 32], [0; 64]).unwrap();
+        Record::checkpoint(
+            RecordContext::new(other, 0, 100, "test", Record::genesis(&other)),
+            fields,
+        )
+        .unwrap()
+    }
+    fn hsc(
+        f: &File,
+        state: Option<State>,
+        opening: bool,
+        run: bool,
+    ) -> Result<Option<State>, AuditError> {
+        let mut r = run;
+        history_segment(f, TRAIL, state, opening, None, &mut None, &mut r)
+    }
+    fn scc(f: &File, state: Option<State>, opening: bool) -> Result<State, AuditError> {
+        scan(f, TRAIL, state, opening, None, &mut None, false)
+    }
+    fn state_from(bytes: &[u8]) -> (Temp, State) {
+        let d = Temp::new();
+        w(&d, bytes);
+        let s = scc(&o(&d), None, true).unwrap();
+        (d, s)
+    }
+    fn state_at_cp0() -> (Temp, State, Record) {
+        let f = cp0();
+        let (d, s) = state_from(&line(&f));
+        (d, s, f)
+    }
+    fn state_unterminated() -> (Temp, State, Record) {
+        let f = cp0();
+        let mut b = line(&f);
+        b.pop();
+        let (d, s) = state_from(&b);
+        assert!(!s.newline && s.gap.is_none());
+        (d, s, f)
+    }
+    fn state_with_gap() -> (Temp, State, Record) {
+        let f = cp0();
+        let mut b = line(&f);
+        b.extend_from_slice(b"{\"torn\":");
+        let (d, s) = state_from(&b);
+        assert!(s.gap.is_some());
+        (d, s, f)
+    }
+    fn concat(records: &[&Record], suffix: &[u8]) -> Vec<u8> {
+        let mut b: Vec<u8> = records.iter().flat_map(|r| line(r)).collect();
+        b.extend_from_slice(suffix);
+        b
+    }
+
+    // ---- Pins: live-open and existing() ---------------------------------
+
+    #[test]
+    fn pin_existing_missing() {
+        let d = Temp::new();
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "missing or nonregular trail file",
+            0,
+        );
+    }
+    #[test]
+    fn pin_existing_fifo() {
+        let d = Temp::new();
+        assert!(
+            Command::new("mkfifo")
+                .arg(d.0.join("audit.jsonl"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "nonregular trail file",
+            0,
+        );
+    }
+
+    // ---- Pins: history_segment direct calls -----------------------------
+
+    #[test]
+    fn pin_hs_glued_byte() {
+        let (d, s, _) = state_unterminated();
+        append_bytes(&d.0.join("audit.jsonl"), b"x");
+        assert_corrupt(
+            hsc(&o(&d), Some(s), false, false),
+            "bytes glued to complete unterminated record",
+            0,
+        );
+    }
+    #[test]
+    fn pin_hs_invalid_record_in_sealed_run() {
+        let d = Temp::new();
+        w(&d, &concat(&[&cp0()], b"{}\n"));
+        assert_corrupt(
+            hsc(&o(&d), None, true, false),
+            "invalid audit record in sealed run",
+            0,
+        );
+    }
+    #[test]
+    fn pin_hs_multiple_records() {
+        let d = Temp::new();
+        w(&d, &multi_record_line(&cp0()));
+        assert_corrupt(
+            hsc(&o(&d), None, true, false),
+            "multiple records in native audit line",
+            0,
+        );
+    }
+    #[test]
+    fn pin_hs_trail_identity() {
+        let d = Temp::new();
+        w(&d, &line(&cp0_other_trail()));
+        assert_corrupt(
+            hsc(&o(&d), None, true, false),
+            "trail identity differs from marker",
+            0,
+        );
+    }
+    #[test]
+    fn pin_hs_unparsable_before_complete() {
+        let d = Temp::new();
+        let f = cp0();
+        w(
+            &d,
+            &[line(&f), b"not json\n".to_vec(), line(&entry(&f))].concat(),
+        );
+        assert_corrupt(
+            hsc(&o(&d), None, true, false),
+            "unparsable line before complete record",
+            0,
+        );
+    }
+    #[test]
+    fn pin_hs_attestation_duplicate_branch() {
+        let d = Temp::new();
+        let f = cp0();
+        w(&d, &[line(&f), b"{\"torn\":\n".to_vec(), line(&f)].concat());
+        assert_corrupt(
+            hsc(&o(&d), None, true, false),
+            "missing or mismatched repair attestation",
+            0,
+        );
+    }
+    #[test]
+    fn pin_hs_attestation_general_branch_broken_link_pair() {
+        // Attestation-order pair, next=seq 6 broken link.
+        let (_pre, s, _) = state_at_cp0();
+        let h5 = Record::new(context(5, [0; 32]), Entry::new("actor", "change", "object")).unwrap();
+        let broken = Record::new(
+            context(6, [42; 32]),
+            Entry::new("actor", "change", "object"),
+        )
+        .unwrap();
+        let d = Temp::new();
+        w(
+            &d,
+            &[line(&h5), b"{\"torn\":\n".to_vec(), line(&broken)].concat(),
+        );
+        assert_corrupt(
+            hsc(&o(&d), Some(s), true, true),
+            "missing or mismatched repair attestation",
+            1,
+        );
+    }
+    #[test]
+    fn pin_hs_record_sequence_did_not_increase() {
+        let d = Temp::new();
+        let first = cp0();
+        let mut mmr = seeded(&first);
+        let second = cp(1, first.hash(), &mmr);
+        mmr.push(second.hash()).unwrap();
+        w(&d, &[line(&first), line(&second), line(&first)].concat());
+        assert_corrupt(
+            hsc(&o(&d), None, true, false),
+            "record sequence did not increase inside sealed run",
+            0,
+        );
+    }
+    #[test]
+    fn pin_hs_missing_initial_checkpoint() {
+        let d = Temp::new();
+        w(&d, &line(&entry(&cp0())));
+        assert_corrupt(
+            hsc(&o(&d), None, true, false),
+            "missing initial checkpoint",
+            0,
+        );
+    }
+    #[test]
+    fn pin_hs_sequence_gap_inside_sealed_run_segment() {
+        // Attestation-order pair, next=seq 7 linked.
+        let (_pre, s, _) = state_at_cp0();
+        let h5 = Record::new(context(5, [0; 32]), Entry::new("actor", "change", "object")).unwrap();
+        let next = Record::new(
+            context(7, h5.hash()),
+            Entry::new("actor", "change", "object"),
+        )
+        .unwrap();
+        let d = Temp::new();
+        w(
+            &d,
+            &[line(&h5), b"{\"torn\":\n".to_vec(), line(&next)].concat(),
+        );
+        assert_corrupt(
+            hsc(&o(&d), Some(s), true, true),
+            "sequence gap inside sealed run segment",
+            0,
+        );
+    }
+    #[test]
+    fn pin_hs_first_successor_does_not_close() {
+        let (_pre, s, first) = state_at_cp0();
+        let d = Temp::new();
+        w(&d, &line(&cp(1, first.hash(), &alt_fold())));
+        assert_corrupt(
+            hsc(&o(&d), Some(s), true, true),
+            "first successor does not close sealed run",
+            0,
+        );
+    }
+    #[test]
+    fn pin_hs_first_successor_lacks_immediate_resume() {
+        let (_pre, s, first) = state_at_cp0();
+        let d = Temp::new();
+        let cp1 = cp(1, first.hash(), &seeded(&first));
+        w(&d, &concat(&[&cp1, &entry(&cp1)], &[]));
+        assert_corrupt(
+            hsc(&o(&d), Some(s), true, true),
+            "first successor lacks immediate resume",
+            0,
+        );
+    }
+    #[test]
+    fn pin_hs_first_successor_lacks_resume() {
+        let (_pre, s, first) = state_at_cp0();
+        let d = Temp::new();
+        w(&d, &line(&cp(1, first.hash(), &seeded(&first))));
+        assert_corrupt(
+            hsc(&o(&d), Some(s), true, true),
+            "first successor lacks resume",
+            0,
+        );
+    }
+    #[test]
+    fn pin_hs_invalid_undamaged_segment() {
+        let d = Temp::new();
+        w(&d, &line(&cp_root(7)));
+        assert_corrupt(
+            hsc(&o(&d), None, true, false),
+            "invalid undamaged segment",
+            0,
+        );
+    }
+    #[test]
+    fn pin_hs_resume_lacks_declaration() {
+        // Hand-crafted State{pending_resume=true} + fragment-only segment
+        // reaches L536 (fallback tail) without L432 or L529 intervening.
+        let state_pending = State {
+            head: Head {
+                seq: 7,
+                hash: [9; 32],
+            },
+            mmr: genesis_fold(),
+            offset: 0,
+            length: 0,
+            checkpoint: true,
+            checkpoint_time: 100,
+            since_checkpoint: 0,
+            newline: true,
+            gap: None,
+            pending_resume: true,
+            run_loss: false,
+            checkpoint_predecessor: None,
+            checkpoint_previous: [0; 32],
+        };
+        let d = Temp::new();
+        w(&d, b"{\"torn\":");
+        assert_corrupt(
+            hsc(&o(&d), Some(state_pending), true, false),
+            "resume checkpoint lacks its declaration",
+            0,
+        );
+    }
+
+    // ---- Pins: scan direct calls ----------------------------------------
+
+    #[test]
+    fn pin_sc_glued_byte() {
+        let (d, s, _) = state_unterminated();
+        append_bytes(&d.0.join("audit.jsonl"), b"x");
+        assert_corrupt(
+            scc(&o(&d), Some(s), false),
+            "bytes glued to complete unterminated record",
+            1,
+        );
+    }
+    #[test]
+    fn pin_sc_invalid_audit_line_or_opening_checkpoint() {
+        let d = Temp::new();
+        w(&d, b"{\n");
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "invalid audit line or opening checkpoint",
+            0,
+        );
+    }
+    #[test]
+    fn pin_sc_multiple_records() {
+        let d = Temp::new();
+        w(&d, &multi_record_line(&cp0()));
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "multiple records in native audit line",
+            1,
+        );
+    }
+    #[test]
+    fn pin_sc_trail_identity() {
+        let d = Temp::new();
+        w(&d, &line(&cp0_other_trail()));
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "trail identity differs from marker",
+            1,
+        );
+    }
+    #[test]
+    fn pin_sc_opening_duplicates_predecessor() {
+        let (d, s, first) = state_at_cp0();
+        w(&d, &line(&first));
+        assert_corrupt(
+            scc(&o(&d), Some(s), true),
+            "opening checkpoint duplicates predecessor",
+            0,
+        );
+    }
+    #[test]
+    fn pin_sc_missing_opening_checkpoint() {
+        let d = Temp::new();
+        w(&d, &line(&entry(&cp0())));
+        assert_corrupt(scc(&o(&d), None, true), "missing opening checkpoint", 0);
+    }
+    #[test]
+    fn pin_sc_repair_attestation() {
+        let d = Temp::new();
+        let f = cp0();
+        w(
+            &d,
+            &[line(&f), b"{\"torn\":\n".to_vec(), line(&entry(&f))].concat(),
+        );
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "missing or mismatched repair attestation",
+            2,
+        );
+    }
+    #[test]
+    fn pin_sc_unclosed_segment_lacks_matching_immediate_resume() {
+        let (d, s, first) = state_with_gap();
+        let cp1 = cp(1, first.hash(), &seeded(&first));
+        w(&d, &concat(&[&cp1, &entry(&cp1)], &[]));
+        assert_corrupt(
+            scc(&o(&d), Some(s), true),
+            "unclosed segment lacks matching immediate resume",
+            0,
+        );
+    }
+    #[test]
+    fn pin_sc_empty_live_file() {
+        let d = Temp::new();
+        w(&d, b"");
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "empty live file or missing opening checkpoint",
+            0,
+        );
+    }
+    #[test]
+    fn pin_sc_resume_lacks_declaration() {
+        let d = Temp::new();
+        w(&d, &line(&cp_root(7)));
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "resume checkpoint lacks its declaration",
+            1,
+        );
+    }
+
+    // ---- Pins: apply_checked via scan direct calls ----------------------
+
+    #[test]
+    fn pin_apply_missing_initial_checkpoint() {
+        // scan(opening=false, state=None) skips scan_inner's L903 guard.
+        let d = Temp::new();
+        w(&d, &line(&entry(&cp0())));
+        assert_corrupt(scc(&o(&d), None, false), "missing initial checkpoint", 1);
+    }
+    #[test]
+    fn pin_apply_initial_checkpoint_does_not_link_genesis() {
+        let d = Temp::new();
+        w(&d, &line(&cp(0, [42; 32], &Mmr::new())));
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "initial checkpoint does not link genesis",
+            0,
+        );
+    }
+    #[test]
+    fn pin_apply_record_rolled_back() {
+        let d = Temp::new();
+        let first = cp0();
+        let bad = Record::new(
+            context(1, [42; 32]),
+            Entry::new("actor", "change", "object"),
+        )
+        .unwrap();
+        w(&d, &concat(&[&first, &bad], &[]));
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "record rolled back, changed or broke its hash link",
+            0,
+        );
+    }
+    #[test]
+    fn pin_apply_sequence_gap_lacks_resume_declaration() {
+        let d = Temp::new();
+        let opening = cp_root(7);
+        let e = Record::new(
+            context(8, opening.hash()),
+            Entry::new("actor", "change", "object"),
+        )
+        .unwrap();
+        w(&d, &concat(&[&opening, &e], &[]));
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "sequence gap lacks a resume declaration",
+            0,
+        );
+    }
+    #[test]
+    fn pin_apply_sequence_gap_without_checkpoint() {
+        let d = Temp::new();
+        let first = cp0();
+        let gap = Record::new(
+            context(5, first.hash()),
+            Entry::new("actor", "change", "object"),
+        )
+        .unwrap();
+        w(&d, &concat(&[&first, &gap], &[]));
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "sequence gap without checkpoint",
+            0,
+        );
+    }
+    #[test]
+    fn pin_apply_checkpoint_mmr_differs() {
+        let d = Temp::new();
+        let first = cp0();
+        let wrong = cp(1, first.hash(), &alt_fold());
+        w(&d, &concat(&[&first, &wrong], &[]));
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "checkpoint MMR differs from preceding records",
+            0,
+        );
+    }
+    #[test]
+    fn pin_apply_resume_not_immediately_after_checkpoint() {
+        let d = Temp::new();
+        let first = cp0();
+        let e = entry(&first);
+        let r = resume_rec(&e, 2, "head=0:placeholder lost_through=0 file=-");
+        w(&d, &concat(&[&first, &e, &r], &[]));
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "resume not immediately after checkpoint",
+            0,
+        );
+    }
+    #[test]
+    fn pin_apply_resume_without_details() {
+        let d = Temp::new();
+        let opening = cp_root(7);
+        let r = Record::new_internal(
+            context(8, opening.hash()),
+            Entry::new("operator", "vigil.audit.resume", "trail").reason("incident"),
+        )
+        .unwrap();
+        w(&d, &concat(&[&opening, &r], &[]));
+        assert_corrupt(scc(&o(&d), None, true), "resume without details", 0);
+    }
+    #[test]
+    fn pin_apply_invalid_resume_details() {
+        let d = Temp::new();
+        let opening = cp_root(7);
+        w(
+            &d,
+            &concat(&[&opening, &resume_rec(&opening, 8, "no_file_marker")], &[]),
+        );
+        assert_corrupt(scc(&o(&d), None, true), "invalid resume details", 0);
+    }
+    #[test]
+    fn pin_apply_invalid_resume_loss_bound() {
+        let d = Temp::new();
+        let opening = cp_root(7);
+        w(
+            &d,
+            &concat(
+                &[&opening, &resume_rec(&opening, 8, "head=0:x file=-")],
+                &[],
+            ),
+        );
+        assert_corrupt(scc(&o(&d), None, true), "invalid resume loss bound", 0);
+    }
+    #[test]
+    fn pin_apply_invalid_resume_head() {
+        let d = Temp::new();
+        let opening = cp_root(7);
+        w(
+            &d,
+            &concat(
+                &[
+                    &opening,
+                    &resume_rec(&opening, 8, "bad lost_through=0 file=-"),
+                ],
+                &[],
+            ),
+        );
+        assert_corrupt(scc(&o(&d), None, true), "invalid resume head", 0);
+    }
+    #[test]
+    fn pin_apply_invalid_resume_head_sequence() {
+        let d = Temp::new();
+        let opening = cp_root(7);
+        let r = resume_rec(&opening, 8, "head=xyz:placeholder lost_through=0 file=-");
+        w(&d, &concat(&[&opening, &r], &[]));
+        assert_corrupt(scc(&o(&d), None, true), "invalid resume head sequence", 0);
+    }
+    #[test]
+    fn pin_apply_resume_after_creation_checkpoint() {
+        let d = Temp::new();
+        let first = cp0();
+        let r = resume_rec(&first, 1, "head=0:placeholder lost_through=0 file=-");
+        w(&d, &concat(&[&first, &r], &[]));
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "resume after creation checkpoint",
+            0,
+        );
+    }
+    #[test]
+    fn pin_apply_resume_declaration_does_not_describe_gap() {
+        let d = Temp::new();
+        let opening = cp_root(7);
+        let wrong = declaration(&opening, 0, Record::genesis(&TRAIL), 5, None);
+        w(&d, &concat(&[&opening, &wrong], &[]));
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "resume declaration does not describe its gap",
+            0,
+        );
+    }
+
+    // ---- Accepted outcomes ----------------------------------------------
+
+    #[test]
+    fn accepted_archived_base() {
+        // Archived base: the first checkpoint has prev != genesis. The
+        // remaining accepted layouts (honest torn tail + resume, two-segment
+        // run, closer + second run, genesis closer) are already pinned by
+        // existing tests in `mod runs` and the top-level resume tests.
+        let d = Temp::new();
+        let archived = cp(7, [42; 32], &genesis_fold());
+        let r = declaration(&archived, 0, [42; 32], 6, None);
+        write_records(&d.0, &[&archived, &r]);
+        assert_eq!(head(&open(&d.0)), Head::of(&r));
+    }
+
+    // ---- Coverage gate --------------------------------------------------
+
+    const PENDING_R0B: &[(&str, usize, &str)] = &[
+        ("missing live file", 0, "refresh() statat on live - R0b"),
+        (
+            "live file shrank below cached length",
+            0,
+            "refresh() cached-length guard - R0b",
+        ),
+        (
+            "old live descriptor was truncated",
+            0,
+            "refresh() post-rotation guard - R0b",
+        ),
+    ];
+    const UNREACHABLE: &[(&str, usize, &str)] = &[
+        (
+            "missing written state",
+            0,
+            "State::after: apply always sets state=Some on Ok",
+        ),
+        (
+            "missing head",
+            0,
+            "history_segment: apply_checked Ok leaves state=Some",
+        ),
+        ("missing head", 1, "scan_inner: apply Ok leaves state=Some"),
+        (
+            "missing head",
+            2,
+            "scan_inner: !first implies at least one apply ran",
+        ),
+        (
+            "invalid opening peaks",
+            0,
+            "CheckpointFields::new rejects peaks.len() != popcount(size)",
+        ),
+        (
+            "resume without predecessor",
+            0,
+            "state=None + non-Checkpoint fires 'missing initial checkpoint' first",
+        ),
+        ("MMR overflow", 0, "requires 2^64 leaves"),
+    ];
+
+    fn parse_sites(source: &str) -> Vec<(String, usize)> {
+        let bytes = source.as_bytes();
+        let mut raw: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i..].starts_with(b"fn corrupt(") {
+                i += b"fn corrupt(".len();
+                continue;
+            }
+            if bytes[i..].starts_with(b"corrupt(") {
+                let mut j = i + b"corrupt(".len();
+                while j < bytes.len() && bytes[j] != b'"' {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    break;
+                }
+                j += 1;
+                let start = j;
+                while j < bytes.len() && bytes[j] != b'"' {
+                    j += 1;
+                }
+                raw.push(std::str::from_utf8(&bytes[start..j]).unwrap().to_string());
+                i = j + 1;
+                continue;
+            }
+            i += 1;
+        }
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        raw.into_iter()
+            .map(|d| {
+                let n = *counts.get(&d).unwrap_or(&0);
+                counts.insert(d.clone(), n + 1);
+                (d, n)
+            })
+            .collect()
+    }
+
+    fn balance(bytes: &[u8], open: usize) -> Option<(usize, Vec<usize>)> {
+        let mut depth: i32 = 1;
+        let mut j = open + 1;
+        let mut commas = Vec::new();
+        let mut in_str = false;
+        let mut escape = false;
+        while j < bytes.len() && depth > 0 {
+            let c = bytes[j];
+            if in_str {
+                if escape {
+                    escape = false;
+                } else if c == b'\\' {
+                    escape = true;
+                } else if c == b'"' {
+                    in_str = false;
+                }
+            } else if c == b'"' {
+                in_str = true;
+            } else if c == b'(' {
+                depth += 1;
+            } else if c == b')' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((j, commas));
+                }
+            } else if c == b',' && depth == 1 {
+                commas.push(j);
+            }
+            j += 1;
+        }
+        None
+    }
+
+    fn parse_assertions(source: &str) -> Vec<(String, usize)> {
+        let bytes = source.as_bytes();
+        let needle = b"assert_corrupt(";
+        let mut asserts = Vec::new();
+        let mut i = 0;
+        while i + needle.len() <= bytes.len() {
+            if &bytes[i..i + needle.len()] != needle {
+                i += 1;
+                continue;
+            }
+            if i > 0 {
+                let p = bytes[i - 1];
+                if p.is_ascii_alphanumeric() || p == b'_' || p == b'"' {
+                    i += 1;
+                    continue;
+                }
+            }
+            if i >= 3 && &bytes[i - 3..i] == b"fn " {
+                i += needle.len();
+                continue;
+            }
+            let open = i + needle.len() - 1;
+            let (close, commas) = match balance(bytes, open) {
+                Some(x) => x,
+                None => {
+                    i += 1;
+                    continue;
+                }
+            };
+            if commas.len() < 2 || commas.len() > 3 {
+                i = close + 1;
+                continue;
+            }
+            let site_end = commas.get(2).copied().unwrap_or(close);
+            let detail_text = std::str::from_utf8(&bytes[commas[0] + 1..commas[1]])
+                .unwrap_or_default()
+                .trim();
+            let site_text = std::str::from_utf8(&bytes[commas[1] + 1..site_end])
+                .unwrap_or_default()
+                .trim();
+            // Skip calls whose args are not literal (forwarded helper
+            // parameters). The gate pairs tests with concrete constants only.
+            if let (Some(detail), Ok(site)) = (
+                detail_text
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"')),
+                site_text.parse::<usize>(),
+            ) {
+                asserts.push((detail.to_string(), site));
+            }
+            i = close + 1;
+        }
+        asserts
+    }
+
+    #[test]
+    fn coverage_gate_pins_every_corrupt_site() {
+        let sites = parse_sites(STORAGE_SRC);
+        let site_set: HashSet<(String, usize)> = sites.iter().cloned().collect();
+        let asserted: HashSet<(String, usize)> =
+            parse_assertions(STORAGE_TESTS_SRC).into_iter().collect();
+        let pending: HashSet<(String, usize)> = PENDING_R0B
+            .iter()
+            .map(|(d, i, _)| ((*d).to_string(), *i))
+            .collect();
+        let unreach: HashSet<(String, usize)> = UNREACHABLE
+            .iter()
+            .map(|(d, i, _)| ((*d).to_string(), *i))
+            .collect();
+        let mut missing = Vec::new();
+        for key in &sites {
+            if !asserted.contains(key) && !pending.contains(key) && !unreach.contains(key) {
+                missing.push(key.clone());
+            }
+        }
+        assert!(missing.is_empty(), "uncovered corrupt sites: {missing:?}");
+        for key in &pending {
+            assert!(site_set.contains(key), "stale PENDING_R0B {key:?}");
+            assert!(!unreach.contains(key), "duplicated classification: {key:?}");
+        }
+        for key in &unreach {
+            assert!(site_set.contains(key), "stale UNREACHABLE {key:?}");
+            assert!(
+                !asserted.contains(key),
+                "{key:?} is UNREACHABLE but a test asserts it"
+            );
+        }
+        assert_eq!(
+            sites.len(),
+            51,
+            "corrupt-site count changed; update gate explicitly"
+        );
+    }
+}
