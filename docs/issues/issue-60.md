@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-10T23:21:54Z
-updated: 2026-10-11T00:50:40Z
+updated: 2026-11-02T20:14:07Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/60
-comments: 2
+comments: 3
 labels: priority:medium, area:testing, effort:medium
 assignees: none
-milestone: 0.2.0 — metrics + traces
+milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-10-18T00:53:31.258Z
+synced: 2026-11-03T09:06:14.348Z
 ---
 
 # [Issue 60]: [test(shipping): reference Collector config and exactly-once conformance across restart and rotation](https://github.com/vig-os/vigil/issues/60)
@@ -89,4 +89,12 @@ _Posted on October 10, 2026 at 11:58 PM_
 _Posted on October 11, 2026 at 12:01 AM_
 
 Naming fix from ADR-0006 review: the shipper config uses its own variables, `SHIPPER_STATE_ROOT` (absolute; the Collector does not expand `~`) and `SHIPPER_STORAGE_DIR`, not `VIGIL_*` names, which vigil itself does not read. The comment above that says `${VIGIL_STATE_ROOT}` means `${SHIPPER_STATE_ROOT}`. The README also documents that each new vigil service must be added to `include` (an unlisted service is silently never shipped).
+
+---
+
+# [Comment #3]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 08:14 PM_
+
+Milestone triage: 0.2.0 was released on 2026-11-02 without this issue, so it moves to 0.3.0, the next release from `dev`.
 

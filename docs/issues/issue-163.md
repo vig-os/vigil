@@ -2,18 +2,18 @@
 type: issue
 state: closed
 created: 2026-11-01T23:56:02Z
-updated: 2026-11-02T10:19:27Z
+updated: 2026-11-02T14:32:45Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/163
-comments: 1
+comments: 2
 labels: none
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-11-02T13:59:41.095Z
+synced: 2026-11-03T09:06:11.143Z
 ---
 
 # [Issue 163]: [feat(rotate): bound total disk use — rotated-segment count and/or total-bytes cap (optionally per signal)](https://github.com/vig-os/vigil/issues/163)
@@ -90,4 +90,21 @@ The design is ADR-0002 amendment 3 (#169, now **Accepted**). The implementation 
   - **Quiet signals.** Under total-cap pressure, a quiet signal's rotated history can be fully pruned; a count cap is a ceiling, not a floor.
   - **Audit trail files.** They are never counted or deleted.
 - **Default caps.** A default cap before 1.0 is tracked in #168.
+
+---
+
+# [Comment #2]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 02:32 PM_
+
+**Released in [0.2.0](https://github.com/vig-os/vigil/releases/tag/0.2.0).** This includes the directory-wide byte cap, the rotated-segment count cap, and per-signal size/count/age rotation overrides with their environment variables (ADR-0002 amendment 3; #169, #176, #178).
+
+Pin the exact tag:
+
+```toml
+vigil-telemetry = { git = "https://github.com/vig-os/vigil", tag = "0.2.0" }
+```
+
+All the new caps are off by default. The README's "Upgrading from 0.1.0" section says exactly what stays the same and which environment variables change behaviour. The open question of default caps is #168.
+
 

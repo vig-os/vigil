@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-11-02T04:57:23Z
-updated: 2026-11-02T04:57:23Z
+updated: 2026-11-02T20:14:26Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/168
-comments: 0
+comments: 1
 labels: discussion, priority:medium, area:docs
 assignees: none
-milestone: none
+milestone: 1.0.0 — stable
 projects: none
 parent: none
 children: none
-synced: 2026-11-02T13:59:38.198Z
+synced: 2026-11-03T09:06:08.968Z
 ---
 
 # [Issue 168]: [decision: default disk caps (max_segments, max_total_bytes) before 1.0](https://github.com/vig-os/vigil/issues/168)
@@ -27,3 +27,11 @@ Open: whether vigil 1.0 should ship a default total cap (OWASP: logging must not
 Options: keep unbounded (document only); default total cap (for example 1 GiB); default count cap per signal. A default needs an env spelling for "no limit" (the amendment's variables have minimum 1 and no off value).
 
 Refs: #163
+---
+
+# [Comment #1]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 08:14 PM_
+
+Milestone triage: 1.0.0. Defaults become part of the stability promise, so this decision must be made before 1.0.
+

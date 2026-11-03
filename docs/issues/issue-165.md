@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-11-02T04:28:21Z
-updated: 2026-11-02T05:04:25Z
+updated: 2026-11-02T20:14:22Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/165
-comments: 1
+comments: 2
 labels: none
 assignees: none
-milestone: none
+milestone: 0.4.0 — adoption
 projects: none
 parent: none
 children: none
-synced: 2026-11-02T13:59:39.511Z
+synced: 2026-11-03T09:06:10.094Z
 ---
 
 # [Issue 165]: [design(audit): erasure-compatible trail — GDPR Art. 17 vs hash chain (pseudonymous refs / crypto-shred / redactable records)](https://github.com/vig-os/vigil/issues/165)
@@ -56,4 +56,12 @@ _Posted on November 2, 2026 at 05:04 AM_
 
 Design: an ADR-0005 amendment covering this issue and #164 (option 1, the attribute rule, and documenting what an erasure leaves provable), then implementation slices.
 
+
+---
+
+# [Comment #2]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 08:14 PM_
+
+Milestone triage: 0.4.0 (adoption). The consumer's requirements (pseudonymous references, plus a rule against attributes shaped like personal data) do not change the record format. The remaining scope will be ruled here before any work is dispatched.
 

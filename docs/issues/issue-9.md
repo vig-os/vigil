@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-09T13:21:55Z
-updated: 2026-10-11T03:45:21Z
+updated: 2026-11-02T20:14:03Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/9
-comments: 2
+comments: 3
 labels: feature, priority:medium, effort:small
 assignees: none
-milestone: 0.2.0 — metrics + traces
+milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-10-18T00:53:44.197Z
+synced: 2026-11-03T09:06:17.036Z
 ---
 
 # [Issue 9]: [feat: semantic-convention pinning via schemaUrl (incl. GenAI/MCP)](https://github.com/vig-os/vigil/issues/9)
@@ -36,4 +36,12 @@ Blocked on the design decisions: ADR-0004 public API and feature flags (#37) and
 _Posted on October 11, 2026 at 03:45 AM_
 
 ADR-0001's new section "Versioning stance at 1.0" (PR #78, #50) states the principle: renaming, removing or changing the meaning of an attribute vigil emits is a major; a purely additive pin move (new revision, new attributes, a moved `schemaUrl` string) is a minor, with a changelog entry naming the old and new `schemaUrl`. This issue owns the pin-bump mechanics (how the commit is pinned, stamped and bumped).
+
+---
+
+# [Comment #3]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 08:14 PM_
+
+Milestone triage: 0.2.0 was released on 2026-11-02 without this issue, so it moves to 0.3.0, the next release from `dev`.
 

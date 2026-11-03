@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-16T14:30:32Z
-updated: 2026-10-16T14:30:33Z
+updated: 2026-11-02T20:14:11Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/150
-comments: 0
+comments: 1
 labels: bug
 assignees: none
-milestone: 0.2.0 — metrics + traces
+milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-10-18T00:53:20.827Z
+synced: 2026-11-03T09:06:13.874Z
 ---
 
 # [Issue 150]: [bug(metrics): MetricStorage::close() blocks behind an in-flight write waiting on the directory lock](https://github.com/vig-os/vigil/issues/150)
@@ -32,3 +32,11 @@ Mirror the #149 trace design. The Closed transition must not wait for an in-flig
 **Acceptance:** with the directory lock held by another process and a write in flight, `close()` returns promptly (a deadline-contract test), and a later write is refused and counted. Mutant: hold the file mutex in `close()` → exit 101.
 
 Refs #7 #8.
+---
+
+# [Comment #1]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 08:14 PM_
+
+Milestone triage: 0.2.0 was released on 2026-11-02 without this issue, so it moves to 0.3.0, the next release from `dev`.
+

@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-11-02T04:28:20Z
-updated: 2026-11-02T12:26:04Z
+updated: 2026-11-02T20:14:15Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/164
-comments: 4
+comments: 6
 labels: none
 assignees: none
-milestone: none
+milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-02T13:59:40.618Z
+synced: 2026-11-03T09:06:10.590Z
 ---
 
 # [Issue 164]: [consumer: audit backend for a regulated workflow system — gate/merge decisions, leases, labelled-row reads, attested time](https://github.com/vig-os/vigil/issues/164)
@@ -96,4 +96,25 @@ Remaining: CP3 (the `vigil-audit schema` command and `--schema` on the CLI opera
 _Posted on November 2, 2026 at 12:26 PM_
 
 Progress: slice **CP3** (the operator CLI) merged in #180 (dev `72091e6`). `vigil-audit schema <file>` prints a canonical schema's `blake3:` digest for the trust file. `vigil-audit rotate` and `vigil-audit resume` take `--schema <file>`, so P8 (an opaque actor and reason id) applies on the CLI too. Remaining: CP4 (verifier schema checks; depends on #13).
+
+---
+
+# [Comment #5]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 02:32 PM_
+
+**CP1–CP3 released in [0.2.0](https://github.com/vig-os/vigil/releases/tag/0.2.0).** This adds typed audit attributes (`FieldKind`, `AttrValue`, `Entry::attr`), record schemas (`RecordSchema`, `ActionFields`), schema-checked writers via `AuditConfig::schema`, `vigil-audit schema <file>`, and `--schema` on `rotate`/`resume` (#175, #177, #179, #180).
+
+- **Breaking:** `Entry::details` starting with `vigil.attrs.` is now refused (`InvalidEntry`). See "Upgrading from 0.1.0" in the README.
+- **Install the CLI:** `cargo install --git https://github.com/vig-os/vigil --tag 0.2.0 --features audit --bin vigil-audit vigil-telemetry` (library: `vigil-telemetry = { git = "https://github.com/vig-os/vigil", tag = "0.2.0", features = ["audit"] }`)
+- **Still open:** CP4, the offline verifier's schema checks (`verify --schema`), waits on #13. This issue stays open until it lands.
+
+
+---
+
+# [Comment #6]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 08:14 PM_
+
+Milestone triage: the remaining slice CP4 (`verify --schema`) depends on the verifier (#13), so this issue tracks 0.3.0.
 

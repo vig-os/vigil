@@ -1,19 +1,19 @@
 ---
 type: issue
-state: open
+state: closed
 created: 2026-11-02T13:36:03Z
-updated: 2026-11-02T13:36:03Z
+updated: 2026-11-02T14:04:54Z
 author: vig-os-release-app[bot]
 author_url: https://github.com/vig-os-release-app[bot]
 url: https://github.com/vig-os/vigil/issues/184
-comments: 0
+comments: 1
 labels: bug
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-11-02T13:59:36.976Z
+synced: 2026-11-03T09:06:06.971Z
 ---
 
 # [Issue 184]: [Release 0.2.0 failed — automatic rollback](https://github.com/vig-os/vigil/issues/184)
@@ -30,3 +30,11 @@ Release 0.2.0 failed during the automated release workflow.
 - Release tags are not deleted by automation (workflow choice; GitHub immutable-release lock-in applies only after a release is **published** when that setting is enabled). If a tag was pushed before the failure, it remains on the remote.
 - Use a new release candidate to validate fixes, then re-run the final release when ready.
 - If a draft GitHub Release exists, manage it from the Releases UI; **publishing** locks the linked tag and assets when **immutable releases** are enabled.
+---
+
+# [Comment #1]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 02:04 PM_
+
+Cause: the final run's validate gate refused because release PR #181 was still a draft (`ERROR: PR #181 is still in draft`). The run stopped before finalize; no tag or commit was written and the rollback had nothing to undo. Fix: #181 marked ready for review, then `release.yml` final re-dispatched at the same release head: run 41456979270 succeeded and tag `0.2.0` is at 64f9b8f. No new candidate was needed. The missing ready step in the release docs, and this issue's recovery text, are filed upstream as vig-os/devkit#1987.
+

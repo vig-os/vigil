@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-09T13:22:04Z
-updated: 2026-10-16T13:54:57Z
+updated: 2026-11-03T04:22:39Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/13
-comments: 11
+comments: 28
 labels: feature, security, priority:medium, area:testing, effort:medium
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-10-18T00:53:42.779Z
+synced: 2026-11-03T09:06:16.545Z
 ---
 
 # [Issue 13]: [feat(audit): verify API/CLI and tamper tests](https://github.com/vig-os/vigil/issues/13)
@@ -334,4 +334,349 @@ _Posted on October 13, 2026 at 12:26 PM_
 _Posted on October 16, 2026 at 01:54 PM_
 
 C2 is merged: #147, at 3d22ec3. The `vigil-audit` binary has the operator commands (keygen, create, checkpoints, checkpoint, rotate, resume) under ruling 13-d3, and public `checkpoints(dir)` is in (amendment 12 OQ11 Accepted). 13-R (#148, 1c8605d) is also merged. Next for #13 is V1 (TrustPolicy), after the 0.1.0 release cut.
+
+---
+
+# [Comment #12]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 03:12 PM_
+
+## Ruling 13-V1-d1 (architect): trust-file grammar details for V1 (`TrustPolicy`)
+
+V1 implements ADR-0005 decision 9 ("Trust file format", "Revocation scope") and amendment 12 §19.1. Decision 9 leaves a few grammar details open; they are decided here and recorded in §19.1 by the V1 PR.
+
+1. **The `schema` line stays with #164 CP4**, as amendment 13 allocates it. Until CP4, a `schema` line is a parse error that names #164 CP4. This fails closed on purpose: a policy that accepted a schema pin before the verifier could check it would let a typed trail verify without its schema claim.
+2. **Anything outside the grammar fails closed.** A line that is not blank or a `#` comment must start with `trail` or `ed25519`. Fields are split on ASCII whitespace. After a line's required field, a token matching `^[a-z_]+=` is an option: `end=` belongs to `trail` and `through=` to `ed25519`. An unknown option, an option on the wrong kind of line, or an option given twice is a parse error. The first token that is not an option starts the free comment, which runs to the end of the line. This way a typo such as `thru=` can never quietly become a comment and leave a revoked key unbounded.
+3. **Spellings.** All hex is lowercase. A trail id is exactly 32 hex characters and a key exactly 64. `end=` and `through=` take `<seq>:blake3:<64 hex>`, with a decimal `u64` seq; this is the same spelling as `vigil-audit --head`.
+4. **The builder makes the same checks.** `build()` runs every semantic check that `from_file` runs: one section per trail id, a key at most once per section, consistent `through=` across sections, at least one section. A second `end` in one section is `InvalidConfig`. A key may carry different `through=` bounds in different sections, because bounds do not combine across trails.
+5. **Errors.** A malformed line is `InvalidConfig` and names its line number. A whole-file error (not UTF-8, or no `trail` line) names no line. A file that cannot be read is `Io`, with the `io::Error` available as `source()`; making that hold for every other `Io` error is #186.
+
+
+---
+
+# [Comment #13]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 04:33 PM_
+
+## Ruling 13-V2-d1 (architect): V2 scope, spans and the §19.3 accessors
+
+1. **Spans do not depend on fragment context.** A fragment candidate that fails its file-position or following-link conditions is `Unparsable`. Both fragments and `Unparsable` lines are span bytes (decision 11 (a)/(b)), so the span layout, `after`, `len`, `D` and the run digest are the same either way. V2 builds spans from `lines::classify` alone. Deciding whether a candidate is a real fragment, and with it the `TornWrite`, `TornWriteRepaired`, `RepairMismatch` and `Unparsable` findings, is V3's work, which reuses the reader's context logic in `storage.rs`.
+2. **One gap digest.** `blake3("vigil.audit.v1.repaired\0" ‖ bytes)` is extracted into one crate-private function. The reader and the span layer both use it, so nothing about the reader's behaviour changes.
+3. **§19.3.** V2 declares the stored accessors `Report::first_seq`, `Finding::accepted_kind` and `Finding::run_digest` together with their types. V3 fills them, adds `is_strict_valid` and `first_broken_link`, and flips §19.3 to Accepted. Until then §19.3 stays Proposed.
+4. The amendment-13 kinds `SchemaUnknown`, `SchemaViolation` and `OperatorText` arrive with #164 CP4.
+
+
+---
+
+# [Comment #14]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 05:34 PM_
+
+## Ruling 13-V3-d1 (architect): V3 split and four engine questions
+
+V3 is split into two PRs. **V3a** covers input handling and ordering, the `verify` / `Verifier` entry points and the chain rules. **V3b** covers fragment and resume context and the `Report` predicates. Each must stay at or under about 400 non-test lines.
+
+1. **Conflicts at one `seq`.**
+   - `Report::records()` counts distinct `(seq, record hash)` pairs among decoded records of the verified trail.
+   - Every distinct candidate at a `seq` is kept and checked. A record at `seq + 1` links if its `prev_hash` matches **any** candidate at `seq`.
+   - There is one `SeqConflict` per `seq`, naming every distinct hash, and at most one `DuplicateRecord` per `seq`.
+   - Clock comparisons are skipped across a conflicting `seq`.
+   - Duplicates are identified by the authenticated record hash, never by display-only bytes.
+   - **Finding order:** findings with a `seq` come first, in ascending `seq` order; findings without one follow; ties break by source path, then line, then kind. `first_broken_link` is the first `Error` in this order.
+   - Why: the result never depends on input order, and no alternative content is hidden. `SeqConflict` is an error in any case.
+2. **Inputs that reach one file twice.** First, deduplicate by inode: one inode is read once, under its segment name when it also appears as `audit.jsonl` (amendment 9, R9). Second, after deduplication, two distinct files with the same vigil name are `InvalidConfig`, even when their bytes are identical. Listing a directory and also one of its files is therefore harmless.
+3. **Staged completion; the verifier is pessimistic in between.**
+   - Each slice reports what it can establish. It never excuses a finding whose excusing evidence a later slice checks: matching checkpoint folds (V4), trusted coverage and `end=` (V5), anchors (V6), receipts and confirmed gaps (V7), review (V8).
+   - So until those land, an unconfirmed resume gap stays `SeqGap`, a repair without trusted coverage stays `TornWrite`, and so on.
+   - V3b implements the §19.3 accessors and predicates and flips §19.3 to Accepted, with its rustdoc naming the later slices that feed it.
+   - §19.6 (the genesis resume) stays Proposed until its confirmation path is testable (V7 or R10). The §19.9 table records this staging.
+   - **No release from dev carries a partial verifier.** The next release waits until #13 has landed through C1. Until then the public `verify` rustdoc says it is incomplete and names #13.
+4. **Mixed native and shipped input.** Only a native vigil file's own physical neighbours decide fragment context, no-crash marks and segment starts. The records merged by `seq` across all inputs decide chain links and duplicates. A shipped copy can never repair or erase damage in a native file.
+
+
+---
+
+# [Comment #15]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 05:37 PM_
+
+**Addendum to ruling 13-V3-d1: V3a ships as two PRs.**
+- **V3a-1** is a crate-private input layer. It expands directories, orders native segments, deduplicates inodes (point 2), reads under the snapshot retry, and streams files through the V2 line layer. It adds no public API and no chain findings.
+- **V3a-2** adds the chain engine and the public `verify` / `Verifier` entry points.
+
+Why: a public verifier that cannot yet detect a broken chain would pass broken trails on dev. The input layer on its own is invisible to users. V3b follows V3a-2.
+
+
+---
+
+# [Comment #16]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 07:20 PM_
+
+## Ruling 13-V3-d2 (architect): what a directory snapshot guarantees
+
+ADR-0005 decision 11 ("Locking and offline use") says the verifier "takes no lock and verifies a snapshot, using ADR-0002 decision 12's retry". A successful read of a directory therefore reflects **exactly one confirmed snapshot**: the attempt whose listing `retry_snapshot` confirmed as stable. Every attempt it discarded leaves no trace and no obligation.
+
+- A segment that retention prunes during `verify` is treated exactly like a segment pruned just before `verify` started. It is absent from the snapshot, and the chain reports what is missing (`SeqGap`, or later V6's start handling). The verifier gains no security from requiring files that an earlier, discarded attempt saw: an attacker who can delete a file could have deleted it before the verifier started. Such a rule would make routine retention fail verifications, and it can never be made airtight.
+- The V3a brief line "a disappearing selected input cannot silently disappear from a successful report" means only this: an explicitly given file that cannot be read is `Io`, and exhausting the retries is `Io`, never a partial success.
+- Cross-directory consistency is per directory (unchanged).
+
+
+---
+
+# [Comment #17]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 08:59 PM_
+
+## Ruling 13-V3-d3 (architect): V3a-2 reports every gap, pessimistically
+
+A fresh review of PR #190 found that a line the classifier marks as a fragment produces no finding, and the line is lost. So junk inserted mid-file, or a cut-off last record, verifies as clean. The V3a-2 brief deferred all fragment handling to V3b. That was my error: it contradicts the reason for the split (no public verifier that fails open lands on dev) and ruling 13-V3-d1 point 3 ("each slice reports what it can establish"). Everything needed is already on dev: the gap spans and their digests (V2) and the `repaired` attestation in each record summary (V3a-1).
+
+**V3a-2 therefore reports each gap once**, per ADR-0005 decision 11 ("Repairs are attested"), as far as it can be established without trusted coverage:
+
+1. **A gap in a native file followed by a line in the same file.**
+   - If that line's `audit.repaired` matches the gap digest, the gap is `TornWrite` (a warning). It is never `TornWriteRepaired` in V3: that needs trusted coverage or `end=`, which V5 checks.
+   - If the line has no attestation, or another digest, the gap is `RepairMismatch` (an error).
+2. **A trailing gap in a native file** (no line after it in that file) is `TornWrite`, with the gap digest over the bytes to the end of the file in its detail. The "no crash outcome" mark for a gap after a rotation-sealed closing checkpoint stays with V3b; until then that gap is a plain `TornWrite`.
+3. **A line with `audit.repaired` and no gap before it** is `TornWriteRepaired`, with the detail "fragment not present". It is info and excuses nothing.
+4. **Shipped input.** A fragment line in a shipped copy is `Unparsable` (an error): the Collector never ships fragments (ADR-0005 l.447), and a shipped copy can never repair damage (ruling 13-V3-d1 point 4).
+5. **Attribution.** Each gap finding names its file and physical line(s), and carries the attesting line's `seq` where there is one.
+
+**Decoder findings carry `seq` when it is known** (the ownership table: "V3 supplies … seq when known"). A line that decodes far enough to read `seq` (for example `HashMismatch`) carries it and sorts in `seq` order.
+
+V3b keeps fragment context, no-crash marks and structural resume. V5 turns a covered `TornWrite` into `TornWriteRepaired`.
+
+
+---
+
+# [Comment #18]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 09:56 PM_
+
+**PR #190, round 3 of 3 (architect).** The round-2 re-review found no fail-open path left: every gap now produces a finding. One defect remains. Gap findings point at the line after the gap instead of at the gap itself, and the detail omits the gap's byte length. ADR-0005 decision 11 and ruling 13-V3-d3 point 5 require both. Round 3 fixes that, makes decoder errors carry `seq` wherever it was read (not only `HashMismatch`), and corrects the CHANGELOG wording. **Size ruling:** the PR is already at about 400 added non-test lines, its hard stop, but this correctness fix is inside the ruled scope. So this round may add up to 25 net production lines, with no new scope.
+
+---
+
+# [Comment #19]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 10:45 PM_
+
+Progress: slice **V3a-2** (the chain engine, plus the public `verify`, `Verifier::{new, trail, verify_dir, verify_files}`) merged in #190 (dev `81952b3`) after 3 rounds. Every gap is reported and never excused (ruling 13-V3-d3). Gap findings point at the gap's own line, with its byte length and the line that attests it. Decoder errors carry `seq` once it has been read. The review nits are in #191. Next: **V3b** (fragment context, no-crash marks, structural resume, the §19.3 accessors). The release gate stands: no release from dev until #13 lands through C1.
+
+---
+
+# [Comment #20]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 10:59 PM_
+
+## Ruling 13-V3-d4 (architect): V3b fragment runs, resumes, native batch lines, and the split
+
+A fresh pre-dispatch check of the V3b brief found four design errors in it. This ruling corrects them from the ADR-0005 text, settles one open question, and splits V3b.
+
+1. **Fragment runs (decision 5, conditions 1 and 3; ADR l.430–438).**
+   - Condition 1 holds for each line in a run of consecutive fragments: the next writer's repair newline ends each one ("Several crashes in a row leave one gap").
+   - Condition 3 is checked once per run, against the **next complete record after the whole run**. That record must link to the last complete record before the run.
+   - If condition 3 fails, each fragment in the run is `Unparsable` at its own line. **The bytes stay in the gap**: spans, gap lengths and digests never change (ruling 13-V2-d1 §1), and the gap is still reported by V3a-2's rules (`RepairMismatch` / `TornWrite`).
+   - A rejected fragment never removes or splits a gap.
+2. **Resume link (decision 5, l.402–403; amendment 12).**
+   - The opening checkpoint at `k` links to the hash of the record at `h`, the last present record before it. The relation is `k ≥ h+1`: when `--lost-through` equals the head, `k = h+1` and nothing is lost (l.952).
+   - For a genesis resume, the link is the genesis value and `k = lost_through + 1 ≥ 1`.
+   - A structurally valid resume **does not remove its `SeqGap`** in V3. Rule 2 (the MMR fold) belongs to V4, and confirmation belongs to V7/V8 (ruling 13-V3-d1 point 3).
+3. **Every resume record is `Resumed` (l.612).**
+   - Every `vigil.audit.resume` record gives one `Resumed` warning, whether its declaration is well-formed or not, so `--strict` fails until a review accepts it.
+   - If the declaration parses, the detail names the operator, the reason, the head, and the gap with `lost_records=0` until V7. If it doesn't, the detail says "malformed declaration" and any `SeqGap` stays.
+4. **Several records on one native line.**
+   - ADR §3 (l.207) says a reader "must accept them". The verifier is a reader, so in any input such a line is **accepted with no finding**: each record is decoded and chain-checked as usual.
+   - `audit.repaired` is read from the line's first record, which is the line the writer wrote after the gap. That keeps V3a-2's behaviour.
+   - The writer's own read (`storage.rs:892`) refuses such a line in a live file, because it needs one record per line to recover its state. The verifier's rustdoc documents this difference, and no new finding kind is added.
+5. **No V5 work in V3b.** No private promotion to `TornWriteRepaired`: that upgrade is V5's.
+6. **Split.**
+   - **V3b-1:** fragment runs (1), the "no crash outcome" mark, plain `Resumed` for every resume record (3), the batch-line test (4), the §19.3 predicates `is_strict_valid` and `first_broken_link`, and §19.3 flipped to Accepted.
+   - **V3b-2:** structural resume validation (2): head, `lost_through`, link and genesis checks, plus the private candidates kept for V4, V5 and V7.
+
+   Neither part fails open. V3b-1 already makes every resume block `--strict`.
+
+
+---
+
+# [Comment #21]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 11:03 PM_
+
+### Addendum to ruling 13-V3-d4 (after the re-check)
+7. **Uncovered tail (ADR l.551 and l.857).** Until V5 checks signatures, no checkpoint is trusted, so every record is in the uncovered tail. V3b-1 emits one `UncoveredTail` (info) spanning `first_seq..=last_seq` whenever the selected trail has records. Its detail reads "no trusted coverage yet (signatures are checked in #13 V5)", and `covered_through` stays `None`. `is_strict_valid()` is therefore false for every non-empty trail until V5 narrows the tail. This is the pessimistic reading ruling 13-V3-d1 point 3 requires. An empty trail emits no `UncoveredTail`.
+8. **`Resumed` once per `seq` (ADR l.822).** There is one `Resumed` per distinct `(seq, hash)`, attributed to the native copy when there is one (otherwise the first shipped copy in order). A resume record of a foreign trail is `TrailMismatch` only: no `Resumed`.
+9. **"The declaration parses"** means all of these:
+   - `storage.rs` `resume_details` succeeds;
+   - `head=<seq>:blake3:<64 lowercase hex>` is canonical;
+   - `lost_through` is a canonical decimal at least the head's `seq`;
+   - `file=` is non-empty and contains no whitespace.
+
+   Anything else is "malformed declaration". The gap text is `gap=<h+1>..=<lost_through>`, or `gap=none` when `lost_through == h`.
+10. **Edges of a fragment run.**
+    - **"Before"** is the last record of the last `Records` line before the run (`range.end-1`). **"After"** is the first record of the first line after the run (`range.start`).
+    - **Condition 3 fails, so each fragment in the run is `Unparsable`, when any of these holds:**
+      - the run starts the file. No honest crash produces this, since a new file always starts with its opening checkpoint written through the staging file;
+      - the line after the run is not a `Records` line, for example an `Invalid` line;
+      - the "after" record does not link to the "before" record.
+    - Condition 3 holds trivially for a trailing run, with no line after it.
+    - **The bytes always stay in the gap.** Existing tests that expect only the gap finding, such as `junk_as_first_line_attributes_gap_to_line_one`, gain the `Unparsable` finding(s).
+
+---
+
+# [Comment #22]() by [gerchowl]()
+
+_Posted on November 3, 2026 at 12:52 AM_
+
+Progress: slice **V3b-1** merged in #192 (dev `f91e714`) after 2 rounds. It adds:
+- fragment-run context (ruling 13-V3-d4), where a rejected fragment is `Unparsable` and its bytes stay in the gap;
+- the "no crash outcome" mark, with every ADR condition;
+- `Resumed` for every resume record, once per `(seq, hash)`;
+- `UncoveredTail` over the whole trail until V5;
+- `Report::is_strict_valid` and `Report::first_broken_link`, with §19.3 Accepted.
+
+Run on the same corrupted trails at dev and at the head, the verifier reports nothing less than before, and gap bytes and digests are byte-identical. The test-coverage nits are in #193. Next: **V3b-2** (structural resume validation). The release gate is unchanged.
+
+---
+
+# [Comment #23]() by [gerchowl]()
+
+_Posted on November 3, 2026 at 01:08 AM_
+
+## Ruling 13-V3-d5 (architect): V3b-2 structural resume validation
+
+The pre-dispatch check of the V3b-2 brief (check-13v3b2, verdict blockers) found condition errors and two open questions. This ruling settles them from the ADR-0005 text on origin/dev f91e714 (decision 5 "Resume gaps", rules 1–3, l.402–411; amendment 12; §19.6). It refines 13-V3-d4 point 2 and addendum 9.
+
+1. **The structural conditions** (rules 1 and 3, the ADR's own words). A resume record `R` of the selected trail, whose declaration parses (addendum 9) and names head `(h, H)` and `lost_through = L`, is **structurally valid** only if all of these hold:
+   - (S1) The record at `k = L+1` is a checkpoint, the **opening**. `R` is the record at `k+1`. "At" means by `seq` in the verified set, not by file position: a shipped copy has no file boundaries and must verify the same (ADR l.403). No condition may require file boundaries.
+   - (S2) **Non-genesis:** a record at `h` with hash `H` is present (in any candidate, ruling 13-V1-d1/d1 point 1: a match with **any** candidate suffices). It is the **last record present below `k`**: no record with `h < seq < k` is present. The opening's `prev_hash` is `H`. `k > h+1`, or `k = h+1` when `L = h` (nothing lost, l.952).
+   - (S3) **Genesis** (`H` is the genesis value, `h = 0`, amendment 12, Proposed): the opening's `prev_hash` is the genesis value, `k = L+1 ≥ 1`, and **no record with `seq < k` is present** (the opening is the first record of the verified set; with a start given, that is V6's). Anything else is not valid. The `ChainBroken` for a genesis link elsewhere stays R10's (§19.6 stays Proposed); V3b-2 adds no finding for it.
+   - The `audit.mmr_size` part of rule 2 stays V4's. Signatures stay V5's. Confirmation stays V7/V8's.
+2. **The head is not present** (check item 6). If the record at `h` is absent from the files (archived, or deleted: the verifier cannot tell them apart, ADR "Collector copy", "`open` is structural"), the resume is **not** structurally valid. The reason is `head-not-present`. Its `SeqGap` and `Resumed` stay. How a start checkpoint (decision 11) covers an archived head is V6's start handling. A note goes on #13 for V6, and no new issue is needed.
+3. **Gap text for a genesis resume** (check item 5). The ADR is explicit: "The gap is `0..=lost_through`" (l.407), and "for a genesis resume, `0` to `k−1`" (l.411).
+   - Addendum 9's `gap=<h+1>..=<lost_through>` / `gap=none` covers the **non-genesis** case only.
+   - For a genesis head, the text is `gap=0..=<lost_through>`. It is never `none`, because seq 0 is always lost.
+   - V3b-2 corrects V3b-1's genesis text (today `gap=1..=2` for L=2, and `gap=none` for L=0). This is a bug fix within #13, with a test that fails on f91e714.
+4. **The outcome is observable and mandatory.**
+   - Every `Resumed` detail of a parsed declaration ends with exactly one suffix:
+     - `structural=valid`, or
+     - `structural=invalid(<reason>)`.
+   - Reasons are fixed tokens, one per failed condition, the first in this order: `no-opening` (S1 checkpoint missing at k), `resume-not-at-k+1`, `head-not-present`, `head-not-last` (a record between h and k), `link-mismatch`, `genesis-not-first`.
+   - A malformed declaration keeps "malformed declaration" and gets no suffix.
+   - The suffix changes no severity and removes no finding. Every `SeqGap`, `ChainBroken` and `Resumed` stays as on f91e714.
+   - No new `FindingKind`, no public API change.
+5. **Candidates.** The validated `(h, H, L, k, resume seq, resume hash)` tuples are kept privately, **unique per `(resume seq, resume hash)`** (native copy first, as addendum 8), for V4 (rule 2 fold), V6 (start), V7 (confirmation).
+   - `#[expect(dead_code, reason = "consumed by #13 V<n>")]` goes only on an item that is really dead in non-test builds: a struct field never read, or a fn never called. Never on a local binding. `just precommit` (clippy `-D warnings`) proves each expectation is fulfilled.
+   - No helper may duplicate what `parse_resume` already enforces.
+6. **Tests and mutants.**
+   - Every acceptance row asserts the exact suffix (or the genesis gap text) and fails on f91e714.
+   - Fixtures: use the real writer (`AuditConfig`, the storage resume path) in `tests/audit_verify.rs` where it can produce the shape. Otherwise use crate-private unit tests (`engine_tests`).
+   - Each mutant runs on **both** `cargo test --features audit verify` and `--test audit_verify`. It counts as killed if **at least one** exits 101, and the brief names the killing test.
+   - Drop the equivalent and gate-only mutants (old M2, M8, M9, and M6 unless it is observable).
+   - Add one mutant per condition in point 1, including "head-not-last" and "resume-not-at-k+1", plus "genesis gap text reverted" and "suffix emitted for a malformed declaration".
+7. **Size.** The revised estimate is to be restated. The hard stop is still ~400 added non-test lines → `BLOCKED: propose split`.
+
+
+---
+
+# [Comment #24]() by [gerchowl]()
+
+_Posted on November 3, 2026 at 01:25 AM_
+
+### Addendum to ruling 13-V3-d5 (after the re-check)
+8. **Several candidates at one `seq`** (a `SeqConflict`). The conditions never depend on input order, consistent with ruling 13-V1-d1/d1 point 1 ("links if its `prev_hash` matches **any** candidate"):
+   - S1 holds when **any** candidate at `k` is a checkpoint that satisfies the link condition (S2 or S3). Among the qualifying checkpoints, the opening is the first in input order (native first), and it is kept in the candidate tuple.
+   - "`R` is the record at `k+1`" means `R` is among the candidates at `k+1`.
+   - "No record with `h < seq < k`" (and genesis "`seq < k`") counts every candidate.
+   - The `SeqConflict` itself stays exactly as on f91e714.
+9. **The genesis head** is `(0, genesis value)`: `h == 0` **and** the hash is the genesis value. Any other `h` with the genesis hash is a non-genesis declaration, which normally ends in `head-not-present`.
+10. **Same outcome for every copy.** The structural outcome belongs to the `(resume seq, resume hash)` pair and is computed once. Its native and shipped copies therefore always show the same suffix. There is no per-path outcome.
+
+
+---
+
+# [Comment #25]() by [gerchowl]()
+
+_Posted on November 3, 2026 at 02:51 AM_
+
+**V3b-2 merged:** #194 → dev a70e01c (structural resume validation, ruling 13-V3-d5 with its addendum 8–10). Each parsed `vigil.audit.resume` declaration now ends with `structural=valid` or `structural=invalid(<reason>)`. The genesis gap text is corrected to `0..=lost_through`. The validated tuples are kept privately for V4, V6 and V7. No finding is removed and no severity changes. The fresh review found no blockers, and its nits are in #195. Next: V4 (`run_digest` / the MMR fold of rule 2). Also for V6 (d5 point 2): an archived head currently reports `head-not-present`; the start handling decides how a start checkpoint covers it.
+
+---
+
+# [Comment #26]() by [gerchowl]()
+
+_Posted on November 3, 2026 at 03:29 AM_
+
+## Ruling 13-V4-d1 (architect): V4 runs, the opening's `mmr_size`, and loss-point ranges
+
+The pre-dispatch check of the V4 brief (verdict blockers) probed its run rule against ADR-0005 on origin/dev a70e01c. The ADR's text settles it, and this ruling binds V4.
+
+1. **A run is the ADR's layout rule, nothing else** (amendment 6): "one or more consecutive segments in which some segment's first complete record is no linking checkpoint, or which holds no complete record, or holds `Unparsable` lines".
+   - The run is closed by the next segment whose first two records are an opening checkpoint that satisfies (i) (its `prev_hash` is the hash of the last complete record in or before the run) and a resume record that satisfies (ii).
+   - **Membership never depends on the head or `lost_through` the resume declares.** A writer of resume details must not be able to choose which checkpoints are exempt from comparison.
+   - The verifier's run set must be the set the storage side already derives for the same files (`history_segment` and its run rules in `src/audit/storage.rs`, from B3d1). V4 must not call storage internals (trap), so it implements the same ADR rule.
+   - V4 adds a test proving that both sides agree on real-writer trails: honest crash, a two-segment run, and the laundering layout as the ADR states it in §19.2 (S1 = [O3, e4, P5, e6, C7] cut to P5).
+   - Where they disagree, stop with `BLOCKED: design question` and the probe output.
+2. **No empty runs.** A run has one or more segments. A resume with no run before its opening adds no run finding; its gap stays decision 5's `SeqGap` + `Resumed`. The n = m = 0 text (l.843) applies only to runs that have segments. Every run finding is pinned to the run's first segment (file, first record's line and seq; or line/seq `None` when the segment holds no complete record). There is no file-less run finding.
+3. **The opening is always compared, and rule 2 binds the candidates.**
+   - Decision 5 rule 2 (l.404): the opening's `mmr_size` is the size of the fold of the base and every record present before it. V4 compares every opening checkpoint (size, root, peaks) against the fold. A mismatch is an `MmrMismatch` and is never exempt, wherever the opening sits.
+   - "Exempt after the first loss point" applies only to checkpoints **inside** a run (amendment 6). Nothing outside a run is exempt.
+   - A resume candidate (13-V3-d5 point 5) whose opening fails rule 2 is removed from the private candidate list, so V6/V7 can never confirm or excuse its gap.
+   - The `structural=…` suffix and its tokens stay as d5 defines them; rule 2 is reported by the `MmrMismatch`, not a new token.
+4. **Ranges are one definition.**
+   - A loss point's `first` and `count` follow ADR amendment 6 and ruling B3d1-d4: `count = loss.seq − first`, where `first` = the preceding complete record's seq + 1, and `count = 0` is legal.
+   - The arithmetic is checked and can never panic.
+   - For a non-increasing seq at a loss point, use the value the storage side gives for the same layout. If storage defines none, stop with `BLOCKED: design question` and the probe, and don't invent one.
+   - The run digest for a real-writer trail must equal what the storage side computes for that trail wherever it computes one.
+5. **Fixtures decode.** Every unit fixture must pass the decoder; for example, `size=0` at seq > 0 is rejected. Run each row on base and on the change, and state each row's base result and its killing mutant.
+
+
+---
+
+# [Comment #27]() by [gerchowl]()
+
+_Posted on November 3, 2026 at 04:01 AM_
+
+## Ruling 13-V4-d2 (architect): V4 brief v2 open points
+
+Settled from ADR-0005 on origin/dev. This adds to 13-V4-d1.
+
+1. **A run exists only when it is closed.**
+   - Amendment 6: the reader "accepts a run … if and only if" (i)–(iii) hold, and "the first linking-checkpoint segment after a run must close it immediately" (B3d1-d3).
+   - Decision 11: an `accept-run` line names the run's resume record, and one whose resume record is missing is `AcceptMismatch`.
+   - So the verifier emits a **run** `SegmentStructure` (with a run digest) only for damaged segments closed by a segment whose first two records satisfy (i) and (ii). (iii) is checked by the fold, and its failure is the opening's `MmrMismatch`, 13-V4-d1 point 3.
+   - Damaged segments that nothing closes keep only decision 8's per-segment `SegmentStructure`, and get no run digest. Otherwise a reviewer could `accept-run` a layout the reader rejects.
+   - Brief v2's §0 change (`native_boundaries_cannot_be_repaired_by_shipped_checkpoint` going to 2 findings) is **retracted**, unless that fixture's empty segment is closed by (i)+(ii); state which with the probe.
+   - Add a row: an unclosed empty or headless segment gives no run finding. Add a mutant: emit a run for an unclosed run.
+2. **OQ-V4-new-1, `after` across segments:** accepted. `after` is `u64::MAX` for a span that starts at a segment's first byte, in every segment of the run (ADR l.830). The storage-agreement row covers a multi-segment run with spans.
+3. **OQ-V4-new-2, no predecessor:** accepted. A run segment adds a loss point only when a complete record precedes it. A run with none lists no range (l.829, l.843). This holds only for closed runs, per point 1.
+4. **Split approved:** V4a is run detection, ranges, spans, digest and the storage agreement. V4b is the fold, the opening and rule-2 comparison, and the candidate filter. They are separate brief files and separate PRs, merged in order. V4a dispatches after the #191/#193/#195 bundle merges.
+
+
+---
+
+# [Comment #28]() by [gerchowl]()
+
+_Posted on November 3, 2026 at 04:22 AM_
+
+## Ruling 13-V4-d3 (architect): the V4a run rule is the reader's, proven by an agreement table
+
+The check of V4a brief (v3) probed 13 layouts with storage `open` and the brief's rule on the same directory. They disagreed in five places, and two of those fail open. This ruling binds V4a and adds to 13-V4-d1 and 13-V4-d2.
+
+1. **The reader is the oracle.** For every layout, the verifier emits run findings **exactly** for the runs whose segments the storage reader accepts as a run (the per-segment `run` flag in `storage.rs` `history_segment` and its callers). Where the reader rejects the trail (`CorruptTrail`), the verifier emits **no** run finding and no run digest; its other findings stay.
+   - V4a proves this with a crate-private **agreement table** in `storage::tests` (lib, `#[cfg(test)]`, so it may call storage internals). It runs storage `open` and `verify` over the same directory for every layout below and every V4a acceptance row, and asserts the same run segments, or none.
+   - Verifier code never calls storage internals (trap).
+2. **The layout cases, as the reader decides them** (ADR amendment 6 "Run boundaries", B3d1-d3, "Base"):
+   - A linking opening after an unsealed segment with **no immediate resume** ends the candidate. That is no run (p12, p06: storage `first successor lacks immediate resume`).
+   - **Any checkpoint first at the base** is the base (l.625), including an archived one with `prev ≠ genesis`, so an archived base alone is no run (p08). A non-checkpoint first record at the base means no run (p07, storage `missing initial checkpoint`).
+   - **A closer ends run 1 and may start run 2** (p01, storage `closing_segment_can_start_second_run`).
+   - **A non-increasing seq** gives no run finding (storage `record sequence did not increase`). The other findings stay, it never panics, and the row is tested. This settles the d1 point 4 non-increasing case.
+3. **Rows.**
+   - Replace A2 with §19.2 **as stated** (S0 deleted), with and without a later crash plus resume. Each row's expected run set is whatever the reader decides.
+   - Use record-free segments for the `after = u64::MAX` spans (A9), and pin A9's digest.
+   - Fix A3 (`L = 9`).
+   - Give every mutant a killer that has actually run. M8 (rule drift) is killed by the agreement table.
+4. **No field that nothing reads.** Cut `Run::first_loss_seq`; V4b adds what it needs. Remove the `expect`s on `run_digest`/`with_run_digest`.
+5. **Escalation.** This is the V4 brief's fourth revision. If the next check finds a blocker in the run rule, the architect escalates to the owner instead of revising again.
+
 

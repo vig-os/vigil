@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-09T13:21:53Z
-updated: 2026-10-16T15:05:01Z
+updated: 2026-11-02T20:13:55Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/8
-comments: 14
+comments: 15
 labels: feature, priority:medium, effort:medium
 assignees: none
-milestone: 0.2.0 — metrics + traces
+milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-10-18T00:53:44.539Z
+synced: 2026-11-03T09:06:17.529Z
 ---
 
 # [Issue 8]: [feat: traces to traces.jsonl (tracing-opentelemetry spans)](https://github.com/vig-os/vigil/issues/8)
@@ -233,4 +233,12 @@ _Posted on October 13, 2026 at 01:01 PM_
 _Posted on October 16, 2026 at 03:05 PM_
 
 8c-2 merged: #149, at a5b710f. `init` and `Config::layer` now export spans to `traces.jsonl`, behind `Config::traces`/`VIGIL_TRACES`. Guard flushes traces concurrently (a happens-before proof) and shuts down with the SpansDropped capture. `TraceStorage::close` never blocks. Log records carry span ids. 3 rounds. Follow-up #150 (the same close-blocking flaw in metrics). Next: 8d (open spans at shutdown; drop OQ7, which moved into 8c-2), 8e, 8f.
+
+---
+
+# [Comment #15]() by [gerchowl]()
+
+_Posted on November 2, 2026 at 08:13 PM_
+
+Milestone triage: 0.2.0 was released on 2026-11-02 without this issue, so it moves to 0.3.0, the next release from `dev`.
 
