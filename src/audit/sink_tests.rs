@@ -66,7 +66,7 @@ fn bad_open(t: &Temp, expected: Option<Head>, kind: AuditErrorKind) {
 }
 pub(super) fn scan_head(s: &Sink) -> Head {
     s.reader
-        .with_current(|d| s.prepare(d), |_, _, s| Ok(s.head))
+        .with_current(|d| s.prepare(d), |_, _, s| Ok(s.run.head))
         .unwrap()
 }
 #[test]
@@ -492,7 +492,7 @@ fn resume_staging_every_prefix_with_and_without_gap() {
             &s,
             &state,
             lost + 1,
-            state.head.hash,
+            state.run.head.hash,
             "vigil.audit.resume",
             &next_resume_file(&t),
         );
@@ -523,7 +523,7 @@ fn sealing_staging_rules_and_interrupted_creation() {
         let dir = File::open(&t.0).unwrap();
         let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
         let closing = s.checkpoint_record(&state, 2_000_000_000).unwrap();
-        let mut mmr = state.mmr.clone();
+        let mut mmr = state.run.mmr.clone();
         mmr.push(closing.hash()).unwrap();
         let opening = Sink::signed(
             &*s.signer,
@@ -576,7 +576,7 @@ fn sealing_staging_rules_and_interrupted_creation() {
         if promote {
             assert_eq!(bytes(&t), staged);
         } else {
-            assert_eq!(scan_head(&reopened), state.head);
+            assert_eq!(scan_head(&reopened), state.run.head);
         }
     }
 }
@@ -813,7 +813,7 @@ fn resume_bytes(
     let cp = Sink::signed(
         &*s.signer,
         RecordContext::new(s.trail, seq, 2_000_000_000, "vigil", previous),
-        &state.mmr,
+        &state.run.mmr,
     )
     .unwrap();
     let entry = Record::new_internal(
@@ -822,8 +822,8 @@ fn resume_bytes(
             .reason("reviewed")
             .details(format!(
                 "head={}:{} lost_through={} file={file}",
-                state.head.seq,
-                digest_string(&state.head.hash),
+                state.run.head.seq,
+                digest_string(&state.run.head.hash),
                 seq - 1,
             )),
     )
@@ -845,8 +845,8 @@ fn resume_promotes_over_live_opening_checkpoint() {
     let staged = resume_bytes(
         &s,
         &state,
-        state.head.seq + 1,
-        state.head.hash,
+        state.run.head.seq + 1,
+        state.run.head.hash,
         "vigil.audit.resume",
         &next_resume_file(&t),
     );
@@ -855,7 +855,7 @@ fn resume_promotes_over_live_opening_checkpoint() {
     reopened.closed = true;
     assert_eq!(bytes(&t), staged);
     assert_resume_filename(&t);
-    assert_eq!(scan_head(&reopened).seq, state.head.seq + 2);
+    assert_eq!(scan_head(&reopened).seq, state.run.head.seq + 2);
     assert!(!t.0.join(".audit-resume.jsonl").exists());
     let names = rotate::rotated_names_at(&dir, "audit").unwrap();
     assert_eq!(names.len(), 2);
@@ -872,7 +872,7 @@ fn assert_resume_discard(rule: u8, seal_before_settle: bool) {
         &s,
         &state,
         8,
-        state.head.hash,
+        state.run.head.hash,
         "vigil.audit.resume",
         &next_resume_file(&t),
     );
@@ -881,8 +881,12 @@ fn assert_resume_discard(rule: u8, seal_before_settle: bool) {
     reopened.closed = true;
     assert_resume_filename(&t);
     let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
-    let seq = state.head.seq + u64::from(rule != 2);
-    let previous = if rule == 0 { [42; 32] } else { state.head.hash };
+    let seq = state.run.head.seq + u64::from(rule != 2);
+    let previous = if rule == 0 {
+        [42; 32]
+    } else {
+        state.run.head.hash
+    };
     let action = if rule == 1 {
         "change"
     } else {
@@ -903,7 +907,7 @@ fn assert_resume_discard(rule: u8, seal_before_settle: bool) {
     } else {
         let mut reopened = open(&t);
         reopened.closed = true;
-        assert_eq!(scan_head(&reopened), state.head);
+        assert_eq!(scan_head(&reopened), state.run.head);
         assert_eq!(bytes(&t), live);
     }
     assert_eq!(rotate::rotated_names_at(&dir, "audit").unwrap(), sealed);
@@ -911,8 +915,8 @@ fn assert_resume_discard(rule: u8, seal_before_settle: bool) {
     let valid = resume_bytes(
         &s,
         &state,
-        state.head.seq + 1,
-        state.head.hash,
+        state.run.head.seq + 1,
+        state.run.head.hash,
         "vigil.audit.resume",
         &file,
     );
@@ -957,8 +961,15 @@ fn resume_without_predecessor_discards_non_genesis_link() {
         .unwrap()
         .0
         .unwrap();
-    state.head.hash = [42; 32];
-    let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume", "-");
+    state.run.head.hash = [42; 32];
+    let staged = resume_bytes(
+        &s,
+        &state,
+        5,
+        state.run.head.hash,
+        "vigil.audit.resume",
+        "-",
+    );
     fs::remove_file(t.0.join("audit.jsonl")).unwrap();
     fs::write(t.0.join(".audit-resume.jsonl"), staged).unwrap();
     bad_open(&t, None, AuditErrorKind::CorruptTrail);
@@ -976,11 +987,18 @@ fn resume_without_predecessor_promotes_genesis_link() {
         .unwrap()
         .0
         .unwrap();
-    state.head.hash = Record::genesis(&s.trail);
-    state.mmr = Mmr::new();
-    state.mmr.push(state.head.hash).unwrap();
-    assert_eq!(state.mmr.size(), 1);
-    let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume", "-");
+    state.run.head.hash = Record::genesis(&s.trail);
+    state.run.mmr = Mmr::new();
+    state.run.mmr.push(state.run.head.hash).unwrap();
+    assert_eq!(state.run.mmr.size(), 1);
+    let staged = resume_bytes(
+        &s,
+        &state,
+        5,
+        state.run.head.hash,
+        "vigil.audit.resume",
+        "-",
+    );
     fs::remove_file(t.0.join("audit.jsonl")).unwrap();
     fs::write(t.0.join(".audit-resume.jsonl"), &staged).unwrap();
     let mut reopened = open(&t);
@@ -1023,8 +1041,8 @@ fn resume_settlement_promotes_over_archived_live_prefix() {
     let staged = resume_bytes(
         &s,
         &state,
-        state.head.seq + 1,
-        state.head.hash,
+        state.run.head.seq + 1,
+        state.run.head.hash,
         "vigil.audit.resume",
         &next_resume_file(&t),
     );
@@ -1033,7 +1051,7 @@ fn resume_settlement_promotes_over_archived_live_prefix() {
     reopened.closed = true;
     assert_eq!(bytes(&t), staged);
     assert_resume_filename(&t);
-    assert_eq!(scan_head(&reopened).seq, state.head.seq + 2);
+    assert_eq!(scan_head(&reopened).seq, state.run.head.seq + 2);
     assert!(!t.0.join(".audit-resume.jsonl").exists());
     let sealed = rotate::rotated_names_at(&dir, "audit").unwrap();
     assert_eq!(sealed.len(), 1);
@@ -1049,7 +1067,7 @@ fn sealing_settlement_promotes_after_archived_prefix_without_live() {
     let dir = File::open(&t.0).unwrap();
     let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
     let closing = s.checkpoint_record(&state, 2_000_000_000).unwrap();
-    let mut mmr = state.mmr.clone();
+    let mut mmr = state.run.mmr.clone();
     mmr.push(closing.hash()).unwrap();
     let opening = Sink::signed(
         &*s.signer,
@@ -1095,9 +1113,16 @@ fn resume_without_predecessor_discards_nonzero_genesis_head() {
         .unwrap()
         .0
         .unwrap();
-    state.head.hash = Record::genesis(&s.trail);
-    state.head.seq = 3;
-    let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume", "-");
+    state.run.head.hash = Record::genesis(&s.trail);
+    state.run.head.seq = 3;
+    let staged = resume_bytes(
+        &s,
+        &state,
+        5,
+        state.run.head.hash,
+        "vigil.audit.resume",
+        "-",
+    );
     fs::remove_file(t.0.join("audit.jsonl")).unwrap();
     fs::write(t.0.join(".audit-resume.jsonl"), staged).unwrap();
     bad_open(&t, None, AuditErrorKind::CorruptTrail);
@@ -1137,8 +1162,8 @@ fn promotable(s: &Sink, t: &Temp, resume: bool) -> Vec<u8> {
         resume_bytes(
             s,
             &state,
-            state.head.seq + 1,
-            state.head.hash,
+            state.run.head.seq + 1,
+            state.run.head.hash,
             "vigil.audit.resume",
             &next_resume_file(t),
         )
@@ -2318,7 +2343,14 @@ fn resume_promotion_uses_record_filename_and_one_final_sync() {
     let dir = File::open(&t.0).unwrap();
     let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
     let name = "audit-20990101T000000.000000000Z.jsonl";
-    let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume", name);
+    let staged = resume_bytes(
+        &s,
+        &state,
+        5,
+        state.run.head.hash,
+        "vigil.audit.resume",
+        name,
+    );
     let live = bytes(&t);
     fs::write(t.0.join(".audit-resume.jsonl"), &staged).unwrap();
     hooks::EVENTS.with(|e| e.borrow_mut().clear());
@@ -2385,7 +2417,14 @@ fn resume_invalid_filename_on_never_rotated_trail_is_discarded() {
         let dir = File::open(&t.0).unwrap();
         assert!(rotate::rotated_names_at(&dir, "audit").unwrap().is_empty());
         let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
-        let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume", file);
+        let staged = resume_bytes(
+            &s,
+            &state,
+            5,
+            state.run.head.hash,
+            "vigil.audit.resume",
+            file,
+        );
         let before = bytes(&t);
         fs::write(t.0.join(".audit-resume.jsonl"), staged).unwrap();
         settle(&dir, s.trail, &s.poisoned).unwrap();
@@ -2412,7 +2451,14 @@ fn resume_filename_validation_and_directory_states() {
         s.closed = true;
         let dir = File::open(&t.0).unwrap();
         let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
-        let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume", file);
+        let staged = resume_bytes(
+            &s,
+            &state,
+            5,
+            state.run.head.hash,
+            "vigil.audit.resume",
+            file,
+        );
         let before = bytes(&t);
         fs::write(t.0.join(".audit-resume.jsonl"), staged).unwrap();
         settle(&dir, s.trail, &s.poisoned).unwrap();
@@ -2449,16 +2495,16 @@ fn resume_filename_validation_and_directory_states() {
             predecessor_run(&dir, s.trail).unwrap().0.unwrap()
         };
         if mode == 1 || mode == 4 {
-            state.head.hash = Record::genesis(&s.trail);
-            state.mmr = Mmr::new();
-            state.mmr.push(state.head.hash).unwrap();
+            state.run.head.hash = Record::genesis(&s.trail);
+            state.run.mmr = Mmr::new();
+            state.run.mmr.push(state.run.head.hash).unwrap();
         }
         let file = if mode == 4 { "-" } else { name };
         let staged = resume_bytes(
             &s,
             &state,
-            state.head.seq + 5,
-            state.head.hash,
+            state.run.head.seq + 5,
+            state.run.head.hash,
             "vigil.audit.resume",
             file,
         );
@@ -2549,7 +2595,14 @@ fn resume_hard_link_is_unlinked_before_directory_validation() {
     let state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
     let name = next_resume_file(&t);
     fs::hard_link(t.0.join("audit.jsonl"), t.0.join(&name)).unwrap();
-    let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume", &name);
+    let staged = resume_bytes(
+        &s,
+        &state,
+        5,
+        state.run.head.hash,
+        "vigil.audit.resume",
+        &name,
+    );
     fs::write(t.0.join(".audit-resume.jsonl"), &staged).unwrap();
     hooks::EVENTS.with(|e| e.borrow_mut().clear());
     settle(&dir, s.trail, &s.poisoned).unwrap();
@@ -2569,17 +2622,29 @@ fn genesis_resume_staging_checks_the_shared_fold() {
         s.closed = true;
         let dir = File::open(&t.0).unwrap();
         let mut state = predecessor_run(&dir, s.trail).unwrap().0.unwrap();
-        state.head.hash = Record::genesis(&s.trail);
-        state.mmr = Mmr::new();
+        state.run.head.hash = Record::genesis(&s.trail);
+        state.run.mmr = Mmr::new();
         state
+            .run
             .mmr
-            .push(if kind == 1 { [42; 32] } else { state.head.hash })
+            .push(if kind == 1 {
+                [42; 32]
+            } else {
+                state.run.head.hash
+            })
             .unwrap();
         if kind == 2 {
-            state.mmr = Mmr::from_peaks(1, vec![state.head.hash]).unwrap();
+            state.run.mmr = Mmr::from_peaks(1, vec![state.run.head.hash]).unwrap();
         }
         fs::remove_file(t.0.join("audit.jsonl")).unwrap();
-        let staged = resume_bytes(&s, &state, 5, state.head.hash, "vigil.audit.resume", "-");
+        let staged = resume_bytes(
+            &s,
+            &state,
+            5,
+            state.run.head.hash,
+            "vigil.audit.resume",
+            "-",
+        );
         fs::write(t.0.join(".audit-resume.jsonl"), &staged).unwrap();
         settle(&dir, s.trail, &s.poisoned).unwrap();
         assert!(!t.0.join(".audit-resume.jsonl").exists());
@@ -2669,7 +2734,7 @@ fn install_resume(t: &Temp, writer: &Sink, lost: u64) -> Record {
         writer,
         &state,
         lost + 1,
-        state.head.hash,
+        state.run.head.hash,
         "vigil.audit.resume",
         &next_resume_file(t),
     );
@@ -2827,8 +2892,8 @@ fn resume_reader_refresh_and_equal_head_regression() {
             .with_current(
                 |_| Ok(()),
                 |_, _, state| {
-                    assert_eq!(state.head, receipt.head);
-                    assert_eq!(state.mmr.size(), 2);
+                    assert_eq!(state.run.head, receipt.head);
+                    assert_eq!(state.run.mmr.size(), 2);
                     Ok(())
                 },
             )
@@ -2879,12 +2944,12 @@ fn resume_discovery_requires_full_validation_before_writing() {
     // application record. Discovery must never turn that into write authority.
     let mut wrong = Mmr::new();
     wrong.push(Record::genesis(&writer.trail)).unwrap();
-    state.mmr = wrong;
+    state.run.mmr = wrong;
     let forged = resume_bytes(
         &writer,
         &state,
         9,
-        state.head.hash,
+        state.run.head.hash,
         "vigil.audit.resume",
         "-",
     );

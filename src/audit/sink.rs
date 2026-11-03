@@ -493,7 +493,9 @@ fn settle(dir: &File, trail: [u8; 16], poisoned: &AtomicBool) -> Result<(), Audi
             records.len() == 1
                 && matches!(records[0].kind, Kind::Checkpoint(_))
                 && records[0].context.seq
-                    == prior.as_ref().map_or(0, |s| s.head.seq.saturating_add(1))
+                    == prior
+                        .as_ref()
+                        .map_or(0, |s| s.run.head.seq.saturating_add(1))
                 && scan_staged(&staged, trail, prior.clone(), run).is_ok()
         });
         if valid {
@@ -658,7 +660,7 @@ impl Sink {
                     seq: 0,
                     hash: Record::genesis(&trail),
                 },
-                |s| s.head,
+                |s| s.run.head,
             );
             if head != want {
                 return Err(error(
@@ -673,7 +675,7 @@ impl Sink {
             };
             #[cfg(test)]
             hooks::point("resume-name-picked");
-            let mut mmr = prior.as_ref().map_or_else(Mmr::new, |s| s.mmr.clone());
+            let mut mmr = prior.as_ref().map_or_else(Mmr::new, |s| s.run.mmr.clone());
             if prior.is_none() {
                 mmr.push(head.hash)?;
             }
@@ -769,18 +771,18 @@ impl Sink {
         )
     }
     fn context(&self, state: &State, time: u64) -> Result<RecordContext, AuditError> {
-        let seq = state
-            .head
+        let head = state.run.head;
+        let seq = head
             .seq
             .checked_add(1)
             .ok_or_else(|| error(AuditErrorKind::InvalidConfig, "sequence overflow"))?;
         let mut context =
-            RecordContext::new(self.trail, seq, time, &self.config.service, state.head.hash);
+            RecordContext::new(self.trail, seq, time, &self.config.service, head.hash);
         context.repaired = state.repair_digest();
         Ok(context)
     }
     fn checkpoint_record(&self, state: &State, time: u64) -> Result<Record, AuditError> {
-        Self::signed(&*self.signer, self.context(state, time)?, &state.mmr)
+        Self::signed(&*self.signer, self.context(state, time)?, &state.run.mmr)
     }
     fn stage(
         dir: &File,
@@ -920,7 +922,7 @@ impl Sink {
                         >= self.config.checkpoint_interval.as_nanos();
                 let mut checkpoint = None;
                 if due || signer_down {
-                    let mut mmr = current.mmr.clone();
+                    let mut mmr = current.run.mmr.clone();
                     mmr.push(record.hash())?;
                     let context = RecordContext::new(
                         self.trail,
@@ -979,7 +981,7 @@ impl Sink {
             bound,
             |dir| self.prepare(dir),
             |dir, file, state, bound_record| {
-                if state.head != expect {
+                if state.run.head != expect {
                     return Err(error(
                         AuditErrorKind::HeadMismatch,
                         "operator requires the exact disk head",
@@ -1046,7 +1048,7 @@ impl Sink {
         time: u64,
     ) -> Result<(), AuditError> {
         let closing = self.checkpoint_record(state, time)?;
-        let mut mmr = state.mmr.clone();
+        let mut mmr = state.run.mmr.clone();
         mmr.push(closing.hash())?;
         let opening = Self::signed(
             &*self.signer,
