@@ -2206,6 +2206,42 @@ mod details {
             1,
         );
     }
+    #[test]
+    fn pin_sc_opening_duplicates_predecessor_non_checkpoint() {
+        // State cached after `[cp0, e1]`; live file begins with `[e1]`,
+        // whose head equals the predecessor's. The order of the two
+        // first-record guards on scan_inner's live path matters here:
+        // the head-equality check must fire before the non-checkpoint
+        // check, so a mutant that swaps them trips this pin.
+        let f = cp0();
+        let e1 = entry(&f);
+        let (d, s) = state_from(&concat(&[&f, &e1], &[]));
+        w(&d, &line(&e1));
+        assert_corrupt(
+            scc(&o(&d), Some(s), true),
+            "opening checkpoint duplicates predecessor",
+            0,
+        );
+    }
+    #[test]
+    fn pin_sc_missing_head_opening_false_empty() {
+        // scan(opening=false, state=None) on an empty file: the loop
+        // never runs, `first` stays false, so the "empty live file"
+        // guard is skipped and the post-loop `state.ok_or_else` fires.
+        let d = Temp::new();
+        w(&d, b"");
+        assert_corrupt(scc(&o(&d), None, false), "missing head", 2);
+    }
+    #[test]
+    fn pin_sc_missing_head_opening_false_fragment_only() {
+        // scan(opening=false, state=None) on a fragment-only file: the
+        // fragment arm consumes the line because `first` is already
+        // false, the loop then ends with no apply, and the post-loop
+        // `state.ok_or_else` fires with "missing head".
+        let d = Temp::new();
+        w(&d, b"{\"torn\":");
+        assert_corrupt(scc(&o(&d), None, false), "missing head", 2);
+    }
 
     // ---- Pins: apply_checked via scan direct calls ----------------------
 
@@ -2425,11 +2461,6 @@ mod details {
             "history_segment: apply_checked Ok leaves state=Some",
         ),
         ("missing head", 1, "scan_inner: apply Ok leaves state=Some"),
-        (
-            "missing head",
-            2,
-            "scan_inner: !first implies at least one apply ran",
-        ),
         (
             "invalid opening peaks",
             0,
