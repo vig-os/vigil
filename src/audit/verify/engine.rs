@@ -256,69 +256,51 @@ pub(super) fn parse_resume(details: Option<&str>) -> Option<(u64, &str, u64)> {
     Some((head_seq, hash_text, lost))
 }
 
-/// Emits one `Resumed` warning per distinct `(seq, hash)` of a `vigil.audit.resume`
-/// record on this trail, attributed to the native copy when present (addendum 8).
-fn resume_findings(collection: &Collection, trail: [u8; 16], findings: &mut Vec<Finding>) {
-    let mut seen = BTreeSet::new();
-    let is_resume = |r: &Summary| {
-        r.trail == trail
-            && r.operator
-                .as_ref()
-                .is_some_and(|(action, ..)| action == "vigil.audit.resume")
-    };
-    let mut emit = |path: &Path, r: &Summary| {
-        if !seen.insert((r.seq, r.hash)) {
-            return;
-        }
-        let (actor, reason, details) = r
+/// Builds `Resumed` findings from the shared per-declaration outcomes
+/// (ruling 13-V3-d5 point 10, #195): one warning per distinct
+/// `(resume_seq, resume_hash)` on this trail, attributed to the native
+/// copy when present (addendum 8). Reads the outcome in place; the
+/// candidate list is derived from the same declarations.
+fn emit_resumed(declarations: &[resume::Declaration<'_>], findings: &mut Vec<Finding>) {
+    for d in declarations {
+        let (actor, reason) = d
+            .resume
             .operator
             .as_ref()
-            .map(|(_, actor, reason, details)| {
-                (actor.as_str(), reason.as_deref(), details.as_deref())
-            })
+            .map(|(_, actor, reason, _)| (actor.as_str(), reason.as_deref()))
             .expect("resume operator");
-        let detail = match parse_resume(details) {
-            Some((head_seq, head_hash, lost)) => {
+        let detail = match &d.body {
+            resume::DeclarationBody::Parsed(p) => {
                 let reason = reason.unwrap_or("");
-                let head_hash_bytes = resume::hex_to_bytes(head_hash);
-                let is_genesis_head = head_seq == 0 && head_hash_bytes == Record::genesis(&trail);
                 // Genesis gap text is `0..=L` (ADR l.407, l.411; d5 point 3).
-                let gap = if is_genesis_head {
-                    format!("0..={lost}")
-                } else if lost == head_seq {
+                let gap = if p.is_genesis {
+                    format!("0..={}", p.lost_through)
+                } else if p.lost_through == p.head_seq {
                     "none".to_owned()
                 } else {
-                    format!("{}..={lost}", head_seq + 1)
+                    format!("{}..={}", p.head_seq + 1, p.lost_through)
                 };
-                let suffix = match resume::structural_check(
-                    collection,
-                    trail,
-                    r,
-                    head_seq,
-                    head_hash_bytes,
-                    lost,
-                    is_genesis_head,
-                ) {
+                let suffix = match &p.outcome {
                     resume::Outcome::Valid(_) => " structural=valid".to_owned(),
                     resume::Outcome::Invalid(why) => format!(" structural=invalid({why})"),
                 };
+                let head_seq = p.head_seq;
+                let head_hash = p.head_hash_text;
                 format!(
-                    "operator={actor} reason={reason} head={head_seq}:{head_hash} gap={gap} lost_records=0{suffix}"
+                    "operator={actor} reason={reason} \
+                     head={head_seq}:{head_hash} \
+                     gap={gap} lost_records=0{suffix}"
                 )
             }
-            None => "malformed declaration".to_owned(),
+            resume::DeclarationBody::Malformed => "malformed declaration".to_owned(),
         };
-        findings.push(finding(K::Resumed, path, Some(r.line), Some(r.seq), detail));
-    };
-    for input in collection.inputs.iter().filter(|i| i.native) {
-        for r in input.data.records.iter().filter(|r| is_resume(r)) {
-            emit(&input.path, r);
-        }
-    }
-    for input in collection.inputs.iter().filter(|i| !i.native) {
-        for r in input.data.records.iter().filter(|r| is_resume(r)) {
-            emit(&input.path, r);
-        }
+        findings.push(finding(
+            K::Resumed,
+            d.path,
+            Some(d.resume.line),
+            Some(d.resume.seq),
+            detail,
+        ));
     }
 }
 
@@ -469,10 +451,14 @@ pub(super) fn check(collection: Collection, trail: [u8; 16]) -> Report {
         }
         previous = Some((seq, candidates));
     }
-    resume_findings(&collection, trail, &mut findings);
+    // Compute the per-declaration structural outcome once (ruling
+    // 13-V3-d5 point 10, #195): both the `Resumed` detail suffix and the
+    // candidate list derive from the same declarations.
+    let declarations = resume::declarations(&collection, trail);
+    emit_resumed(&declarations, &mut findings);
     // Validated structural-resume tuples (ruling 13-V3-d5 points 1, 5, 10);
     // consumed by #13 V4 (rule 2 fold), V6 (start) and V7 (confirmation).
-    let _pending_resumes = resume::collect_candidates(&collection, trail);
+    let _pending_resumes = resume::candidates(&declarations);
     let first_seq = groups.first_key_value().map(|(&s, _)| s);
     let last_seq = groups.last_key_value().map(|(&s, _)| s);
     if let (Some(first), Some(last)) = (first_seq, last_seq) {
@@ -481,7 +467,10 @@ pub(super) fn check(collection: Collection, trail: [u8; 16]) -> Report {
             None,
             None,
             None,
-            format!("records seq {first}..={last}, no trusted coverage yet (signatures are checked in #13 V5)"),
+            format!(
+                "records seq {first}..={last}, no trusted coverage yet \
+                 (signatures are checked in #13 V5)"
+            ),
         ));
     }
     findings.sort_by_key(|f| {

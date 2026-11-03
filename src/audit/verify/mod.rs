@@ -246,7 +246,8 @@ mod mod_tests;
 /// (ADR l.407), never `none`. An archived head is indistinguishable from
 /// a deleted one and resolves to `head-not-present`; a start checkpoint
 /// covering an archived head is V6's. V4–V8/R10 supply folds, signatures,
-/// coverage, anchors, receipts, review and archive rules. Native gaps are reported, never excused, until
+/// coverage, anchors, receipts, review and archive rules. Native gaps are
+/// reported, never excused, until
 /// V5 supplies trusted coverage: a matching `audit.repaired` is a
 /// `TornWrite`, a missing or different one is `RepairMismatch`, and a
 /// trailing gap is `TornWrite` with the bytes-to-EOF digest. V5 then promotes
