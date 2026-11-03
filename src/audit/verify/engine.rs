@@ -168,9 +168,15 @@ fn file_findings(input: &Input, no_crash: bool, findings: &mut Vec<Finding>) {
     }
 }
 
-/// True when `input` has a trailing fragment gap and the next native input in
-/// `collection.inputs` starts with an opening checkpoint at `closing_seq + 1`
-/// whose second complete record is not `vigil.audit.resume` (ADR l.446-451).
+/// True when `input` has a trailing fragment gap after a closing checkpoint,
+/// and the next native input in `collection.inputs` starts with an opening
+/// checkpoint linked to that closing (ADR l.446-451, ruling 13-V3-d4): all of
+///   - the archive's last complete record is a closing checkpoint;
+///   - the successor's first complete record is an opening checkpoint;
+///   - that opening links back to the closing (`previous == closing.hash`);
+///   - its `seq` is `closing.seq + 1`;
+///   - the opening is not followed by a `vigil.audit.resume` record;
+///   - the archive ends with a trailing fragment gap.
 fn mark_no_crash(collection: &Collection, idx: usize) -> bool {
     let input = &collection.inputs[idx];
     if !input.native {
@@ -179,6 +185,10 @@ fn mark_no_crash(collection: &Collection, idx: usize) -> bool {
     let Some(closing) = input.data.records.last() else {
         return false;
     };
+    // The archive's last complete record must itself be a closing checkpoint.
+    if closing.checkpoint.is_none() {
+        return false;
+    }
     let Some(last) = input.data.items.last() else {
         return false;
     };
@@ -199,7 +209,10 @@ fn mark_no_crash(collection: &Collection, idx: usize) -> bool {
         return false;
     };
     let opening = &next.data.records[range.start];
-    if opening.checkpoint.is_none() || closing.seq.checked_add(1) != Some(opening.seq) {
+    if opening.checkpoint.is_none()
+        || closing.seq.checked_add(1) != Some(opening.seq)
+        || opening.previous != closing.hash
+    {
         return false;
     }
     // Successor's second complete record must not be a resume entry.

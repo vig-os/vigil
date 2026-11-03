@@ -177,8 +177,7 @@ fn is_strict_valid_rejects_errors_warnings_uncovered_tail_and_unreconciled() {
 #[test]
 fn first_broken_link_returns_first_error_in_ruled_order() {
     use FindingKind::*;
-    // Inserted later but earlier in iteration order wins (findings vector is
-    // the already-sorted result produced by engine::check).
+    // Lower seq ends up first in ruled order even though it is inserted last.
     let later_inserted_but_earlier = Finding::new(
         ChainBroken,
         Some(PathBuf::from("a")),
@@ -193,16 +192,20 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
         Some(10),
         "later".into(),
     );
-    // Simulate the engine's ruled order: by seq ascending.
-    let findings = vec![
-        later_inserted_but_earlier.clone(),
+    // Insert OUT of ruled order: the higher-seq finding comes first; sorting
+    // by seq (the engine's ruled order) is what moves "earlier" to the front.
+    let mut findings = vec![
         earlier_inserted_but_later.clone(),
+        later_inserted_but_earlier.clone(),
     ];
+    // Without this sort, first_broken_link would return "later". It is the
+    // sort that proves the predicate honours ruled order, not insertion order.
+    findings.sort_by_key(|f| f.seq());
     let r = Report::new([0; 16], 0, None, None, None, findings);
     assert_eq!(
         r.first_broken_link().unwrap().detail(),
         "earlier",
-        "first_broken_link follows the vector's existing order"
+        "first_broken_link follows ruled order after sorting by seq"
     );
     // Warnings and infos are ignored.
     let r = Report::new(

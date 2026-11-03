@@ -519,6 +519,7 @@ fn no_crash_mark_appends_when_successor_opens_without_resume() {
     use ctx::*;
     // Current file: closing checkpoint seq=5, then a trailing fragment.
     let closing = checkpoint(5, 7, [6; 32]);
+    let closing_hash = closing.hash;
     let current = Input {
         path: "audit-0.jsonl".into(),
         native: true,
@@ -528,8 +529,9 @@ fn no_crash_mark_appends_when_successor_opens_without_resume() {
             spans: vec![span(4, [1; 32])],
         }),
     };
-    // Successor native starts with opening checkpoint seq=6, no resume at second position.
-    let opening = checkpoint(6, 8, [7; 32]);
+    // Successor native starts with an opening checkpoint seq=6 whose `previous`
+    // is the real closing hash, no resume at second position.
+    let opening = checkpoint(6, 8, closing_hash);
     let next_record = record(7, 9, opening.hash, 7);
     let successor = Input {
         path: "audit.jsonl".into(),
@@ -550,6 +552,167 @@ fn no_crash_mark_appends_when_successor_opens_without_resume() {
     let tw = kinds(&report, K::TornWrite);
     assert_eq!(tw.len(), 1, "{:?}", report.findings());
     assert!(tw[0].detail().contains("; no crash outcome"));
+}
+
+#[test]
+fn no_crash_mark_absent_when_archive_last_record_is_not_a_checkpoint() {
+    use ctx::*;
+    // The archive's last complete record is a plain record (not a closing
+    // checkpoint); the trailing fragment remains, but ADR condition 1 fails.
+    let last = record(5, 7, [6; 32], 5);
+    let last_hash = last.hash;
+    let current = Input {
+        path: "audit-0.jsonl".into(),
+        native: true,
+        data: Rc::new(Data {
+            records: vec![last],
+            items: vec![item_records(0..1, 1), fragment(2)],
+            spans: vec![span(4, [1; 32])],
+        }),
+    };
+    let opening = checkpoint(6, 8, last_hash);
+    let successor = Input {
+        path: "audit.jsonl".into(),
+        native: true,
+        data: Rc::new(Data {
+            records: vec![opening],
+            items: vec![item_records(0..1, 1)],
+            spans: vec![],
+        }),
+    };
+    let report = check(
+        Collection {
+            inputs: vec![current, successor],
+            shipped: vec![],
+        },
+        TRAIL,
+    );
+    let tw: Vec<_> = kinds(&report, K::TornWrite)
+        .into_iter()
+        .filter(|f| f.file() == Some(Path::new("audit-0.jsonl")))
+        .collect();
+    assert_eq!(tw.len(), 1, "{:?}", report.findings());
+    assert!(!tw[0].detail().contains("no crash outcome"));
+}
+
+#[test]
+fn no_crash_mark_absent_when_opening_does_not_link_to_closing() {
+    use ctx::*;
+    // Opening's `previous` differs from the closing's hash: ADR link fails.
+    let closing = checkpoint(5, 7, [6; 32]);
+    let current = Input {
+        path: "audit-0.jsonl".into(),
+        native: true,
+        data: Rc::new(Data {
+            records: vec![closing],
+            items: vec![item_records(0..1, 1), fragment(2)],
+            spans: vec![span(4, [1; 32])],
+        }),
+    };
+    // `[9; 32]` is not the closing's hash (`[7; 32]`).
+    let opening = checkpoint(6, 8, [9; 32]);
+    let successor = Input {
+        path: "audit.jsonl".into(),
+        native: true,
+        data: Rc::new(Data {
+            records: vec![opening],
+            items: vec![item_records(0..1, 1)],
+            spans: vec![],
+        }),
+    };
+    let report = check(
+        Collection {
+            inputs: vec![current, successor],
+            shipped: vec![],
+        },
+        TRAIL,
+    );
+    let tw: Vec<_> = kinds(&report, K::TornWrite)
+        .into_iter()
+        .filter(|f| f.file() == Some(Path::new("audit-0.jsonl")))
+        .collect();
+    assert_eq!(tw.len(), 1, "{:?}", report.findings());
+    assert!(!tw[0].detail().contains("no crash outcome"));
+}
+
+#[test]
+fn no_crash_mark_absent_when_opening_seq_is_not_closing_plus_one() {
+    use ctx::*;
+    let closing = checkpoint(5, 7, [6; 32]);
+    let closing_hash = closing.hash;
+    let current = Input {
+        path: "audit-0.jsonl".into(),
+        native: true,
+        data: Rc::new(Data {
+            records: vec![closing],
+            items: vec![item_records(0..1, 1), fragment(2)],
+            spans: vec![span(4, [1; 32])],
+        }),
+    };
+    // Opening seq is 7, not closing.seq + 1 == 6.
+    let opening = checkpoint(7, 8, closing_hash);
+    let successor = Input {
+        path: "audit.jsonl".into(),
+        native: true,
+        data: Rc::new(Data {
+            records: vec![opening],
+            items: vec![item_records(0..1, 1)],
+            spans: vec![],
+        }),
+    };
+    let report = check(
+        Collection {
+            inputs: vec![current, successor],
+            shipped: vec![],
+        },
+        TRAIL,
+    );
+    let tw: Vec<_> = kinds(&report, K::TornWrite)
+        .into_iter()
+        .filter(|f| f.file() == Some(Path::new("audit-0.jsonl")))
+        .collect();
+    assert_eq!(tw.len(), 1, "{:?}", report.findings());
+    assert!(!tw[0].detail().contains("no crash outcome"));
+}
+
+#[test]
+fn no_crash_mark_absent_when_successor_first_record_is_not_a_checkpoint() {
+    use ctx::*;
+    let closing = checkpoint(5, 7, [6; 32]);
+    let closing_hash = closing.hash;
+    let current = Input {
+        path: "audit-0.jsonl".into(),
+        native: true,
+        data: Rc::new(Data {
+            records: vec![closing],
+            items: vec![item_records(0..1, 1), fragment(2)],
+            spans: vec![span(4, [1; 32])],
+        }),
+    };
+    // First complete record of the successor is a plain record, not a checkpoint.
+    let opening = record(6, 8, closing_hash, 6);
+    let successor = Input {
+        path: "audit.jsonl".into(),
+        native: true,
+        data: Rc::new(Data {
+            records: vec![opening],
+            items: vec![item_records(0..1, 1)],
+            spans: vec![],
+        }),
+    };
+    let report = check(
+        Collection {
+            inputs: vec![current, successor],
+            shipped: vec![],
+        },
+        TRAIL,
+    );
+    let tw: Vec<_> = kinds(&report, K::TornWrite)
+        .into_iter()
+        .filter(|f| f.file() == Some(Path::new("audit-0.jsonl")))
+        .collect();
+    assert_eq!(tw.len(), 1, "{:?}", report.findings());
+    assert!(!tw[0].detail().contains("no crash outcome"));
 }
 
 #[test]
@@ -657,9 +820,12 @@ fn no_crash_mark_absent_when_successor_starts_with_fragment() {
 }
 
 #[test]
-fn two_record_native_line_is_accepted_without_segment_structure() {
+fn two_record_native_line_is_accepted_without_any_finding_on_that_line() {
     use ctx::*;
     // Native file whose first "line" (items[0]) carries two valid records.
+    // ADR §3 (ruling 13-V3-d4 point 4): the verifier accepts such a line and
+    // raises *no* finding attributed to it. Both records still count in
+    // records().
     let g = GENESIS();
     let first = checkpoint(0, 1, g);
     let second = record(1, 2, first.hash, 1);
@@ -675,4 +841,85 @@ fn two_record_native_line_is_accepted_without_segment_structure() {
     );
     assert_eq!(report.records(), 2);
     assert!(kinds(&report, K::SegmentStructure).is_empty());
+    // Not a single finding is attributed to the native batch line.
+    for f in report.findings() {
+        assert_ne!(
+            f.line(),
+            Some(1),
+            "no finding may attach to the batch line: {f:?}",
+        );
+    }
+}
+
+#[test]
+fn two_record_native_line_with_repaired_on_second_record_is_silent() {
+    use ctx::*;
+    // Native two-record line where the SECOND record carries `audit.repaired`.
+    // Ruling 13-V3-d4 point 4: `audit.repaired` is read only from the first
+    // record of the line, so a later record's `repaired` is deliberately
+    // ignored. No TornWriteRepaired / RepairMismatch is raised for it, and no
+    // finding at all is attributed to that line.
+    let g = GENESIS();
+    let first = checkpoint(0, 1, g);
+    let mut second = record(1, 2, first.hash, 1);
+    second.repaired = Some([0xab; 32]);
+    let records = vec![first, second];
+    let items = vec![item_records(0..2, 1)];
+    let input = native_input("audit.jsonl", records, items, vec![]);
+    let report = check(
+        Collection {
+            inputs: vec![input],
+            shipped: vec![],
+        },
+        TRAIL,
+    );
+    assert_eq!(report.records(), 2);
+    assert!(kinds(&report, K::TornWriteRepaired).is_empty());
+    assert!(kinds(&report, K::RepairMismatch).is_empty());
+    assert!(kinds(&report, K::TornWrite).is_empty());
+    for f in report.findings() {
+        assert_ne!(
+            f.line(),
+            Some(1),
+            "no finding may attach to the batch line: {f:?}",
+        );
+    }
+}
+
+#[test]
+fn foreign_trail_resume_is_trail_mismatch_without_resumed() {
+    use ctx::*;
+    // A `vigil.audit.resume` record whose trail is NOT the selected one must
+    // produce TrailMismatch and no Resumed warning (ruling 13-V3-d4 add. 8).
+    // This kills the mutant "Resumed without the trail filter".
+    let g = GENESIS();
+    let open = checkpoint(0, 1, g);
+    let resume_text = format!(
+        "head=0:{} lost_through=0 file=sealed.jsonl",
+        digest_string(&g)
+    );
+    let mut foreign_resume = resume_record(1, 2, open.hash, &resume_text);
+    foreign_resume.trail = [2; 16]; // not TRAIL
+    let input = Input {
+        path: "audit.jsonl".into(),
+        native: true,
+        data: Rc::new(Data {
+            records: vec![open, foreign_resume],
+            items: vec![],
+            spans: vec![],
+        }),
+    };
+    let report = check(
+        Collection {
+            inputs: vec![input],
+            shipped: vec![],
+        },
+        TRAIL,
+    );
+    assert_eq!(kinds(&report, K::TrailMismatch).len(), 1);
+    assert!(
+        kinds(&report, K::Resumed).is_empty(),
+        "{:?}",
+        report.findings()
+    );
 }
