@@ -15,6 +15,7 @@
 use super::{
     Finding, Report,
     input::{Collection, Input, LineContent, Summary},
+    resume,
 };
 use crate::audit::{FindingKind as K, Record, digest_string, hex};
 use std::{
@@ -226,7 +227,7 @@ fn mark_no_crash(collection: &Collection, idx: usize) -> bool {
 
 /// Validates a resume `audit.details` block per ruling 13-V3-d4 addendum 9.
 /// Returns `Some((head_seq, head_hash_text, lost_through))` when canonical.
-fn parse_resume(details: Option<&str>) -> Option<(u64, &str, u64)> {
+pub(super) fn parse_resume(details: Option<&str>) -> Option<(u64, &str, u64)> {
     let details = details?;
     // Mirrors `storage::resume_details`; ruling 9 keeps the exact split points.
     let (named, file) = details.split_once(" file=")?;
@@ -279,13 +280,30 @@ fn resume_findings(collection: &Collection, trail: [u8; 16], findings: &mut Vec<
         let detail = match parse_resume(details) {
             Some((head_seq, head_hash, lost)) => {
                 let reason = reason.unwrap_or("");
-                let gap = if lost == head_seq {
+                let head_hash_bytes = resume::hex_to_bytes(head_hash);
+                let is_genesis_head = head_seq == 0 && head_hash_bytes == Record::genesis(&trail);
+                // Genesis gap text is `0..=L` (ADR l.407, l.411; d5 point 3).
+                let gap = if is_genesis_head {
+                    format!("0..={lost}")
+                } else if lost == head_seq {
                     "none".to_owned()
                 } else {
                     format!("{}..={lost}", head_seq + 1)
                 };
+                let suffix = match resume::structural_check(
+                    collection,
+                    trail,
+                    r,
+                    head_seq,
+                    head_hash_bytes,
+                    lost,
+                    is_genesis_head,
+                ) {
+                    resume::Outcome::Valid(_) => " structural=valid".to_owned(),
+                    resume::Outcome::Invalid(why) => format!(" structural=invalid({why})"),
+                };
                 format!(
-                    "operator={actor} reason={reason} head={head_seq}:{head_hash} gap={gap} lost_records=0"
+                    "operator={actor} reason={reason} head={head_seq}:{head_hash} gap={gap} lost_records=0{suffix}"
                 )
             }
             None => "malformed declaration".to_owned(),
@@ -452,6 +470,9 @@ pub(super) fn check(collection: Collection, trail: [u8; 16]) -> Report {
         previous = Some((seq, candidates));
     }
     resume_findings(&collection, trail, &mut findings);
+    // Validated structural-resume tuples (ruling 13-V3-d5 points 1, 5, 10);
+    // consumed by #13 V4 (rule 2 fold), V6 (start) and V7 (confirmation).
+    let _pending_resumes = resume::collect_candidates(&collection, trail);
     let first_seq = groups.first_key_value().map(|(&s, _)| s);
     let last_seq = groups.last_key_value().map(|(&s, _)| s);
     if let (Some(first), Some(last)) = (first_seq, last_seq) {
