@@ -2028,11 +2028,15 @@ mod details {
     }
     #[test]
     fn pin_hs_attestation_consumes_gap() {
-        // R2a brief: on `[cp0, e1, fragment, e2(attested)]` the reader's
-        // strict pass through `scan_inner` reaches the attested second
-        // record, so `history_segment` returns a state with no pending
-        // gap. A mutant that replaces `gap.take()` with `gap.as_ref().
-        // ..clone()` keeps the gap in the returned state.
+        // R2a brief: on `[cp0, e1, fragment, e2(attested)]`,
+        // `history_segment`'s outer call to `scan_inner` succeeds and
+        // never enters the fallback body, so this pin reaches only
+        // `scan_inner`'s `gap.take()`. A mutant that replaces that
+        // `gap.take()` with `gap.as_ref().cloned()` keeps the gap in
+        // the returned state. The fallback body's own `gap.take()`
+        // sites are pinned separately
+        // (`pin_hs_fallback_duplicate_branch_consumes_gap` and
+        // `pin_hs_fallback_general_branch_consumes_gap`).
         let f = cp0();
         let e1 = entry(&f);
         let fragment = b"{\"torn\":\n";
@@ -2052,13 +2056,13 @@ mod details {
         let state = hsc(&o(&d), None, true, false).unwrap().unwrap();
         assert!(
             state.gap.is_none(),
-            "attestation must consume the gap on history_segment's strict path",
+            "attestation must consume the gap on scan_inner's take site",
         );
     }
     #[test]
     fn pin_hs_fallback_duplicate_branch_consumes_gap() {
         // R2a brief: on the fallback body's duplicate branch, a mutant
-        // that replaces `gap.take()` with `gap.as_ref()..clone()` leaves
+        // that replaces `gap.take()` with `gap.as_ref().cloned()` leaves
         // the fragment digest in `gap` across the `continue`. A later
         // non-duplicate record whose `repaired` is `None` then trips
         // the general-branch attestation, swapping the observable
@@ -2099,6 +2103,50 @@ mod details {
             hsc(&o(&d), Some(s), true, true),
             "first successor lacks resume",
             0,
+        );
+    }
+    #[test]
+    fn pin_hs_fallback_general_branch_consumes_gap() {
+        // R2a brief: on `[cp0, e1, fragment, e2(attested), e3, "not
+        // json\n"]` the trailing unparsable line fails the strict
+        // `scan_inner`, so `history_segment`'s fallback body runs.
+        // There the mid-segment general branch's `gap.take()`
+        // consumes the fragment digest when e2 attests it; e3's
+        // subsequent (unattested) attestation check then finds `gap`
+        // empty and passes. A mutant that replaces that `gap.take()`
+        // with `gap.as_ref().cloned()` leaves the digest in `gap`
+        // across e2, so e3's attestation call fires `missing or
+        // mismatched repair attestation` instead. On head the call
+        // returns `Ok` with no pending gap in the returned state.
+        let f = cp0();
+        let e1 = entry(&f);
+        let fragment = b"{\"torn\":\n";
+        let mut digest = blake3::Hasher::new();
+        digest.update(b"vigil.audit.v1.repaired\0");
+        digest.update(fragment);
+        let e2 = Record::new(
+            context(2, e1.hash()).repaired(*digest.finalize().as_bytes()),
+            Entry::new("a", "b", "c"),
+        )
+        .unwrap();
+        let e3 = entry(&e2);
+        let d = Temp::new();
+        w(
+            &d,
+            &[
+                line(&f),
+                line(&e1),
+                fragment.to_vec(),
+                line(&e2),
+                line(&e3),
+                b"not json\n".to_vec(),
+            ]
+            .concat(),
+        );
+        let state = hsc(&o(&d), None, true, false).unwrap().unwrap();
+        assert!(
+            state.gap.is_none(),
+            "attestation must consume the gap on history_segment's fallback general branch",
         );
     }
     #[test]
@@ -2285,7 +2333,7 @@ mod details {
     fn pin_sc_attestation_consumes_gap() {
         // R2a brief: on `[cp0, e1, fragment, e2(attested)]` the strict
         // scan reaches the attested successor and takes the gap. A
-        // mutant that replaces `gap.take()` with `gap.as_ref()..clone()`
+        // mutant that replaces `gap.take()` with `gap.as_ref().cloned()`
         // leaves the fragment digest in the returned state.
         let f = cp0();
         let e1 = entry(&f);
