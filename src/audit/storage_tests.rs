@@ -1981,13 +1981,18 @@ mod details {
     }
     #[test]
     fn pin_hs_fallback_duplicate_leaves_offset_at_first_copy() {
-        // 197-d1 addendum 12: a complete identical duplicate takes
-        // `history_segment`'s duplicate branch and `continue`s without
-        // updating `s.offset`/`s.newline`. A trailing `not json` line
-        // trips strict `scan_inner` so the fallback body runs. After
-        // the duplicate, `s.offset` stays at the end of the first copy;
-        // a mutant that sets `s.offset`/`s.newline` before the duplicate
-        // `continue` would push it past the second copy.
+        // R2a brief's binding amendments (new pin and mutant: the
+        // identical-duplicate state quirk): a complete identical
+        // duplicate takes `history_segment`'s duplicate branch and
+        // `continue`s without updating `s.offset`/`s.newline`. A
+        // trailing `not json` line trips strict `scan_inner` so the
+        // fallback body runs. After the duplicate, `s.offset` stays at
+        // the end of the first copy; a mutant that sets `s.offset`
+        // before the duplicate `continue` would push it past the second
+        // copy. The newline half of the quirk is not observable here:
+        // the trailing `not json\n` line hits the fragment/invalid
+        // branch, which unconditionally overwrites `s.newline` with its
+        // own trailing-newline flag.
         let d = Temp::new();
         let f = cp0();
         let first = line(&f);
@@ -2018,6 +2023,81 @@ mod details {
         assert_corrupt(
             hsc(&o(&d), Some(s), true, true),
             "missing or mismatched repair attestation",
+            0,
+        );
+    }
+    #[test]
+    fn pin_hs_attestation_consumes_gap() {
+        // R2a brief: on `[cp0, e1, fragment, e2(attested)]` the reader's
+        // strict pass through `scan_inner` reaches the attested second
+        // record, so `history_segment` returns a state with no pending
+        // gap. A mutant that replaces `gap.take()` with `gap.as_ref().
+        // ..clone()` keeps the gap in the returned state.
+        let f = cp0();
+        let e1 = entry(&f);
+        let fragment = b"{\"torn\":\n";
+        let mut digest = blake3::Hasher::new();
+        digest.update(b"vigil.audit.v1.repaired\0");
+        digest.update(fragment);
+        let e2 = Record::new(
+            context(2, e1.hash()).repaired(*digest.finalize().as_bytes()),
+            Entry::new("a", "b", "c"),
+        )
+        .unwrap();
+        let d = Temp::new();
+        w(
+            &d,
+            &[line(&f), line(&e1), fragment.to_vec(), line(&e2)].concat(),
+        );
+        let state = hsc(&o(&d), None, true, false).unwrap().unwrap();
+        assert!(
+            state.gap.is_none(),
+            "attestation must consume the gap on history_segment's strict path",
+        );
+    }
+    #[test]
+    fn pin_hs_fallback_duplicate_branch_consumes_gap() {
+        // R2a brief: on the fallback body's duplicate branch, a mutant
+        // that replaces `gap.take()` with `gap.as_ref()..clone()` leaves
+        // the fragment digest in `gap` across the `continue`. A later
+        // non-duplicate record whose `repaired` is `None` then trips
+        // the general-branch attestation, swapping the observable
+        // `first successor lacks resume` detail for `missing or
+        // mismatched repair attestation`. The duplicate carries the
+        // attestation itself (same record hash, same `repaired`), so
+        // the duplicate-branch attestation currently passes.
+        let (_pre, s, first) = state_at_cp0();
+        let fragment = b"{\"torn\":\n";
+        let mut digest = blake3::Hasher::new();
+        digest.update(b"vigil.audit.v1.repaired\0");
+        digest.update(fragment);
+        let digest = *digest.finalize().as_bytes();
+        let mmr = seeded(&first);
+        let cp1 = Record::checkpoint(
+            context(1, first.hash()).repaired(digest),
+            CheckpointFields::new(
+                mmr.size(),
+                mmr.root(),
+                mmr.peaks().to_vec(),
+                [1; 32],
+                [0; 64],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let successor = Record::new(
+            context(2, cp1.hash()),
+            Entry::new("actor", "change", "object"),
+        )
+        .unwrap();
+        let d = Temp::new();
+        w(
+            &d,
+            &[line(&cp1), fragment.to_vec(), line(&cp1), line(&successor)].concat(),
+        );
+        assert_corrupt(
+            hsc(&o(&d), Some(s), true, true),
+            "first successor lacks resume",
             0,
         );
     }
@@ -2200,6 +2280,34 @@ mod details {
         let d = Temp::new();
         w(&d, &line(&entry(&cp0())));
         assert_corrupt(scc(&o(&d), None, true), "missing opening checkpoint", 0);
+    }
+    #[test]
+    fn pin_sc_attestation_consumes_gap() {
+        // R2a brief: on `[cp0, e1, fragment, e2(attested)]` the strict
+        // scan reaches the attested successor and takes the gap. A
+        // mutant that replaces `gap.take()` with `gap.as_ref()..clone()`
+        // leaves the fragment digest in the returned state.
+        let f = cp0();
+        let e1 = entry(&f);
+        let fragment = b"{\"torn\":\n";
+        let mut digest = blake3::Hasher::new();
+        digest.update(b"vigil.audit.v1.repaired\0");
+        digest.update(fragment);
+        let e2 = Record::new(
+            context(2, e1.hash()).repaired(*digest.finalize().as_bytes()),
+            Entry::new("a", "b", "c"),
+        )
+        .unwrap();
+        let d = Temp::new();
+        w(
+            &d,
+            &[line(&f), line(&e1), fragment.to_vec(), line(&e2)].concat(),
+        );
+        let state = scc(&o(&d), None, true).unwrap();
+        assert!(
+            state.gap.is_none(),
+            "attestation must consume the gap on the strict scan path",
+        );
     }
     #[test]
     fn pin_sc_repair_attestation() {

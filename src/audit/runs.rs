@@ -56,16 +56,9 @@ pub(crate) struct RunState {
 /// (B3d1-d1/d4); `genesis` forces the `(genesis || seq == 0) && !root_link`
 /// path (staging settlement and the amendment-9 genesis closer).
 ///
-/// Together with [`check_attestation`], this reproduces the reader's first
-/// violation for a sealed-run fragment gap as the reader orders it today
-/// (197-d1 addendum 7): on `[cp0, e1, fragment, e2 prev != e1]`
-/// `check_attestation` fires `missing or mismatched repair attestation`
-/// first; on `[cp0, e1, fragment, e2 seq+2]` the reader-side seq-gap check
-/// in `storage::history_segment` fires `sequence gap inside sealed run
-/// segment` first. Until #197 R2b moves the segment-level run, boundary
-/// and base classification here, this pair is still not a complete
-/// first-violation oracle for a segment; nothing outside the reader may
-/// use it as one.
+/// The reader calls [`check_attestation`] and `apply_checked` at their
+/// pre-#197 R2a positions on each path; see the module caveat for why this
+/// pair is not a complete first-violation oracle until R2b.
 pub(crate) fn apply_checked(
     prior: Option<&RunState>,
     record: &Record,
