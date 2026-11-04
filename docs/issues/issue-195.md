@@ -1,19 +1,19 @@
 ---
 type: issue
-state: open
+state: closed
 created: 2026-11-03T02:50:59Z
-updated: 2026-11-03T02:50:59Z
+updated: 2026-11-03T13:22:17Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/195
-comments: 0
+comments: 1
 labels: bug, priority:medium, effort:small
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-03T09:06:05.140Z
+synced: 2026-11-04T08:43:06.212Z
 ---
 
 # [Issue 195]: [test(audit): V3b-2 follow-ups: k−1 boundary rows, single outcome computation, A13/A7w/A16 assertions](https://github.com/vig-os/vigil/issues/195)
@@ -35,4 +35,12 @@ Follow-up to #194 (#13 V3b-2), from the fresh review (verdict: nits). Behaviour 
    - ADR-0005 §19.9 says "§19.6 stays Proposed" twice in a row.
 
 Refs: #13
+
+---
+
+# [Comment #1]() by [gerchowl]()
+
+_Posted on November 3, 2026 at 01:22 PM_
+
+Fixed by #196 (merged to dev at 6f8b953), reviewed by fresh reviewers over three rounds.
 

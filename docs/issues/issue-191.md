@@ -1,19 +1,19 @@
 ---
 type: issue
-state: open
+state: closed
 created: 2026-11-02T22:45:43Z
-updated: 2026-11-03T03:03:39Z
+updated: 2026-11-03T13:22:09Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/191
-comments: 2
+comments: 3
 labels: bug, priority:medium, effort:small
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-03T09:06:05.948Z
+synced: 2026-11-04T08:43:07.598Z
 ---
 
 # [Issue 191]: [audit(verify): rule and pin decode-kind precedence for lines with several defects](https://github.com/vig-os/vigil/issues/191)
@@ -70,4 +70,12 @@ _Posted on November 3, 2026 at 03:03 AM_
 
    A v=2 line with an envelope defect therefore reports the envelope defect. This matches dev today (probed: v=2 + duplicate key → `InvalidField`, v=2 + `droppedAttributesCount=1` → `UnknownField`), so nothing is reordered. Add one test pinning a v=2 + envelope-defect pair.
 7. **`MissingField` carries no field name** (`AuditError` has none), so the trail-before-seq order can only be pinned by kind. The "missing trail + missing seq" test asserts `MissingField` and the `seq`, and claims nothing more. Adding a field name to findings is out of scope here.
+
+---
+
+# [Comment #3]() by [gerchowl]()
+
+_Posted on November 3, 2026 at 01:22 PM_
+
+Fixed by #196 (merged to dev at 6f8b953), reviewed by fresh reviewers over three rounds.
 

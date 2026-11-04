@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-09T13:22:04Z
-updated: 2026-11-03T04:22:39Z
+updated: 2026-11-03T10:18:00Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/13
-comments: 28
+comments: 29
 labels: feature, security, priority:medium, area:testing, effort:medium
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-03T09:06:16.545Z
+synced: 2026-11-04T08:43:08.630Z
 ---
 
 # [Issue 13]: [feat(audit): verify API/CLI and tamper tests](https://github.com/vig-os/vigil/issues/13)
@@ -678,5 +678,24 @@ The check of V4a brief (v3) probed 13 layouts with storage `open` and the brief'
    - Give every mutant a killer that has actually run. M8 (rule drift) is killed by the agreement table.
 4. **No field that nothing reads.** Cut `Run::first_loss_seq`; V4b adds what it needs. Remove the `expect`s on `run_digest`/`with_run_digest`.
 5. **Escalation.** This is the V4 brief's fourth revision. If the next check finds a blocker in the run rule, the architect escalates to the owner instead of revising again.
+
+
+---
+
+# [Comment #29]() by [gerchowl]()
+
+_Posted on November 3, 2026 at 10:18 AM_
+
+## Ruling 13-V4-d4 (owner decision, 2026-11-03): one shared run classifier
+
+Four V4a brief revisions restated the reader's run rule from the ADR prose, and each drifted from the reader. The last check found 11 layouts where storage `open` and the brief's verifier disagree: an archived base, the immediate-resume boundary after a run segment, a genesis closer after a fragment-only segment, and trails the reader rejects for other reasons. Following 13-V4-d3 point 5, this was escalated to the owner, who chose **one definition**.
+
+1. **A refactor PR comes first** (its own issue, before V4a). It moves the reader's run classification into one pure, crate-private module: the per-segment `run`, `unsealed` and boundary-resume logic, base selection, run closure (i)+(ii), and the in-run sequence and link rules that today live in `history_segment` and its callers in `src/audit/storage.rs`.
+   - **Pure:** no I/O, no locks, no writer state. It works on already-decoded segment summaries.
+   - **Complete:** it returns the per-segment classification **and every violation** it finds, as typed values (an enum, not strings).
+   - **The reader keeps its exact behaviour.** It maps the first violation, in its current order, to the same `CorruptTrail` it reports today, with the same detail text. All `audit::storage::tests` pass unchanged.
+2. **V4a then calls that module.** A run finding is emitted exactly for the runs the classifier accepts. The fold condition (iii) stays V4b's: V4b uses the same module, or the shared fold, for the MMR comparison. The agreement table (13-V4-d3 point 1) remains as a regression test.
+3. **The trap is narrowed.** The verifier still never calls `history_segment`, `scan_inner` or `apply_checked`. It may call the shared pure classifier.
+4. The open point from the last check (which rejected trails may show a run) is settled by the classifier's typed violations. V4a emits no run for a run the classifier rejects, except for a fold-only violation (iii), which is V4b's `MmrMismatch`.
 
 

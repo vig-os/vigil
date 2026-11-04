@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-10-09T14:07:47Z
-updated: 2026-11-02T05:22:26Z
+updated: 2026-11-04T02:45:24Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/vigil/issues/20
@@ -13,12 +13,18 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-11-02T13:59:42.688Z
+synced: 2026-11-04T08:43:08.080Z
 ---
 
 # [Issue 20]: [Dependency Dashboard](https://github.com/vig-os/vigil/issues/20)
 
 This issue lists Renovate updates and detected dependencies. Read the [Dependency Dashboard](https://docs.renovatebot.com/key-concepts/dashboard/) docs to learn more.<br>[View this repository on the Mend.io Web Portal](https://developer.mend.io/github/vig-os/vigil).
+
+## Rate-Limited
+
+The following updates are currently rate-limited. To force their creation now, click on a checkbox below.
+
+ - [ ] <!-- unlimit-branch=renovate/syn-3.x -->build(cargo): update rust crate syn to v3
 
 ## Open
 
@@ -41,7 +47,7 @@ The following updates have all been created. To force a retry/rebase of any, cli
 <details><summary>cargo (1)</summary>
 <blockquote>
 
-<details><summary>Cargo.toml (23)</summary>
+<details><summary>Cargo.toml (25)</summary>
 
  - `getrandom 0.3` → [Updates: `0.4`]
  - `base64 0.22` → [Updates: `0.23`]
@@ -66,6 +72,8 @@ The following updates have all been created. To force a retry/rebase of any, cli
  - `criterion 0.8.2`
  - `proptest 1` → [Updates: `1`]
  - `log 0.4` → [Updates: `0.4`]
+ - `syn 2` → [Updates: `3`]
+ - `proc-macro2 1`
 
 </details>
 

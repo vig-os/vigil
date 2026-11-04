@@ -1,19 +1,19 @@
 ---
 type: issue
-state: open
+state: closed
 created: 2026-11-03T00:52:23Z
-updated: 2026-11-03T00:52:23Z
+updated: 2026-11-03T13:22:12Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/193
-comments: 0
+comments: 1
 labels: bug, priority:medium, effort:small
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-03T09:06:05.523Z
+synced: 2026-11-04T08:43:06.997Z
 ---
 
 # [Issue 193]: [audit(verify): test the no-crash mark's native-successor condition and the engine's finding sort](https://github.com/vig-os/vigil/issues/193)
@@ -30,4 +30,12 @@ The fresh re-review of #192 (#13 V3b-1, round 2) found two test-coverage gaps. T
 - Prove each fix with a runtime mutant: exit 101, then revert, then exit 0.
 
 Refs: #13 (V3b-1 review nits). Lands before C1.
+
+---
+
+# [Comment #1]() by [gerchowl]()
+
+_Posted on November 3, 2026 at 01:22 PM_
+
+Fixed by #196 (merged to dev at 6f8b953), reviewed by fresh reviewers over three rounds.
 
