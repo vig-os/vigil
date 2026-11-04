@@ -17,7 +17,7 @@ fn child_role() {
     if let Some(operation) = role.strip_prefix("resume-race-") {
         let dir = File::open(&path).unwrap();
         let trail = marker(&dir).unwrap();
-        let h = predecessor_run(&dir, trail).unwrap().0.unwrap().head;
+        let h = predecessor_run(&dir, trail).unwrap().0.unwrap().run.head;
         let key = super::operators::SignOnly::new("22", false);
         let contender = operation == "contender";
         let once = std::cell::Cell::new(false);
@@ -88,7 +88,9 @@ fn child_role() {
         let dir = File::open(&path).unwrap();
         let trail = marker(&dir).unwrap();
         let prior = predecessor_run(&dir, trail).unwrap().0;
-        let head = prior.map_or((0, Record::genesis(&trail)), |s| (s.head.seq, s.head.hash));
+        let head = prior.map_or((0, Record::genesis(&trail)), |s| {
+            (s.run.head.seq, s.run.head.hash)
+        });
         install_park(std::env::var("VIGIL_CRASH_SITE").unwrap());
         let _result = AuditConfig::new("vigil")
             .dir(&path)

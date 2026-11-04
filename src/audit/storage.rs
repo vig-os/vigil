@@ -10,8 +10,9 @@
 use super::{
     AuditError, AuditErrorKind, Record,
     format::{Kind, validation::MAX_PAYLOAD_BYTES},
+    runs::{self, RunState},
 };
-use crate::{audit::Mmr, rotate::Directory};
+use crate::rotate::Directory;
 use rustix::fs::{self as rfs, Mode, OFlags};
 use std::{
     fs::File,
@@ -27,7 +28,7 @@ pub(crate) struct Head {
     pub(crate) hash: [u8; 32],
 }
 impl Head {
-    fn of(record: &Record) -> Self {
+    pub(super) fn of(record: &Record) -> Self {
         Self {
             seq: record.context.seq,
             hash: record.hash(),
@@ -39,20 +40,13 @@ impl Head {
 /// so a later refresh re-reads the entire gap before checking its attestation.
 #[derive(Clone)]
 pub(crate) struct State {
-    pub(crate) head: Head,
-    pub(crate) mmr: Mmr,
+    pub(crate) run: RunState,
     offset: u64,
     pub(crate) length: u64,
-    checkpoint: bool,
     pub(crate) checkpoint_time: u64,
     pub(crate) since_checkpoint: u64,
     newline: bool,
     gap: Option<blake3::Hasher>,
-    pending_resume: bool,
-    // A broken hash link in the pending run, cleared by its closing resume.
-    run_loss: bool,
-    checkpoint_predecessor: Option<Head>,
-    checkpoint_previous: [u8; 32],
 }
 impl State {
     /// Advances from known writer output, never from a reread of our own bytes.
@@ -242,7 +236,7 @@ impl TrailReader {
             .map_err(io_error)?
     }
 }
-fn corrupt(detail: &str) -> AuditError {
+pub(super) fn corrupt(detail: &str) -> AuditError {
     AuditError::new(AuditErrorKind::CorruptTrail, detail)
 }
 fn io_error(error: io::Error) -> AuditError {
@@ -432,7 +426,9 @@ pub(crate) fn history_segment(
             return Err(corrupt("unparsable line before complete record"));
         }
         if !(first || closing && count == 1)
-            && state.as_ref().is_some_and(|s| s.head == Head::of(record))
+            && state
+                .as_ref()
+                .is_some_and(|s| s.run.head == Head::of(record))
         {
             if let Some(hash) = gap.take()
                 && record.context.repaired != Some(*hash.finalize().as_bytes())
@@ -443,7 +439,7 @@ pub(crate) fn history_segment(
         }
         if state
             .as_ref()
-            .is_some_and(|s| record.context.seq <= s.head.seq)
+            .is_some_and(|s| record.context.seq <= s.run.head.seq)
         {
             return Err(corrupt(
                 "record sequence did not increase inside sealed run",
@@ -452,7 +448,7 @@ pub(crate) fn history_segment(
         let broken = first
             && state
                 .as_ref()
-                .is_some_and(|s| record.context.previous != s.head.hash);
+                .is_some_and(|s| record.context.previous != s.run.head.hash);
         if first && (!matches!(record.kind, Kind::Checkpoint(_)) || broken) {
             damaged = true;
         }
@@ -466,7 +462,7 @@ pub(crate) fn history_segment(
             && !outside_run
             && state
                 .as_ref()
-                .is_some_and(|s| record.context.seq != s.head.seq + 1)
+                .is_some_and(|s| record.context.seq != s.run.head.seq + 1)
         {
             return Err(corrupt("sequence gap inside sealed run segment"));
         }
@@ -499,7 +495,7 @@ pub(crate) fn history_segment(
             }
             *run = false;
         }
-        let before_loss = !(broken || state.as_ref().is_some_and(|s| s.run_loss));
+        let before_loss = !(broken || state.as_ref().is_some_and(|s| s.run.run_loss));
         apply_checked(
             record,
             &mut state,
@@ -509,9 +505,9 @@ pub(crate) fn history_segment(
         )?;
         let s = state.as_mut().ok_or_else(|| corrupt("missing head"))?;
         if count == 1 && closing {
-            s.run_loss = false;
+            s.run.run_loss = false;
         }
-        if expected == Some(s.head) {
+        if expected == Some(s.run.head) {
             *found = Some(record.clone());
         }
         s.offset = offset;
@@ -532,7 +528,7 @@ pub(crate) fn history_segment(
         *run = true;
     }
     if let Some(s) = &mut state {
-        if s.pending_resume {
+        if s.run.pending_resume {
             return Err(corrupt("resume checkpoint lacks its declaration"));
         }
         s.length = offset;
@@ -584,7 +580,7 @@ fn scan_closing(
 }
 fn sealed(state: &State) -> bool {
     // A complete JSON checkpoint without LF is still a record (ADR-0005 d5).
-    state.checkpoint && state.gap.is_none() && !state.pending_resume
+    state.run.checkpoint && state.gap.is_none() && !state.run.pending_resume
 }
 /// Discovers the minimum declared loss bound using only two bounded header
 /// records per file after the cached inode (or its retained sealed-name bound).
@@ -618,16 +614,6 @@ pub(crate) fn resumes_after(
     Ok(minimum)
 }
 
-fn resume_details(details: &str) -> Result<(&str, &str, &str), AuditError> {
-    let (named, file) = details
-        .split_once(" file=")
-        .ok_or_else(|| corrupt("invalid resume details"))?;
-    let (named, lost) = named
-        .split_once(" lost_through=")
-        .ok_or_else(|| corrupt("invalid resume loss bound"))?;
-    Ok((named, lost, file))
-}
-
 fn resume_header(file: &File, trail: [u8; 16]) -> Result<Option<u64>, AuditError> {
     let mut reader = BufReader::new(file);
     for index in 0..2 {
@@ -656,7 +642,7 @@ fn resume_header(file: &File, trail: [u8; 16]) -> Result<Option<u64>, AuditError
                 return Ok(entry
                     .details
                     .as_deref()
-                    .and_then(|details| resume_details(details).ok())
+                    .and_then(|details| runs::resume_details(details).ok())
                     .and_then(|(_, bound, _)| bound.parse().ok()));
             }
         }
@@ -896,7 +882,11 @@ fn scan_inner(
         if record.context.trail != trail {
             return Err(corrupt("trail identity differs from marker"));
         }
-        if first && state.as_ref().is_some_and(|s| s.head == Head::of(record)) {
+        if first
+            && state
+                .as_ref()
+                .is_some_and(|s| s.run.head == Head::of(record))
+        {
             return Err(corrupt("opening checkpoint duplicates predecessor"));
         }
         if first && !matches!(record.kind, Kind::Checkpoint(_)) {
@@ -918,7 +908,7 @@ fn scan_inner(
             boundary_resume = false;
         }
         let s = state.as_mut().ok_or_else(|| corrupt("missing head"))?;
-        if expected == Some(s.head) {
+        if expected == Some(s.run.head) {
             *found = Some(record.clone());
         }
         s.offset = offset;
@@ -929,7 +919,7 @@ fn scan_inner(
         return Err(corrupt("empty live file or missing opening checkpoint"));
     }
     let mut state = state.ok_or_else(|| corrupt("missing head"))?;
-    if state.pending_resume || boundary_resume {
+    if state.run.pending_resume || boundary_resume {
         return Err(corrupt("resume checkpoint lacks its declaration"));
     }
     state.length = offset;
@@ -939,10 +929,12 @@ fn scan_inner(
 fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<(), AuditError> {
     apply_checked(record, state, genesis, false, true)?;
     if let Some(s) = state {
-        s.run_loss = false;
+        s.run.run_loss = false;
     }
     Ok(())
 }
+// Reader-side shim over the shared `runs::apply_checked` (#197 R1): adds
+// `State`'s writer bookkeeping; `Ok(None)` leaves `State` in place.
 fn apply_checked(
     record: &Record,
     state: &mut Option<State>,
@@ -950,125 +942,29 @@ fn apply_checked(
     broken_boundary: bool,
     compare_mmr: bool,
 ) -> Result<(), AuditError> {
-    let head = Head::of(record);
-    let root_link =
-        state.is_none() && record.context.previous == Record::genesis(&record.context.trail);
-    // A root checkpoint above zero declares loss and needs an immediate resume;
-    // an archived prefix instead carries its predecessor hash and MMR (d2/d8).
-    let mut pending = state.is_none() && head.seq > 0 && root_link;
-    let mut mmr = if let Some(s) = state.as_ref() {
-        s.mmr.clone()
-    } else {
-        let Kind::Checkpoint(cp) = &record.kind else {
-            return Err(corrupt("missing initial checkpoint"));
-        };
-        if (genesis || head.seq == 0) && !root_link {
-            return Err(corrupt("initial checkpoint does not link genesis"));
-        }
-        if root_link && head.seq > 0 {
-            // Amendment 9: the lost creation hash is unavailable. Both reader
-            // paths authenticate the computable genesis leaf through this fold.
-            let mut fold = Mmr::new();
-            fold.push(Record::genesis(&record.context.trail))?;
-            fold
-        } else {
-            Mmr::from_peaks(cp.size, cp.peaks.clone())
-                .map_err(|_| corrupt("invalid opening peaks"))?
-        }
+    let prior_run = state.as_ref().map(|s| &s.run);
+    let Some(next_run) =
+        runs::apply_checked(prior_run, record, genesis, broken_boundary, compare_mmr)?
+    else {
+        return Ok(()); // Collector-style identical duplicate: leave state in place.
     };
-    let prior = state.as_ref().map(|s| s.head);
-    if let Some(s) = state.as_ref() {
-        if head == s.head {
-            return Ok(());
-        } // Collector-style identical duplicates add no leaf.
-        if head.seq <= s.head.seq || (!broken_boundary && record.context.previous != s.head.hash) {
-            return Err(corrupt(
-                "record rolled back, changed or broke its hash link",
-            ));
-        }
-        if s.pending_resume
-            && !matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume")
-        {
-            return Err(corrupt("sequence gap lacks a resume declaration"));
-        }
-        if !broken_boundary && head.seq != s.head.seq + 1 {
-            if !matches!(record.kind, Kind::Checkpoint(_)) {
-                return Err(corrupt("sequence gap without checkpoint"));
-            }
-            pending = true;
-        }
-    }
-    match &record.kind {
-        Kind::Checkpoint(cp) => {
-            if compare_mmr
-                && (cp.size != mmr.size() || cp.root != mmr.root() || cp.peaks != mmr.peaks())
-            {
-                return Err(corrupt("checkpoint MMR differs from preceding records"));
-            }
-        }
-        Kind::Entry(entry) if entry.action == "vigil.audit.resume" => {
-            let s = state
-                .as_ref()
-                .ok_or_else(|| corrupt("resume without predecessor"))?;
-            if !s.checkpoint {
-                return Err(corrupt("resume not immediately after checkpoint"));
-            }
-            let details = entry
-                .details
-                .as_deref()
-                .ok_or_else(|| corrupt("resume without details"))?;
-            let (named, lost, file) = resume_details(details)?;
-            let (seq_text, hash) = named
-                .strip_prefix("head=")
-                .and_then(|v| v.split_once(':'))
-                .ok_or_else(|| corrupt("invalid resume head"))?;
-            let seq = seq_text
-                .parse::<u64>()
-                .map_err(|_| corrupt("invalid resume head sequence"))?;
-            let bound = s
-                .head
-                .seq
-                .checked_sub(1)
-                .ok_or_else(|| corrupt("resume after creation checkpoint"))?;
-            if lost != bound.to_string()
-                || seq.to_string() != seq_text
-                || seq >= s.head.seq
-                || hash != crate::audit::digest_string(&s.checkpoint_previous)
-                || s.checkpoint_predecessor.is_some_and(|p| p.seq != seq)
-                || (s.checkpoint_predecessor.is_none()
-                    && s.checkpoint_previous == Record::genesis(&record.context.trail)
-                    && seq != 0)
-                || file.is_empty()
-                || file.bytes().any(|b| b.is_ascii_whitespace())
-            {
-                return Err(corrupt("resume declaration does not describe its gap"));
-            }
-        }
-        Kind::Entry(_) => {}
-    }
-    mmr.push(head.hash).map_err(|_| corrupt("MMR overflow"))?;
+    let is_cp = matches!(record.kind, Kind::Checkpoint(_));
     *state = Some(State {
-        head,
-        mmr,
+        run: next_run,
         offset: 0,
         length: 0,
-        checkpoint: matches!(record.kind, Kind::Checkpoint(_)),
-        checkpoint_time: if matches!(record.kind, Kind::Checkpoint(_)) {
+        checkpoint_time: if is_cp {
             record.context.time
         } else {
             state.as_ref().map_or(0, |s| s.checkpoint_time)
         },
-        since_checkpoint: if matches!(record.kind, Kind::Checkpoint(_)) {
+        since_checkpoint: if is_cp {
             0
         } else {
             state.as_ref().map_or(1, |s| s.since_checkpoint + 1)
         },
         newline: true,
         gap: None,
-        pending_resume: pending,
-        run_loss: broken_boundary || state.as_ref().is_some_and(|s| s.run_loss),
-        checkpoint_predecessor: prior,
-        checkpoint_previous: record.context.previous,
     });
     Ok(())
 }

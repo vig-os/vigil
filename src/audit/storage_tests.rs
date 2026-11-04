@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    audit::{CheckpointFields, Entry, RecordContext},
+    audit::{CheckpointFields, Entry, Mmr, RecordContext, runs::RunState},
     rotate::{RotatingFile, RotationConfig},
 };
 use std::{
@@ -75,7 +75,7 @@ fn open(path: &Path) -> TrailReader {
 }
 fn head(reader: &TrailReader) -> Head {
     reader
-        .with_current(|_| Ok(()), |_, _, s| Ok(s.head))
+        .with_current(|_| Ok(()), |_, _, s| Ok(s.run.head))
         .unwrap()
 }
 fn entry(previous: &Record) -> Record {
@@ -325,7 +325,7 @@ fn gap_requires_matching_resume_declaration() {
 }
 fn write_child(file: &File, s: &State) -> Result<(), AuditError> {
     let record = Record::new(
-        context(s.head.seq + 1, s.head.hash),
+        context(s.run.head.seq + 1, s.run.head.hash),
         Entry::new(std::process::id().to_string(), "child", "test"),
     )
     .unwrap();
@@ -965,7 +965,7 @@ mod runs {
         let resume = declaration(&checkpoint, 0, Record::genesis(&TRAIL), 4, None);
         write_records(&d.0, &[&checkpoint, &resume]);
         assert_eq!(head(&open(&d.0)), Head::of(&resume));
-        assert_eq!(open(&d.0).cache.lock().unwrap().state.mmr.size(), 3);
+        assert_eq!(open(&d.0).cache.lock().unwrap().state.run.mmr.size(), 3);
     }
     #[test]
     fn closing_segment_can_start_second_run() {
@@ -1523,7 +1523,7 @@ mod runs {
                         assert_eq!(result.err().unwrap().kind(), AuditErrorKind::CorruptTrail);
                     }
                 } else if let Some(reader) = cached {
-                    let result = reader.with_current(|_| Ok(()), |_, _, s| Ok(s.head));
+                    let result = reader.with_current(|_| Ok(()), |_, _, s| Ok(s.run.head));
                     if resumed {
                         assert_eq!(result.unwrap(), Head::of(&resume));
                     } else {
@@ -1608,7 +1608,7 @@ mod runs {
                         sink.close().unwrap();
                     }
                 } else if let Some(reader) = cached {
-                    let result = reader.with_current(|_| Ok(()), |_, _, s| Ok(s.head));
+                    let result = reader.with_current(|_| Ok(()), |_, _, s| Ok(s.run.head));
                     if wrong {
                         assert_eq!(result.unwrap_err().kind(), AuditErrorKind::CorruptTrail);
                     } else {
@@ -1746,7 +1746,14 @@ mod details {
     use super::*;
     use std::collections::{HashMap, HashSet};
 
+    // #197 R1: the per-record state machine moved from `storage.rs` into
+    // `runs.rs`, so the gate scans both. Each file is parsed on its own
+    // with `syn::parse_file` and the `corrupt` call sites are collected
+    // across both in a fixed file order (storage.rs first, then runs.rs),
+    // so the `(detail, occurrence)` keys stay stable and the count stays
+    // 51 (34 in storage.rs + 17 in runs.rs).
     const STORAGE_SRC: &str = include_str!("storage.rs");
+    const RUNS_SRC: &str = include_str!("runs.rs");
     const STORAGE_TESTS_SRC: &str = include_str!("storage_tests.rs");
 
     fn assert_corrupt<T>(result: Result<T, AuditError>, detail: &str, _site: usize) {
@@ -2077,22 +2084,24 @@ mod details {
         // Hand-crafted State{pending_resume=true} + fragment-only segment
         // reaches L536 (fallback tail) without L432 or L529 intervening.
         let state_pending = State {
-            head: Head {
-                seq: 7,
-                hash: [9; 32],
+            run: RunState {
+                head: Head {
+                    seq: 7,
+                    hash: [9; 32],
+                },
+                mmr: genesis_fold(),
+                checkpoint: true,
+                pending_resume: true,
+                run_loss: false,
+                checkpoint_predecessor: None,
+                checkpoint_previous: [0; 32],
             },
-            mmr: genesis_fold(),
             offset: 0,
             length: 0,
-            checkpoint: true,
             checkpoint_time: 100,
             since_checkpoint: 0,
             newline: true,
             gap: None,
-            pending_resume: true,
-            run_loss: false,
-            checkpoint_predecessor: None,
-            checkpoint_previous: [0; 32],
         };
         let d = Temp::new();
         w(&d, b"{\"torn\":");
@@ -3047,13 +3056,14 @@ mod details {
         path.segments.last().map(|s| &s.ident)
     }
 
-    fn parse_sites(source: &str) -> Vec<(String, usize)> {
+    fn parse_sites(sources: &[&str]) -> Vec<(String, usize)> {
         // Every `ExprCall` whose callee path ends in `corrupt` and
         // whose first argument is a string literal is a corrupt-site
-        // in storage.rs. Keyed by `(detail, occurrence in file order)`
-        // -- the same key `assert_corrupt(result, "detail", site)` uses.
-        let file: syn::File = syn::parse_file(source)
-            .expect("coverage gate: storage.rs is not valid Rust (parse_file failed)");
+        // in the reader. Each source is parsed on its own with
+        // `syn::parse_file` and sites are collected in the caller's
+        // fixed order, so the `(detail, occurrence)` key stays stable
+        // across both files -- the same key
+        // `assert_corrupt(result, "detail", site)` uses.
         struct Collect {
             raw: Vec<String>,
         }
@@ -3070,7 +3080,11 @@ mod details {
             }
         }
         let mut c = Collect { raw: Vec::new() };
-        syn::visit::Visit::visit_file(&mut c, &file);
+        for source in sources {
+            let file: syn::File = syn::parse_file(source)
+                .expect("coverage gate: a reader source is not valid Rust (parse_file failed)");
+            syn::visit::Visit::visit_file(&mut c, &file);
+        }
         let mut counts: HashMap<String, usize> = HashMap::new();
         c.raw
             .into_iter()
@@ -3335,7 +3349,11 @@ mod details {
 
     #[test]
     fn coverage_gate_pins_every_corrupt_site() {
-        let sites = parse_sites(STORAGE_SRC);
+        // Fixed file order: storage.rs first (34 sites), then runs.rs
+        // (17 sites). Each source is parsed on its own with
+        // `syn::parse_file`, so neither file needs to be syntactically
+        // concatenable with the other.
+        let sites = parse_sites(&[STORAGE_SRC, RUNS_SRC]);
         let site_set: HashSet<(String, usize)> = sites.iter().cloned().collect();
         let asserted: HashSet<(String, usize)> =
             parse_assertions(STORAGE_TESTS_SRC).into_iter().collect();

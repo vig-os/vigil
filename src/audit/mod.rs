@@ -28,6 +28,7 @@ mod config;
 mod format;
 mod lines;
 mod mmr;
+pub(crate) mod runs;
 mod signing;
 mod sink;
 #[cfg_attr(not(test), allow(dead_code))] // Verifier wiring follows in #13.

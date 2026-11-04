@@ -74,8 +74,8 @@ fn public_receipt_checkpoint_and_close_roundtrip() {
     )
     .unwrap();
     assert!(found.is_some());
-    assert_eq!(state.head.seq, receipt.seq());
-    assert_eq!(state.head.hash, receipt.hash());
+    assert_eq!(state.run.head.seq, receipt.seq());
+    assert_eq!(state.run.head.hash, receipt.hash());
     let records = temp.records();
     assert_eq!(records.len(), 2);
     assert_eq!(records[1].context.seq, receipt.seq());
