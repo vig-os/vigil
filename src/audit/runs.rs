@@ -9,10 +9,15 @@
 //! (`checkpoint_time`, `since_checkpoint`), the walk cursor (`offset`,
 //! `length`, `newline`) and the gap-hasher stay in `State`.
 //!
-//! Until #197 R2, `apply_checked` alone is not a complete first-violation
-//! oracle for a sealed-run fragment gap: `storage::history_segment` and
-//! `scan_inner` still own the repair-attestation check that must fire first
-//! on that path (197-d1 addendum 7). R2 moves segment-level classification.
+//! `check_attestation` (a fragment gap's repair attestation, checked as data) and
+//! `apply_checked` (the per-record checks) are pure. Together with the reader-side
+//! segment checks that still run ahead of them in `storage.rs`, they reproduce the
+//! reader's first violation on every path: in `history_segment`, multiple records,
+//! trail identity, an unparsable line before a complete record, a non-increasing seq
+//! inside a sealed run, a missing initial checkpoint and a sequence gap inside a
+//! sealed run segment; in `scan_inner`, the immediate-resume boundary. On their own
+//! they are **not** a complete first-violation oracle: until #197 R2b moves those
+//! segment-level checks here, nothing outside the reader may use them as one.
 use super::{
     AuditError, Mmr, Record,
     format::Kind,
@@ -44,19 +49,16 @@ pub(crate) struct RunState {
 /// Advances [`RunState`] by one complete record. Returns the new state on
 /// success, `Ok(None)` for a collector-style identical duplicate, and an
 /// [`AuditError`] whose detail is byte-identical to the former inline state
-/// machine (ruling 13-V4-d4 point 1); [`super::storage::apply_checked`]
-/// delegates here. `broken_boundary` disables the hash-link and in-run
-/// seq-gap checks at a damaged run entry (B3d1-d1/d3); `compare_mmr`
-/// disables the fold (iii) comparison inside a run segment whose preceding
-/// records may be lost (B3d1-d1/d4); `genesis` forces the
-/// `(genesis || seq == 0) && !root_link` path (staging settlement and the
-/// amendment-9 genesis closer).
+/// machine (ruling 13-V4-d4 point 1); the reader's shim delegates here.
+/// `broken_boundary` disables the hash-link and in-run seq-gap checks at a
+/// damaged run entry (B3d1-d1/d3); `compare_mmr` disables the fold (iii)
+/// comparison inside a run segment whose preceding records may be lost
+/// (B3d1-d1/d4); `genesis` forces the `(genesis || seq == 0) && !root_link`
+/// path (staging settlement and the amendment-9 genesis closer).
 ///
-/// Until #197 R2, this is not a complete first-violation oracle for a
-/// sealed-run fragment gap (197-d1 addendum 7). For `[cp0, e1, fragment,
-/// e2 prev != e1]`, `storage::history_segment` emits
-/// `missing or mismatched repair attestation` first; this alone emits
-/// `record rolled back, changed or broke its hash link`.
+/// The reader calls [`check_attestation`] and `apply_checked` at their
+/// pre-#197 R2a positions on each path; see the module caveat for why this
+/// pair is not a complete first-violation oracle until R2b.
 pub(crate) fn apply_checked(
     prior: Option<&RunState>,
     record: &Record,
@@ -143,6 +145,22 @@ pub(crate) fn apply_checked(
         checkpoint_predecessor: predecessor,
         checkpoint_previous: record.context.previous,
     }))
+}
+
+/// Checks the repair attestation of a fragment gap: the record after the
+/// gap must carry `repaired` equal to the digest of the gap's bytes. The
+/// reader calls this at the same point on each path as before #197 R2a,
+/// so the reader's first violation is unchanged (see the module doc).
+pub(crate) fn check_attestation(
+    digest: Option<[u8; 32]>,
+    repaired: Option<[u8; 32]>,
+) -> Result<(), AuditError> {
+    if let Some(d) = digest
+        && repaired != Some(d)
+    {
+        return Err(corrupt("missing or mismatched repair attestation"));
+    }
+    Ok(())
 }
 
 /// Parses the three positional fields of a resume `details` string; shared
