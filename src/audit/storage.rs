@@ -40,6 +40,7 @@ impl Head {
 /// so a later refresh re-reads the entire gap before checking its attestation.
 #[derive(Clone)]
 pub(crate) struct State {
+    /// The pure per-record run state (see [`super::runs::RunState`]).
     pub(crate) run: RunState,
     offset: u64,
     pub(crate) length: u64,
@@ -430,11 +431,10 @@ pub(crate) fn history_segment(
                 .as_ref()
                 .is_some_and(|s| s.run.head == Head::of(record))
         {
-            if let Some(hash) = gap.take()
-                && record.context.repaired != Some(*hash.finalize().as_bytes())
-            {
-                return Err(corrupt("missing or mismatched repair attestation"));
-            }
+            runs::check_attestation(
+                gap.take().map(|h| *h.finalize().as_bytes()),
+                record.context.repaired,
+            )?;
             continue;
         }
         if state
@@ -466,11 +466,10 @@ pub(crate) fn history_segment(
         {
             return Err(corrupt("sequence gap inside sealed run segment"));
         }
-        if let Some(hash) = gap.take()
-            && record.context.repaired != Some(*hash.finalize().as_bytes())
-        {
-            return Err(corrupt("missing or mismatched repair attestation"));
-        }
+        runs::check_attestation(
+            gap.take().map(|h| *h.finalize().as_bytes()),
+            record.context.repaired,
+        )?;
         if first {
             // A segment may close one run and, through damage later in the
             // same file, start another. Compare this checkpoint before treating
@@ -892,11 +891,10 @@ fn scan_inner(
         if first && !matches!(record.kind, Kind::Checkpoint(_)) {
             return Err(corrupt("missing opening checkpoint"));
         }
-        if let Some(gap) = gap.take()
-            && record.context.repaired != Some(*gap.finalize().as_bytes())
-        {
-            return Err(corrupt("missing or mismatched repair attestation"));
-        }
+        runs::check_attestation(
+            gap.take().map(|g| *g.finalize().as_bytes()),
+            record.context.repaired,
+        )?;
         if boundary_resume
             && !first
             && !matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume")
@@ -933,8 +931,9 @@ fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<()
     }
     Ok(())
 }
-// Reader-side shim over the shared `runs::apply_checked` (#197 R1): adds
-// `State`'s writer bookkeeping; `Ok(None)` leaves `State` in place.
+/// Applies one record to the reader's state; the per-record logic lives in
+/// [`super::runs::apply_checked`], and this keeps the writer-only fields
+/// (`checkpoint_time`, `since_checkpoint`) in `State`.
 fn apply_checked(
     record: &Record,
     state: &mut Option<State>,

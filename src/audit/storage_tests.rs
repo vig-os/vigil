@@ -1750,8 +1750,18 @@ mod details {
     // `runs.rs`, so the gate scans both. Each file is parsed on its own
     // with `syn::parse_file` and the `corrupt` call sites are collected
     // across both in a fixed file order (storage.rs first, then runs.rs),
-    // so the `(detail, occurrence)` keys stay stable and the count stays
-    // 51 (34 in storage.rs + 17 in runs.rs).
+    // so the `(detail, occurrence)` keys stay stable.
+    //
+    // #197 R2a (addendum 7): the 3 `missing or mismatched repair
+    // attestation` sites in `storage.rs` (two in `history_segment` and
+    // one in `scan_inner`) merge into one site in
+    // `runs.rs::check_attestation`. The reader still orders attestation
+    // ahead of `apply_checked`'s record checks, so the pair
+    // `[h5, fragment, next]` still gives `sequence gap inside sealed run
+    // segment` on seq 7 linked and `missing or mismatched repair
+    // attestation` on seq 6 broken. Count: 49 = 31 in `storage.rs`
+    // (34 − 3 attestation sites) + 18 in `runs.rs`
+    // (17 + 1 `check_attestation` site).
     const STORAGE_SRC: &str = include_str!("storage.rs");
     const RUNS_SRC: &str = include_str!("runs.rs");
     const STORAGE_TESTS_SRC: &str = include_str!("storage_tests.rs");
@@ -1970,6 +1980,27 @@ mod details {
         );
     }
     #[test]
+    fn pin_hs_fallback_duplicate_leaves_offset_at_first_copy() {
+        // 197-d1 addendum 12: a complete identical duplicate takes
+        // `history_segment`'s duplicate branch and `continue`s without
+        // updating `s.offset`/`s.newline`. A trailing `not json` line
+        // trips strict `scan_inner` so the fallback body runs. After
+        // the duplicate, `s.offset` stays at the end of the first copy;
+        // a mutant that sets `s.offset`/`s.newline` before the duplicate
+        // `continue` would push it past the second copy.
+        let d = Temp::new();
+        let f = cp0();
+        let first = line(&f);
+        let expected_offset = first.len() as u64;
+        let bytes = [first.clone(), first, b"not json\n".to_vec()].concat();
+        w(&d, &bytes);
+        let state = hsc(&o(&d), None, true, false).unwrap().unwrap();
+        assert_eq!(
+            state.offset, expected_offset,
+            "duplicate `continue` must not advance the walk cursor past the first copy",
+        );
+    }
+    #[test]
     fn pin_hs_attestation_general_branch_broken_link_pair() {
         // Attestation-order pair, next=seq 6 broken link.
         let (_pre, s, _) = state_at_cp0();
@@ -1987,7 +2018,7 @@ mod details {
         assert_corrupt(
             hsc(&o(&d), Some(s), true, true),
             "missing or mismatched repair attestation",
-            1,
+            0,
         );
     }
     #[test]
@@ -2181,7 +2212,7 @@ mod details {
         assert_corrupt(
             scc(&o(&d), None, true),
             "missing or mismatched repair attestation",
-            2,
+            0,
         );
     }
     #[test]
@@ -2598,7 +2629,7 @@ mod details {
         assert_corrupt(
             TrailReader::open(&d.0, TRAIL, None),
             "missing or mismatched repair attestation",
-            1,
+            0,
         );
     }
     #[test]
@@ -3349,8 +3380,8 @@ mod details {
 
     #[test]
     fn coverage_gate_pins_every_corrupt_site() {
-        // Fixed file order: storage.rs first (34 sites), then runs.rs
-        // (17 sites). Each source is parsed on its own with
+        // Fixed file order: storage.rs first (31 sites after #197 R2a),
+        // then runs.rs (18 sites). Each source is parsed on its own with
         // `syn::parse_file`, so neither file needs to be syntactically
         // concatenable with the other.
         let sites = parse_sites(&[STORAGE_SRC, RUNS_SRC]);
@@ -3383,7 +3414,7 @@ mod details {
         }
         assert_eq!(
             sites.len(),
-            51,
+            49,
             "corrupt-site count changed; update gate explicitly"
         );
     }
