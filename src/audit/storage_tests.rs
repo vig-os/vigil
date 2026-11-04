@@ -3270,6 +3270,13 @@ mod details {
                 // the alias source and as the alias destination. Glob
                 // imports (`use foo::*`) are allowed -- no binding is
                 // named here.
+                //
+                // Note on recursion: we call `self.visit_use_tree(..)`
+                // for children, not `syn::visit::visit_use_tree(..)`,
+                // so nested `UseTree`s re-enter this override instead
+                // of falling through to the default
+                // `visit_use_name`/`visit_use_rename` which do not
+                // check the ident.
                 match t {
                     syn::UseTree::Path(p) => {
                         assert!(
@@ -3278,7 +3285,7 @@ mod details {
                              the helper must not be re-exported or routed through \
                              another path"
                         );
-                        syn::visit::visit_use_tree(self, &p.tree);
+                        self.visit_use_tree(&p.tree);
                     }
                     syn::UseTree::Name(n) => assert!(
                         n.ident != "assert_corrupt",
@@ -3296,7 +3303,7 @@ mod details {
                     syn::UseTree::Glob(_) => {}
                     syn::UseTree::Group(g) => {
                         for item in &g.items {
-                            syn::visit::visit_use_tree(self, item);
+                            self.visit_use_tree(item);
                         }
                     }
                 }
