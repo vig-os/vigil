@@ -1220,6 +1220,7 @@ dependencies = [
  "opentelemetry-appender-tracing",
  "opentelemetry-proto",
  "opentelemetry_sdk",
+ "proc-macro2",
  "proptest",
  "rustix",
  "serde",

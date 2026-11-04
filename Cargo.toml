@@ -62,6 +62,11 @@ log = "0.4"
 # macro paths), so this direct edge resolves to the same locked 2.0.119
 # without pulling in a new crate.
 syn = { version = "2", default-features = false, features = ["parsing", "full", "visit", "printing"] }
+# 197-d1 addendum 10 fix 2: the gate walks macro-invocation token streams
+# via syn::Macro::tokens, which is a proc_macro2::TokenStream. proc-macro2
+# is already locked (1.0.107, pulled in by syn itself), so this direct
+# dev-dep edge resolves to the same crate.
+proc-macro2 = { version = "1", default-features = false }
 
 [[bench]]
 name = "performance"

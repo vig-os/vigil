@@ -3014,10 +3014,34 @@ mod details {
     // and left the class open; parsing the real grammar closes the
     // class.
     //
-    // Known limit, stated here on purpose: a static gate cannot prove
-    // a call is reachable (`if false { assert_corrupt(..) }` still
-    // registers). Mutants remain the proof that each pin fires at
-    // runtime -- see this module's mutant proofs in the PR body.
+    // 197-d1 addendum 10 threat model: this gate catches *drift* --
+    // a `corrupt()` site added or renamed in `storage.rs` without a
+    // matching pin in this file, or a pin whose `(detail, occurrence)`
+    // label names no site. It does **not** defend against deliberate
+    // sabotage by a test author who shadows, aliases, hides through a
+    // macro or imports the helper under another name. Addendum 10's
+    // round-4 fixes raise the bar against accidental shadowing so a
+    // normal mistake cannot silently make an unpinned site look
+    // covered:
+    //   - exactly one `fn assert_corrupt` item is allowed, and it must
+    //     live in `mod details`; any second `fn` item, or any
+    //     `let`/binding/closure-arg pattern named `assert_corrupt`,
+    //     fails the gate;
+    //   - the identifier `assert_corrupt` anywhere inside a macro
+    //     invocation's token stream (nested token groups recursively)
+    //     fails the gate -- pins must be direct calls, not wrapped in
+    //     `vec![...]`, `assert!({...})`, `proptest!`, etc.;
+    //   - the identifier `assert_corrupt` anywhere in a `use` tree
+    //     (plain import, group, rename as alias source or destination)
+    //     fails the gate.
+    //
+    // Runtime exact-string asserts and per-site mutants remain the
+    // proof that each pin fires. Known limit, stated on purpose:
+    // reachability -- a static gate cannot prove a call is reached
+    // (`if false { assert_corrupt(..) }`, an uncalled closure that
+    // only ever appears as a direct call syntactically). Mutants are
+    // the proof that each pin fires at runtime; see this module's
+    // mutant proofs in the PR body.
 
     fn path_last_segment(path: &syn::Path) -> Option<&syn::Ident> {
         path.segments.last().map(|s| &s.ident)
@@ -3060,12 +3084,18 @@ mod details {
 
     fn parse_assertions(source: &str) -> Vec<(String, usize)> {
         // Every use of a path ending in `assert_corrupt` -- other than
-        // the helper's own `fn` item -- must be a direct call whose
-        // detail argument is a string literal and whose occurrence
-        // argument is an integer literal. Anything else panics:
+        // the single helper `fn` item in `mod details` -- must be a
+        // direct call whose detail argument is a string literal and
+        // whose occurrence argument is an integer literal. Anything
+        // else panics:
         //   - alias:        `let f = assert_corrupt;`
         //   - fn pointer:   `let f = assert_corrupt::<()>;`
-        //   - non-literal:  `assert_corrupt(r, label, 0)`.
+        //   - non-literal:  `assert_corrupt(r, label, 0)`;
+        //   - shadowing fn: a second `fn assert_corrupt<T>(...) {}` item;
+        //   - binding pat:  `let assert_corrupt = ...;`, `|assert_corrupt| ...`;
+        //   - macro-hidden: `vec![assert_corrupt::<()>(...)]`,
+        //                   `assert!({ let f = assert_corrupt::<()>; ... })`;
+        //   - use alias:    `use self::assert_corrupt as ac;`.
         // Dead-code calls (`if false { assert_corrupt(..); }`) still
         // register; see the known-limit note above.
         let file: syn::File = syn::parse_file(source)
@@ -3073,6 +3103,12 @@ mod details {
 
         struct Visitor {
             found: Vec<(String, usize)>,
+            // Addendum 10 fix 1: track every `fn assert_corrupt` item
+            // we meet. Exactly one is allowed, and it must be in
+            // `mod details` (the helper). Any other fails the gate.
+            helper_count: usize,
+            mod_stack: Vec<String>,
+            helper_mod_stack: Option<Vec<String>>,
         }
 
         impl Visitor {
@@ -3116,18 +3152,68 @@ mod details {
                 };
                 self.found.push((detail, site));
             }
+
+            // Addendum 10 fix 2: walk a macro's `TokenStream`, recursing
+            // into nested `Group`s, and fail on any `Ident` equal to
+            // `assert_corrupt`. `syn`'s `visit::Visit` stops at macro
+            // boundaries, so `vec![assert_corrupt::<()>(...)]` and
+            // `assert!({ let f = assert_corrupt::<()>; ... })` would be
+            // invisible otherwise. String and char literals appear as
+            // `TokenTree::Literal`, not `TokenTree::Ident`, so a panic
+            // message that happens to contain the word "assert_corrupt"
+            // does not trip this check.
+            fn walk_macro_tokens(stream: proc_macro2::TokenStream) {
+                use proc_macro2::TokenTree;
+                for tt in stream {
+                    match tt {
+                        TokenTree::Group(g) => Self::walk_macro_tokens(g.stream()),
+                        TokenTree::Ident(i) => assert!(
+                            i != "assert_corrupt",
+                            "coverage gate: `assert_corrupt` appears as an identifier \
+                             inside a macro invocation's token stream; pins must be \
+                             direct calls, not wrapped in `vec![...]`, \
+                             `assert!({{ ... }})`, `proptest!`, etc."
+                        ),
+                        _ => {}
+                    }
+                }
+            }
         }
 
         impl<'ast> syn::visit::Visit<'ast> for Visitor {
+            fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+                self.mod_stack.push(m.ident.to_string());
+                syn::visit::visit_item_mod(self, m);
+                self.mod_stack.pop();
+            }
+
             fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
                 // The helper's own `fn assert_corrupt<T>(...)` definition
                 // is not a use of the name -- walk its body but not its
-                // signature.
+                // signature. Any second such item is caught by
+                // `helper_count` after the full traversal.
                 if item.sig.ident == "assert_corrupt" {
+                    self.helper_count += 1;
+                    if self.helper_count == 1 {
+                        self.helper_mod_stack = Some(self.mod_stack.clone());
+                    }
                     syn::visit::visit_block(self, &item.block);
                     return;
                 }
                 syn::visit::visit_item_fn(self, item);
+            }
+
+            fn visit_pat_ident(&mut self, p: &'ast syn::PatIdent) {
+                // Addendum 10 fix 1 (continued): a `let`/closure-arg/
+                // match-arm/for-loop pattern binding the name
+                // `assert_corrupt` would shadow the helper. Reject it.
+                assert!(
+                    p.ident != "assert_corrupt",
+                    "coverage gate: `assert_corrupt` used as a binding pattern \
+                     (let/closure-arg/match-arm/for-loop); the helper is a `fn` \
+                     item and must not be shadowed"
+                );
+                syn::visit::visit_pat_ident(self, p);
             }
 
             fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
@@ -3170,17 +3256,73 @@ mod details {
                 syn::visit::visit_expr_path(self, p);
             }
 
-            fn visit_use_tree(&mut self, _t: &'ast syn::UseTree) {
-                // `use` imports do not call the helper. If one ever
-                // appears, re-exporting `assert_corrupt` out of this
-                // test module is itself worth catching, but today the
-                // helper is used only within `mod details`, so we skip
-                // use-trees to avoid false hits on their path segments.
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                Self::walk_macro_tokens(mac.tokens.clone());
+                syn::visit::visit_macro(self, mac);
+            }
+
+            fn visit_use_tree(&mut self, t: &'ast syn::UseTree) {
+                // Addendum 10 fix 3: `use self::assert_corrupt as ac;`
+                // and friends create an alias binding that the rest of
+                // the visitor cannot recognise (the call site is `ac(..)`,
+                // not `assert_corrupt(..)`). Reject `assert_corrupt`
+                // anywhere in a `use` tree: as the imported name, as
+                // the alias source and as the alias destination. Glob
+                // imports (`use foo::*`) are allowed -- no binding is
+                // named here.
+                match t {
+                    syn::UseTree::Path(p) => {
+                        assert!(
+                            p.ident != "assert_corrupt",
+                            "coverage gate: `assert_corrupt` appears in a `use` tree; \
+                             the helper must not be re-exported or routed through \
+                             another path"
+                        );
+                        syn::visit::visit_use_tree(self, &p.tree);
+                    }
+                    syn::UseTree::Name(n) => assert!(
+                        n.ident != "assert_corrupt",
+                        "coverage gate: `assert_corrupt` is imported by a `use` tree; \
+                         pins must call the in-scope helper directly, not reach it \
+                         through a `use` import"
+                    ),
+                    syn::UseTree::Rename(r) => assert!(
+                        r.ident != "assert_corrupt" && r.rename != "assert_corrupt",
+                        "coverage gate: `assert_corrupt` appears in a `use` tree \
+                         (as alias source or destination); the helper must not be \
+                         aliased (`use self::assert_corrupt as ac`, \
+                         `use foo::bar as assert_corrupt`)"
+                    ),
+                    syn::UseTree::Glob(_) => {}
+                    syn::UseTree::Group(g) => {
+                        for item in &g.items {
+                            syn::visit::visit_use_tree(self, item);
+                        }
+                    }
+                }
             }
         }
 
-        let mut v = Visitor { found: Vec::new() };
+        let mut v = Visitor {
+            found: Vec::new(),
+            helper_count: 0,
+            mod_stack: Vec::new(),
+            helper_mod_stack: None,
+        };
         syn::visit::Visit::visit_file(&mut v, &file);
+        // Addendum 10 fix 1 (final): exactly one helper, in `mod details`.
+        assert!(
+            v.helper_count == 1,
+            "coverage gate: expected exactly one `fn assert_corrupt` item, found {}",
+            v.helper_count
+        );
+        let expected_path: &[String] = &[String::from("details")];
+        assert!(
+            v.helper_mod_stack.as_deref() == Some(expected_path),
+            "coverage gate: the `fn assert_corrupt` helper is not in `mod details` \
+             (module stack: {:?})",
+            v.helper_mod_stack
+        );
         v.found
     }
 
