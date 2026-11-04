@@ -10,7 +10,7 @@
 use super::{
     AuditError, AuditErrorKind, Record,
     format::{Kind, validation::MAX_PAYLOAD_BYTES},
-    runs::{self, RunState},
+    runs::{self, Advance, Classifier, Mode as ClassifierMode, RunState, SegmentContext},
 };
 use crate::rotate::Directory;
 use rustix::fs::{self as rfs, Mode, OFlags};
@@ -792,32 +792,32 @@ pub(crate) fn scan(
     )
 }
 
-/// Boundary policy for scanning one segment under ADR-0005 amendment 6.
-struct SegmentContext {
-    /// Whether scanning starts at the segment's opening checkpoint.
-    opening: bool,
-    /// Whether an absent predecessor requires a genesis link.
-    genesis: bool,
-    /// Whether predecessor history ends inside a run requiring immediate resume.
-    run: bool,
-}
-
 fn scan_inner(
     file: &File,
     trail: [u8; 16],
-    mut state: Option<State>,
+    state: Option<State>,
     expected: Option<Head>,
     found: &mut Option<Record>,
     context: SegmentContext,
 ) -> Result<State, AuditError> {
-    let SegmentContext {
-        opening,
-        genesis,
-        run,
-    } = context;
-    let genesis = genesis || (run && state.is_none());
+    // #197 R2b1: strict-mode scan_inner is a thin shim over `runs::Classifier`.
+    // The shim performs byte-level I/O (reading a physical line, the
+    // byte-glue check for an unterminated predecessor, `offset`/`newline`/
+    // `length` bookkeeping, and the three writer-only State fields),
+    // threads a `runs::Classifier` for every segment-level per-record check,
+    // and calls `runs::check_attestation` at each record's reader-side
+    // position (addendum 7 / addendum 12). The classifier's strict path owns:
+    //   - multiple records in native audit line
+    //   - trail identity differs from marker
+    //   - opening checkpoint duplicates predecessor
+    //   - missing opening checkpoint
+    //   - unclosed segment lacks matching immediate resume
+    //   - invalid audit line or opening checkpoint (Fragment@first/boundary, Unparsable)
+    //   - empty live file or missing opening checkpoint
+    //   - resume checkpoint lacks its declaration
+    //   - every `apply_checked` detail (R1).
     let mut file = file.try_clone().map_err(io_error)?;
-    let start = if opening {
+    let start = if context.opening {
         0
     } else {
         state.as_ref().map_or(0, |s| s.offset)
@@ -825,14 +825,15 @@ fn scan_inner(
     file.seek(SeekFrom::Start(start)).map_err(io_error)?;
     let mut reader = BufReader::new(file);
     let mut offset = start;
-    let mut first = opening;
-    // ADR-0005 lines 524–525: resume renames the old live file AS IS. Lines
-    // 406/411/770 allow its trailing fragment and require writer/verifier parity.
-    // Defer an unclosed predecessor's boundary until the successor's immediate
-    // resume validates head/hash/lost_through below; file= is informational (525).
-    let mut boundary_resume = opening && (run || state.as_ref().is_some_and(|s| !sealed(s)));
-    let mut gap = None::<blake3::Hasher>;
-    if !opening
+    let mut last_offset = state.as_ref().map_or(start, |s| s.offset);
+    let mut last_newline = state.as_ref().is_none_or(|s| s.newline);
+    let mut cp_time = state.as_ref().map_or(0, |s| s.checkpoint_time);
+    let mut since_cp = state.as_ref().map_or(0, |s| s.since_checkpoint);
+    // The initial boundary_resume flag matches the former `scan_inner` line 833:
+    // an opening at the start of a run, or an opening after an unsealed predecessor.
+    let initial_boundary =
+        context.opening && (context.run || state.as_ref().is_some_and(|s| !sealed(s)));
+    if !context.opening
         && let Some(s) = &state
         && !s.newline
         && s.gap.is_none()
@@ -845,12 +846,13 @@ fn scan_inner(
                 return Err(corrupt("bytes glued to complete unterminated record"));
             }
             offset += 1;
-            if let Some(s) = &mut state {
-                s.offset = offset;
-                s.newline = true;
-            }
+            last_offset = offset;
+            last_newline = true;
         }
     }
+    let prior_run = state.map(|s| s.run);
+    let mut classifier =
+        Classifier::new(prior_run, context, ClassifierMode::Strict, initial_boundary);
     loop {
         let mut line = Vec::new();
         let (count, newline) = read_line(&mut reader, &mut line)?;
@@ -861,68 +863,62 @@ fn scan_inner(
         SCANNED.with(|n| n.set(n.get() + count));
         offset += count as u64;
         let payload = line.strip_suffix(b"\n").unwrap_or(&line);
-        let records = match super::lines::classify(payload) {
-            super::lines::Line::Record(Ok(records)) => records,
-            super::lines::Line::Fragment if !first && !boundary_resume => {
-                gap.get_or_insert_with(super::gap_hasher).update(&line);
-                if let Some(s) = &mut state {
-                    s.newline = newline;
+        match super::lines::classify(payload) {
+            super::lines::Line::Record(Ok(records)) => {
+                if records.len() != 1 {
+                    // The classifier returns `multiple records in native audit
+                    // line` ahead of every other check; attestation is unused.
+                    classifier.feed_record(&records[0], records.len(), trail, None)?;
+                    unreachable!("feed_record returns Err when count != 1");
                 }
-                continue;
+                let record = &records[0];
+                // Pass the current gap digest into `feed_record`; the classifier
+                // runs `check_attestation` at base's per-path position
+                // (addendum 12: between `missing opening checkpoint` and
+                // `unclosed segment lacks matching immediate resume`).
+                let gap_digest = classifier.take_gap();
+                let advance = classifier.feed_record(record, 1, trail, gap_digest)?;
+                if expected == classifier.state().map(|s| s.head) {
+                    *found = Some(record.clone());
+                }
+                // Base's `apply_checked` wrapper leaves writer-only fields
+                // untouched on a Duplicate; only Record advances them. Offset
+                // and newline advance on BOTH paths (base's `scan_inner` sets
+                // `s.offset = offset; s.newline = newline` unconditionally
+                // after `apply`).
+                if matches!(advance, Advance::Record) {
+                    let is_cp = matches!(record.kind, Kind::Checkpoint(_));
+                    if is_cp {
+                        cp_time = record.context.time;
+                        since_cp = 0;
+                    } else {
+                        since_cp = since_cp.saturating_add(1).max(1);
+                    }
+                }
+                last_offset = offset;
+                last_newline = newline;
             }
-            _ => return Err(corrupt("invalid audit line or opening checkpoint")),
-        };
-        // Native writer files contain one record per line. Collector batches
-        // are a verifier input (#13), never a native storage representation.
-        if records.len() != 1 {
-            return Err(corrupt("multiple records in native audit line"));
+            super::lines::Line::Fragment => {
+                classifier.feed_fragment(&line)?;
+                last_newline = newline;
+            }
+            super::lines::Line::Unparsable(_) | super::lines::Line::Record(Err(_)) => {
+                classifier.feed_unparsable(&line)?;
+                // feed_unparsable always returns Err in strict mode; unreachable.
+                unreachable!("feed_unparsable returns Err in strict mode");
+            }
         }
-        let record = &records[0];
-        if record.context.trail != trail {
-            return Err(corrupt("trail identity differs from marker"));
-        }
-        if first
-            && state
-                .as_ref()
-                .is_some_and(|s| s.run.head == Head::of(record))
-        {
-            return Err(corrupt("opening checkpoint duplicates predecessor"));
-        }
-        if first && !matches!(record.kind, Kind::Checkpoint(_)) {
-            return Err(corrupt("missing opening checkpoint"));
-        }
-        runs::check_attestation(
-            gap.take().map(|g| *g.finalize().as_bytes()),
-            record.context.repaired,
-        )?;
-        if boundary_resume
-            && !first
-            && !matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume")
-        {
-            return Err(corrupt("unclosed segment lacks matching immediate resume"));
-        }
-        apply(record, &mut state, genesis)?;
-        if !first {
-            boundary_resume = false;
-        }
-        let s = state.as_mut().ok_or_else(|| corrupt("missing head"))?;
-        if expected == Some(s.run.head) {
-            *found = Some(record.clone());
-        }
-        s.offset = offset;
-        s.newline = newline;
-        first = false;
     }
-    if first {
-        return Err(corrupt("empty live file or missing opening checkpoint"));
-    }
-    let mut state = state.ok_or_else(|| corrupt("missing head"))?;
-    if state.run.pending_resume || boundary_resume {
-        return Err(corrupt("resume checkpoint lacks its declaration"));
-    }
-    state.length = offset;
-    state.gap = gap;
-    Ok(state)
+    let finished = classifier.finish()?;
+    Ok(State {
+        run: finished.state,
+        offset: last_offset,
+        length: offset,
+        checkpoint_time: cp_time,
+        since_checkpoint: since_cp,
+        newline: last_newline,
+        gap: finished.gap,
+    })
 }
 fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<(), AuditError> {
     apply_checked(record, state, genesis, false, true)?;

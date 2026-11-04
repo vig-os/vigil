@@ -1759,9 +1759,25 @@ mod details {
     // ahead of `apply_checked`'s record checks, so the pair
     // `[h5, fragment, next]` still gives `sequence gap inside sealed run
     // segment` on seq 7 linked and `missing or mismatched repair
-    // attestation` on seq 6 broken. Count: 49 = 31 in `storage.rs`
-    // (34 − 3 attestation sites) + 18 in `runs.rs`
-    // (17 + 1 `check_attestation` site).
+    // attestation` on seq 6 broken.
+    //
+    // #197 R2b1: 10 strict-mode sites in `scan_inner` move into
+    // `runs::Classifier` (`feed_record`, `finish`, and the merged
+    // `invalid_opening_line` helper): `invalid audit line or opening checkpoint`
+    // (collapsed from the fragment+unparsable arms into one helper),
+    // `multiple records in native audit line` (occ 1), `trail identity
+    // differs from marker` (occ 1), `opening checkpoint duplicates
+    // predecessor`, `missing opening checkpoint`, `unclosed segment lacks
+    // matching immediate resume`, `empty live file or missing opening
+    // checkpoint`, `resume checkpoint lacks its declaration` (occ 1), and
+    // `missing head` (scan_inner's post-loop `state.ok_or_else`, now
+    // `runs::Classifier::finish`). The scan_inner `missing head` at line 908
+    // (UNREACHABLE) becomes a classifier invariant with no inline
+    // `corrupt("missing head")` call, so the total drops by one. The 3
+    // `history_segment` copies that stay in `storage.rs` (its own
+    // `multiple records`/`trail identity`/`resume checkpoint lacks …`
+    // copies and the fallback walk sites) are **R2b2** scope. Count:
+    // 48 = 21 in `storage.rs` (31 − 10) + 27 in `runs.rs` (18 + 9).
     const STORAGE_SRC: &str = include_str!("storage.rs");
     const RUNS_SRC: &str = include_str!("runs.rs");
     const STORAGE_TESTS_SRC: &str = include_str!("storage_tests.rs");
@@ -2371,6 +2387,99 @@ mod details {
             0,
         );
     }
+    // ---- Pins added by #197 R2b S1-fixed (defects found by diff on base) -
+    #[test]
+    fn pin_sc_trail_identity_after_pending_fragment() {
+        // Defect 1 of unfixed S1: attestation was called BEFORE
+        // `feed_record` in the reader shim, which ran it ahead of
+        // `trail identity differs from marker`. Base's per-path order
+        // (addendum 12) runs multi/trail/dup/missing-opening BEFORE
+        // check_attestation. Layout: `[cp0, e1, "{\"torn\":\n"]` cached,
+        // then a record from another trail appended; `scan(opening=false)`
+        // must emit `trail identity differs from marker`, not
+        // `missing or mismatched repair attestation`.
+        let f = cp0();
+        let e1 = entry(&f);
+        let fragment = b"{\"torn\":\n";
+        let (d, s) = state_from(&[line(&f), line(&e1), fragment.to_vec()].concat());
+        assert!(s.gap.is_some(), "setup: gap must be pending");
+        append_bytes(&d.0.join("audit.jsonl"), &line(&cp0_other_trail()));
+        assert_corrupt(
+            scc(&o(&d), Some(s), false),
+            "trail identity differs from marker",
+            1,
+        );
+    }
+    #[test]
+    fn pin_sc_multiple_records_fails_apply_checked_first() {
+        // Kills surviving M2 of the S1 brief (multi-records precondition
+        // deferred past `apply_checked`): the first record in the batch
+        // has a broken hash link so `apply_checked` would error with
+        // `record rolled back, changed or broke its hash link`; base's
+        // order emits `multiple records in native audit line` first.
+        let f = cp0();
+        let bad = Record::new(
+            context(1, [42; 32]),
+            Entry::new("actor", "change", "object"),
+        )
+        .unwrap();
+        let d = Temp::new();
+        let mut bytes = line(&f);
+        bytes.extend_from_slice(&multi_record_line(&bad));
+        w(&d, &bytes);
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "multiple records in native audit line",
+            1,
+        );
+    }
+    #[test]
+    fn pin_sc_duplicate_does_not_bump_since_checkpoint() {
+        // Defect 2 of unfixed S1: the reader shim bumped `since_checkpoint`
+        // on `Advance::Duplicate` (base's `apply_checked` wrapper leaves
+        // writer-only fields in place on a duplicate). Layout `[cp0, e1, e1]`
+        // on live open: base's `since_checkpoint == 1` (from e1); unfixed
+        // S1 gave 2.
+        let f = cp0();
+        let e1 = entry(&f);
+        let d = Temp::new();
+        w(&d, &concat(&[&f, &e1, &e1], &[]));
+        let state = scc(&o(&d), None, true).expect("scan should accept the duplicate");
+        assert_eq!(
+            state.since_checkpoint, 1,
+            "a duplicate must not bump since_checkpoint (base's apply_checked wrapper semantic)",
+        );
+        assert!(
+            !state.run.run_loss,
+            "a duplicate must clear run_loss on the preserved state (base's apply wrapper)",
+        );
+    }
+    #[test]
+    fn pin_sc_attestation_between_missing_opening_and_apply() {
+        // Kills M4 (attestation moved out of its base shim position:
+        // between `missing opening checkpoint` and `apply_checked`).
+        // Layout: `[cp0, fragment, record_with_broken_link]`. Both
+        // attestation and `apply_checked` would error. Base runs
+        // attestation first → `missing or mismatched repair attestation`;
+        // a mutant that moves attestation AFTER apply_checked fires the
+        // hash-link error instead.
+        let f = cp0();
+        let bad = Record::new(
+            context(1, [42; 32]),
+            Entry::new("actor", "change", "object"),
+        )
+        .unwrap();
+        let d = Temp::new();
+        w(
+            &d,
+            &[line(&f), b"{\"torn\":\n".to_vec(), line(&bad)].concat(),
+        );
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "missing or mismatched repair attestation",
+            0,
+        );
+    }
     #[test]
     fn pin_sc_unclosed_segment_lacks_matching_immediate_resume() {
         let (d, s, first) = state_with_gap();
@@ -2426,7 +2535,7 @@ mod details {
         // guard is skipped and the post-loop `state.ok_or_else` fires.
         let d = Temp::new();
         w(&d, b"");
-        assert_corrupt(scc(&o(&d), None, false), "missing head", 2);
+        assert_corrupt(scc(&o(&d), None, false), "missing head", 1);
     }
     #[test]
     fn pin_sc_missing_head_opening_false_fragment_only() {
@@ -2436,7 +2545,7 @@ mod details {
         // `state.ok_or_else` fires with "missing head".
         let d = Temp::new();
         w(&d, b"{\"torn\":");
-        assert_corrupt(scc(&o(&d), None, false), "missing head", 2);
+        assert_corrupt(scc(&o(&d), None, false), "missing head", 1);
     }
 
     // ---- Pins: apply_checked via scan direct calls ----------------------
@@ -3187,7 +3296,14 @@ mod details {
             0,
             "history_segment: apply_checked Ok leaves state=Some",
         ),
-        ("missing head", 1, "scan_inner: apply Ok leaves state=Some"),
+        // #197 R2b1: scan_inner's UNREACHABLE `missing head` (apply Ok)
+        // moved into `runs::Classifier::feed_record` where the new state
+        // is returned by `apply_checked` directly (no `state.as_mut().ok_or_else`
+        // guard). The merged state follow-up is a classifier invariant with
+        // no inline `corrupt("missing head")` call, so this UNREACHABLE row
+        // drops. The remaining `missing head` sites are history_segment's
+        // (occ 0, UNREACHABLE) and runs::Classifier::finish's (occ 1, tested
+        // by `pin_sc_missing_head_opening_false_*`).
         (
             "invalid opening peaks",
             0,
@@ -3570,7 +3686,7 @@ mod details {
         }
         assert_eq!(
             sites.len(),
-            49,
+            48,
             "corrupt-site count changed; update gate explicitly"
         );
     }
