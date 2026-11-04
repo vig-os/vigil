@@ -800,7 +800,7 @@ fn scan_inner(
     found: &mut Option<Record>,
     context: SegmentContext,
 ) -> Result<State, AuditError> {
-    // #197 R2b1: strict-mode scan_inner is a thin shim over `runs::Classifier`.
+    // #197 R2b S1: strict-mode scan_inner is a thin shim over `runs::Classifier`.
     // The shim performs byte-level I/O (reading a physical line, the
     // byte-glue check for an unterminated predecessor, `offset`/`newline`/
     // `length` bookkeeping, and the three writer-only State fields),

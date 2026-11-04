@@ -213,11 +213,14 @@ fn validate_resume(details: &str, s: &RunState, record: &Record) -> Result<(), A
     Ok(())
 }
 
-/// The merged strict-mode `invalid audit line or opening checkpoint` site.
-/// `Fragment` at `first`/`boundary_resume` and every `Unparsable`/`Record(Err)`
-/// payload collapse here (197 R2b S1 §2a item 1). The syn coverage gate counts
-/// this one `corrupt("...")` call and the pin `pin_sc_invalid_audit_line_or_opening_checkpoint`
-/// targets it at occurrence 0.
+/// Strict-mode `invalid audit line or opening checkpoint` site. `Fragment`
+/// at `first`/`boundary_resume` and every `Unparsable`/`Record(Err)` payload
+/// both reach this helper, exactly as they both reached the single
+/// `scan_inner` site on base `95f8bcf` (no merge happened — base already
+/// had one such site). The syn coverage gate counts this one
+/// `corrupt("...")` call and the pin
+/// `pin_sc_invalid_audit_line_or_opening_checkpoint` targets it at
+/// occurrence 0.
 fn invalid_opening_line() -> AuditError {
     corrupt("invalid audit line or opening checkpoint")
 }
@@ -255,9 +258,12 @@ pub(crate) enum Advance {
     /// Record folded into state; cursor advances.
     Record,
     /// Collector-style identical duplicate; prior state is unchanged.
-    /// Reachable on refresh paths where an already-seen record is observed
-    /// again without an intervening write; the reader advances offset/newline
-    /// anyway (matches storage::apply_checked's wrapper behaviour).
+    /// Reachable on any strict path whose segment carries two bytewise-
+    /// identical records in sequence: a plain live open of `[cp0, e1, e1]`,
+    /// `scan_staged`/`scan_closing` over the same layout, and a `refresh`
+    /// that re-reads an already-consumed record. The reader advances
+    /// offset/newline anyway (matches storage::apply_checked's wrapper
+    /// behaviour).
     Duplicate,
 }
 
@@ -266,9 +272,12 @@ pub(crate) enum Advance {
 /// paths without buffering the trail. Push API: the reader's shim performs
 /// byte-level work (reading a line, running [`super::lines::classify`]) and
 /// then calls [`Classifier::feed_record`], [`Classifier::feed_fragment`] or
-/// [`Classifier::feed_unparsable`]. The reader's shim calls
-/// [`check_attestation`] immediately before each `feed_record` (addendum 7
-/// / addendum 12: the reader's per-path order binds).
+/// [`Classifier::feed_unparsable`]. [`check_attestation`] runs **inside**
+/// [`Classifier::feed_record`], after the `missing opening checkpoint` check
+/// and before the `unclosed segment lacks matching immediate resume` check
+/// (addendum 7 / addendum 12: the reader's per-path order binds); the shim
+/// finalises the current gap via [`Classifier::take_gap`] and hands the
+/// digest in as `gap_digest`.
 pub(crate) struct Classifier {
     state: Option<RunState>,
     mode: Mode,
@@ -319,18 +328,14 @@ impl Classifier {
 
     /// Feeds one complete record (strict mode). Returns [`Advance::Record`]
     /// on a folded record, [`Advance::Duplicate`] on a collector-style
-    /// identical duplicate (the reader's shim preserves `run_loss=false`
-    /// via the classifier, and must NOT bump `since_checkpoint`), and `Err`
-    /// with the exact detail string the reader emitted at this site today
-    /// (ruling 13-V4-d4 point 1). `gap_digest` is the hasher output from
-    /// [`Classifier::take_gap`]; the classifier runs [`check_attestation`]
-    /// at base's exact per-path position (addendum 12: between `missing
-    /// opening checkpoint` and `unclosed segment lacks matching immediate
-    /// resume`).
-    ///
-    /// Duplicates ARE reachable from `scan_inner`'s wrappers (`refresh`,
-    /// a second `scan` after a prior successful advance), despite R2b S1's
-    /// draft rustdoc claiming otherwise.
+    /// identical duplicate (the classifier preserves `run_loss=false` on the
+    /// retained state, and the reader's shim must NOT bump `since_checkpoint`
+    /// on this outcome), and `Err` with the exact detail string the reader
+    /// emitted at this site today (ruling 13-V4-d4 point 1). `gap_digest` is
+    /// the hasher output from [`Classifier::take_gap`]; the classifier runs
+    /// [`check_attestation`] at base's exact per-path position (addendum 12:
+    /// between `missing opening checkpoint` and `unclosed segment lacks
+    /// matching immediate resume`).
     pub(crate) fn feed_record(
         &mut self,
         record: &Record,
@@ -401,9 +406,11 @@ impl Classifier {
     /// In strict mode this extends the gap hasher when a prior complete record
     /// is in scope; at the first position or across an unclosed boundary it is
     /// an opening-checkpoint violation. The `Fragment`-at-opening path and the
-    /// `Unparsable`/`Record(Err)` path share a single reader-side detail site
-    /// `invalid audit line or opening checkpoint` (the merged strict site,
-    /// see 197-r2b1 §2a item 1).
+    /// `Unparsable`/`Record(Err)` path both reach the single reader-side
+    /// detail site `invalid audit line or opening checkpoint` (via
+    /// [`invalid_opening_line`]); base `95f8bcf`'s `scan_inner` already had
+    /// one such site, so this is a move, not a merge (see 197-r2b S1 §2a
+    /// item 1).
     pub(crate) fn feed_fragment(&mut self, bytes: &[u8]) -> Result<(), AuditError> {
         assert!(
             matches!(self.mode, Mode::Strict),
@@ -418,7 +425,8 @@ impl Classifier {
 
     /// Feeds one physical line classified as [`super::lines::Line::Unparsable`]
     /// or a `Record(Err)`. Strict mode always treats this as an opening-checkpoint
-    /// violation (same merged site as [`Classifier::feed_fragment`]'s guard); the
+    /// violation at the same [`invalid_opening_line`] site
+    /// [`Classifier::feed_fragment`]'s opening/boundary guard reaches; the
     /// tolerant mode (R2b S2) accepts it as damaged evidence.
     pub(crate) fn feed_unparsable(&mut self, _bytes: &[u8]) -> Result<(), AuditError> {
         assert!(

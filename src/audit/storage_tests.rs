@@ -1761,22 +1761,25 @@ mod details {
     // segment` on seq 7 linked and `missing or mismatched repair
     // attestation` on seq 6 broken.
     //
-    // #197 R2b1: 10 strict-mode sites in `scan_inner` move into
-    // `runs::Classifier` (`feed_record`, `finish`, and the merged
-    // `invalid_opening_line` helper): `invalid audit line or opening checkpoint`
-    // (collapsed from the fragment+unparsable arms into one helper),
-    // `multiple records in native audit line` (occ 1), `trail identity
-    // differs from marker` (occ 1), `opening checkpoint duplicates
-    // predecessor`, `missing opening checkpoint`, `unclosed segment lacks
-    // matching immediate resume`, `empty live file or missing opening
-    // checkpoint`, `resume checkpoint lacks its declaration` (occ 1), and
-    // `missing head` (scan_inner's post-loop `state.ok_or_else`, now
-    // `runs::Classifier::finish`). The scan_inner `missing head` at line 908
-    // (UNREACHABLE) becomes a classifier invariant with no inline
-    // `corrupt("missing head")` call, so the total drops by one. The 3
-    // `history_segment` copies that stay in `storage.rs` (its own
+    // #197 R2b S1: 10 strict-mode sites in `scan_inner` move into
+    // `runs::Classifier` (`feed_record`, `finish`, and the
+    // `invalid_opening_line` helper): `invalid audit line or opening
+    // checkpoint` (one site, served by `invalid_opening_line`; base
+    // `95f8bcf` already had one such site in `scan_inner` for both the
+    // fragment-at-opening and unparsable arms, so this is a move, not a
+    // merge), `multiple records in native audit line` (occ 1), `trail
+    // identity differs from marker` (occ 1), `opening checkpoint
+    // duplicates predecessor`, `missing opening checkpoint`, `unclosed
+    // segment lacks matching immediate resume`, `empty live file or
+    // missing opening checkpoint`, `resume checkpoint lacks its
+    // declaration` (occ 1), and `missing head` (scan_inner's post-loop
+    // `state.ok_or_else`, now `runs::Classifier::finish`). The scan_inner
+    // `missing head` at line 908 (UNREACHABLE) becomes a classifier
+    // invariant with no inline `corrupt("missing head")` call, so the
+    // total drops by one — that one drop is where 49 → 48 comes from.
+    // The 3 `history_segment` copies that stay in `storage.rs` (its own
     // `multiple records`/`trail identity`/`resume checkpoint lacks …`
-    // copies and the fallback walk sites) are **R2b2** scope. Count:
+    // copies and the fallback walk sites) are **R2b S2** scope. Count:
     // 48 = 21 in `storage.rs` (31 − 10) + 27 in `runs.rs` (18 + 9).
     const STORAGE_SRC: &str = include_str!("storage.rs");
     const RUNS_SRC: &str = include_str!("runs.rs");
@@ -2449,10 +2452,13 @@ mod details {
             state.since_checkpoint, 1,
             "a duplicate must not bump since_checkpoint (base's apply_checked wrapper semantic)",
         );
-        assert!(
-            !state.run.run_loss,
-            "a duplicate must clear run_loss on the preserved state (base's apply wrapper)",
-        );
+        // The duplicate branch of `Classifier::feed_record` also clears
+        // `run_loss` on the preserved state (matches base's `apply`
+        // wrapper), but that clear is not observable on strict paths: every
+        // strict scan reaches a duplicate only through a prior `Record`
+        // outcome that already set `run_loss = false`. Dropping the clear
+        // still leaves this scan returning `run_loss = false` here, so no
+        // assertion is pinned.
     }
     #[test]
     fn pin_sc_attestation_between_missing_opening_and_apply() {
@@ -3296,14 +3302,15 @@ mod details {
             0,
             "history_segment: apply_checked Ok leaves state=Some",
         ),
-        // #197 R2b1: scan_inner's UNREACHABLE `missing head` (apply Ok)
+        // #197 R2b S1: scan_inner's UNREACHABLE `missing head` (apply Ok)
         // moved into `runs::Classifier::feed_record` where the new state
         // is returned by `apply_checked` directly (no `state.as_mut().ok_or_else`
-        // guard). The merged state follow-up is a classifier invariant with
-        // no inline `corrupt("missing head")` call, so this UNREACHABLE row
-        // drops. The remaining `missing head` sites are history_segment's
-        // (occ 0, UNREACHABLE) and runs::Classifier::finish's (occ 1, tested
-        // by `pin_sc_missing_head_opening_false_*`).
+        // guard). The follow-up on the returned state is a classifier
+        // invariant with no inline `corrupt("missing head")` call, so this
+        // UNREACHABLE row drops. The remaining `missing head` sites are
+        // history_segment's (occ 0, UNREACHABLE) and
+        // runs::Classifier::finish's (occ 1, tested by
+        // `pin_sc_missing_head_opening_false_*`).
         (
             "invalid opening peaks",
             0,
