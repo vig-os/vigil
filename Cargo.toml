@@ -56,6 +56,17 @@ flate2 = "1"
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 log = "0.4"
+# 197-d1 addendum 9: the audit::storage coverage gate parses storage.rs and
+# storage_tests.rs with syn instead of a hand-written lexer. syn 2.x is
+# already a transitive dependency (via blake3's and ed25519-dalek's derive
+# macro paths), so this direct edge resolves to the same locked 2.0.119
+# without pulling in a new crate.
+syn = { version = "2", default-features = false, features = ["parsing", "full", "visit", "printing"] }
+# 197-d1 addendum 10 fix 2: the gate walks macro-invocation token streams
+# via syn::Macro::tokens, which is a proc_macro2::TokenStream. proc-macro2
+# is already locked (1.0.107, pulled in by syn itself), so this direct
+# dev-dep edge resolves to the same crate.
+proc-macro2 = { version = "1", default-features = false }
 
 [[bench]]
 name = "performance"
