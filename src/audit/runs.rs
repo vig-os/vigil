@@ -184,7 +184,7 @@ pub(crate) fn resume_details(details: &str) -> Result<(&str, &str, &str), AuditE
 
 /// Validates the resume declaration carried in a `vigil.audit.resume`
 /// entry's `details`, emitting the exact first-violation detail string
-/// `storage::apply_checked` emitted today (ruling 13-V4-d4 point 1).
+/// `storage::apply_checked` emits (ruling 13-V4-d4 point 1).
 fn validate_resume(details: &str, s: &RunState, record: &Record) -> Result<(), AuditError> {
     let (named, lost, file) = resume_details(details)?;
     let (seq_text, hash) = named
@@ -417,7 +417,7 @@ impl Classifier {
     /// identical duplicate (the classifier preserves `run_loss=false` on the
     /// retained state, and the reader's shim must NOT bump `since_checkpoint`
     /// on this outcome), and `Err` with the exact detail string the reader
-    /// emitted at this site today (ruling 13-V4-d4 point 1). `gap_digest` is
+    /// emits at this site (ruling 13-V4-d4 point 1). `gap_digest` is
     /// the hasher output from [`Classifier::take_gap`]; the classifier runs
     /// [`check_attestation`] at base's exact per-path position (addendum 12:
     /// between `missing opening checkpoint` and `unclosed segment lacks
@@ -503,7 +503,7 @@ impl Classifier {
     pub(crate) fn feed_fragment(&mut self, bytes: &[u8]) -> Result<(), AuditError> {
         assert!(
             matches!(self.mode, Mode::Strict),
-            "Tolerant mode lands in #197 R2b S2"
+            "feed_fragment is strict-mode-only; tolerant mode uses feed_fragment_tolerant"
         );
         if self.first || self.boundary_resume {
             return Err(invalid_opening_line());
@@ -520,7 +520,7 @@ impl Classifier {
     pub(crate) fn feed_unparsable(&mut self, _bytes: &[u8]) -> Result<(), AuditError> {
         assert!(
             matches!(self.mode, Mode::Strict),
-            "Tolerant mode lands in #197 R2b S2"
+            "feed_unparsable is strict-mode-only; tolerant mode uses feed_unparsable_tolerant"
         );
         Err(invalid_opening_line())
     }
@@ -532,7 +532,7 @@ impl Classifier {
     pub(crate) fn finish(self) -> Result<FinishOutcome, AuditError> {
         assert!(
             matches!(self.mode, Mode::Strict),
-            "Tolerant mode lands in #197 R2b S2"
+            "finish is strict-mode-only; tolerant mode uses finish_tolerant"
         );
         if self.first {
             return Err(corrupt("empty live file or missing opening checkpoint"));
@@ -549,11 +549,10 @@ impl Classifier {
 
     // ---- Tolerant mode (#197 R2b S2) -----------------------------------
 
-    /// Tolerant-mode: feed one Fragment line. The reader's shim bumps the
-    /// gap hasher for a fragment arriving after a complete record
-    /// (preserves the attestation input today); any fragment also sets
-    /// `prefix` at `count == 0` and clears `closing` at `count == 1`
-    /// (matches `history_segment`'s current branch).
+    /// Tolerant-mode: feed one Fragment line. Extends the gap hasher when a
+    /// prior complete record is in scope so the next record's attestation
+    /// covers it; any fragment also sets `prefix` at `count == 0` and
+    /// clears `closing` at `count == 1`.
     pub(crate) fn feed_fragment_tolerant(&mut self, bytes: &[u8]) {
         debug_assert!(matches!(self.mode, Mode::Tolerant));
         if !self.first {
@@ -583,9 +582,8 @@ impl Classifier {
         }
     }
 
-    /// Tolerant-mode: feed a `Line::Record(Err(_))` payload. Today's
-    /// `history_segment` emits `invalid audit record in sealed run` without
-    /// touching latches, then propagates the error.
+    /// Tolerant-mode: feed a `Line::Record(Err(_))` payload. Returns
+    /// `invalid audit record in sealed run` without touching latches.
     pub(crate) fn feed_record_err_tolerant(&self) -> Result<(), AuditError> {
         debug_assert!(matches!(self.mode, Mode::Tolerant));
         Err(corrupt("invalid audit record in sealed run"))
@@ -721,10 +719,10 @@ impl Classifier {
     /// Tolerant-mode terminal check for one segment. Returns the segment's
     /// final `RunState` (possibly `None` when no complete record was folded),
     /// the gap hasher the reader threads into `State.gap`, and the owned
-    /// `*run` flag. `history_segment`'s current epilogue is reproduced here:
-    /// `must_close && *run` → `first successor lacks resume`, `count == 0`
-    /// latches `damaged`, `!damaged && !*run` → `invalid undamaged segment`,
-    /// `damaged` promotes `*run`, and a pending-resume state short-circuits
+    /// `*run` flag. Epilogue order: `must_close && run_flag` →
+    /// `first successor lacks resume`, `count == 0` latches `damaged`,
+    /// `!damaged && !run_flag` → `invalid undamaged segment`, `damaged`
+    /// promotes `run_flag`, and a pending-resume state short-circuits
     /// `resume checkpoint lacks its declaration`.
     pub(crate) fn finish_tolerant(mut self) -> Result<TolerantFinishOutcome, AuditError> {
         debug_assert!(matches!(self.mode, Mode::Tolerant));
@@ -760,7 +758,7 @@ impl Classifier {
 pub(crate) enum TolerantPrep {
     /// Identical-duplicate branch of the `history_segment` fallback walk.
     /// The reader calls [`check_attestation`] and continues without
-    /// updating `state.offset` or `state.newline` (preserves the R2a quirk).
+    /// updating `state.offset` or `state.newline`.
     Duplicate,
     /// General branch of the `history_segment` fallback walk. The reader
     /// calls [`check_attestation`] and then

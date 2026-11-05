@@ -1788,8 +1788,9 @@ mod details {
     // finish_tolerant / feed_record_err_tolerant); the shim keeps the
     // reader-side `missing head` defence-in-depth site after
     // `feed_record_apply_tolerant` as its one storage-side invariant
-    // (tested, not UNREACHABLE). Count stays 48 = 9 in `storage.rs` + 39
-    // in `runs.rs`.
+    // (UNREACHABLE: `feed_record_apply_tolerant` on `Ok` leaves
+    // `classifier.state()=Some`, matched by the UNREACHABLE table row
+    // below). Count stays 48 = 9 in `storage.rs` + 39 in `runs.rs`.
     const STORAGE_SRC: &str = include_str!("storage.rs");
     const RUNS_SRC: &str = include_str!("runs.rs");
     const STORAGE_TESTS_SRC: &str = include_str!("storage_tests.rs");
@@ -2031,6 +2032,28 @@ mod details {
         assert_eq!(
             state.offset, expected_offset,
             "duplicate `continue` must not advance the walk cursor past the first copy",
+        );
+    }
+    #[test]
+    fn pin_hs_fallback_fragment_only_opening_updates_state_newline() {
+        // Fragment-only opening segment (opening=true) after a
+        // predecessor state whose `newline=false` (an unterminated
+        // prior record). Strict scan rejects the fragment with
+        // `invalid audit line or opening checkpoint`; the fallback
+        // walks the single Fragment line, whose branch writes
+        // `s.newline = newline` so the outcome reflects the fragment's
+        // trailing LF. Catches a mutant that skips the `s.newline`
+        // update on the Fragment branch.
+        let (_pre, prev_state, _) = state_unterminated();
+        assert!(!prev_state.newline);
+        let d2 = Temp::new();
+        w(&d2, b"{\"torn\":\n");
+        let state = hsc(&o(&d2), Some(prev_state), true, false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            state.newline,
+            "Fragment branch must write the trailing LF into `s.newline`",
         );
     }
     #[test]
@@ -2295,7 +2318,10 @@ mod details {
     #[test]
     fn pin_hs_resume_lacks_declaration() {
         // Hand-crafted State{pending_resume=true} + fragment-only segment
-        // reaches L536 (fallback tail) without L432 or L529 intervening.
+        // reaches `finish_tolerant`'s pending-resume check
+        // (`resume checkpoint lacks its declaration`) without the
+        // duplicate-branch head-match or the `invalid undamaged segment`
+        // guard intervening.
         let state_pending = State {
             run: RunState {
                 head: Head {
@@ -2593,7 +2619,9 @@ mod details {
 
     #[test]
     fn pin_apply_missing_initial_checkpoint() {
-        // scan(opening=false, state=None) skips scan_inner's L903 guard.
+        // scan(opening=false, state=None) reaches `feed_record`'s
+        // `missing initial checkpoint` guard on the first non-Checkpoint
+        // record.
         let d = Temp::new();
         w(&d, &line(&entry(&cp0())));
         assert_corrupt(scc(&o(&d), None, false), "missing initial checkpoint", 1);
@@ -2873,7 +2901,7 @@ mod details {
     #[test]
     fn pin_open_fallback_attestation_duplicate_branch() {
         // [cp0, fragment, cp0] on a sealed segment: the duplicate head
-        // reaches the duplicate-branch attestation check (L440).
+        // reaches the duplicate-branch `check_attestation` call.
         let f = cp0();
         let d = seg_only([line(&f), b"{\"torn\":\n".to_vec(), line(&f)].concat());
         assert_corrupt(
@@ -2898,7 +2926,9 @@ mod details {
     #[test]
     fn pin_open_fallback_missing_initial_checkpoint() {
         // A rotated segment whose first record is a non-Checkpoint
-        // fires L462 in the fallback body (strict fires L903 above).
+        // fires `feed_record_prepare_tolerant`'s `missing initial
+        // checkpoint` guard (strict fires `missing opening checkpoint`
+        // first through `feed_record`).
         let d = seg_only(line(&entry(&cp0())));
         assert_corrupt(
             TrailReader::open(&d.0, TRAIL, None),
@@ -2921,8 +2951,8 @@ mod details {
     fn pin_open_fallback_attestation_general_branch_broken_link_pair() {
         // Two rotated segments: seg0 seals state at cp0; seg1 opens with
         // h5 (seq=5), then a fragment, then a broken-link seq=6. The
-        // fragment+broken pair reaches the general-branch attestation
-        // check (L476) in the fallback body on seg1.
+        // fragment+broken pair reaches the general-branch
+        // `check_attestation` call in the fallback body on seg1.
         let f = cp0();
         let h5 = Record::new(context(5, [0; 32]), Entry::new("actor", "change", "object")).unwrap();
         let broken = Record::new(
@@ -2963,7 +2993,9 @@ mod details {
     fn boundary_resume_sealed_run_rotated_successor_lacks_immediate_resume() {
         // seg0 is a sealed-run segment (cp0 + trailing fragment); seg1
         // opens with a correct closing cp1, then a non-resume entry.
-        // Fallback's count==1 && closing && !is_resume fires L498.
+        // `feed_record_apply_tolerant`'s count==1 && closing &&
+        // !is_resume branch fires `first successor lacks immediate
+        // resume`.
         let f = cp0();
         let close = cp(1, f.hash(), &seeded(&f));
         let d = two_segs(
@@ -2980,7 +3012,9 @@ mod details {
     fn boundary_resume_fragment_only_rotated_successor_lacks_immediate_resume() {
         // seg0 is fragment-only (no records); seg1 opens with a
         // root-linked cp5 (closing the inherited run), then a non-resume
-        // entry. Fallback's count==1 && closing && !is_resume fires L498.
+        // entry. `feed_record_apply_tolerant`'s count==1 && closing &&
+        // !is_resume branch fires `first successor lacks immediate
+        // resume`.
         let close = cp_root(5);
         let d = two_segs(
             b"{\"torn\":".to_vec(),
@@ -2995,7 +3029,8 @@ mod details {
     #[test]
     fn pin_open_fallback_first_successor_lacks_resume_eof() {
         // seg0 unsealed; seg1 is just a correct closing cp (no second
-        // record), so must_close && *run at end-of-loop fires L523.
+        // record), so `must_close && run_flag` in `finish_tolerant`
+        // fires `first successor lacks resume`.
         let f = cp0();
         let close = cp(1, f.hash(), &seeded(&f));
         let d = two_segs([line(&f), b"{\"torn\":".to_vec()].concat(), line(&close));
@@ -3009,8 +3044,9 @@ mod details {
     fn pin_open_fallback_invalid_undamaged_segment() {
         // A rotated segment with a single root-linked cp(7) (prev==genesis
         // but seq>0) parses cleanly through the fallback body but is
-        // neither damaged nor inside an inherited run, so L529 fires at
-        // end-of-loop before the pending-resume check.
+        // neither damaged nor inside an inherited run, so `finish_tolerant`
+        // fires `invalid undamaged segment` before the pending-resume
+        // check.
         let d = seg_only(line(&cp_root(7)));
         assert_corrupt(
             TrailReader::open(&d.0, TRAIL, None),
@@ -3021,8 +3057,10 @@ mod details {
     #[test]
     fn pin_open_fallback_resume_checkpoint_lacks_declaration() {
         // cp(7) root-linked sets pending_resume; the trailing "not json\n"
-        // marks the segment damaged (so L529 is skipped) and the state's
-        // pending_resume=true then fires L536 at the end of the fallback.
+        // marks the segment damaged (so the `invalid undamaged segment`
+        // guard is skipped) and the state's pending_resume=true then
+        // fires `resume checkpoint lacks its declaration` in
+        // `finish_tolerant`.
         let d = seg_only([line(&cp_root(7)), b"not json\n".to_vec()].concat());
         assert_corrupt(
             TrailReader::open(&d.0, TRAIL, None),
@@ -3106,7 +3144,8 @@ mod details {
         let d = Temp::new();
         let first = cp0();
         // Rotated segment that fails strict scan and trips the fallback
-        // body's "invalid audit record in sealed run" guard (L421).
+        // body's `invalid audit record in sealed run` guard
+        // (`feed_record_err_tolerant`).
         fs::write(segment(&d.0, 0), [line(&first), b"{}\n".to_vec()].concat()).unwrap();
         fs::write(d.0.join("audit.jsonl"), line(&first)).unwrap();
         trail_marker(&d);
@@ -3204,9 +3243,10 @@ mod details {
     #[test]
     fn boundary_resume_sealed_run_live_lacks_matching_immediate_resume() {
         // seg0 unsealed; the live file opens with a correct cp1, then
-        // a non-resume entry. scan_inner's live-path L914 fires before
-        // apply, which is a different site from the rotated-successor
-        // L498 pin above.
+        // a non-resume entry. scan_inner's live-path hits `feed_record`'s
+        // `unclosed segment lacks matching immediate resume` guard
+        // before apply, which is a different site from the rotated-
+        // successor `first successor lacks immediate resume` pin above.
         let d = Temp::new();
         let first = cp0();
         let close = cp(1, first.hash(), &seeded(&first));
@@ -3225,7 +3265,9 @@ mod details {
     #[test]
     fn boundary_resume_fragment_only_live_lacks_matching_immediate_resume() {
         // seg0 fragment-only; live opens with a root-linked cp5 then a
-        // non-resume entry. scan_inner's L914 fires before apply.
+        // non-resume entry. scan_inner's `feed_record`
+        // `unclosed segment lacks matching immediate resume` guard
+        // fires before apply.
         let d = Temp::new();
         let close = cp_root(5);
         fs::write(segment(&d.0, 0), b"{\"torn\":").unwrap();
@@ -3240,8 +3282,8 @@ mod details {
     fn opening_mmr_mismatch_closing_opening() {
         // Live-file layout where the second record is a sealed-run
         // close+open opening whose claimed MMR disagrees with the fold.
-        // apply_checked's MMR comparison fires L1006, before any
-        // boundary-handling branch.
+        // `apply_checked`'s MMR comparison fires `checkpoint MMR differs
+        // from preceding records` before any boundary-handling branch.
         let d = Temp::new();
         let first = cp0();
         let wrong_close = cp(1, first.hash(), &alt_fold());
@@ -3271,7 +3313,8 @@ mod details {
         )
         .unwrap();
 
-        // Live open: scan_closing hits apply_checked's L985.
+        // Live open: scan_closing hits `apply_checked`'s hash-link
+        // check (`record rolled back, changed or broke its hash link`).
         let d_open = Temp::new();
         write_records(&d_open.0, &[&first, &e1, &x]);
         assert_corrupt(

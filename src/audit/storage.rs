@@ -328,7 +328,7 @@ pub(crate) fn history_segment(
     // Decision 8 still applies when a malformed suffix makes the successor
     // enter the run fallback: a linking opening cannot defer its declaration.
     let unsealed_boundary = opening && state.as_ref().is_some_and(|s| !sealed(s));
-    // Strict pass first, through the shared `scan_inner` shim (R2b1).
+    // Strict pass first, through the shared `scan_inner` shim.
     match scan_inner(
         file,
         trail,
@@ -420,9 +420,8 @@ pub(crate) fn history_segment(
         let record = &records[0];
         match classifier.feed_record_prepare_tolerant(record, record_count, trail)? {
             TolerantPrep::Duplicate => {
-                // Preserves today's quirk: identical-duplicate branch calls
-                // `check_attestation` but does NOT update `state.offset` /
-                // `state.newline`.
+                // Identical-duplicate branch: calls `check_attestation` but
+                // does NOT update `state.offset` / `state.newline`.
                 runs::check_attestation(classifier.take_gap(), record.context.repaired)?;
                 continue;
             }
@@ -894,9 +893,8 @@ fn apply_checked(
 /// Next `(checkpoint_time, since_checkpoint)` after folding `record` onto
 /// the predecessor's `(checkpoint_time, since_checkpoint)` in `prior`. A
 /// `Kind::Checkpoint` resets to `(record.context.time, 0)`; any other kind
-/// increments `since_checkpoint` saturating at `u64::MAX` (base used plain
-/// `+ 1`, which would panic on overflow; the saturating form keeps the same
-/// value on every realistic input and never panics).
+/// adds `1`. At the `u64::MAX` bound the `+ 1` panics in debug and wraps
+/// in release; the reader never carries `2^64` records in one segment.
 ///
 /// Shared by `scan_inner`, `apply_checked` and `history_segment`'s
 /// tolerant-mode fallback rebuild so the three stay identical on every
@@ -906,7 +904,7 @@ fn next_cp_fields(prior: Option<(u64, u64)>, record: &Record) -> (u64, u64) {
         return (record.context.time, 0);
     }
     let (cp_time, since_cp) = prior.unwrap_or((0, 0));
-    (cp_time, since_cp.saturating_add(1).max(1))
+    (cp_time, since_cp + 1)
 }
 
 #[cfg(test)]
