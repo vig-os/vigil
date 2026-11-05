@@ -22,6 +22,15 @@
 //! wrapper (#197 R2b S3b) consumes it. Nothing outside the reader or the
 //! verifier may call this module as a first-violation oracle.
 //!
+//! **S3a scope (ruling 197-d1 addendum 18):** [`Reaction::Collect`] in
+//! this slice runs **tolerant mode only** -- the only constructor is
+//! [`Classifier::new_collect`], which builds a tolerant classifier.
+//! Strict-mode Collect, a Collect entry for a `Record(Err)` line, and
+//! the collector-first-equals-reader-first sweep over the strict
+//! single-segment paths land in **#197 R2b S3a′**; until then the
+//! collector is not a first-violation oracle for any strict path, and
+//! no caller may treat it as one.
+//!
 //! Addendum 16 point 2: on a fold (iii) mismatch the record-apply callsite
 //! inside the [`Classifier`] special-cases [`Reaction::Collect`] and
 //! re-applies through [`apply_checked`] with `compare_mmr = false`,
@@ -200,13 +209,22 @@ impl From<Violation> for AuditError {
 /// (iii) salvage in the record-apply callsite is the one asymmetric site:
 /// under [`Reaction::Collect`] the mismatch is recorded without latching
 /// and classification continues via `apply_checked(.., compare_mmr=false)`.
+///
+/// **S3a scope (ruling 197-d1 addendum 18):** [`Reaction::Collect`] is
+/// wired to **tolerant mode only** in S3a. The only constructor is
+/// [`Classifier::new_collect`] (tolerant); there is no strict-mode
+/// collect constructor and no Collect entry for a `Record(Err)` line.
+/// Strict×Collect and the strict first-equality sweep land in
+/// **#197 R2b S3a′**.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reaction {
     /// Return the violation as an [`AuditError`] from the enclosing
     /// [`Classifier`] method (the reader's today-identical behaviour).
     Stop,
     /// Record `(position, v)` and continue under ruling 197-d1 point 4.
-    /// Used by [`Classifier::new_collect`].
+    /// Used by [`Classifier::new_collect`]. **S3a wires this to tolerant
+    /// mode only (ruling 197-d1 addendum 18); strict-mode Collect lands
+    /// in #197 R2b S3a′.**
     Collect,
 }
 
@@ -497,6 +515,8 @@ pub(crate) enum Advance {
 /// `recovery_pending` instead of returning early. The record-apply
 /// callsite special-cases a fold (iii) mismatch and splices-in the
 /// checkpoint through [`apply_checked`] with `compare_mmr = false`.
+/// **S3a wires Collect to tolerant mode only** (ruling 197-d1
+/// addendum 18); strict-mode Collect lands in #197 R2b S3a′.
 pub(crate) struct Classifier {
     state: Option<RunState>,
     mode: Mode,
@@ -659,6 +679,14 @@ impl Classifier {
     /// (iii) salvage through [`apply_checked`] with `compare_mmr=false`.
     /// Consumed by S3b's `classify` iterator and the V4a walk; S3a's own
     /// unit rows drive it directly.
+    ///
+    /// **S3a is tolerant-only (ruling 197-d1 addendum 18).** This is the
+    /// sole Collect constructor in S3a: there is no strict-mode
+    /// counterpart. A strict Collect constructor and a Collect entry for
+    /// a `Record(Err)` line land in **#197 R2b S3a′**. Callers that need
+    /// a strict first-violation oracle still use [`Classifier::new`]
+    /// under [`Reaction::Stop`]; the collector in S3a must not be
+    /// treated as equivalent to the reader on any strict path.
     #[cfg_attr(
         not(test),
         expect(
@@ -1124,6 +1152,8 @@ impl Classifier {
     /// `self.state` forward as the new `saved_prior`, adopts the caller-
     /// supplied segment context and `inherited` flag, and sets the
     /// collector segment index to `next_segment_index` (0-based).
+    /// Tolerant-only in S3a (ruling 197-d1 addendum 18); the Collect
+    /// reaction has no strict-mode constructor until #197 R2b S3a′.
     #[cfg_attr(
         not(test),
         expect(
@@ -1194,6 +1224,11 @@ impl Classifier {
     /// `recovery_pending`. The fold (iii) salvage inside
     /// `feed_record_apply_tolerant` continues classification without
     /// latching.
+    ///
+    /// **Tolerant-only in S3a (ruling 197-d1 addendum 18).** This entry
+    /// drives the tolerant state machine exclusively. A strict-mode
+    /// Collect entry and a Collect entry for a `Record(Err)` line land
+    /// in **#197 R2b S3a′**.
     #[cfg_attr(
         not(test),
         expect(
@@ -1249,6 +1284,7 @@ impl Classifier {
     /// Addendum 16 point 1: Collect-reaction entry point for a Fragment
     /// line. Bumps the record index, short-circuits on `recovery_pending`,
     /// then delegates to the shared [`Classifier::feed_fragment_tolerant`].
+    /// Tolerant-only in S3a (ruling 197-d1 addendum 18).
     #[cfg_attr(
         not(test),
         expect(
@@ -1268,6 +1304,8 @@ impl Classifier {
     /// Addendum 16 point 1: Collect-reaction entry point for an Unparsable
     /// line. Bumps the record index, short-circuits on `recovery_pending`,
     /// then delegates to the shared [`Classifier::feed_unparsable_tolerant`].
+    /// Tolerant-only in S3a (ruling 197-d1 addendum 18); the Collect entry
+    /// for a `Record(Err)` line lands in #197 R2b S3a′.
     #[cfg_attr(
         not(test),
         expect(
@@ -1292,6 +1330,10 @@ impl Classifier {
     /// declaration`) are recorded in Collect mode too. Returns the
     /// accumulated violations plus the final pure `RunState`, owned
     /// `run_flag`, and the gap hasher.
+    ///
+    /// Tolerant-only in S3a (ruling 197-d1 addendum 18): this epilogue
+    /// is the tolerant mode's finish-time check set; a strict Collect
+    /// finish lands with the rest of Strict×Collect in #197 R2b S3a′.
     #[cfg_attr(
         not(test),
         expect(
@@ -1371,13 +1413,14 @@ fn runs_trial_apply(prior: Option<&RunState>, record: &Record, genesis: bool) ->
 mod collector_tests {
     //! Minimal collector-API smoke rows. S3a's own unit coverage is a
     //! deliberately small set that exercises every added surface so no
-    //! item is `dead_code` in either configuration. The full
-    //! collector_first-equals-reader-first sweep and the collector rows
-    //! R1–R10 from the brief (fold (iii) salvage, multi-violation
-    //! layouts, finish-time records, reset-at-boundary) are the
-    //! implementer's deliverable, driven by the sweep probe this brief
-    //! requires and the mutant sweep the independent pre-dispatch check
-    //! runs.
+    //! item is `dead_code` in either configuration.
+    //!
+    //! Per ruling 197-d1 addendum 18, S3a ships Collect for **tolerant
+    //! mode only**: the tolerant collector-first-equals-reader-first
+    //! sweep over the `history_segment` single-segment paths is the
+    //! mandatory PR proof for S3a. Strict×Collect, the Collect entry for
+    //! a `Record(Err)` line, the remaining killing rows and the strict
+    //! first-equality sweep land in #197 R2b S3a′.
     use super::*;
     use crate::audit::{AuditError, CheckpointFields, Entry, Mmr, Record, RecordContext};
 
