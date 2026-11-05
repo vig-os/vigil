@@ -1773,14 +1773,23 @@ mod details {
     // segment lacks matching immediate resume`, `empty live file or
     // missing opening checkpoint`, `resume checkpoint lacks its
     // declaration` (occ 1), and `missing head` (scan_inner's post-loop
-    // `state.ok_or_else`, now `runs::Classifier::finish`). The scan_inner
-    // `missing head` at line 908 (UNREACHABLE) becomes a classifier
-    // invariant with no inline `corrupt("missing head")` call, so the
-    // total drops by one — that one drop is where 49 → 48 comes from.
-    // The 3 `history_segment` copies that stay in `storage.rs` (its own
-    // `multiple records`/`trail identity`/`resume checkpoint lacks …`
-    // copies and the fallback walk sites) are **R2b S2** scope. Count:
-    // 48 = 21 in `storage.rs` (31 − 10) + 27 in `runs.rs` (18 + 9).
+    // `state.ok_or_else`, now `runs::Classifier::finish`). scan_inner's
+    // post-`apply_checked` `missing head` UNREACHABLE site becomes a
+    // classifier invariant with no inline `corrupt("missing head")`
+    // call, so the total drops by one — that one drop is where 49 → 48
+    // comes from.
+    //
+    // #197 R2b S2: `history_segment`'s tolerant-mode walk (including the
+    // fallback rescan from a saved segment-start state) moves onto
+    // `runs::Classifier` through the new tolerant API, with a reader
+    // shim in `storage.rs` driving it. The 12 `history_segment` tolerant
+    // `corrupt` sites move from `storage.rs` into `runs.rs`
+    // (feed_record_prepare_tolerant / feed_record_apply_tolerant /
+    // finish_tolerant / feed_record_err_tolerant); the shim keeps the
+    // reader-side `missing head` defence-in-depth site after
+    // `feed_record_apply_tolerant` as its one storage-side invariant
+    // (tested, not UNREACHABLE). Count stays 48 = 9 in `storage.rs` + 39
+    // in `runs.rs`.
     const STORAGE_SRC: &str = include_str!("storage.rs");
     const RUNS_SRC: &str = include_str!("runs.rs");
     const STORAGE_TESTS_SRC: &str = include_str!("storage_tests.rs");
@@ -2166,6 +2175,32 @@ mod details {
         assert!(
             state.gap.is_none(),
             "attestation must consume the gap on history_segment's fallback general branch",
+        );
+    }
+    #[test]
+    fn pin_hs_fallback_rebuild_increments_since_checkpoint() {
+        // #197 R2b S2: the fallback body rebuilds the writer-only
+        // fields (`checkpoint_time`, `since_checkpoint`) through the
+        // shared `next_cp_fields` helper, same as `scan_inner` and
+        // `apply_checked`. A fallback that folds a record after its
+        // opening checkpoint must leave `since_checkpoint == 1` and
+        // `checkpoint_time == cp0.context.time`. A trailing
+        // `not json\n` line trips strict `scan_inner` so the fallback
+        // body runs. Kills mutant O2 (the fallback rebuild no longer
+        // increments `since_checkpoint`).
+        let d = Temp::new();
+        let f = cp0();
+        let e1 = entry(&f);
+        let bytes = [line(&f), line(&e1), b"not json\n".to_vec()].concat();
+        w(&d, &bytes);
+        let state = hsc(&o(&d), None, true, false).unwrap().unwrap();
+        assert_eq!(
+            state.checkpoint_time, 100,
+            "fallback rebuild must preserve the opening checkpoint's time",
+        );
+        assert_eq!(
+            state.since_checkpoint, 1,
+            "fallback rebuild must increment since_checkpoint on the first non-checkpoint record",
         );
     }
     #[test]
@@ -2850,7 +2885,9 @@ mod details {
     #[test]
     fn pin_open_fallback_sequence_did_not_increase_rotated_duplicate_opening() {
         // Brief's example: a rotated duplicate opening (different hash,
-        // same seq=0) hits L448 inside the fallback body.
+        // same seq=0) fires the sealed-seq check inside the fallback
+        // body (feed_record_prepare_tolerant: `record sequence did not
+        // increase inside sealed run`).
         let d = seg_only(concat(&[&cp0(), &alt_cp0()], &[]));
         assert_corrupt(
             TrailReader::open(&d.0, TRAIL, None),
@@ -2908,7 +2945,8 @@ mod details {
         // seg0 ends with a trailing fragment (unsealed); seg1 opens with
         // a Checkpoint that correctly links cp0 but with the wrong fold.
         // The fallback trial fails on MMR mismatch → closing=false,
-        // broken=false, Checkpoint → L488.
+        // broken=false, Checkpoint → the `first successor does not close
+        // sealed run` branch in feed_record_apply_tolerant.
         let f = cp0();
         let wrong_opening = cp(1, f.hash(), &alt_fold());
         let d = two_segs(
@@ -3300,7 +3338,7 @@ mod details {
         (
             "missing head",
             0,
-            "history_segment: apply_checked Ok leaves state=Some",
+            "history_segment shim: feed_record_apply_tolerant Ok leaves classifier.state()=Some",
         ),
         // #197 R2b S1: scan_inner's UNREACHABLE `missing head` (apply Ok)
         // moved into `runs::Classifier::feed_record` where the new state

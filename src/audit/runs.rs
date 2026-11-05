@@ -10,13 +10,15 @@
 //! `length`, `newline`) and the gap-hasher stay in `State`.
 //!
 //! `check_attestation` (a fragment gap's repair attestation, checked as data) and
-//! `apply_checked` (the per-record checks) are pure. Together with the reader-side
-//! segment checks that still run ahead of them in `storage.rs`, they reproduce the
-//! reader's first violation on every path. #197 R2b S1 adds the push-API
-//! [`Classifier`] (strict mode only) for `scan_inner`/`scan`/`scan_staged`/
-//! `scan_closing`; `history_segment`'s fallback walk and tolerant mode land
-//! in #197 R2b S2, and the `classify` iterator and V4a's consumption land
-//! in #197 R2b S3 (addendum 13).
+//! `apply_checked` (the per-record checks) are pure. #197 R2b S1 moves
+//! `scan_inner`'s strict-mode per-segment checks into the push-API
+//! [`Classifier`] (strict mode); #197 R2b S2 adds the tolerant-mode drive
+//! used by `history_segment`'s fallback walk (restored from a saved
+//! segment-start state). Together with the reader-side byte-level and
+//! file-open checks that still run in `storage.rs`, they reproduce the
+//! reader's first violation on every path. The `classify` iterator over
+//! segment summaries, the every-violation collector, and V4a's consumption
+//! land in #197 R2b S3 (addendum 13).
 //!
 //! On their own [`Classifier`] + [`check_attestation`] are **not** a complete
 //! first-violation oracle until #197 R2b S3 adds the every-violation
@@ -240,15 +242,15 @@ pub(crate) struct SegmentContext {
     pub(crate) run: bool,
 }
 
-/// Classifier mode. `Strict` mirrors today's `scan_inner`/`scan`/`scan_staged`/
-/// `scan_closing`; `Tolerant` (the `history_segment` fallback walk) lands in
-/// #197 R2b S2.
+/// Classifier mode. `Strict` drives the reader's `scan_inner` family
+/// (`scan_inner`/`scan`/`scan_staged`/`scan_closing`); `Tolerant` drives the
+/// `history_segment` fallback walk from the saved segment-start state the
+/// reader threads in on `CorruptTrail` (#197 R2b S2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
     /// Strict single-pass classifier (the reader's `scan_inner` family).
     Strict,
-    /// Tolerant fallback classifier (reserved for #197 R2b S2).
-    #[expect(dead_code, reason = "#197 R2b S2 drives the tolerant path")]
+    /// Tolerant fallback classifier (the `history_segment` fallback walk).
     Tolerant,
 }
 
@@ -285,6 +287,46 @@ pub(crate) struct Classifier {
     first: bool,
     boundary_resume: bool,
     gap: Option<blake3::Hasher>,
+    /// Tolerant-mode: saved segment-start run state. The first-record trial
+    /// consults this snapshot so a closing checkpoint still compares with its
+    /// predecessor's run (the reader clones the run state before the strict
+    /// pass and hands it in on `CorruptTrail`).
+    saved_prior: Option<RunState>,
+    /// Tolerant-mode: `*run || unsealed_boundary` as set by the reader's
+    /// `history_segment` shim.
+    inherited: bool,
+    /// Tolerant-mode: the reader's `*run` out-parameter, owned by the
+    /// classifier between `new_tolerant` and `finish_tolerant`; the reader
+    /// shim reads it back through [`TolerantFinishOutcome::run_flag`] on
+    /// finish.
+    run_flag: bool,
+    /// Tolerant-mode counter: complete-record count in the fallback walk.
+    count: usize,
+    /// Tolerant-mode latch: a fragment or Unparsable ran before any record.
+    prefix: bool,
+    /// Tolerant-mode latch: the first record closed the inherited run and
+    /// the next record must be its immediate `vigil.audit.resume`.
+    closing: bool,
+    /// Tolerant-mode latch: a closer has fired `count==1 && closing` but
+    /// the EOF obligation is not yet resolved by a second complete record.
+    must_close: bool,
+    /// Tolerant-mode latch: a damaged line (Unparsable payload, broken
+    /// opening, missing opening) demoted the segment to evidence only.
+    damaged: bool,
+    /// Tolerant-mode latch: an Unparsable line was observed since the last
+    /// complete record; the next complete record errors
+    /// `unparsable line before complete record`.
+    invalid_line: bool,
+    /// Tolerant-mode: `broken` flag carried from
+    /// [`Classifier::feed_record_prepare_tolerant`] into
+    /// [`Classifier::feed_record_apply_tolerant`] on the General branch
+    /// (set when `first && previous != state.head.hash`).
+    broken_from_prepare: bool,
+    /// Tolerant-mode: `outside_run` flag carried from
+    /// [`Classifier::feed_record_prepare_tolerant`] into
+    /// [`Classifier::feed_record_apply_tolerant`] on the General branch
+    /// (`inherited && !run_flag` at `prepare` time).
+    outside_run_from_prepare: bool,
 }
 
 /// The run state and gap hasher produced by [`Classifier::finish`] on success.
@@ -305,12 +347,56 @@ impl Classifier {
         initial_boundary_resume: bool,
     ) -> Self {
         Self {
-            state: prior_run,
+            state: prior_run.clone(),
             mode,
             ctx,
             first: ctx.opening,
             boundary_resume: initial_boundary_resume,
             gap: None,
+            saved_prior: prior_run,
+            inherited: false,
+            run_flag: false,
+            count: 0,
+            prefix: false,
+            closing: false,
+            must_close: false,
+            damaged: false,
+            invalid_line: false,
+            broken_from_prepare: false,
+            outside_run_from_prepare: false,
+        }
+    }
+
+    /// Builds a tolerant-mode classifier for the `history_segment` fallback
+    /// walk. `prior_run` is the **saved segment-start** run state (the
+    /// reader clones it before the strict pass and restores it here on
+    /// `CorruptTrail`); `inherited` is `*run || unsealed_boundary` as set in
+    /// the reader shim. The classifier owns the `*run` flag between this
+    /// call and [`Classifier::finish_tolerant`] (the reader reads it back
+    /// via [`TolerantFinishOutcome::run_flag`]).
+    pub(crate) fn new_tolerant(
+        prior_run: Option<RunState>,
+        ctx: SegmentContext,
+        inherited: bool,
+    ) -> Self {
+        Self {
+            state: prior_run.clone(),
+            mode: Mode::Tolerant,
+            ctx,
+            first: ctx.opening,
+            boundary_resume: false,
+            gap: None,
+            saved_prior: prior_run,
+            inherited,
+            run_flag: inherited,
+            count: 0,
+            prefix: false,
+            closing: false,
+            must_close: false,
+            damaged: false,
+            invalid_line: false,
+            broken_from_prepare: false,
+            outside_run_from_prepare: false,
         }
     }
 
@@ -336,6 +422,9 @@ impl Classifier {
     /// [`check_attestation`] at base's exact per-path position (addendum 12:
     /// between `missing opening checkpoint` and `unclosed segment lacks
     /// matching immediate resume`).
+    ///
+    /// Duplicates ARE reachable from `scan_inner`'s wrappers (`refresh`,
+    /// a second `scan` after a prior successful advance).
     pub(crate) fn feed_record(
         &mut self,
         record: &Record,
@@ -345,7 +434,7 @@ impl Classifier {
     ) -> Result<Advance, AuditError> {
         assert!(
             matches!(self.mode, Mode::Strict),
-            "Tolerant mode lands in #197 R2b S2"
+            "Tolerant mode uses feed_record_prepare_tolerant / feed_record_apply_tolerant"
         );
         if record_count != 1 {
             return Err(corrupt("multiple records in native audit line"));
@@ -457,4 +546,243 @@ impl Classifier {
             gap: self.gap,
         })
     }
+
+    // ---- Tolerant mode (#197 R2b S2) -----------------------------------
+
+    /// Tolerant-mode: feed one Fragment line. The reader's shim bumps the
+    /// gap hasher for a fragment arriving after a complete record
+    /// (preserves the attestation input today); any fragment also sets
+    /// `prefix` at `count == 0` and clears `closing` at `count == 1`
+    /// (matches `history_segment`'s current branch).
+    pub(crate) fn feed_fragment_tolerant(&mut self, bytes: &[u8]) {
+        debug_assert!(matches!(self.mode, Mode::Tolerant));
+        if !self.first {
+            self.gap.get_or_insert_with(super::gap_hasher).update(bytes);
+        }
+        if self.count == 0 {
+            self.prefix = true;
+        }
+        if self.count == 1 {
+            self.closing = false;
+        }
+    }
+
+    /// Tolerant-mode: feed one Unparsable line (a `Line::Unparsable` or a
+    /// non-record payload the parser rejected). Latches `damaged` and
+    /// `invalid_line`, plus the same `prefix`/`closing` bookkeeping as
+    /// [`Classifier::feed_fragment_tolerant`].
+    pub(crate) fn feed_unparsable_tolerant(&mut self) {
+        debug_assert!(matches!(self.mode, Mode::Tolerant));
+        self.damaged = true;
+        self.invalid_line = true;
+        if self.count == 0 {
+            self.prefix = true;
+        }
+        if self.count == 1 {
+            self.closing = false;
+        }
+    }
+
+    /// Tolerant-mode: feed a `Line::Record(Err(_))` payload. Today's
+    /// `history_segment` emits `invalid audit record in sealed run` without
+    /// touching latches, then propagates the error.
+    pub(crate) fn feed_record_err_tolerant(&self) -> Result<(), AuditError> {
+        debug_assert!(matches!(self.mode, Mode::Tolerant));
+        Err(corrupt("invalid audit record in sealed run"))
+    }
+
+    /// Tolerant-mode: pre-attestation record checks. Returns
+    /// [`TolerantPrep::Duplicate`] when the record matches the duplicate
+    /// short-circuit (the reader then calls [`check_attestation`] and
+    /// continues without updating `state.offset`); [`TolerantPrep::General`]
+    /// otherwise (the reader calls [`check_attestation`] and then
+    /// [`Classifier::feed_record_apply_tolerant`]).
+    ///
+    /// Addendum 12: on the General branch, this method runs base's checks
+    /// up to and including the seq-gap check; the reader then calls
+    /// `check_attestation`; the apply method runs the remaining checks
+    /// (first-record trial, is_resume, apply_checked). Order inside
+    /// prepare: multiple records → trail identity → invalid_line →
+    /// duplicate short-circuit → (General only) sealed-seq → broken/damaged
+    /// latch → missing-cp → seq-gap.
+    pub(crate) fn feed_record_prepare_tolerant(
+        &mut self,
+        record: &Record,
+        record_count: usize,
+        trail: [u8; 16],
+    ) -> Result<TolerantPrep, AuditError> {
+        debug_assert!(matches!(self.mode, Mode::Tolerant));
+        if record_count != 1 {
+            return Err(corrupt("multiple records in native audit line"));
+        }
+        if record.context.trail != trail {
+            return Err(corrupt("trail identity differs from marker"));
+        }
+        if self.invalid_line {
+            return Err(corrupt("unparsable line before complete record"));
+        }
+        let head = Head::of(record);
+        let allow_dup = !(self.first || (self.closing && self.count == 1));
+        if allow_dup && self.state.as_ref().is_some_and(|s| s.head == head) {
+            return Ok(TolerantPrep::Duplicate);
+        }
+        // General branch: the remaining pre-attestation checks.
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|s| record.context.seq <= s.head.seq)
+        {
+            return Err(corrupt(
+                "record sequence did not increase inside sealed run",
+            ));
+        }
+        let broken = self.first
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|s| record.context.previous != s.head.hash);
+        let is_cp = matches!(record.kind, Kind::Checkpoint(_));
+        if self.first && (!is_cp || broken) {
+            self.damaged = true;
+        }
+        if self.state.is_none() && !is_cp {
+            return Err(corrupt("missing initial checkpoint"));
+        }
+        let outside_run = self.inherited && !self.run_flag;
+        if !self.first
+            && !outside_run
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|s| record.context.seq != s.head.seq + 1)
+        {
+            return Err(corrupt("sequence gap inside sealed run segment"));
+        }
+        self.broken_from_prepare = broken;
+        self.outside_run_from_prepare = outside_run;
+        Ok(TolerantPrep::General)
+    }
+
+    /// Tolerant-mode: post-attestation record apply. Runs the
+    /// `history_segment` general-branch checks from the first-record trial
+    /// through `apply_checked`, updates state and latches.
+    ///
+    /// Must be called after [`Classifier::feed_record_prepare_tolerant`]
+    /// returned [`TolerantPrep::General`] and the reader has resolved the
+    /// gap through [`check_attestation`].
+    pub(crate) fn feed_record_apply_tolerant(&mut self, record: &Record) -> Result<(), AuditError> {
+        debug_assert!(matches!(self.mode, Mode::Tolerant));
+        let broken = self.broken_from_prepare;
+        let outside_run = self.outside_run_from_prepare;
+        let is_cp = matches!(record.kind, Kind::Checkpoint(_));
+        if self.first {
+            // Trial apply against the saved segment-start state so a closing
+            // checkpoint still compares with its predecessor's run; matches
+            // the reader's pre-fallback run-state snapshot.
+            let trial_genesis = self.saved_prior.is_none();
+            let trial_ok = runs_trial_apply(self.saved_prior.as_ref(), record, trial_genesis);
+            self.closing = self.inherited && !self.prefix && !self.damaged && trial_ok;
+            if self.inherited && is_cp && !broken && !self.closing {
+                return Err(corrupt("first successor does not close sealed run"));
+            }
+            self.must_close = self.closing;
+        }
+        let is_resume = matches!(
+            &record.kind,
+            Kind::Entry(e) if e.action == "vigil.audit.resume"
+        );
+        if self.count == 1 && self.closing {
+            self.must_close = false;
+            if !is_resume {
+                return Err(corrupt("first successor lacks immediate resume"));
+            }
+            self.run_flag = false;
+        }
+        let before_loss = !(broken || self.state.as_ref().is_some_and(|s| s.run_loss));
+        let compare_mmr = outside_run || before_loss;
+        let next = apply_checked(self.state.as_ref(), record, false, broken, compare_mmr)?;
+        let Some(mut next) = next else {
+            // Collector-style identical duplicate reaching the general branch
+            // (should not occur because the duplicate short-circuit guards
+            // against it, but preserve the invariant).
+            self.first = false;
+            self.count += 1;
+            return Ok(());
+        };
+        if self.count == 1 && self.closing {
+            next.run_loss = false;
+        }
+        self.state = Some(next);
+        self.first = false;
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Tolerant-mode terminal check for one segment. Returns the segment's
+    /// final `RunState` (possibly `None` when no complete record was folded),
+    /// the gap hasher the reader threads into `State.gap`, and the owned
+    /// `*run` flag. `history_segment`'s current epilogue is reproduced here:
+    /// `must_close && *run` → `first successor lacks resume`, `count == 0`
+    /// latches `damaged`, `!damaged && !*run` → `invalid undamaged segment`,
+    /// `damaged` promotes `*run`, and a pending-resume state short-circuits
+    /// `resume checkpoint lacks its declaration`.
+    pub(crate) fn finish_tolerant(mut self) -> Result<TolerantFinishOutcome, AuditError> {
+        debug_assert!(matches!(self.mode, Mode::Tolerant));
+        if self.must_close && self.run_flag {
+            return Err(corrupt("first successor lacks resume"));
+        }
+        if self.count == 0 {
+            self.damaged = true;
+        }
+        if !self.damaged && !self.run_flag {
+            return Err(corrupt("invalid undamaged segment"));
+        }
+        if self.damaged {
+            self.run_flag = true;
+        }
+        if let Some(s) = self.state.as_ref()
+            && s.pending_resume
+        {
+            return Err(corrupt("resume checkpoint lacks its declaration"));
+        }
+        Ok(TolerantFinishOutcome {
+            gap: self.gap,
+            run_flag: self.run_flag,
+        })
+    }
+}
+
+/// Pre-attestation tolerant-mode classification outcome. The reader's shim
+/// resolves [`check_attestation`] at the reader-side position (addendum 12)
+/// and then either `continue`s on `Duplicate` or calls
+/// [`Classifier::feed_record_apply_tolerant`] on `General`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TolerantPrep {
+    /// Identical-duplicate branch of the `history_segment` fallback walk.
+    /// The reader calls [`check_attestation`] and continues without
+    /// updating `state.offset` or `state.newline` (preserves the R2a quirk).
+    Duplicate,
+    /// General branch of the `history_segment` fallback walk. The reader
+    /// calls [`check_attestation`] and then
+    /// [`Classifier::feed_record_apply_tolerant`].
+    General,
+}
+
+/// Terminal outcome of a tolerant-mode segment scan. The reader observes
+/// transient state through `classifier.state()` on each successful
+/// `feed_record_apply_tolerant`, so `finish_tolerant` only returns the
+/// final `gap` hasher and the owned `*run` flag; the final `RunState` is
+/// already in the reader's `Option<State>` and does not need re-export.
+/// V4a's `classify` wrapper (R2b S3) exposes the final state through a
+/// separate per-segment record.
+pub(crate) struct TolerantFinishOutcome {
+    pub(crate) gap: Option<blake3::Hasher>,
+    pub(crate) run_flag: bool,
+}
+
+/// First-record trial apply used by the tolerant-mode classifier. Calls
+/// the pure [`apply_checked`] directly against the saved segment-start
+/// [`RunState`] without allocating a full `State`.
+fn runs_trial_apply(prior: Option<&RunState>, record: &Record, genesis: bool) -> bool {
+    apply_checked(prior, record, genesis, false, true).is_ok()
 }

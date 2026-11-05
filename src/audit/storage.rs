@@ -10,7 +10,9 @@
 use super::{
     AuditError, AuditErrorKind, Record,
     format::{Kind, validation::MAX_PAYLOAD_BYTES},
-    runs::{self, Advance, Classifier, Mode as ClassifierMode, RunState, SegmentContext},
+    runs::{
+        self, Advance, Classifier, Mode as ClassifierMode, RunState, SegmentContext, TolerantPrep,
+    },
 };
 use crate::rotate::Directory;
 use rustix::fs::{self as rfs, Mode, OFlags};
@@ -317,7 +319,7 @@ fn initial_record(
 pub(crate) fn history_segment(
     file: &File,
     trail: [u8; 16],
-    mut state: Option<State>,
+    state: Option<State>,
     opening: bool,
     expected: Option<Head>,
     found: &mut Option<Record>,
@@ -326,6 +328,7 @@ pub(crate) fn history_segment(
     // Decision 8 still applies when a malformed suffix makes the successor
     // enter the run fallback: a linking opening cannot defer its declaration.
     let unsealed_boundary = opening && state.as_ref().is_some_and(|s| !sealed(s));
+    // Strict pass first, through the shared `scan_inner` shim (R2b1).
     match scan_inner(
         file,
         trail,
@@ -345,16 +348,21 @@ pub(crate) fn history_segment(
         Err(error) if error.kind() == AuditErrorKind::CorruptTrail => {}
         Err(error) => return Err(error),
     }
+    // #197 R2b S2: fallback rescan from the **saved segment-start state**.
+    // The reader's shim threads a tolerant-mode `runs::Classifier` for every
+    // per-record and finish-time check. `check_attestation` stays at the
+    // reader-side positions on both branches (addendum 7 / addendum 12):
+    // the Duplicate branch calls it directly, the General branch calls it
+    // between `prepare` and `apply`.
     let inherited = *run || unsealed_boundary;
-    *run = inherited;
-    let mut damaged = false;
-    let mut first = opening;
-    let mut count = 0;
-    let mut closing = false;
-    let mut must_close = false;
-    let mut prefix = false;
-    let mut invalid_line = false;
-    let mut gap = None::<blake3::Hasher>;
+    let ctx = SegmentContext {
+        opening,
+        genesis: false,
+        run: *run,
+    };
+    let saved_prior = state.as_ref().map(|s| s.run.clone());
+    let mut classifier = Classifier::new_tolerant(saved_prior, ctx, inherited);
+    let mut state = state;
     let mut file = file.try_clone().map_err(io_error)?;
     let mut offset = if opening {
         0
@@ -389,149 +397,75 @@ pub(crate) fn history_segment(
         let classification = super::lines::classify(payload);
         let records = match classification {
             super::lines::Line::Record(Ok(records)) => records,
-            super::lines::Line::Fragment | super::lines::Line::Unparsable(_) => {
-                // A fragment-only segment and an Unparsable crash outcome are
-                // retained evidence. Ordinary repair attestations still apply
-                // to fragments between complete records in the same segment.
-                if matches!(classification, super::lines::Line::Fragment) {
-                    if !first {
-                        gap.get_or_insert_with(super::gap_hasher).update(&line);
-                    }
-                } else {
-                    damaged = true;
-                    invalid_line = true;
+            super::lines::Line::Fragment => {
+                classifier.feed_fragment_tolerant(&line);
+                if let Some(s) = &mut state {
+                    s.newline = newline;
                 }
-                if count == 0 {
-                    prefix = true;
-                }
-                if count == 1 {
-                    closing = false;
-                }
+                continue;
+            }
+            super::lines::Line::Unparsable(_) => {
+                classifier.feed_unparsable_tolerant();
                 if let Some(s) = &mut state {
                     s.newline = newline;
                 }
                 continue;
             }
             super::lines::Line::Record(Err(_)) => {
-                return Err(corrupt("invalid audit record in sealed run"));
+                classifier.feed_record_err_tolerant()?;
+                unreachable!("feed_record_err_tolerant always errors");
             }
         };
-        if records.len() != 1 {
-            return Err(corrupt("multiple records in native audit line"));
-        }
+        let record_count = records.len();
         let record = &records[0];
-        if record.context.trail != trail {
-            return Err(corrupt("trail identity differs from marker"));
-        }
-        if invalid_line {
-            return Err(corrupt("unparsable line before complete record"));
-        }
-        if !(first || closing && count == 1)
-            && state
-                .as_ref()
-                .is_some_and(|s| s.run.head == Head::of(record))
-        {
-            runs::check_attestation(
-                gap.take().map(|h| *h.finalize().as_bytes()),
-                record.context.repaired,
-            )?;
-            continue;
-        }
-        if state
-            .as_ref()
-            .is_some_and(|s| record.context.seq <= s.run.head.seq)
-        {
-            return Err(corrupt(
-                "record sequence did not increase inside sealed run",
-            ));
-        }
-        let broken = first
-            && state
-                .as_ref()
-                .is_some_and(|s| record.context.previous != s.run.head.hash);
-        if first && (!matches!(record.kind, Kind::Checkpoint(_)) || broken) {
-            damaged = true;
-        }
-        // The first present complete record is the base, never the first
-        // checkpoint found later in a headless segment.
-        if state.is_none() && !matches!(record.kind, Kind::Checkpoint(_)) {
-            return Err(corrupt("missing initial checkpoint"));
-        }
-        let outside_run = inherited && !*run;
-        if !first
-            && !outside_run
-            && state
-                .as_ref()
-                .is_some_and(|s| record.context.seq != s.run.head.seq + 1)
-        {
-            return Err(corrupt("sequence gap inside sealed run segment"));
-        }
-        runs::check_attestation(
-            gap.take().map(|h| *h.finalize().as_bytes()),
-            record.context.repaired,
-        )?;
-        if first {
-            // A segment may close one run and, through damage later in the
-            // same file, start another. Compare this checkpoint before treating
-            // the remaining in-run checkpoints solely as leaves.
-            let mut trial = state.clone();
-            closing = inherited
-                && !prefix
-                && !damaged
-                && apply(record, &mut trial, state.is_none()).is_ok();
-            if inherited && matches!(record.kind, Kind::Checkpoint(_)) && !broken && !closing {
-                return Err(corrupt("first successor does not close sealed run"));
+        match classifier.feed_record_prepare_tolerant(record, record_count, trail)? {
+            TolerantPrep::Duplicate => {
+                // Preserves today's quirk: identical-duplicate branch calls
+                // `check_attestation` but does NOT update `state.offset` /
+                // `state.newline`.
+                runs::check_attestation(classifier.take_gap(), record.context.repaired)?;
+                continue;
             }
-            must_close = closing;
+            TolerantPrep::General => {}
         }
-        let is_resume = matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume");
-        if count == 1 && closing {
-            // A complete second record resolves the EOF obligation; its kind
-            // and declaration are checked independently before closing the run.
-            must_close = false;
-            if !is_resume {
-                return Err(corrupt("first successor lacks immediate resume"));
-            }
-            *run = false;
-        }
-        let before_loss = !(broken || state.as_ref().is_some_and(|s| s.run.run_loss));
-        apply_checked(
+        runs::check_attestation(classifier.take_gap(), record.context.repaired)?;
+        classifier.feed_record_apply_tolerant(record)?;
+        let Some(run_state) = classifier.state() else {
+            return Err(corrupt("missing head"));
+        };
+        let head = run_state.head;
+        let new_run = run_state.clone();
+        // The reader rebuilds `State`'s writer-only fields through the shared
+        // `next_cp_fields` helper so the three fold sites (`scan_inner`,
+        // `apply_checked` and this fallback) stay identical on every input;
+        // the classifier owns the `RunState`.
+        let (cp_time, since_cp) = next_cp_fields(
+            state
+                .as_ref()
+                .map(|s| (s.checkpoint_time, s.since_checkpoint)),
             record,
-            &mut state,
-            false,
-            broken,
-            outside_run || before_loss,
-        )?;
-        let s = state.as_mut().ok_or_else(|| corrupt("missing head"))?;
-        if count == 1 && closing {
-            s.run.run_loss = false;
-        }
-        if expected == Some(s.run.head) {
+        );
+        let (length_prev, gap_prev) = state
+            .as_ref()
+            .map_or((0, None), |s| (s.length, s.gap.clone()));
+        state = Some(State {
+            run: new_run,
+            offset,
+            length: length_prev,
+            checkpoint_time: cp_time,
+            since_checkpoint: since_cp,
+            newline,
+            gap: gap_prev,
+        });
+        if expected == Some(head) {
             *found = Some(record.clone());
         }
-        s.offset = offset;
-        s.newline = newline;
-        first = false;
-        count += 1;
     }
-    if must_close && *run {
-        return Err(corrupt("first successor lacks resume"));
-    }
-    if count == 0 {
-        damaged = true;
-    }
-    if !damaged && !*run {
-        return Err(corrupt("invalid undamaged segment"));
-    }
-    if damaged {
-        *run = true;
-    }
+    let outcome = classifier.finish_tolerant()?;
+    *run = outcome.run_flag;
     if let Some(s) = &mut state {
-        if s.run.pending_resume {
-            return Err(corrupt("resume checkpoint lacks its declaration"));
-        }
         s.length = offset;
-        s.gap = gap;
+        s.gap = outcome.gap;
     }
     Ok(state)
 }
@@ -805,7 +739,8 @@ fn scan_inner(
     // byte-glue check for an unterminated predecessor, `offset`/`newline`/
     // `length` bookkeeping, and the three writer-only State fields),
     // threads a `runs::Classifier` for every segment-level per-record check,
-    // and calls `runs::check_attestation` at each record's reader-side
+    // and hands the finalized gap digest to `runs::Classifier::feed_record`,
+    // which itself calls `runs::check_attestation` at base's per-path
     // position (addendum 7 / addendum 12). The classifier's strict path owns:
     //   - multiple records in native audit line
     //   - trail identity differs from marker
@@ -865,10 +800,11 @@ fn scan_inner(
         let payload = line.strip_suffix(b"\n").unwrap_or(&line);
         match super::lines::classify(payload) {
             super::lines::Line::Record(Ok(records)) => {
-                if records.len() != 1 {
+                let record_count = records.len();
+                if record_count != 1 {
                     // The classifier returns `multiple records in native audit
                     // line` ahead of every other check; attestation is unused.
-                    classifier.feed_record(&records[0], records.len(), trail, None)?;
+                    classifier.feed_record(&records[0], record_count, trail, None)?;
                     unreachable!("feed_record returns Err when count != 1");
                 }
                 let record = &records[0];
@@ -882,18 +818,12 @@ fn scan_inner(
                     *found = Some(record.clone());
                 }
                 // Base's `apply_checked` wrapper leaves writer-only fields
-                // untouched on a Duplicate; only Record advances them. Offset
-                // and newline advance on BOTH paths (base's `scan_inner` sets
-                // `s.offset = offset; s.newline = newline` unconditionally
-                // after `apply`).
+                // untouched on a Duplicate; the Advance tells us which path
+                // ran. Offset/newline advance on both paths (base's
+                // `scan_inner` sets `s.offset = offset; s.newline = newline`
+                // unconditionally after `apply`).
                 if matches!(advance, Advance::Record) {
-                    let is_cp = matches!(record.kind, Kind::Checkpoint(_));
-                    if is_cp {
-                        cp_time = record.context.time;
-                        since_cp = 0;
-                    } else {
-                        since_cp = since_cp.saturating_add(1).max(1);
-                    }
+                    (cp_time, since_cp) = next_cp_fields(Some((cp_time, since_cp)), record);
                 }
                 last_offset = offset;
                 last_newline = newline;
@@ -943,25 +873,40 @@ fn apply_checked(
     else {
         return Ok(()); // Collector-style identical duplicate: leave state in place.
     };
-    let is_cp = matches!(record.kind, Kind::Checkpoint(_));
+    let (cp_time, since_cp) = next_cp_fields(
+        state
+            .as_ref()
+            .map(|s| (s.checkpoint_time, s.since_checkpoint)),
+        record,
+    );
     *state = Some(State {
         run: next_run,
         offset: 0,
         length: 0,
-        checkpoint_time: if is_cp {
-            record.context.time
-        } else {
-            state.as_ref().map_or(0, |s| s.checkpoint_time)
-        },
-        since_checkpoint: if is_cp {
-            0
-        } else {
-            state.as_ref().map_or(1, |s| s.since_checkpoint + 1)
-        },
+        checkpoint_time: cp_time,
+        since_checkpoint: since_cp,
         newline: true,
         gap: None,
     });
     Ok(())
+}
+
+/// Next `(checkpoint_time, since_checkpoint)` after folding `record` onto
+/// the predecessor's `(checkpoint_time, since_checkpoint)` in `prior`. A
+/// `Kind::Checkpoint` resets to `(record.context.time, 0)`; any other kind
+/// increments `since_checkpoint` saturating at `u64::MAX` (base used plain
+/// `+ 1`, which would panic on overflow; the saturating form keeps the same
+/// value on every realistic input and never panics).
+///
+/// Shared by `scan_inner`, `apply_checked` and `history_segment`'s
+/// tolerant-mode fallback rebuild so the three stay identical on every
+/// writer-only field update.
+fn next_cp_fields(prior: Option<(u64, u64)>, record: &Record) -> (u64, u64) {
+    if matches!(record.kind, Kind::Checkpoint(_)) {
+        return (record.context.time, 0);
+    }
+    let (cp_time, since_cp) = prior.unwrap_or((0, 0));
+    (cp_time, since_cp.saturating_add(1).max(1))
 }
 
 #[cfg(test)]
