@@ -31,16 +31,21 @@
 //! collector is not a first-violation oracle for any strict path, and
 //! no caller may treat it as one.
 //!
-//! Addendum 16 point 2: on a fold (iii) mismatch the record-apply callsite
-//! inside the [`Classifier`] special-cases [`Reaction::Collect`] and
-//! re-applies through [`apply_checked`] with `compare_mmr = false`,
-//! splicing-in the checkpoint's declared MMR (no hand-built MMR, no
-//! hand-built `RunState`). Any other violation ends the run under
+//! Addendum 16 point 2 and ruling 197-d1 addendum 17.3: on a fold (iii)
+//! mismatch the record-apply callsite inside the [`Classifier`]
+//! special-cases [`Reaction::Collect`] and re-applies through
+//! [`apply_checked`] with `compare_mmr = false`, so the MMR continues as
+//! **the computed fold including the checkpoint's own leaf** -- the state
+//! the trail would have if the checkpoint had been honest (no hand-built
+//! MMR, no hand-built `RunState`, the checkpoint's declared size/root/
+//! peaks are discarded). Any other violation ends the run under
 //! consideration and resumes at the next segment boundary
 //! ([`Classifier::reset_at_boundary`]); the tolerant finish-time checks
 //! (`invalid undamaged segment`, `first successor lacks resume`,
 //! `resume checkpoint lacks its declaration`) are recorded in Collect mode
-//! too (addendum 16 point 5).
+//! too (addendum 16 point 5). A recorded fold-(iii) mismatch marks its
+//! segment damaged for the end-of-segment checks (ruling 197-d1 addendum
+//! 19.2), so no follow-on `InvalidUndamagedSegment` derives from it.
 use super::{
     AuditError, Mmr, Record,
     format::Kind,
@@ -467,6 +472,62 @@ pub(crate) struct SegmentContext {
     /// Whether predecessor history ends inside a run that must be closed
     /// by the first successor's immediate resume.
     pub(crate) run: bool,
+}
+
+/// Ruling 197-d1 addendum 19.1: `history_segment`'s strict-pass-then-
+/// tolerant-fallback-from-saved-state sequence is ONE function
+/// parameterised by [`Reaction`]. The dispatch is: strict first; on
+/// `AuditErrorKind::CorruptTrail` the caller runs the tolerant fallback
+/// with the supplied [`Reaction`]; on any other strict `Err` (e.g. an
+/// I/O failure) the error propagates unchanged.
+///
+/// The reader (`storage.rs::history_segment`) calls this with
+/// [`Reaction::Stop`], so a strict pass that returns Ok becomes the
+/// reader's own `Ok(state)` and no tolerant walk runs. The collector's
+/// `history_segment` entry calls it with [`Reaction::Collect`]: when
+/// strict passes, the collector records **nothing** (empty violations);
+/// when strict fails with `CorruptTrail`, the tolerant Collect walk
+/// accumulates the per-segment violations. A mutant that touches this
+/// dispatch (e.g. swapping Ok/Err, treating every strict `Err` as
+/// `CorruptTrail`) fails both a reader pin and a collector row because
+/// the same `Err` kind drives both.
+pub(crate) fn history_segment<R, Sf>(
+    reaction: Reaction,
+    strict: Sf,
+) -> Result<HistorySegmentDispatch<R>, AuditError>
+where
+    Sf: FnOnce() -> Result<R, AuditError>,
+{
+    match strict() {
+        Ok(r) => Ok(HistorySegmentDispatch::Strict(r)),
+        Err(e) if e.kind() == super::AuditErrorKind::CorruptTrail => {
+            Ok(HistorySegmentDispatch::Tolerant(reaction))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Result of [`history_segment`]'s shared dispatch (addendum 19.1).
+/// `Strict(r)` means the strict pass returned `Ok(r)` (reader propagates
+/// `r`; collector returns an empty-violation outcome); `Tolerant(r)`
+/// means the strict pass returned `CorruptTrail` and the caller runs the
+/// tolerant fallback with [`Reaction`] `r`.
+#[derive(Debug)]
+pub(crate) enum HistorySegmentDispatch<R> {
+    /// Strict single-pass classified the whole segment.
+    Strict(R),
+    /// Strict returned `CorruptTrail`; the caller runs the tolerant
+    /// fallback with this [`Reaction`]. The reader (Stop) ignores the
+    /// field and runs its own Stop-reaction tolerant walk; the collector
+    /// uses the field to select Collect semantics.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the reader ignores the Reaction field (its tolerant fallback is Stop-only); the collector (#[cfg(test)] rows and #197 R2b S3b) matches on it to select Collect semantics"
+        )
+    )]
+    Tolerant(Reaction),
 }
 
 /// Classifier mode. `Strict` drives the reader's `scan_inner` family
@@ -1041,13 +1102,17 @@ impl Classifier {
         // the push below is a second site for this detail -- marked
         // UNREACHABLE for the reader-side pin gate (the salvage records
         // without returning an `AuditError`; exercised by
-        // `collector_tests::collector_fold_iii_mismatch_continues_*`).
+        // `collector_tests::collector_fold_iii_mismatch_on_history_segment_*`).
         let next = match apply_checked(self.state.as_ref(), record, false, broken, compare_mmr) {
             Ok(opt) => opt,
             Err(Violation::CheckpointMmrDiffers) if matches!(self.reaction, Reaction::Collect) => {
                 // Record-only (no `on_violation`, no latch); splice-in.
                 self.collected
                     .push((self.current_pos, Violation::CheckpointMmrDiffers));
+                // Addendum 19.2: a recorded fold-(iii) mismatch marks its
+                // segment damaged for the end-of-segment checks, so no
+                // derived `InvalidUndamagedSegment` follows.
+                self.damaged = true;
                 match apply_checked(self.state.as_ref(), record, false, broken, false) {
                     Ok(opt) => opt,
                     Err(w) => return Err(self.on_violation(w)),
@@ -1082,25 +1147,51 @@ impl Classifier {
     /// `resume checkpoint lacks its declaration`.
     pub(crate) fn finish_tolerant(mut self) -> Result<TolerantFinishOutcome, AuditError> {
         debug_assert!(matches!(self.mode, Mode::Tolerant));
+        self.run_end_of_segment_epilogue()?;
+        Ok(TolerantFinishOutcome {
+            gap: self.gap,
+            run_flag: self.run_flag,
+        })
+    }
+
+    /// Ruling 197-d1 addendum 19.1: the end-of-segment epilogue is ONE
+    /// function parameterised by [`Reaction`]. [`Classifier::finish_tolerant`]
+    /// (Stop), [`Classifier::finish_collect`] (Collect) and
+    /// [`Classifier::reset_at_boundary`] (Collect, at every segment
+    /// boundary) all call this; a mutant that touches a line here fails
+    /// both a reader pin and a collector row. Ordering is unchanged:
+    /// `first successor lacks resume` -> `count==0` damaged latch ->
+    /// `invalid undamaged segment` -> `damaged` promotes `run_flag` ->
+    /// `resume checkpoint lacks its declaration`. Under [`Reaction::Stop`]
+    /// the first violation returns `Err`; under [`Reaction::Collect`] each
+    /// violation is pushed directly into `collected` so follow-on checks
+    /// still run.
+    fn run_end_of_segment_epilogue(&mut self) -> Result<(), AuditError> {
         if let Some(v) = self.finish_check_first_successor_lacks_resume() {
-            return Err(self.on_violation(v));
+            if matches!(self.reaction, Reaction::Stop) {
+                return Err(self.on_violation(v));
+            }
+            self.collected.push((self.current_pos, v));
         }
         if self.count == 0 {
             self.damaged = true;
         }
         if let Some(v) = self.finish_check_invalid_undamaged_segment() {
-            return Err(self.on_violation(v));
+            if matches!(self.reaction, Reaction::Stop) {
+                return Err(self.on_violation(v));
+            }
+            self.collected.push((self.current_pos, v));
         }
         if self.damaged {
             self.run_flag = true;
         }
         if let Some(v) = self.finish_check_resume_lacks_declaration() {
-            return Err(self.on_violation(v));
+            if matches!(self.reaction, Reaction::Stop) {
+                return Err(self.on_violation(v));
+            }
+            self.collected.push((self.current_pos, v));
         }
-        Ok(TolerantFinishOutcome {
-            gap: self.gap,
-            run_flag: self.run_flag,
-        })
+        Ok(())
     }
 
     /// Finish-time check shared by [`Classifier::finish_tolerant`] and
@@ -1177,21 +1268,10 @@ impl Classifier {
         // run under consideration (`recovery_pending`), since no second
         // report comes from a run that is already dead.
         if !self.recovery_pending {
-            if let Some(v) = self.finish_check_first_successor_lacks_resume() {
-                self.collected.push((self.current_pos, v));
-            }
-            if self.count == 0 {
-                self.damaged = true;
-            }
-            if let Some(v) = self.finish_check_invalid_undamaged_segment() {
-                self.collected.push((self.current_pos, v));
-            }
-            if self.damaged {
-                self.run_flag = true;
-            }
-            if let Some(v) = self.finish_check_resume_lacks_declaration() {
-                self.collected.push((self.current_pos, v));
-            }
+            // Addendum 19.1: the shared epilogue returns Ok() under
+            // Reaction::Collect (every would-be `Err` is pushed into
+            // `collected` instead of returning).
+            let _ = self.run_end_of_segment_epilogue();
         }
         self.saved_prior = self.state.clone();
         self.ctx = boundary_ctx;
@@ -1248,37 +1328,41 @@ impl Classifier {
         if self.recovery_pending {
             return;
         }
-        let prep = match self.feed_record_prepare_tolerant(record, record_count, trail) {
+        let prep = match self.feed_record_tolerant_entry(record, record_count, trail) {
             Ok(p) => p,
             Err(_) => return, // on_violation recorded it; recovery_pending set
         };
-        // Attestation runs at the reader's per-path position (addendum 12),
-        // consuming `self.gap` like the reader's `classifier.take_gap()`.
-        if self.recovery_pending {
+        if matches!(prep, TolerantPrep::Duplicate) {
+            // Addendum 17.2 / 19.1: the duplicate-line handling is in the
+            // shared `feed_record_tolerant_entry` path above; here we only
+            // skip the apply, like the reader's `continue`.
             return;
         }
-        let gap_digest = self.take_gap();
-        if let Err(v) = check_attestation(gap_digest, record.context.repaired) {
-            let _ = self.on_violation(v);
-            return;
+        let _ = self.feed_record_apply_tolerant(record);
+    }
+
+    /// Ruling 197-d1 addendum 19.1 (and 17.2): the duplicate-line arm is
+    /// ONE function. The reader's `history_segment` fallback and the
+    /// collector's [`Classifier::feed_record_collect`] both enter the
+    /// tolerant path through this method, which runs `prepare` ->
+    /// `take_gap` -> `check_attestation` and returns the [`TolerantPrep`]
+    /// so the caller branches: on `Duplicate`, continue without state
+    /// updates; on `General`, call [`Classifier::feed_record_apply_tolerant`].
+    /// A mutant removing the attestation here fails BOTH a reader pin
+    /// and a collector row.
+    pub(crate) fn feed_record_tolerant_entry(
+        &mut self,
+        record: &Record,
+        record_count: usize,
+        trail: [u8; 16],
+    ) -> Result<TolerantPrep, AuditError> {
+        debug_assert!(matches!(self.mode, Mode::Tolerant));
+        let prep = self.feed_record_prepare_tolerant(record, record_count, trail)?;
+        let gap = self.take_gap();
+        if let Err(v) = check_attestation(gap, record.context.repaired) {
+            return Err(self.on_violation(v));
         }
-        match prep {
-            TolerantPrep::Duplicate => {
-                // Addendum 17.2: the duplicate-line handling is the
-                // reader's own code path. The reader
-                // (`history_segment`) calls `check_attestation(...)` and
-                // then `continue`s -- no `count += 1`, no `first = false`,
-                // no state mutation. Mirroring that here is the whole
-                // point. `self.gap` was already consumed by the earlier
-                // `check_attestation(gap_digest, ...)` call pattern; the
-                // reader passes `classifier.take_gap()`, so S3b's
-                // `classify` iterator supplies the same value here
-                // through `gap_digest`.
-            }
-            TolerantPrep::General => {
-                let _ = self.feed_record_apply_tolerant(record);
-            }
-        }
+        Ok(prep)
     }
 
     /// Addendum 16 point 1: Collect-reaction entry point for a Fragment
@@ -1343,27 +1427,14 @@ impl Classifier {
     )]
     pub(crate) fn finish_collect(mut self) -> CollectorOutcome {
         debug_assert!(matches!(self.reaction, Reaction::Collect));
-        // Shared helpers own the Violation::X construction sites so the
-        // coverage gate does not count finish_collect as a second site.
         // Addendum 17.4: skip the end-of-segment checks when the run has
         // already been ended by an earlier violation (`recovery_pending`),
         // since no second report comes from a run that is already dead.
+        // Addendum 19.1: the epilogue is one function parameterised by
+        // Reaction; under Collect it returns Ok (would-be `Err`s go into
+        // `collected`).
         if !self.recovery_pending {
-            if let Some(v) = self.finish_check_first_successor_lacks_resume() {
-                self.collected.push((self.current_pos, v));
-            }
-            if self.count == 0 {
-                self.damaged = true;
-            }
-            if let Some(v) = self.finish_check_invalid_undamaged_segment() {
-                self.collected.push((self.current_pos, v));
-            }
-            if self.damaged {
-                self.run_flag = true;
-            }
-            if let Some(v) = self.finish_check_resume_lacks_declaration() {
-                self.collected.push((self.current_pos, v));
-            }
+            let _ = self.run_end_of_segment_epilogue();
         }
         CollectorOutcome {
             state: self.state,
@@ -1473,7 +1544,9 @@ mod collector_tests {
 
     /// Smoke row: `Reaction` values, `CollectorPos` default, and the
     /// `CollectorOutcome` fields are all live so the gate doesn't fire
-    /// dead_code on them.
+    /// dead_code on them. Also reads the `HistorySegmentDispatch::Tolerant`
+    /// `Reaction` field so the dead_code analyser sees it used in test
+    /// mode (the reader ignores it with `_`; this covers the field).
     #[test]
     fn reaction_and_collector_types_are_live() {
         assert_eq!(Reaction::Stop, Reaction::Stop);
@@ -1492,6 +1565,31 @@ mod collector_tests {
         assert!(!outcome.run_flag);
         assert_eq!(outcome.violations.len(), 1);
         assert!(outcome.gap.is_none());
+        // Drive the shared `history_segment` orchestration both ways so
+        // the `Strict(R)` and `Tolerant(Reaction)` dispatch fields are
+        // READ (not just pattern-bound to `_`) in test mode.
+        let ok = super::history_segment::<i32, _>(Reaction::Stop, || Ok(42)).unwrap();
+        match ok {
+            HistorySegmentDispatch::Strict(r) => assert_eq!(r, 42),
+            HistorySegmentDispatch::Tolerant(_) => panic!("Ok strict should take Strict"),
+        }
+        let fallback = super::history_segment::<i32, _>(Reaction::Collect, || {
+            Err(AuditError::new(
+                crate::audit::AuditErrorKind::CorruptTrail,
+                "trial",
+            ))
+        })
+        .unwrap();
+        match fallback {
+            HistorySegmentDispatch::Strict(_) => panic!("CorruptTrail should take Tolerant"),
+            HistorySegmentDispatch::Tolerant(r) => assert_eq!(r, Reaction::Collect),
+        }
+        // Non-CorruptTrail errors propagate unchanged.
+        let err = super::history_segment::<i32, _>(Reaction::Stop, || {
+            Err(AuditError::new(crate::audit::AuditErrorKind::Io, "io"))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), crate::audit::AuditErrorKind::Io);
     }
 
     /// Smoke row: build a collector, feed one checkpoint, finish it.
@@ -1615,74 +1713,338 @@ mod collector_tests {
         Record::checkpoint(context(seq, previous), fields).unwrap()
     }
 
-    /// Amendment 3 (addendum 17.3): fold "as if matched" is the computed
-    /// fold INCLUDING the checkpoint's own leaf. On `[cp0,e1,bad_cp2,e3,cp4]`
-    /// the collector records **exactly one** `CheckpointMmrDiffers`, the
-    /// classification continues past the mismatch, and a later honest
-    /// checkpoint (`cp4`) that matches the "as if" fold is accepted.
-    /// Pins the exact full recorded list, not just a count: the full list
-    /// contains exactly one `CheckpointMmrDiffers` and no other variants.
+    /// Feeds `[cp0,e1,bad_cp2,e3,cp4]` through a Collect-reaction tolerant
+    /// classifier built for a given `history_segment` path (opening,run).
+    /// Returns the recorded violation list and the final state. Helper for
+    /// the four `collector_fold_iii_mismatch_on_history_segment_*` rows.
+    fn drive_bad_cp_sequence(
+        opening: bool,
+        run: bool,
+    ) -> (
+        Vec<(CollectorPos, Violation)>,
+        Option<RunState>,
+        [Record; 5],
+    ) {
+        let ctx = SegmentContext {
+            opening,
+            genesis: false,
+            run,
+        };
+        let mut c = Classifier::new_collect(None, ctx, run);
+        let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        let e1 = entry(1, cp0.hash());
+        let bc = bad_cp(2, e1.hash());
+        let e3 = entry(3, bc.hash());
+        let m_at_cp4 = mmr_after(&[cp0.clone(), e1.clone(), bc.clone(), e3.clone()]);
+        let cp4 = cp(4, e3.hash(), &m_at_cp4);
+        c.feed_record_collect(&cp0, 1, TRAIL, 0);
+        c.feed_record_collect(&e1, 1, TRAIL, 1);
+        c.feed_record_collect(&bc, 1, TRAIL, 2);
+        c.feed_record_collect(&e3, 1, TRAIL, 3);
+        c.feed_record_collect(&cp4, 1, TRAIL, 4);
+        let out = c.finish_collect();
+        (out.violations, out.state, [cp0, e1, bc, e3, cp4])
+    }
+
+    /// Asserts the full recorded list is exactly `[(2, CheckpointMmrDiffers)]`
+    /// and the final MMR is the computed fold INCLUDING every record's leaf
+    /// (addendum 17.3 / 19.2). Shared assertion used by the three paths on
+    /// which the fold-(iii) salvage is reached.
+    fn assert_salvage_only(
+        violations: &[(CollectorPos, Violation)],
+        state: &Option<RunState>,
+        records: &[Record; 5],
+    ) {
+        // Exact full list: one CheckpointMmrDiffers at record_index=2.
+        assert_eq!(
+            violations.len(),
+            1,
+            "exact full list is one entry; got: {:?}",
+            violations.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+        );
+        assert_eq!(violations[0].1, Violation::CheckpointMmrDiffers);
+        assert_eq!(violations[0].0.record_index_in_segment, 2);
+        // Addendum 19.2: no derived `InvalidUndamagedSegment` (the fold
+        // mismatch marked the segment damaged so the undamaged check is
+        // skipped) and no `FirstSuccessorLacksResume` / `ResumeCheckpointLacksDeclaration`.
+        assert!(
+            !violations.iter().any(|(_, v)| matches!(
+                v,
+                Violation::InvalidUndamagedSegment
+                    | Violation::FirstSuccessorLacksResume
+                    | Violation::ResumeCheckpointLacksDeclaration
+            )),
+            "no derived end-of-segment violations; got: {:?}",
+            violations.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+        );
+        // Final MMR is the computed fold including bad_cp2's leaf.
+        let final_state = state.as_ref().expect("fold continued past salvage");
+        assert_eq!(
+            final_state.mmr.root(),
+            mmr_after(records).root(),
+            "final MMR is the computed `as if matched` fold including every record",
+        );
+    }
+
+    /// Addendum 17.3 / 19.2, path (opening=true, run=false): fold-(iii)
+    /// salvage is reached at bad_cp2 and the recorded list is exactly
+    /// `[(2, CheckpointMmrDiffers)]`; the final MMR includes bad_cp2's
+    /// leaf. Any mutant that removes the salvage, reroutes it, or stops
+    /// marking the segment damaged after recording changes this list.
     #[test]
-    fn collector_fold_iii_mismatch_continues_full_list() {
+    fn collector_fold_iii_mismatch_on_history_segment_opening_true_run_false() {
+        let (violations, state, records) = drive_bad_cp_sequence(true, false);
+        assert_salvage_only(&violations, &state, &records);
+    }
+
+    /// Addendum 17.3 / 19.2, path (opening=false, run=false): same exact
+    /// recorded list and final MMR as the opening case; the continuation
+    /// path still reaches the salvage because strict fails at bad_cp2
+    /// with `CheckpointMmrDiffers`.
+    #[test]
+    fn collector_fold_iii_mismatch_on_history_segment_opening_false_run_false() {
+        let (violations, state, records) = drive_bad_cp_sequence(false, false);
+        assert_salvage_only(&violations, &state, &records);
+    }
+
+    /// Addendum 17.3 / 19.2, path (opening=false, run=true): inherited
+    /// run with a continuation segment. The tolerant classifier's
+    /// `first-record trial` only fires at `first`, which is `false`
+    /// here, so `inherited && is_cp && !broken && !closing` does not
+    /// fire and bad_cp2's salvage is still reached with the same exact
+    /// list and final MMR.
+    #[test]
+    fn collector_fold_iii_mismatch_on_history_segment_opening_false_run_true() {
+        let (violations, state, records) = drive_bad_cp_sequence(false, true);
+        assert_salvage_only(&violations, &state, &records);
+    }
+
+    /// Addendum 17.3 / 19.2, path (opening=true, run=true): an inherited
+    /// run with a new opening segment. On this path the tolerant
+    /// first-record trial on cp0 succeeds and latches `closing=true` /
+    /// `must_close=true`, so the SECOND record (e1) must be an immediate
+    /// `vigil.audit.resume` to close the inherited run. e1 is not a
+    /// resume, so `FirstSuccessorLacksImmediateResume` fires at
+    /// record_index=1 and `recovery_pending` latches: bad_cp2's salvage
+    /// is NOT reached on this path. The recorded list is exactly
+    /// `[(1, FirstSuccessorLacksImmediateResume)]`; subsequent feeds are
+    /// no-ops. This row pins the per-path first-violation equality (the
+    /// reader errors with the same detail at the same record on this
+    /// layout) and asserts the salvage is never derived past
+    /// `recovery_pending`.
+    #[test]
+    fn collector_fold_iii_mismatch_on_history_segment_opening_true_run_true() {
+        let (violations, _state, _records) = drive_bad_cp_sequence(true, true);
+        assert_eq!(
+            violations.len(),
+            1,
+            "exact full list is one entry; got: {:?}",
+            violations.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            violations[0].1,
+            Violation::FirstSuccessorLacksImmediateResume,
+        );
+        assert_eq!(violations[0].0.record_index_in_segment, 1);
+    }
+
+    /// Addendum 19.1 / mutant 6 ("Collect keeps only the first"): the
+    /// collector must accumulate violations across **multiple** segments
+    /// through `reset_at_boundary`, not just record the first. This row
+    /// pins the exact two-violation list across two segments: segment 0
+    /// has a non-cp opening (latches `MissingInitialCheckpoint` + the
+    /// `recovery_pending` flag), the boundary clears it, and segment 1
+    /// fires a second `MissingInitialCheckpoint`. If a mutant turned
+    /// `on_violation` under Collect into a no-op after the first latch
+    /// (or made `recovery_pending` persist across boundaries), the
+    /// second violation would be missing or mis-tagged.
+    #[test]
+    fn collector_accumulates_violations_across_segment_boundaries() {
         let ctx = SegmentContext {
             opening: true,
             genesis: true,
             run: false,
         };
         let mut c = Classifier::new_collect(None, ctx, false);
+        // Segment 0: a non-cp opening record latches
+        // `MissingInitialCheckpoint` + `recovery_pending`.
+        let not_cp0 = entry(0, Record::genesis(&TRAIL));
+        c.feed_record_collect(&not_cp0, 1, TRAIL, 0);
+        assert!(c.recovery_pending, "non-cp opening latches recovery");
+        assert_eq!(c.collected.len(), 1);
+        // Cross the segment boundary: `reset_at_boundary` clears
+        // `recovery_pending`, bumps the segment index, and keeps the
+        // accumulated violations.
+        let boundary_ctx = SegmentContext {
+            opening: true,
+            genesis: false,
+            run: false,
+        };
+        c.reset_at_boundary(boundary_ctx, false, 1);
+        assert!(!c.recovery_pending, "boundary clears recovery_pending");
+        // Segment 1: another non-cp opening latches a second
+        // `MissingInitialCheckpoint` after the boundary.
+        let not_cp1 = entry(5, [7; 32]);
+        c.feed_record_collect(&not_cp1, 1, TRAIL, 0);
+        let out = c.finish_collect();
+        // Two violations across two segments.
+        assert_eq!(
+            out.violations.len(),
+            2,
+            "two independent violations across segments; got: {:?}",
+            out.violations
+                .iter()
+                .map(|(p, v)| (p.segment_index, p.record_index_in_segment, *v))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(out.violations[0].0.segment_index, 0);
+        assert_eq!(out.violations[0].1, Violation::MissingInitialCheckpoint);
+        assert_eq!(out.violations[1].0.segment_index, 1);
+        assert_eq!(out.violations[1].1, Violation::MissingInitialCheckpoint);
+    }
 
-        // cp0 at the trail's genesis.
+    /// Addendum 19.1 (shared epilogue mutant): the `count==0 -> damaged`
+    /// line in the shared `run_end_of_segment_epilogue` is required for
+    /// a fragment-only segment to count as damaged. Without it, the
+    /// collector would record `InvalidUndamagedSegment` (because
+    /// `!damaged && !run_flag`). This row asserts the collector records
+    /// NO `InvalidUndamagedSegment` on a fragment-only segment. A mutant
+    /// removing the `count==0` line in the shared epilogue flips this.
+    /// (Paired with the reader pin
+    /// `pin_hs_fallback_fragment_only_opening_updates_state_newline`,
+    /// which expects `Ok` on the reader side.)
+    #[test]
+    fn collector_fragment_only_segment_counts_as_damaged() {
+        let ctx = SegmentContext {
+            opening: false,
+            genesis: false,
+            run: false,
+        };
+        let mut c = Classifier::new_collect(None, ctx, false);
+        c.feed_fragment_collect(b"{\"torn\":\n", 0);
+        let out = c.finish_collect();
+        assert!(
+            !out.violations
+                .iter()
+                .any(|(_, v)| *v == Violation::InvalidUndamagedSegment),
+            "count==0 marks segment damaged, skipping InvalidUndamagedSegment; \
+             violations={:?}",
+            out.violations.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Addendum 19.1 / 17.2 (shared duplicate-arm mutant): the
+    /// `check_attestation` call inside the shared
+    /// `feed_record_tolerant_entry` is required for the collector's
+    /// `Duplicate` path to record `MissingOrMismatchedAttestation`. A
+    /// mutant that removes the attestation from the shared path would
+    /// let the collector silently accept an unattested duplicate. This
+    /// row pins the collector records `MissingOrMismatchedAttestation`
+    /// when a fragment-then-duplicate pair carries a missing repair.
+    /// (Paired with the reader pin
+    /// `pin_hs_attestation_duplicate_branch` on the same code path.)
+    #[test]
+    fn collector_duplicate_arm_shares_attestation_check() {
+        let ctx = SegmentContext {
+            opening: true,
+            genesis: true,
+            run: false,
+        };
+        let mut c = Classifier::new_collect(None, ctx, false);
+        // Feed cp0, then a Fragment (sets the gap digest), then a
+        // duplicate cp0 record whose `repaired` is `None` so the
+        // attestation check fails inside the shared duplicate-arm entry.
         let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
         c.feed_record_collect(&cp0, 1, TRAIL, 0);
+        c.feed_fragment_collect(b"torn-bytes", 1);
+        c.feed_record_collect(&cp0, 1, TRAIL, 2);
+        let out = c.finish_collect();
+        assert!(
+            out.violations
+                .iter()
+                .any(|(_, v)| *v == Violation::MissingOrMismatchedAttestation),
+            "duplicate-arm share: missing attestation recorded; violations={:?}",
+            out.violations.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+        );
+    }
 
-        // e1 extends cp0.
+    /// Addendum 19.1: a `history_segment`-entry pattern for Collect.
+    /// Runs the shared `runs::history_segment` dispatch with
+    /// `Reaction::Collect`, supplying a strict trial as the `strict`
+    /// closure; on `Strict(_)` the collector records NOTHING; on
+    /// `Tolerant(reaction)` it drives the tolerant Collect classifier.
+    /// Reused by every collector-first-equality case below.
+    fn collect_via_orchestration(opening: bool, run: bool, records: &[Record]) -> Vec<Violation> {
+        let ctx = SegmentContext {
+            opening,
+            genesis: false,
+            run,
+        };
+        // Strict trial: new strict classifier, feed each record, finish.
+        let mut strict = Classifier::new(None, ctx, Mode::Strict, opening && run);
+        let strict_result: Result<(), AuditError> = (|| {
+            for (i, r) in records.iter().enumerate() {
+                let gap = strict.take_gap();
+                let _ = strict.feed_record(r, 1, TRAIL, gap)?;
+                let _ = i;
+            }
+            strict.finish().map(|_| ())
+        })();
+        let dispatch =
+            super::history_segment::<(), _>(Reaction::Collect, || strict_result).unwrap();
+        match dispatch {
+            HistorySegmentDispatch::Strict(()) => Vec::new(),
+            HistorySegmentDispatch::Tolerant(_) => {
+                let mut tol = Classifier::new_collect(None, ctx, run);
+                for (i, r) in records.iter().enumerate() {
+                    tol.feed_record_collect(r, 1, TRAIL, i);
+                }
+                tol.finish_collect()
+                    .violations
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .collect()
+            }
+        }
+    }
+
+    /// Addendum 19.1: D1 (`[cp0, e1, cp2]` on `history_segment(true,false)`)
+    /// is the strict-pass-Ok case the reviewer flagged. Under the shared
+    /// orchestration the collector's history_segment entry records
+    /// **nothing**, matching the reader's `Ok`. Without strict-first the
+    /// tolerant epilogue would record `InvalidUndamagedSegment`.
+    #[test]
+    fn collector_history_segment_entry_matches_reader_on_strict_pass_ok() {
+        let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
         let e1 = entry(1, cp0.hash());
-        c.feed_record_collect(&e1, 1, TRAIL, 1);
+        let mmr_at_cp2 = mmr_after(&[cp0.clone(), e1.clone()]);
+        let cp2 = cp(2, e1.hash(), &mmr_at_cp2);
+        let violations = collect_via_orchestration(true, false, &[cp0, e1, cp2]);
+        assert!(
+            violations.is_empty(),
+            "strict-pass-Ok path records nothing; got: {violations:?}",
+        );
+    }
 
-        // bad_cp2: declared peaks don't match the real fold.
+    /// Addendum 19.1: fold-(iii) salvage path through orchestration. On
+    /// `[cp0, e1, bad_cp2, e3, cp4]` strict fails at bad_cp2 with
+    /// `CheckpointMmrDiffers`; the orchestration dispatches to tolerant
+    /// Collect which records exactly `[CheckpointMmrDiffers]` (addendum
+    /// 19.2: no derived `InvalidUndamagedSegment`).
+    #[test]
+    fn collector_history_segment_entry_salvages_fold_iii_mismatch() {
+        let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        let e1 = entry(1, cp0.hash());
         let bc = bad_cp(2, e1.hash());
-        c.feed_record_collect(&bc, 1, TRAIL, 2);
-
-        // e3 extends bad_cp2's position (the "as if matched" fold now
-        // includes bad_cp2 as a real leaf).
         let e3 = entry(3, bc.hash());
-        c.feed_record_collect(&e3, 1, TRAIL, 3);
-
-        // cp4 declares the MMR the trail actually computes including
-        // bad_cp2's leaf: this is the "as if matched" semantics.
         let m_at_cp4 = mmr_after(&[cp0.clone(), e1.clone(), bc.clone(), e3.clone()]);
         let cp4 = cp(4, e3.hash(), &m_at_cp4);
-        c.feed_record_collect(&cp4, 1, TRAIL, 4);
-
-        let out = c.finish_collect();
-        // Exact full list: the ONE CheckpointMmrDiffers at bad_cp2, nothing
-        // else (even in the finish-epilogue, since the run flag advanced
-        // and the segment is not damaged -- but addendum 17.4 means even
-        // the undamaged-epilogue check doesn't run past recovery_pending,
-        // which for the fold-(iii) salvage is NOT set).
-        let kinds: Vec<Violation> = out.violations.iter().map(|(_, v)| *v).collect();
+        let violations = collect_via_orchestration(true, false, &[cp0, e1, bc, e3, cp4]);
         assert_eq!(
-            kinds
-                .iter()
-                .filter(|v| **v == Violation::CheckpointMmrDiffers)
-                .count(),
-            1,
-            "exactly one CheckpointMmrDiffers recorded; full list: {kinds:?}",
-        );
-        // The single recorded violation's position is bad_cp2's (record_index=2).
-        let salvage = out
-            .violations
-            .iter()
-            .find(|(_, v)| *v == Violation::CheckpointMmrDiffers)
-            .expect("salvage violation exists");
-        assert_eq!(salvage.0.record_index_in_segment, 2);
-        // The final state's MMR equals the "as if matched" fold (the
-        // computed one including every record, cp4's declaration matches).
-        let final_state = out.state.expect("fold continued past salvage");
-        assert_eq!(
-            final_state.mmr.root(),
-            mmr_after(&[cp0, e1, bc, e3, cp4]).root(),
-            "final MMR is the computed `as if matched` fold",
+            violations,
+            vec![Violation::CheckpointMmrDiffers],
+            "fold-(iii) salvage records exactly one CheckpointMmrDiffers; \
+             got: {violations:?}",
         );
     }
 

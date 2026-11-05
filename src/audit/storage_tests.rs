@@ -3434,7 +3434,7 @@ mod details {
         (
             "checkpoint MMR differs from preceding records",
             1,
-            "Addendum 16 point 2 (17.3): fold (iii) salvage push in feed_record_apply_tolerant records the Violation into the collector's vector without returning an AuditError; exercised by collector_tests::collector_fold_iii_mismatch_continues_full_list and collector_tests::collector_salvage_mmr_includes_the_checkpoint_leaf (no reader-side assert_corrupt).",
+            "Addendum 16 point 2 (17.3 / 19.2): fold (iii) salvage push in feed_record_apply_tolerant records the Violation into the collector's vector without returning an AuditError; exercised by collector_tests::collector_fold_iii_mismatch_on_history_segment_opening_true_run_false (and its three per-path siblings) and collector_tests::collector_salvage_mmr_includes_the_checkpoint_leaf (no reader-side assert_corrupt).",
         ),
         (
             "missing written state",
@@ -3667,6 +3667,20 @@ mod details {
                     self.in_cfg_test += 1;
                 }
                 syn::visit::visit_item_impl(self, i);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+            fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+                // Addendum 19.6: a `#[cfg(test)]` fn inside an `impl`
+                // block is an `ImplItemFn`, not an `ItemFn`; without
+                // this visit the gate would count its `Violation::X`
+                // sites as product sites.
+                let bump = attrs_have_cfg_test(&f.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_impl_item_fn(self, f);
                 if bump {
                     self.in_cfg_test -= 1;
                 }
