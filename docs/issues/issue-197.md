@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-11-03T10:18:01Z
-updated: 2026-11-04T08:38:36Z
+updated: 2026-11-05T08:15:46Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/197
-comments: 10
+comments: 18
 labels: priority:medium
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-04T08:43:05.301Z
+synced: 2026-11-05T09:02:39.888Z
 ---
 
 # [Issue 197]: [refactor(audit): extract the reader's run classification into one shared pure module (#13 V4 prerequisite)](https://github.com/vig-os/vigil/issues/197)
@@ -203,4 +203,160 @@ _Posted on November 4, 2026 at 06:45 AM_
 _Posted on November 4, 2026 at 08:38 AM_
 
 R2b S1 (#204) round 2 light re-review: comment-only delta, no behaviour change, all gates and CI green. One stale `//` comment is **carried into S2**, which rewrites this region of `storage.rs`: the `scan_inner` header comment (~`storage.rs:812`) still says the shim "calls `runs::check_attestation` at each record's reader-side position", but the strict `Classifier::feed_record` now makes that call internally. The PR-body `run_loss` overclaim was corrected by the architect.
+
+---
+
+# [Comment #11]() by [gerchowl]()
+
+_Posted on November 5, 2026 at 12:08 AM_
+
+
+### Addendum 14 to ruling 197-d1 (owner decision 2026-11-05: S2 lands as one PR)
+14. **R2b S2 lands as one atomic PR of about 645 non-test lines, above the usual ~400 limit.**
+    - The only safe cut the planner found was "dead code first": S2a would add the tolerant classifier unused, behind `#[allow(dead_code)]` with 12 temporary UNREACHABLE gate rows, and S2b would switch `history_segment` onto it. That split meets the size limit only on paper, because S2a can't be verified on its own. A cut by behaviour needs hybrid latch bookkeeping that the planner judged unsafe.
+    - The owner chose a single PR: the two prototype slices (`S2a.patch` then `S2b.patch` on 3994b07) squashed. No dead code, no `#[allow]` and no carrier UNREACHABLE rows ever reach dev. The gate stays at 48 sites.
+    - **The proof is not the pins.** An independent systematic base-vs-head differential (all short token layouts, as for #204), comparing error strings and Ok-state fields (including `since_checkpoint`, `run_loss`, `checkpoint_time`, offset, length, newline and gap), is mandatory in the pre-dispatch check, in the implementer's PR and in the fresh review. Each differential must be shown to detect a planted regression.
+    - **Mutant M4** as specified (sealed-seq ↔ missing-checkpoint) is equivalent, because the two guards have disjoint preconditions. It is replaced by **M4′**: swap trail identity with the sealed-seq check, on a layout where both guards fire.
+
+
+---
+
+# [Comment #12]() by [gerchowl]()
+
+_Posted on November 5, 2026 at 02:41 AM_
+
+
+### Addendum 15 to ruling 197-d1 (R2b S2: the `since_checkpoint` increment at the u64 bound)
+15. **The shared writer-field helper saturates. The refactor deliberately unifies two base expressions, and this is the only intended difference from base.**
+    - On dev (3994b07), base was inconsistent:
+      - `scan_inner` computed `since_checkpoint` with `saturating_add(1)` (plus a no-op `.max(1)`);
+      - the `storage::apply_checked` wrapper, which the fallback also uses, computed it with plain `+ 1`. At `u64::MAX` that panics in debug and wraps to 0 in release. A wrap to 0 would falsely signal "just checkpointed" to the writer's cadence (`sink.rs`).
+    - S2's single helper `next_cp_fields` (required by the S2 check, for DRY) cannot match both. It uses **`saturating_add(1)`** everywhere.
+    - The only observable difference from base is on the `apply_checked`/fallback path when `since_checkpoint == u64::MAX`: saturate instead of panic or wrap. The bound counts records since a checkpoint, so it is unreachable in practice, but the semantics must still be the correct ones.
+    - Pins lock this on a strict path and on the `apply_checked`/fallback path: a state with `since_checkpoint = u64::MAX` stays `u64::MAX` after one more record.
+    - The PR body states this as the single intended deviation, with this addendum as the reason. Differentials against base must show identical results everywhere except rows with that predecessor context on the `apply_checked`/fallback path, where base panics or wraps.
+    - The architect's round-2 brief wrongly called plain `+ 1` "base's expression" for `scan_inner`. That brief is superseded.
+
+
+---
+
+# [Comment #13]() by [gerchowl]()
+
+_Posted on November 5, 2026 at 03:41 AM_
+
+R2b S2 (#205) final review at feed1727: a 311,025-row base-vs-head differential. The only output differences are the documented addendum-15 saturation rows (4,874, all in `since_checkpoint = u64::MAX` contexts, where base panics and head saturates). One more internal difference is recorded for the record: on an `Err` from the fallback, head leaves `*run` at the caller's value where base had set `inherited`. It is unobservable, since all five callers propagate with `?` and drop `run`. The PR body now states it accurately (the architect corrected a false "pre-existing" claim).
+
+---
+
+# [Comment #14]() by [gerchowl]()
+
+_Posted on November 5, 2026 at 04:33 AM_
+
+
+### Addendum 16 to ruling 197-d1 (R2b S3a: one classifier with a Stop/Collect reaction)
+16. **The every-violation collector is a reaction mode of the one classifier, never a second copy of the checks** (the owner's decision 13-V4-d4).
+    - The S3a prototype's `Mode::Collector` copied the tolerant checks. Its pre-dispatch check showed three things:
+      - a mutant changed in only the collector's copy survived every test;
+      - the collector disagreed with the reader on strict paths, and 9 of 35 kinds could never be emitted;
+      - its fold-(iii) splice left the MMR one leaf short and produced a spurious violation.
+    - Binding design:
+      1. **One classifier, two reactions.** Keep `Mode{Strict,Tolerant}` and add `Reaction{Stop,Collect}`. Every check site calls a single `on_violation(v)`. `Stop` returns `Err(v.into())`, which is today's reader behaviour, byte-identical. `Collect` records `(v, position)` and then continues as point 4 says. The collector therefore sees exactly the reader's per-path order. **Its first recorded violation equals the reader's first violation on the same layout and path (strict and tolerant)**, and a test proves this across a systematic layout sweep.
+      2. **Fold (iii) "as if matched"** re-applies the record through the shared `apply_checked(..., compare_mmr = false)`. No hand-built `RunState`, no hand-built MMR.
+      3. **Typed at the source.** Each check site constructs a `Violation` variant directly; `detail()` gives today's exact string. There is no `from_detail` string round-trip and no `panic!` fallback.
+      4. **The coverage gate is re-keyed deliberately** (as in addendum 7) to count `Violation` construction sites instead of `corrupt("literal")` calls. The PR states the new count and mapping, and a renamed or added variant without a pin fails the gate. R0's per-site pins keep asserting today's exact detail strings.
+      5. Tolerant finish-time checks (`invalid undamaged segment`, `first successor lacks resume`, …) are recorded in Collect mode too.
+    - Proof: an independent systematic differential (reader unchanged), the reader-vs-collector-first equality sweep, collector rows, and mutants, including one that changes a check (one shared site, so both reactions see it).
+
+
+---
+
+# [Comment #15]() by [gerchowl]()
+
+_Posted on November 5, 2026 at 05:49 AM_
+
+
+### Addendum 17 to ruling 197-d1 (R2b S3a: the open points from the v3 full-proof check)
+17. **Settled from the S3a v3 check (reader unchanged over 221,625 cases; four blockers):**
+    1. **Collect covers both modes.** `Reaction::Collect` has entry points for **Strict and Tolerant**, plus an entry for a `Record(Err)` line. On every single-segment path, the collector's first recorded violation equals the reader's first violation, with zero mismatches. **Multi-segment paths** (live open, refresh, open fallback) are proven in **S3b** through `classify`, not here.
+    2. **No copies, the duplicate arm included.** The duplicate-line handling is the reader's own code path, with only the reaction differing. Neither the collector nor anything else duplicates the reader's `Duplicate` arm.
+    3. **"As if matched" (point 4, fold iii)** means the MMR continues as the **computed fold including the checkpoint's own leaf**: the state the trail would have if the checkpoint had been honest. The checkpoint's declared size, root and peaks are discarded. A later honest checkpoint then matches. The row `[cp0,e1,bad_cp2,e3,cp4]` pins the **exact full recorded list** this semantics yields on each path, with exactly one `CheckpointMmrDiffers`. The earlier `from_peaks(cp.size, cp.peaks)` expectation is void.
+    4. **End-of-segment checks:**
+       - they are **skipped while the run is already ended** by an earlier violation, since no second report comes from a run that is already dead;
+       - they **run at every segment boundary otherwise**, including `reset_at_boundary`, not only on the last segment.
+    5. **The gate derives the variant set from the `enum Violation` definition (syn)**, not from `ALL`. Every variant must have a site and a pin, or a proven UNREACHABLE entry. `ALL` must equal the parsed set. `#[cfg(test)]` code is excluded from site counting. Every UNREACHABLE reason cites a test or proof that exists.
+    6. Every surviving mutant from the check gets a killing row:
+       - fold ends the run;
+       - salvage skipped;
+       - boundary `saved_prior=None`;
+       - Collect keeps only the first;
+       - Collect skips attestation;
+       - duplicate arm without `count += 1`;
+       - sealed-seq `<=`→`<`, which must also fail a collector row.
+    - **Size:** if the non-test code exceeds ~400 lines after these fixes, stop with `BLOCKED: size <N>` for an owner decision (as in addendum 14). Don't trim proof or behaviour to fit.
+
+
+---
+
+# [Comment #16]() by [gerchowl]()
+
+_Posted on November 5, 2026 at 06:14 AM_
+
+
+### Addendum 18 to ruling 197-d1 (S3a is split into S3a and S3a′)
+18. **To stay at about 400 non-test lines per PR, S3a lands in two parts.** This is a split, not a size exception.
+    - **S3a (branch `refactor/197-r2b-s3a-collector`, about 391 lines):**
+      - the one-classifier `Reaction{Stop,Collect}` for **Tolerant** mode;
+      - the duplicate arm on the reader's own code path (17.2);
+      - fold "as if matched" with the computed fold including the checkpoint leaf (17.3);
+      - end-of-segment checks skipped once the run is ended and run at every boundary otherwise (17.4);
+      - the gate deriving variants from `enum Violation` and excluding `#[cfg(test)]` code (17.5);
+      - the killing rows that tolerant mode can host.
+      
+      The collector is **documented as tolerant-only until S3a′**. It has no consumer before S3b's `classify`, so S3a is correct on its own.
+    - **S3a′:** Strict×Collect and the `Record(Err)` Collect entry (17.1), the remaining killing rows (boundary `saved_prior=None`, Collect skips attestation, duplicate arm without `count += 1`, and sealed-seq `<=`→`<` failing a collector row), and the first-equality sweep over the strict single-segment paths.
+    - **Proof for S3a, mandatory before merge:**
+      - a base-vs-head reader differential over **every** reader path (the duplicate-arm rewiring touches the reader);
+      - the collector-first-equals-reader-first sweep over the **tolerant** single-segment paths (`history_segment` ×4), with zero mismatches;
+      - the S3a rows;
+      - the gate's G1–G3, with G2 exiting 101.
+      
+      The fresh reviewer runs these independently.
+
+
+---
+
+# [Comment #17]() by [gerchowl]()
+
+_Posted on November 5, 2026 at 06:56 AM_
+
+
+### Addendum 19 to ruling 197-d1 (S3a: shared orchestration, and no derived violations)
+19. **The reader's orchestration is one function parameterised by `Reaction`, and a fold mismatch produces no derived violation.**
+    - The PR #206 review (reader unchanged over 467,483 cases) found that the collector still diverges from the reader. It skipped `history_segment`'s strict pass: 1,046 cases where the reader returns Ok but the collector records, D1 among them. It also re-implemented the finish epilogue and the duplicate-line arm, and a mutant in either copy survives.
+    - Binding:
+      1. **One orchestration.** `history_segment`'s strict-pass-then-tolerant-fallback-from-saved-state sequence, the duplicate-line arm and the end-of-segment epilogue each live in **one** function, parameterised by `Reaction`. The reader calls it with `Stop`; the collector calls it with `Collect`.
+         - In particular, Collect on `history_segment` runs the strict pass first. If that passes, the collector records **nothing**, exactly as the reader returns Ok. Only a strict failure enters the tolerant fallback, in Collect.
+         - This moves code out of `storage.rs` into the shared function. That is allowed and required. Behaviour is proven by the reader differential.
+      2. **No derived violations.** When a fold-(iii) mismatch is recorded in a segment, that segment counts as **damaged** for its end-of-segment checks. So `[cp0,e1,bad_cp2,e3,cp4]` records **exactly** `[(2, CheckpointMmrDiffers)]` on every `history_segment` path, with no follow-on `InvalidUndamagedSegment`. (Under `Stop` the reader never reaches that point, so its behaviour is unchanged.)
+      3. Every shared function gets a mutant that fails **both** a reader pin and a collector row.
+
+
+---
+
+# [Comment #18]() by [gerchowl]()
+
+_Posted on November 5, 2026 at 08:15 AM_
+
+
+### Addendum 20 to ruling 197-d1 (S3a: the I/O boundary of the shared walk, the gate, and 19.2 precedence)
+20. **Settled from PR #206 review 2** (reader unchanged over 404,992 cases; first-equality 0 mismatches over 85,268):
+    1. **The I/O boundary.** The `history_segment` walk is shared only up to I/O, and that boundary is fixed here:
+       - `storage.rs` keeps **only byte-level I/O and byte checks**: the seek, reading lines, the glued-byte and LF checks. It turns a segment into a stream of decoded line events (record, fragment, unparsable, …).
+       - **All orchestration** goes into **one** `runs.rs` function that takes that event stream, the prior state and the `Reaction`. That means the saved prior state and its restore for the fallback, the `inherited` computation (including `unsealed_boundary`), the strict pass → tolerant fallback decision, per-line feeding, and the epilogue.
+       - The reader calls it with `Stop`, and the collector with `Collect` (S3b's `classify` will consume the same event stream). There is **no test-only copy** of the orchestration.
+       - Mutants on `inherited`, on the `saved_prior` restore and on the fallback decision must fail **both** a reader pin and a collector row.
+    2. **The gate requires coverage per variant.** Every `Violation` variant has at least one construction site **and** a pin, or a proven UNREACHABLE entry. A variant added to the enum, `ALL` and `detail()` with no site and no pin (G3) fails the gate with exit 101.
+    3. **19.2 precedence.** First-equality (the collector's first equals the reader's first) takes precedence. "Exactly `[(2, CheckpointMmrDiffers)]`, no derived violation" applies on every path where no earlier violation precedes the bad checkpoint. On `history_segment(true,true)` the reader's earlier first violation (`FirstSuccessorLacksImmediateResume` at 1) stands, and is pinned.
+    - **Size:** if moving the walk takes non-test code beyond ~400 lines, stop with `BLOCKED: size <N>` for an owner decision (as in addendum 14). Don't keep a partial share to fit.
+
 
