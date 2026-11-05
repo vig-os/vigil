@@ -11,7 +11,8 @@ use super::{
     AuditError, AuditErrorKind, Record,
     format::{Kind, validation::MAX_PAYLOAD_BYTES},
     runs::{
-        self, Advance, Classifier, Mode as ClassifierMode, RunState, SegmentContext, TolerantPrep,
+        self, Advance, Classifier, HistorySegmentDispatch, Mode as ClassifierMode, Reaction,
+        RunState, SegmentContext, TolerantPrep,
     },
 };
 use crate::rotate::Directory;
@@ -328,25 +329,26 @@ pub(crate) fn history_segment(
     // Decision 8 still applies when a malformed suffix makes the successor
     // enter the run fallback: a linking opening cannot defer its declaration.
     let unsealed_boundary = opening && state.as_ref().is_some_and(|s| !sealed(s));
-    // Strict pass first, through the shared `scan_inner` shim.
-    match scan_inner(
-        file,
-        trail,
-        state.clone(),
-        expected,
-        found,
-        SegmentContext {
-            opening,
-            genesis: false,
-            run: *run,
-        },
-    ) {
-        Ok(next) => {
+    let ctx = SegmentContext {
+        opening,
+        genesis: false,
+        run: *run,
+    };
+    // Addendum 19.1: history_segment's strict-pass-then-tolerant-fallback
+    // sequence is ONE function in runs.rs, parameterised by Reaction. The
+    // reader calls it with Reaction::Stop; the collector's history_segment
+    // entry (in #[cfg(test)] rows and #197 R2b S3b) calls it with
+    // Reaction::Collect. On strict Ok the reader returns the strict state;
+    // on strict CorruptTrail the tolerant fallback runs below. Any other
+    // strict Err (e.g. I/O) propagates unchanged.
+    match runs::history_segment::<State, _>(Reaction::Stop, || {
+        scan_inner(file, trail, state.clone(), expected, found, ctx)
+    })? {
+        HistorySegmentDispatch::Strict(next) => {
             *run = false;
             return Ok(Some(next));
         }
-        Err(error) if error.kind() == AuditErrorKind::CorruptTrail => {}
-        Err(error) => return Err(error),
+        HistorySegmentDispatch::Tolerant(_) => {}
     }
     // Fallback rescan from the **saved segment-start state**. The shim
     // threads a tolerant-mode `runs::Classifier` for every per-record and
@@ -355,11 +357,6 @@ pub(crate) fn history_segment(
     // Duplicate branch calls it directly, the General branch calls it
     // between `prepare` and `apply`.
     let inherited = *run || unsealed_boundary;
-    let ctx = SegmentContext {
-        opening,
-        genesis: false,
-        run: *run,
-    };
     let saved_prior = state.as_ref().map(|s| s.run.clone());
     let mut classifier = Classifier::new_tolerant(saved_prior, ctx, inherited);
     let mut state = state;
@@ -418,16 +415,15 @@ pub(crate) fn history_segment(
         };
         let record_count = records.len();
         let record = &records[0];
-        match classifier.feed_record_prepare_tolerant(record, record_count, trail)? {
-            TolerantPrep::Duplicate => {
-                // Identical-duplicate branch: calls `check_attestation` but
-                // does NOT update `state.offset` / `state.newline`.
-                runs::check_attestation(classifier.take_gap(), record.context.repaired)?;
-                continue;
-            }
-            TolerantPrep::General => {}
+        // Addendum 19.1 / 17.2: the Duplicate arm (prepare -> take_gap ->
+        // check_attestation -> skip-apply) is shared with the collector's
+        // `feed_record_collect` through `feed_record_tolerant_entry`. On
+        // `Duplicate`, continue without updating `state.offset` /
+        // `state.newline`; on `General`, run `feed_record_apply_tolerant`.
+        let prep = classifier.feed_record_tolerant_entry(record, record_count, trail)?;
+        if matches!(prep, TolerantPrep::Duplicate) {
+            continue;
         }
-        runs::check_attestation(classifier.take_gap(), record.context.repaired)?;
         classifier.feed_record_apply_tolerant(record)?;
         let Some(run_state) = classifier.state() else {
             return Err(corrupt("missing head"));
