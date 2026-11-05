@@ -1748,27 +1748,42 @@ mod details {
     use std::collections::{HashMap, HashSet};
 
     // The gate parses `storage.rs` and `runs.rs` separately with
-    // `syn::parse_file` and collects the `corrupt` call sites across
-    // both in a fixed file order (storage.rs first, then runs.rs), so
-    // the `(detail, occurrence)` keys stay stable.
+    // `syn::parse_file` and collects sites across both in a fixed file
+    // order (storage.rs first, then runs.rs), so the
+    // `(detail, occurrence)` keys stay stable. From R2b S3a onward the
+    // gate is re-keyed per ruling 197-d1 addendum 16 point 4: it
+    // counts every `corrupt("literal")` in `storage.rs` and every
+    // `Violation::<Variant>` construction expression in `runs.rs`,
+    // mapping each variant to its `detail()` string.
     //
-    // The pure classifier (`runs::Classifier`) owns 39 of the 48 sites:
+    // The pure classifier (`runs::Classifier`) owns 41 of the 50 sites:
     // every `apply_checked` detail (ruling 197-d1 point 2, R1), the
     // strict-mode per-segment checks driven by `feed_record` / `finish`
-    // / `invalid_opening_line`, and the tolerant-mode checks driven by
+    // / `invalid_opening_line`, the tolerant-mode checks driven by
     // `feed_record_prepare_tolerant` / `feed_record_apply_tolerant` /
-    // `finish_tolerant` / `feed_record_err_tolerant`. The reader shim
-    // in `storage.rs` keeps the remaining 9 sites: the byte-level and
-    // file-open checks, plus a defence-in-depth `missing head` after
-    // `feed_record_apply_tolerant` (UNREACHABLE: a successful apply
-    // leaves `classifier.state()=Some`, matched by the UNREACHABLE
-    // table row below). `check_attestation` is the single site for
-    // `missing or mismatched repair attestation` (ruling 197-d1
-    // addendum 7); the reader orders it per path at the position
-    // ruling 197-d1 addendum 12 fixes. The `missing head` site that
-    // used to sit after `apply_checked` in the reader is now a
-    // classifier invariant with no inline call, so the total sits at
-    // 48 = 9 in `storage.rs` + 39 in `runs.rs`.
+    // `finish_tolerant` / `feed_record_err_tolerant`, and the finish-
+    // time records inside `finish_collect` (addendum 16 point 5). The
+    // reader shim in `storage.rs` keeps the remaining 9 sites: the
+    // byte-level and file-open checks, plus a defence-in-depth
+    // `missing head` after `feed_record_apply_tolerant` (UNREACHABLE:
+    // a successful apply leaves `classifier.state()=Some`, matched by
+    // the UNREACHABLE table row below). `check_attestation` is the
+    // single site for `missing or mismatched repair attestation`
+    // (ruling 197-d1 addendum 7); the reader orders it per path at the
+    // position ruling 197-d1 addendum 12 fixes. The `missing head`
+    // site that used to sit after `apply_checked` in the reader is now
+    // a classifier invariant with no inline call, so the total sits at
+    // 50 = 9 in `storage.rs` + 41 in `runs.rs`. The extra site
+    // over the 39+9=48 base is: the fold (iii) salvage push adds
+    // one `Violation::CheckpointMmrDiffers` construction site inside
+    // `feed_record_apply_tolerant` (UNREACHABLE for the reader-side
+    // pin gate: exercised by `collector_tests`, no `assert_corrupt`),
+    // and `apply_checked`'s fresh-Mmr genesis fold now carries an
+    // explicit `.map_err(|_| Violation::MmrOverflow)?` (UNREACHABLE:
+    // `Mmr::new()` + push of one leaf cannot overflow). A renamed
+    // variant whose `detail()` is not updated, or a new
+    // `Violation::<X>` variant without a pin, fails the gate
+    // (addendum 16 point 4).
     const STORAGE_SRC: &str = include_str!("storage.rs");
     const RUNS_SRC: &str = include_str!("runs.rs");
     const STORAGE_TESTS_SRC: &str = include_str!("storage_tests.rs");
@@ -3417,6 +3432,11 @@ mod details {
 
     const UNREACHABLE: &[(&str, usize, &str)] = &[
         (
+            "checkpoint MMR differs from preceding records",
+            1,
+            "Addendum 16 point 2 (17.3 / 19.2): fold (iii) salvage push in feed_record_apply_tolerant records the Violation into the collector's vector without returning an AuditError; exercised by collector_tests::collector_fold_iii_mismatch_on_history_segment_opening_true_run_false (and its three per-path siblings) and collector_tests::collector_salvage_mmr_includes_the_checkpoint_leaf (no reader-side assert_corrupt).",
+        ),
+        (
             "missing written state",
             0,
             "State::after: apply always sets state=Some on Ok",
@@ -3443,7 +3463,16 @@ mod details {
             0,
             "state=None + non-Checkpoint fires 'missing initial checkpoint' first",
         ),
-        ("MMR overflow", 0, "requires 2^64 leaves"),
+        (
+            "MMR overflow",
+            0,
+            "apply_checked's fresh-Mmr genesis fold: Mmr::new() + push of one leaf cannot overflow size or miss peaks",
+        ),
+        (
+            "MMR overflow",
+            1,
+            "apply_checked's main record fold: requires 2^64 leaves",
+        ),
     ];
 
     // 197-d1 addendum 9: the gate parses Rust with `syn::parse_file`
@@ -3488,18 +3517,68 @@ mod details {
         path.segments.last().map(|s| &s.ident)
     }
 
-    fn parse_sites(sources: &[&str]) -> Vec<(String, usize)> {
-        // Every `ExprCall` whose callee path ends in `corrupt` and
-        // whose first argument is a string literal is a corrupt-site
-        // in the reader. Each source is parsed on its own with
-        // `syn::parse_file` and sites are collected in the caller's
-        // fixed order, so the `(detail, occurrence)` key stays stable
-        // across both files -- the same key
-        // `assert_corrupt(result, "detail", site)` uses.
-        struct Collect {
+    fn parse_sites() -> Vec<(String, usize)> {
+        // Addendum 16 point 4: the gate scans `storage.rs` for every
+        // `corrupt("literal")` call (ExprCall whose callee ends in
+        // `corrupt`, first arg is a string literal) and scans `runs.rs`
+        // for every `Violation::<Variant>` construction expression
+        // (ExprPath whose first segment is `Violation`), mapping each
+        // variant to its `detail()` string via the single source of
+        // truth [`runs::Violation::detail`]. Sites are collected in a
+        // fixed file order (storage.rs first, then runs.rs) so the
+        // `(detail, occurrence)` key stays stable across both files
+        // -- the same key `assert_corrupt(result, "detail", site)` uses.
+        // The pattern binding `v @ Violation::CheckpointMmrDiffers` in
+        // `feed_record_apply_tolerant`'s salvage arm is NOT a
+        // construction expression (patterns are not expressions), so
+        // this scan does not double-count it.
+        use crate::audit::runs::Violation;
+
+        // Addendum 17.5: derive the variant set by syn-parsing
+        // `enum Violation` from `runs.rs` (not from `Violation::ALL`),
+        // and fail unless `ALL` equals it. A variant added to the enum
+        // but missing from `ALL`, with a live construction site and no
+        // pin, fails the gate: the site is counted and the pin is
+        // missing.
+        let parse_enum_variants = |file: &syn::File| -> HashSet<String> {
+            let mut names = HashSet::new();
+            for item in &file.items {
+                if let syn::Item::Enum(e) = item
+                    && e.ident == "Violation"
+                {
+                    for v in &e.variants {
+                        names.insert(v.ident.to_string());
+                    }
+                }
+            }
+            names
+        };
+        let runs_pre: syn::File = syn::parse_file(RUNS_SRC)
+            .expect("coverage gate: runs.rs is not valid Rust (parse_file failed)");
+        let enum_variants: HashSet<String> = parse_enum_variants(&runs_pre);
+        assert!(
+            !enum_variants.is_empty(),
+            "coverage gate: syn-parse of enum Violation yielded no variants",
+        );
+        let all_variants: HashSet<String> =
+            Violation::ALL.iter().map(|v| format!("{v:?}")).collect();
+        assert_eq!(
+            enum_variants, all_variants,
+            "coverage gate: enum Violation's variant set != Violation::ALL \
+             (addendum 17.5: the ALL list must mirror the enum definition)",
+        );
+
+        // Variant-name → detail string. With the ALL==enum cross-check
+        // above, every parsed enum variant also has a runtime detail().
+        let name_to_detail: HashMap<String, &'static str> = Violation::ALL
+            .iter()
+            .map(|v| (format!("{v:?}"), v.detail()))
+            .collect();
+
+        struct CollectStorage {
             raw: Vec<String>,
         }
-        impl<'ast> syn::visit::Visit<'ast> for Collect {
+        impl<'ast> syn::visit::Visit<'ast> for CollectStorage {
             fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
                 if let syn::Expr::Path(p) = &*call.func
                     && path_last_segment(&p.path).is_some_and(|i| i == "corrupt")
@@ -3511,15 +3590,132 @@ mod details {
                 syn::visit::visit_expr_call(self, call);
             }
         }
-        let mut c = Collect { raw: Vec::new() };
-        for source in sources {
-            let file: syn::File = syn::parse_file(source)
-                .expect("coverage gate: a reader source is not valid Rust (parse_file failed)");
-            syn::visit::Visit::visit_file(&mut c, &file);
+
+        // Addendum 17.5: exclude `#[cfg(test)]` code from site counting.
+        // A `Violation::X` construction inside a `#[cfg(test)]` module or
+        // item is a test, not a product site, and must not count.
+        fn attrs_have_cfg_test(attrs: &[syn::Attribute]) -> bool {
+            attrs.iter().any(|a| {
+                a.path().is_ident("cfg")
+                    && a.parse_args::<syn::Meta>().ok().is_some_and(|m| match m {
+                        syn::Meta::Path(p) => p.is_ident("test"),
+                        _ => false,
+                    })
+            })
         }
+
+        struct CollectRuns<'a> {
+            raw: Vec<String>,
+            name_to_detail: &'a HashMap<String, &'static str>,
+            in_pattern: usize,
+            in_cfg_test: usize,
+        }
+        impl<'ast, 'a> syn::visit::Visit<'ast> for CollectRuns<'a> {
+            fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
+                // Two-segment path `Violation::<Variant>`. `Self::X` paths
+                // inside `impl Violation` have `Self` as the first segment
+                // and are therefore skipped (the `const ALL` list and
+                // `fn detail` are the enum's own definition, not call
+                // sites). In syn 2.x `Pat::Path` wraps `ExprPath`, so a
+                // pattern-position `Violation::<Variant>` (as in the fold
+                // (iii) salvage arm `Err(Violation::CheckpointMmrDiffers)
+                // if ... =>`) also reaches this visitor; the `in_pattern`
+                // stack skips those — the salvage arm's pattern is NOT
+                // a construction site (patterns match values, they do
+                // not create them), the ONE construction for the salvage
+                // is the explicit `self.collected.push((.., Violation::X))`
+                // inside the arm body.
+                if self.in_pattern == 0 && self.in_cfg_test == 0 {
+                    let segs = &p.path.segments;
+                    if segs.len() == 2
+                        && segs[0].ident == "Violation"
+                        && let Some(detail) = self.name_to_detail.get(&segs[1].ident.to_string())
+                    {
+                        self.raw.push((*detail).to_string());
+                    }
+                }
+                syn::visit::visit_expr_path(self, p);
+            }
+            fn visit_pat(&mut self, p: &'ast syn::Pat) {
+                self.in_pattern += 1;
+                syn::visit::visit_pat(self, p);
+                self.in_pattern -= 1;
+            }
+            fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+                let bump = attrs_have_cfg_test(&m.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_item_mod(self, m);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+            fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+                let bump = attrs_have_cfg_test(&f.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_item_fn(self, f);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+            fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+                let bump = attrs_have_cfg_test(&i.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_item_impl(self, i);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+            fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+                // Addendum 19.6: a `#[cfg(test)]` fn inside an `impl`
+                // block is an `ImplItemFn`, not an `ItemFn`; without
+                // this visit the gate would count its `Violation::X`
+                // sites as product sites.
+                let bump = attrs_have_cfg_test(&f.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_impl_item_fn(self, f);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+            fn visit_item_const(&mut self, c: &'ast syn::ItemConst) {
+                let bump = attrs_have_cfg_test(&c.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_item_const(self, c);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+        }
+
+        let mut raw: Vec<String> = Vec::new();
+        let storage: syn::File = syn::parse_file(STORAGE_SRC)
+            .expect("coverage gate: storage.rs is not valid Rust (parse_file failed)");
+        let mut cs = CollectStorage { raw: Vec::new() };
+        syn::visit::Visit::visit_file(&mut cs, &storage);
+        raw.extend(cs.raw);
+        let runs: syn::File = syn::parse_file(RUNS_SRC)
+            .expect("coverage gate: runs.rs is not valid Rust (parse_file failed)");
+        let mut cr = CollectRuns {
+            raw: Vec::new(),
+            name_to_detail: &name_to_detail,
+            in_pattern: 0,
+            in_cfg_test: 0,
+        };
+        syn::visit::Visit::visit_file(&mut cr, &runs);
+        raw.extend(cr.raw);
+
         let mut counts: HashMap<String, usize> = HashMap::new();
-        c.raw
-            .into_iter()
+        raw.into_iter()
             .map(|d| {
                 let n = *counts.get(&d).unwrap_or(&0);
                 counts.insert(d.clone(), n + 1);
@@ -3781,11 +3977,12 @@ mod details {
 
     #[test]
     fn coverage_gate_pins_every_corrupt_site() {
-        // Fixed file order: storage.rs first (9 sites), then runs.rs
-        // (39 sites). Each source is parsed on its own with
-        // `syn::parse_file`, so neither file needs to be syntactically
-        // concatenable with the other.
-        let sites = parse_sites(&[STORAGE_SRC, RUNS_SRC]);
+        // Fixed file order: storage.rs first (9 corrupt-literal sites),
+        // then runs.rs (41 `Violation::<X>` construction sites, re-keyed
+        // per addendum 16 point 4). Each source is parsed on its own
+        // with `syn::parse_file`, so neither file needs to be
+        // syntactically concatenable with the other.
+        let sites = parse_sites();
         let site_set: HashSet<(String, usize)> = sites.iter().cloned().collect();
         let asserted: HashSet<(String, usize)> =
             parse_assertions(STORAGE_TESTS_SRC).into_iter().collect();
@@ -3815,7 +4012,7 @@ mod details {
         }
         assert_eq!(
             sites.len(),
-            48,
+            50,
             "corrupt-site count changed; update gate explicitly"
         );
     }
