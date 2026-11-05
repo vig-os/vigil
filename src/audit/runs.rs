@@ -9,19 +9,18 @@
 //! (`checkpoint_time`, `since_checkpoint`), the walk cursor (`offset`,
 //! `length`, `newline`) and the gap-hasher stay in `State`.
 //!
-//! `check_attestation` (a fragment gap's repair attestation, checked as data) and
-//! `apply_checked` (the per-record checks) are pure. #197 R2b S1 moves
-//! `scan_inner`'s strict-mode per-segment checks into the push-API
-//! [`Classifier`] (strict mode); #197 R2b S2 adds the tolerant-mode drive
-//! used by `history_segment`'s fallback walk (restored from a saved
-//! segment-start state). Together with the reader-side byte-level and
+//! `check_attestation` (a fragment gap's repair attestation, checked as data)
+//! and `apply_checked` (the per-record checks) are pure. The push-API
+//! [`Classifier`] drives `scan_inner`'s strict-mode per-segment checks and,
+//! in tolerant mode, `history_segment`'s fallback walk restored from a saved
+//! segment-start state. Together with the reader-side byte-level and
 //! file-open checks that still run in `storage.rs`, they reproduce the
-//! reader's first violation on every path. The `classify` iterator over
-//! segment summaries, the every-violation collector, and V4a's consumption
-//! land in #197 R2b S3 (addendum 13).
+//! reader's first violation on every path. See #197 for the follow-up
+//! slice (ruling 197-d1 addendum 13) that adds the `classify` iterator over
+//! segment summaries, the every-violation collector and V4a's consumption.
 //!
 //! On their own [`Classifier`] + [`check_attestation`] are **not** a complete
-//! first-violation oracle until #197 R2b S3 adds the every-violation
+//! first-violation oracle until that slice adds the every-violation
 //! collector and the `classify` iterator wrapper; nothing outside the reader
 //! may use them as one until then.
 use super::{
@@ -54,17 +53,20 @@ pub(crate) struct RunState {
 
 /// Advances [`RunState`] by one complete record. Returns the new state on
 /// success, `Ok(None)` for a collector-style identical duplicate, and an
-/// [`AuditError`] whose detail is byte-identical to the former inline state
-/// machine (ruling 13-V4-d4 point 1); the reader's shim delegates here.
+/// [`AuditError`] whose detail matches the reader's inline per-record
+/// state machine (ruling 13-V4-d4 point 1); the reader's shim delegates
+/// here.
 /// `broken_boundary` disables the hash-link and in-run seq-gap checks at a
 /// damaged run entry (B3d1-d1/d3); `compare_mmr` disables the fold (iii)
 /// comparison inside a run segment whose preceding records may be lost
 /// (B3d1-d1/d4); `genesis` forces the `(genesis || seq == 0) && !root_link`
 /// path (staging settlement and the amendment-9 genesis closer).
 ///
-/// The reader calls [`check_attestation`] and `apply_checked` at their
-/// pre-#197 R2a positions on each path; see the module caveat for why this
-/// pair is not a complete first-violation oracle until R2b.
+/// The reader calls [`check_attestation`] and `apply_checked` at the
+/// reader's per-path position (ruling 197-d1 addenda 7 and 12); see the
+/// module caveat for why this pair is not a complete first-violation
+/// oracle until the follow-up slice adds the every-violation collector
+/// and the `classify` iterator.
 pub(crate) fn apply_checked(
     prior: Option<&RunState>,
     record: &Record,
@@ -155,7 +157,7 @@ pub(crate) fn apply_checked(
 
 /// Checks the repair attestation of a fragment gap: the record after the
 /// gap must carry `repaired` equal to the digest of the gap's bytes. The
-/// reader calls this at the same point on each path as before #197 R2a,
+/// reader calls this at its per-path position (ruling 197-d1 addendum 12)
 /// so the reader's first violation is unchanged (see the module doc).
 pub(crate) fn check_attestation(
     digest: Option<[u8; 32]>,
@@ -170,8 +172,7 @@ pub(crate) fn check_attestation(
 }
 
 /// Parses the three positional fields of a resume `details` string; shared
-/// with the reader's `resume_header` and R1-identical to the former
-/// `storage::resume_details` (ruling 13-V4-d4 point 1).
+/// with the reader's `resume_header` (ruling 13-V4-d4 point 1).
 pub(crate) fn resume_details(details: &str) -> Result<(&str, &str, &str), AuditError> {
     let (named, file) = details
         .split_once(" file=")
@@ -217,9 +218,7 @@ fn validate_resume(details: &str, s: &RunState, record: &Record) -> Result<(), A
 
 /// Strict-mode `invalid audit line or opening checkpoint` site. `Fragment`
 /// at `first`/`boundary_resume` and every `Unparsable`/`Record(Err)` payload
-/// both reach this helper, exactly as they both reached the single
-/// `scan_inner` site on base `95f8bcf` (no merge happened — base already
-/// had one such site). The syn coverage gate counts this one
+/// both reach this single helper, so the syn coverage gate counts one
 /// `corrupt("...")` call and the pin
 /// `pin_sc_invalid_audit_line_or_opening_checkpoint` targets it at
 /// occurrence 0.
@@ -228,8 +227,8 @@ fn invalid_opening_line() -> AuditError {
 }
 
 /// Boundary policy for scanning one segment under ADR-0005 amendment 6.
-/// Moved from `storage.rs` so the pure `Classifier` and the future
-/// `classify` wrapper (#197 R2b S3) can consume it.
+/// Lives in the pure module so the `Classifier` and the `classify` wrapper
+/// (see #197 for the follow-up slice) can consume it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SegmentContext {
     /// Whether scanning starts at the segment's opening checkpoint.
@@ -245,7 +244,7 @@ pub(crate) struct SegmentContext {
 /// Classifier mode. `Strict` drives the reader's `scan_inner` family
 /// (`scan_inner`/`scan`/`scan_staged`/`scan_closing`); `Tolerant` drives the
 /// `history_segment` fallback walk from the saved segment-start state the
-/// reader threads in on `CorruptTrail` (#197 R2b S2).
+/// reader threads in on `CorruptTrail`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
     /// Strict single-pass classifier (the reader's `scan_inner` family).
@@ -264,22 +263,22 @@ pub(crate) enum Advance {
     /// identical records in sequence: a plain live open of `[cp0, e1, e1]`,
     /// `scan_staged`/`scan_closing` over the same layout, and a `refresh`
     /// that re-reads an already-consumed record. The reader advances
-    /// offset/newline anyway (matches storage::apply_checked's wrapper
-    /// behaviour).
+    /// offset/newline anyway; the shim leaves the writer-only fields in
+    /// place on this outcome.
     Duplicate,
 }
 
-/// Resumable segment-level classifier (#197 R2b S1 strict; R2b S2 and R2b S3
-/// extend it). No I/O. The reader threads this across its lock and refresh
-/// paths without buffering the trail. Push API: the reader's shim performs
-/// byte-level work (reading a line, running [`super::lines::classify`]) and
-/// then calls [`Classifier::feed_record`], [`Classifier::feed_fragment`] or
+/// Resumable segment-level classifier. No I/O. The reader threads this
+/// across its lock and refresh paths without buffering the trail. Push
+/// API: the reader's shim performs byte-level work (reading a line,
+/// running [`super::lines::classify`]) and then calls
+/// [`Classifier::feed_record`], [`Classifier::feed_fragment`] or
 /// [`Classifier::feed_unparsable`]. [`check_attestation`] runs **inside**
-/// [`Classifier::feed_record`], after the `missing opening checkpoint` check
-/// and before the `unclosed segment lacks matching immediate resume` check
-/// (addendum 7 / addendum 12: the reader's per-path order binds); the shim
-/// finalises the current gap via [`Classifier::take_gap`] and hands the
-/// digest in as `gap_digest`.
+/// [`Classifier::feed_record`], after the `missing opening checkpoint`
+/// check and before the `unclosed segment lacks matching immediate resume`
+/// check (ruling 197-d1 addenda 7 and 12: the reader's per-path order
+/// binds); the shim finalises the current gap via [`Classifier::take_gap`]
+/// and hands the digest in as `gap_digest`.
 pub(crate) struct Classifier {
     state: Option<RunState>,
     mode: Mode,
@@ -419,11 +418,11 @@ impl Classifier {
     /// on this outcome), and `Err` with the exact detail string the reader
     /// emits at this site (ruling 13-V4-d4 point 1). `gap_digest` is
     /// the hasher output from [`Classifier::take_gap`]; the classifier runs
-    /// [`check_attestation`] at base's exact per-path position (addendum 12:
-    /// between `missing opening checkpoint` and `unclosed segment lacks
-    /// matching immediate resume`).
+    /// [`check_attestation`] at the reader's per-path position (ruling
+    /// 197-d1 addendum 12: between `missing opening checkpoint` and
+    /// `unclosed segment lacks matching immediate resume`).
     ///
-    /// Duplicates ARE reachable from `scan_inner`'s wrappers (`refresh`,
+    /// Duplicates are reachable from `scan_inner`'s wrappers (`refresh`,
     /// a second `scan` after a prior successful advance).
     pub(crate) fn feed_record(
         &mut self,
@@ -453,9 +452,9 @@ impl Classifier {
         if self.first && !matches!(record.kind, Kind::Checkpoint(_)) {
             return Err(corrupt("missing opening checkpoint"));
         }
-        // Base's per-path position for check_attestation (addendum 12):
-        // after `missing opening checkpoint`, before `unclosed segment lacks
-        // matching immediate resume`.
+        // Reader's per-path position for check_attestation (ruling 197-d1
+        // addendum 12): after `missing opening checkpoint`, before
+        // `unclosed segment lacks matching immediate resume`.
         check_attestation(gap_digest, record.context.repaired)?;
         if self.boundary_resume
             && !self.first
@@ -469,8 +468,9 @@ impl Classifier {
         let next_opt = apply_checked(self.state.as_ref(), record, genesis, false, true)?;
         let Some(mut next) = next_opt else {
             // Collector-style identical duplicate: state unchanged, cursor
-            // still advances in the reader's shim. Base's `apply` wrapper
-            // clears `run_loss` on the preserved state; preserve that quirk.
+            // still advances in the reader's shim. Clear `run_loss` on the
+            // preserved state so the duplicate branch matches the strict
+            // `apply` wrapper semantic.
             if let Some(s) = self.state.as_mut() {
                 s.run_loss = false;
             }
@@ -480,8 +480,8 @@ impl Classifier {
             self.first = false;
             return Ok(Advance::Duplicate);
         };
-        // The storage-side `apply` wrapper clears `run_loss` after the fold
-        // for the strict path; preserve that here.
+        // Strict mode clears `run_loss` on the folded state (matching the
+        // storage-side `apply` wrapper semantic).
         next.run_loss = false;
         self.state = Some(next);
         if !self.first {
@@ -497,9 +497,7 @@ impl Classifier {
     /// an opening-checkpoint violation. The `Fragment`-at-opening path and the
     /// `Unparsable`/`Record(Err)` path both reach the single reader-side
     /// detail site `invalid audit line or opening checkpoint` (via
-    /// [`invalid_opening_line`]); base `95f8bcf`'s `scan_inner` already had
-    /// one such site, so this is a move, not a merge (see 197-r2b S1 §2a
-    /// item 1).
+    /// [`invalid_opening_line`]).
     pub(crate) fn feed_fragment(&mut self, bytes: &[u8]) -> Result<(), AuditError> {
         assert!(
             matches!(self.mode, Mode::Strict),
@@ -515,8 +513,9 @@ impl Classifier {
     /// Feeds one physical line classified as [`super::lines::Line::Unparsable`]
     /// or a `Record(Err)`. Strict mode always treats this as an opening-checkpoint
     /// violation at the same [`invalid_opening_line`] site
-    /// [`Classifier::feed_fragment`]'s opening/boundary guard reaches; the
-    /// tolerant mode (R2b S2) accepts it as damaged evidence.
+    /// [`Classifier::feed_fragment`]'s opening/boundary guard reaches; tolerant
+    /// mode (see [`Classifier::feed_unparsable_tolerant`]) accepts it as
+    /// damaged evidence.
     pub(crate) fn feed_unparsable(&mut self, _bytes: &[u8]) -> Result<(), AuditError> {
         assert!(
             matches!(self.mode, Mode::Strict),
@@ -547,7 +546,7 @@ impl Classifier {
         })
     }
 
-    // ---- Tolerant mode (#197 R2b S2) -----------------------------------
+    // ---- Tolerant mode -------------------------------------------------
 
     /// Tolerant-mode: feed one Fragment line. Extends the gap hasher when a
     /// prior complete record is in scope so the next record's attestation
@@ -596,13 +595,13 @@ impl Classifier {
     /// otherwise (the reader calls [`check_attestation`] and then
     /// [`Classifier::feed_record_apply_tolerant`]).
     ///
-    /// Addendum 12: on the General branch, this method runs base's checks
-    /// up to and including the seq-gap check; the reader then calls
-    /// `check_attestation`; the apply method runs the remaining checks
-    /// (first-record trial, is_resume, apply_checked). Order inside
-    /// prepare: multiple records → trail identity → invalid_line →
-    /// duplicate short-circuit → (General only) sealed-seq → broken/damaged
-    /// latch → missing-cp → seq-gap.
+    /// Ruling 197-d1 addendum 12: on the General branch this method runs
+    /// the pre-attestation checks up to and including the seq-gap check;
+    /// the reader then calls `check_attestation`; the apply method runs
+    /// the remaining checks (first-record trial, is_resume, apply_checked).
+    /// Order inside prepare: multiple records → trail identity →
+    /// invalid_line → duplicate short-circuit → (General only) sealed-seq
+    /// → broken/damaged latch → missing-cp → seq-gap.
     pub(crate) fn feed_record_prepare_tolerant(
         &mut self,
         record: &Record,
@@ -771,8 +770,8 @@ pub(crate) enum TolerantPrep {
 /// `feed_record_apply_tolerant`, so `finish_tolerant` only returns the
 /// final `gap` hasher and the owned `*run` flag; the final `RunState` is
 /// already in the reader's `Option<State>` and does not need re-export.
-/// V4a's `classify` wrapper (R2b S3) exposes the final state through a
-/// separate per-segment record.
+/// V4a's `classify` wrapper (see #197 for the follow-up slice) exposes
+/// the final state through a separate per-segment record.
 pub(crate) struct TolerantFinishOutcome {
     pub(crate) gap: Option<blake3::Hasher>,
     pub(crate) run_flag: bool,

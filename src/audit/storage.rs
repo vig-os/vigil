@@ -348,11 +348,11 @@ pub(crate) fn history_segment(
         Err(error) if error.kind() == AuditErrorKind::CorruptTrail => {}
         Err(error) => return Err(error),
     }
-    // #197 R2b S2: fallback rescan from the **saved segment-start state**.
-    // The reader's shim threads a tolerant-mode `runs::Classifier` for every
-    // per-record and finish-time check. `check_attestation` stays at the
-    // reader-side positions on both branches (addendum 7 / addendum 12):
-    // the Duplicate branch calls it directly, the General branch calls it
+    // Fallback rescan from the **saved segment-start state**. The shim
+    // threads a tolerant-mode `runs::Classifier` for every per-record and
+    // finish-time check; `check_attestation` runs at the reader's per-path
+    // position on both branches (ruling 197-d1 addenda 7 and 12): the
+    // Duplicate branch calls it directly, the General branch calls it
     // between `prepare` and `apply`.
     let inherited = *run || unsealed_boundary;
     let ctx = SegmentContext {
@@ -733,14 +733,15 @@ fn scan_inner(
     found: &mut Option<Record>,
     context: SegmentContext,
 ) -> Result<State, AuditError> {
-    // #197 R2b S1: strict-mode scan_inner is a thin shim over `runs::Classifier`.
-    // The shim performs byte-level I/O (reading a physical line, the
-    // byte-glue check for an unterminated predecessor, `offset`/`newline`/
-    // `length` bookkeeping, and the three writer-only State fields),
-    // threads a `runs::Classifier` for every segment-level per-record check,
-    // and hands the finalized gap digest to `runs::Classifier::feed_record`,
-    // which itself calls `runs::check_attestation` at base's per-path
-    // position (addendum 7 / addendum 12). The classifier's strict path owns:
+    // Strict-mode `scan_inner` is a thin shim over `runs::Classifier`. The
+    // shim performs byte-level I/O (reading a physical line, the byte-glue
+    // check for an unterminated predecessor, `offset`/`newline`/`length`
+    // bookkeeping, and the three writer-only State fields), threads a
+    // `runs::Classifier` for every segment-level per-record check, and
+    // hands the finalized gap digest to `runs::Classifier::feed_record`,
+    // which itself calls `runs::check_attestation` at the reader's per-path
+    // position (ruling 197-d1 addenda 7 and 12). The classifier's strict
+    // path owns:
     //   - multiple records in native audit line
     //   - trail identity differs from marker
     //   - opening checkpoint duplicates predecessor
@@ -763,8 +764,9 @@ fn scan_inner(
     let mut last_newline = state.as_ref().is_none_or(|s| s.newline);
     let mut cp_time = state.as_ref().map_or(0, |s| s.checkpoint_time);
     let mut since_cp = state.as_ref().map_or(0, |s| s.since_checkpoint);
-    // The initial boundary_resume flag matches the former `scan_inner` line 833:
-    // an opening at the start of a run, or an opening after an unsealed predecessor.
+    // `boundary_resume` starts set at an opening that either opens a run or
+    // follows an unsealed predecessor; the first successor must then be an
+    // immediate `vigil.audit.resume`.
     let initial_boundary =
         context.opening && (context.run || state.as_ref().is_some_and(|s| !sealed(s)));
     if !context.opening
@@ -807,20 +809,19 @@ fn scan_inner(
                     unreachable!("feed_record returns Err when count != 1");
                 }
                 let record = &records[0];
-                // Pass the current gap digest into `feed_record`; the classifier
-                // runs `check_attestation` at base's per-path position
-                // (addendum 12: between `missing opening checkpoint` and
-                // `unclosed segment lacks matching immediate resume`).
+                // Pass the current gap digest into `feed_record`; the
+                // classifier runs `check_attestation` at the reader's
+                // per-path position (ruling 197-d1 addendum 12: between
+                // `missing opening checkpoint` and `unclosed segment lacks
+                // matching immediate resume`).
                 let gap_digest = classifier.take_gap();
                 let advance = classifier.feed_record(record, 1, trail, gap_digest)?;
                 if expected == classifier.state().map(|s| s.head) {
                     *found = Some(record.clone());
                 }
-                // Base's `apply_checked` wrapper leaves writer-only fields
-                // untouched on a Duplicate; the Advance tells us which path
-                // ran. Offset/newline advance on both paths (base's
-                // `scan_inner` sets `s.offset = offset; s.newline = newline`
-                // unconditionally after `apply`).
+                // A Duplicate leaves the writer-only fields untouched; a
+                // Record folds the record through `next_cp_fields`.
+                // Offset/newline advance on both paths.
                 if matches!(advance, Advance::Record) {
                     (cp_time, since_cp) = next_cp_fields(Some((cp_time, since_cp)), record);
                 }
@@ -893,8 +894,9 @@ fn apply_checked(
 /// Next `(checkpoint_time, since_checkpoint)` after folding `record` onto
 /// the predecessor's `(checkpoint_time, since_checkpoint)` in `prior`. A
 /// `Kind::Checkpoint` resets to `(record.context.time, 0)`; any other kind
-/// adds `1`. At the `u64::MAX` bound the `+ 1` panics in debug and wraps
-/// in release; the reader never carries `2^64` records in one segment.
+/// adds `1`, saturating at `u64::MAX` (per ruling 197-d1 addendum 15: the
+/// bound counts records since a checkpoint and is unreachable in practice,
+/// but the semantics must still be correct on every path).
 ///
 /// Shared by `scan_inner`, `apply_checked` and `history_segment`'s
 /// tolerant-mode fallback rebuild so the three stay identical on every
@@ -904,7 +906,7 @@ fn next_cp_fields(prior: Option<(u64, u64)>, record: &Record) -> (u64, u64) {
         return (record.context.time, 0);
     }
     let (cp_time, since_cp) = prior.unwrap_or((0, 0));
-    (cp_time, since_cp + 1)
+    (cp_time, since_cp.saturating_add(1))
 }
 
 #[cfg(test)]

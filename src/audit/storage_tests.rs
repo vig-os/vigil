@@ -1737,60 +1737,38 @@ fn inherited_run_reaches_first_strict_scan_of_later_history() {
 }
 
 // ------------------------------------------------------------
-// #197 R0a: pin every reader CorruptTrail detail per site, with a
-// coverage gate keyed per call site in storage.rs. Tests only.
-// Each test body has a literal `assert_corrupt(result, "detail", site)`
-// call so the gate's static scan of storage_tests.rs sees every pin.
+// Pins every reader CorruptTrail detail per site (#197 R0a), with a
+// coverage gate keyed per call site in storage.rs and runs.rs. Tests
+// only. Each test body has a literal `assert_corrupt(result, "detail",
+// site)` call so the gate's static scan of storage_tests.rs sees every
+// pin.
 // ------------------------------------------------------------
 mod details {
     use super::*;
     use std::collections::{HashMap, HashSet};
 
-    // #197 R1: the per-record state machine moved from `storage.rs` into
-    // `runs.rs`, so the gate scans both. Each file is parsed on its own
-    // with `syn::parse_file` and the `corrupt` call sites are collected
-    // across both in a fixed file order (storage.rs first, then runs.rs),
-    // so the `(detail, occurrence)` keys stay stable.
+    // The gate parses `storage.rs` and `runs.rs` separately with
+    // `syn::parse_file` and collects the `corrupt` call sites across
+    // both in a fixed file order (storage.rs first, then runs.rs), so
+    // the `(detail, occurrence)` keys stay stable.
     //
-    // #197 R2a (addendum 7): the 3 `missing or mismatched repair
-    // attestation` sites in `storage.rs` (two in `history_segment` and
-    // one in `scan_inner`) merge into one site in
-    // `runs.rs::check_attestation`. The reader still orders attestation
-    // ahead of `apply_checked`'s record checks, so the pair
-    // `[h5, fragment, next]` still gives `sequence gap inside sealed run
-    // segment` on seq 7 linked and `missing or mismatched repair
-    // attestation` on seq 6 broken.
-    //
-    // #197 R2b S1: 10 strict-mode sites in `scan_inner` move into
-    // `runs::Classifier` (`feed_record`, `finish`, and the
-    // `invalid_opening_line` helper): `invalid audit line or opening
-    // checkpoint` (one site, served by `invalid_opening_line`; base
-    // `95f8bcf` already had one such site in `scan_inner` for both the
-    // fragment-at-opening and unparsable arms, so this is a move, not a
-    // merge), `multiple records in native audit line` (occ 1), `trail
-    // identity differs from marker` (occ 1), `opening checkpoint
-    // duplicates predecessor`, `missing opening checkpoint`, `unclosed
-    // segment lacks matching immediate resume`, `empty live file or
-    // missing opening checkpoint`, `resume checkpoint lacks its
-    // declaration` (occ 1), and `missing head` (scan_inner's post-loop
-    // `state.ok_or_else`, now `runs::Classifier::finish`). scan_inner's
-    // post-`apply_checked` `missing head` UNREACHABLE site becomes a
-    // classifier invariant with no inline `corrupt("missing head")`
-    // call, so the total drops by one — that one drop is where 49 → 48
-    // comes from.
-    //
-    // #197 R2b S2: `history_segment`'s tolerant-mode walk (including the
-    // fallback rescan from a saved segment-start state) moves onto
-    // `runs::Classifier` through the new tolerant API, with a reader
-    // shim in `storage.rs` driving it. The 12 `history_segment` tolerant
-    // `corrupt` sites move from `storage.rs` into `runs.rs`
-    // (feed_record_prepare_tolerant / feed_record_apply_tolerant /
-    // finish_tolerant / feed_record_err_tolerant); the shim keeps the
-    // reader-side `missing head` defence-in-depth site after
-    // `feed_record_apply_tolerant` as its one storage-side invariant
-    // (UNREACHABLE: `feed_record_apply_tolerant` on `Ok` leaves
-    // `classifier.state()=Some`, matched by the UNREACHABLE table row
-    // below). Count stays 48 = 9 in `storage.rs` + 39 in `runs.rs`.
+    // The pure classifier (`runs::Classifier`) owns 39 of the 48 sites:
+    // every `apply_checked` detail (ruling 197-d1 point 2, R1), the
+    // strict-mode per-segment checks driven by `feed_record` / `finish`
+    // / `invalid_opening_line`, and the tolerant-mode checks driven by
+    // `feed_record_prepare_tolerant` / `feed_record_apply_tolerant` /
+    // `finish_tolerant` / `feed_record_err_tolerant`. The reader shim
+    // in `storage.rs` keeps the remaining 9 sites: the byte-level and
+    // file-open checks, plus a defence-in-depth `missing head` after
+    // `feed_record_apply_tolerant` (UNREACHABLE: a successful apply
+    // leaves `classifier.state()=Some`, matched by the UNREACHABLE
+    // table row below). `check_attestation` is the single site for
+    // `missing or mismatched repair attestation` (ruling 197-d1
+    // addendum 7); the reader orders it per path at the position
+    // ruling 197-d1 addendum 12 fixes. The `missing head` site that
+    // used to sit after `apply_checked` in the reader is now a
+    // classifier invariant with no inline call, so the total sits at
+    // 48 = 9 in `storage.rs` + 39 in `runs.rs`.
     const STORAGE_SRC: &str = include_str!("storage.rs");
     const RUNS_SRC: &str = include_str!("runs.rs");
     const STORAGE_TESTS_SRC: &str = include_str!("storage_tests.rs");
@@ -2010,18 +1988,17 @@ mod details {
     }
     #[test]
     fn pin_hs_fallback_duplicate_leaves_offset_at_first_copy() {
-        // R2a brief's binding amendments (new pin and mutant: the
-        // identical-duplicate state quirk): a complete identical
-        // duplicate takes `history_segment`'s duplicate branch and
-        // `continue`s without updating `s.offset`/`s.newline`. A
-        // trailing `not json` line trips strict `scan_inner` so the
-        // fallback body runs. After the duplicate, `s.offset` stays at
-        // the end of the first copy; a mutant that sets `s.offset`
-        // before the duplicate `continue` would push it past the second
-        // copy. The newline half of the quirk is not observable here:
-        // the trailing `not json\n` line hits the fragment/invalid
-        // branch, which unconditionally overwrites `s.newline` with its
-        // own trailing-newline flag.
+        // A complete identical duplicate takes `history_segment`'s
+        // duplicate branch and `continue`s without updating
+        // `s.offset`/`s.newline`. A trailing `not json` line trips
+        // strict `scan_inner` so the fallback body runs. After the
+        // duplicate, `s.offset` stays at the end of the first copy;
+        // a mutant that sets `s.offset` before the duplicate
+        // `continue` would push it past the second copy. The newline
+        // half of the quirk is not observable here: the trailing
+        // `not json\n` line hits the fragment/invalid branch, which
+        // unconditionally overwrites `s.newline` with its own
+        // trailing-newline flag.
         let d = Temp::new();
         let f = cp0();
         let first = line(&f);
@@ -2079,13 +2056,14 @@ mod details {
     }
     #[test]
     fn pin_hs_attestation_consumes_gap() {
-        // R2a brief: on `[cp0, e1, fragment, e2(attested)]`,
-        // `history_segment`'s outer call to `scan_inner` succeeds and
-        // never enters the fallback body, so this pin reaches only
-        // `scan_inner`'s `gap.take()`. A mutant that replaces that
-        // `gap.take()` with `gap.as_ref().cloned()` keeps the gap in
-        // the returned state. The fallback body's own `gap.take()`
-        // sites are pinned separately
+        // Pins that the strict `scan_inner` consumes the gap digest when
+        // the attested successor passes `check_attestation`. On
+        // `[cp0, e1, fragment, e2(attested)]`, `history_segment`'s outer
+        // `scan_inner` succeeds and never enters the fallback body, so
+        // this pin reaches only `scan_inner`'s `gap.take()`. A mutant
+        // that replaces that `gap.take()` with `gap.as_ref().cloned()`
+        // keeps the gap in the returned state. The fallback body's own
+        // `gap.take()` sites are pinned separately
         // (`pin_hs_fallback_duplicate_branch_consumes_gap` and
         // `pin_hs_fallback_general_branch_consumes_gap`).
         let f = cp0();
@@ -2112,15 +2090,16 @@ mod details {
     }
     #[test]
     fn pin_hs_fallback_duplicate_branch_consumes_gap() {
-        // R2a brief: on the fallback body's duplicate branch, a mutant
-        // that replaces `gap.take()` with `gap.as_ref().cloned()` leaves
-        // the fragment digest in `gap` across the `continue`. A later
-        // non-duplicate record whose `repaired` is `None` then trips
-        // the general-branch attestation, swapping the observable
+        // Pins that the fallback body's duplicate branch consumes the
+        // gap digest. A mutant that replaces `gap.take()` with
+        // `gap.as_ref().cloned()` on that branch leaves the fragment
+        // digest in `gap` across the `continue`. A later non-duplicate
+        // record whose `repaired` is `None` then trips the
+        // general-branch attestation, swapping the observable
         // `first successor lacks resume` detail for `missing or
         // mismatched repair attestation`. The duplicate carries the
         // attestation itself (same record hash, same `repaired`), so
-        // the duplicate-branch attestation currently passes.
+        // the duplicate-branch attestation passes.
         let (_pre, s, first) = state_at_cp0();
         let fragment = b"{\"torn\":\n";
         let mut digest = blake3::Hasher::new();
@@ -2158,17 +2137,20 @@ mod details {
     }
     #[test]
     fn pin_hs_fallback_general_branch_consumes_gap() {
-        // R2a brief: on `[cp0, e1, fragment, e2(attested), e3, "not
-        // json\n"]` the trailing unparsable line fails the strict
-        // `scan_inner`, so `history_segment`'s fallback body runs.
-        // There the mid-segment general branch's `gap.take()`
-        // consumes the fragment digest when e2 attests it; e3's
-        // subsequent (unattested) attestation check then finds `gap`
-        // empty and passes. A mutant that replaces that `gap.take()`
-        // with `gap.as_ref().cloned()` leaves the digest in `gap`
-        // across e2, so e3's attestation call fires `missing or
-        // mismatched repair attestation` instead. On head the call
-        // returns `Ok` with no pending gap in the returned state.
+        // Pins that the fallback body's general branch consumes the gap
+        // digest when an attested successor passes
+        // `check_attestation`. On
+        // `[cp0, e1, fragment, e2(attested), e3, "not json\n"]` the
+        // trailing unparsable line fails the strict `scan_inner`, so
+        // `history_segment`'s fallback body runs. There the
+        // mid-segment general branch's `gap.take()` consumes the
+        // fragment digest when e2 attests it; e3's subsequent
+        // (unattested) attestation check then finds `gap` empty and
+        // passes. A mutant that replaces that `gap.take()` with
+        // `gap.as_ref().cloned()` leaves the digest in `gap` across
+        // e2, so e3's attestation call fires `missing or mismatched
+        // repair attestation` instead. The call returns `Ok` with no
+        // pending gap in the returned state.
         let f = cp0();
         let e1 = entry(&f);
         let fragment = b"{\"torn\":\n";
@@ -2202,15 +2184,15 @@ mod details {
     }
     #[test]
     fn pin_hs_fallback_rebuild_increments_since_checkpoint() {
-        // #197 R2b S2: the fallback body rebuilds the writer-only
-        // fields (`checkpoint_time`, `since_checkpoint`) through the
-        // shared `next_cp_fields` helper, same as `scan_inner` and
+        // Pins that the fallback body rebuilds the writer-only fields
+        // (`checkpoint_time`, `since_checkpoint`) through the shared
+        // `next_cp_fields` helper, same as `scan_inner` and
         // `apply_checked`. A fallback that folds a record after its
         // opening checkpoint must leave `since_checkpoint == 1` and
         // `checkpoint_time == cp0.context.time`. A trailing
         // `not json\n` line trips strict `scan_inner` so the fallback
-        // body runs. Kills mutant O2 (the fallback rebuild no longer
-        // increments `since_checkpoint`).
+        // body runs. Kills mutant O2 (the fallback rebuild skipping
+        // the `since_checkpoint` increment).
         let d = Temp::new();
         let f = cp0();
         let e1 = entry(&f);
@@ -2224,6 +2206,61 @@ mod details {
         assert_eq!(
             state.since_checkpoint, 1,
             "fallback rebuild must increment since_checkpoint on the first non-checkpoint record",
+        );
+    }
+    #[test]
+    fn pin_strict_since_checkpoint_saturates_at_u64_max() {
+        // Pins that `next_cp_fields` saturates `since_checkpoint` at
+        // `u64::MAX` on the strict path (per ruling 197-d1 addendum 15:
+        // the increment uses `saturating_add(1)` on every path so the
+        // strict and apply_checked/fallback paths cannot drift at the
+        // bound). From a predecessor state with
+        // `since_checkpoint = u64::MAX`, one more non-checkpoint record
+        // on `scan(opening=false)` must leave `since_checkpoint` at
+        // `u64::MAX`, without panic or wrap. A `+ 1` mutant panics in
+        // debug and wraps to 0 in release.
+        let (d, s, first) = state_at_cp0();
+        let saturated = State {
+            since_checkpoint: u64::MAX,
+            ..s
+        };
+        let e1 = entry(&first);
+        append_bytes(&d.0.join("audit.jsonl"), &line(&e1));
+        let state =
+            scc(&o(&d), Some(saturated), false).expect("strict path must not panic at u64::MAX");
+        assert_eq!(
+            state.since_checkpoint,
+            u64::MAX,
+            "strict path must saturate since_checkpoint at u64::MAX",
+        );
+    }
+    #[test]
+    fn pin_fallback_since_checkpoint_saturates_at_u64_max() {
+        // Pins that `next_cp_fields` saturates `since_checkpoint` at
+        // `u64::MAX` on the `apply_checked`/fallback path too (per
+        // ruling 197-d1 addendum 15). From a predecessor state with
+        // `since_checkpoint = u64::MAX`, one more non-checkpoint record
+        // on `history_segment`'s fallback body (tripped by a trailing
+        // unparsable line) must leave `since_checkpoint` at `u64::MAX`,
+        // without panic or wrap. A `+ 1` mutant panics in debug and
+        // wraps to 0 in release.
+        let (d, s, first) = state_at_cp0();
+        let saturated = State {
+            since_checkpoint: u64::MAX,
+            ..s
+        };
+        let e1 = entry(&first);
+        append_bytes(
+            &d.0.join("audit.jsonl"),
+            &[line(&e1), b"not json\n".to_vec()].concat(),
+        );
+        let state = hsc(&o(&d), Some(saturated), false, false)
+            .expect("fallback path must not panic at u64::MAX")
+            .expect("fallback must return a state after folding the successor");
+        assert_eq!(
+            state.since_checkpoint,
+            u64::MAX,
+            "fallback path must saturate since_checkpoint at u64::MAX",
         );
     }
     #[test]
@@ -2411,10 +2448,12 @@ mod details {
     }
     #[test]
     fn pin_sc_attestation_consumes_gap() {
-        // R2a brief: on `[cp0, e1, fragment, e2(attested)]` the strict
-        // scan reaches the attested successor and takes the gap. A
-        // mutant that replaces `gap.take()` with `gap.as_ref().cloned()`
-        // leaves the fragment digest in the returned state.
+        // Pins that the strict `scan` consumes the gap digest when an
+        // attested successor passes `check_attestation`. On
+        // `[cp0, e1, fragment, e2(attested)]` the strict scan reaches
+        // the attested successor and takes the gap. A mutant that
+        // replaces `gap.take()` with `gap.as_ref().cloned()` leaves
+        // the fragment digest in the returned state.
         let f = cp0();
         let e1 = entry(&f);
         let fragment = b"{\"torn\":\n";
@@ -2451,17 +2490,16 @@ mod details {
             0,
         );
     }
-    // ---- Pins added by #197 R2b S1-fixed (defects found by diff on base) -
+    // ---- Pins on the strict `scan` per-path order (ruling 197-d1 addendum 12) -
     #[test]
     fn pin_sc_trail_identity_after_pending_fragment() {
-        // Defect 1 of unfixed S1: attestation was called BEFORE
-        // `feed_record` in the reader shim, which ran it ahead of
-        // `trail identity differs from marker`. Base's per-path order
-        // (addendum 12) runs multi/trail/dup/missing-opening BEFORE
-        // check_attestation. Layout: `[cp0, e1, "{\"torn\":\n"]` cached,
-        // then a record from another trail appended; `scan(opening=false)`
-        // must emit `trail identity differs from marker`, not
-        // `missing or mismatched repair attestation`.
+        // Pins the reader's per-path order on `scan(opening=false)`
+        // (ruling 197-d1 addendum 12: multi / trail / dup /
+        // missing-opening run BEFORE `check_attestation`). Layout:
+        // `[cp0, e1, "{\"torn\":\n"]` cached, then a record from
+        // another trail appended; `scan(opening=false)` must emit
+        // `trail identity differs from marker`, not `missing or
+        // mismatched repair attestation`.
         let f = cp0();
         let e1 = entry(&f);
         let fragment = b"{\"torn\":\n";
@@ -2476,11 +2514,12 @@ mod details {
     }
     #[test]
     fn pin_sc_multiple_records_fails_apply_checked_first() {
-        // Kills surviving M2 of the S1 brief (multi-records precondition
-        // deferred past `apply_checked`): the first record in the batch
-        // has a broken hash link so `apply_checked` would error with
-        // `record rolled back, changed or broke its hash link`; base's
-        // order emits `multiple records in native audit line` first.
+        // Pins that `multiple records in native audit line` runs ahead
+        // of `apply_checked`'s per-record checks (ruling 197-d1
+        // addendum 12). The first record in the batch has a broken
+        // hash link so `apply_checked` would error with `record rolled
+        // back, changed or broke its hash link`; the classifier emits
+        // `multiple records in native audit line` first.
         let f = cp0();
         let bad = Record::new(
             context(1, [42; 32]),
@@ -2499,11 +2538,12 @@ mod details {
     }
     #[test]
     fn pin_sc_duplicate_does_not_bump_since_checkpoint() {
-        // Defect 2 of unfixed S1: the reader shim bumped `since_checkpoint`
-        // on `Advance::Duplicate` (base's `apply_checked` wrapper leaves
-        // writer-only fields in place on a duplicate). Layout `[cp0, e1, e1]`
-        // on live open: base's `since_checkpoint == 1` (from e1); unfixed
-        // S1 gave 2.
+        // Pins the duplicate semantic on the strict path: a complete
+        // identical duplicate must leave the writer-only
+        // `since_checkpoint` in place (ruling 13-V4-d4 point 1).
+        // Layout `[cp0, e1, e1]` on live open gives
+        // `since_checkpoint == 1` (from e1); a mutant that bumps on
+        // `Advance::Duplicate` would give 2.
         let f = cp0();
         let e1 = entry(&f);
         let d = Temp::new();
@@ -2511,25 +2551,28 @@ mod details {
         let state = scc(&o(&d), None, true).expect("scan should accept the duplicate");
         assert_eq!(
             state.since_checkpoint, 1,
-            "a duplicate must not bump since_checkpoint (base's apply_checked wrapper semantic)",
+            "a duplicate must not bump since_checkpoint",
         );
         // The duplicate branch of `Classifier::feed_record` also clears
-        // `run_loss` on the preserved state (matches base's `apply`
-        // wrapper), but that clear is not observable on strict paths: every
-        // strict scan reaches a duplicate only through a prior `Record`
-        // outcome that already set `run_loss = false`. Dropping the clear
-        // still leaves this scan returning `run_loss = false` here, so no
-        // assertion is pinned.
+        // `run_loss` on the preserved state (matching the strict
+        // `apply` wrapper semantic), but that clear is not observable
+        // on strict paths: every strict scan reaches a duplicate only
+        // through a prior `Record` outcome that already set
+        // `run_loss = false`. Dropping the clear still leaves this
+        // scan returning `run_loss = false` here, so no assertion is
+        // pinned.
     }
     #[test]
     fn pin_sc_attestation_between_missing_opening_and_apply() {
-        // Kills M4 (attestation moved out of its base shim position:
-        // between `missing opening checkpoint` and `apply_checked`).
-        // Layout: `[cp0, fragment, record_with_broken_link]`. Both
-        // attestation and `apply_checked` would error. Base runs
-        // attestation first → `missing or mismatched repair attestation`;
-        // a mutant that moves attestation AFTER apply_checked fires the
-        // hash-link error instead.
+        // Pins the reader's per-path position for `check_attestation`
+        // on the strict path (ruling 197-d1 addendum 12: between
+        // `missing opening checkpoint` and `apply_checked`'s
+        // per-record checks). Layout:
+        // `[cp0, fragment, record_with_broken_link]`. Both attestation
+        // and `apply_checked` would error. Attestation runs first ->
+        // `missing or mismatched repair attestation`; a mutant that
+        // moves attestation after `apply_checked` fires the hash-link
+        // error instead.
         let f = cp0();
         let bad = Record::new(
             context(1, [42; 32]),
@@ -3383,14 +3426,12 @@ mod details {
             0,
             "history_segment shim: feed_record_apply_tolerant Ok leaves classifier.state()=Some",
         ),
-        // #197 R2b S1: scan_inner's UNREACHABLE `missing head` (apply Ok)
-        // moved into `runs::Classifier::feed_record` where the new state
-        // is returned by `apply_checked` directly (no `state.as_mut().ok_or_else`
-        // guard). The follow-up on the returned state is a classifier
-        // invariant with no inline `corrupt("missing head")` call, so this
-        // UNREACHABLE row drops. The remaining `missing head` sites are
-        // history_segment's (occ 0, UNREACHABLE) and
-        // runs::Classifier::finish's (occ 1, tested by
+        // `Classifier::feed_record` returns the new state from
+        // `apply_checked` directly; its post-apply follow-up is a
+        // classifier invariant with no inline `corrupt("missing head")`
+        // call. The remaining `missing head` sites are
+        // `history_segment`'s (occ 0, UNREACHABLE) and
+        // `runs::Classifier::finish`'s (occ 1, tested by
         // `pin_sc_missing_head_opening_false_*`).
         (
             "invalid opening peaks",
@@ -3740,8 +3781,8 @@ mod details {
 
     #[test]
     fn coverage_gate_pins_every_corrupt_site() {
-        // Fixed file order: storage.rs first (31 sites after #197 R2a),
-        // then runs.rs (18 sites). Each source is parsed on its own with
+        // Fixed file order: storage.rs first (9 sites), then runs.rs
+        // (39 sites). Each source is parsed on its own with
         // `syn::parse_file`, so neither file needs to be syntactically
         // concatenable with the other.
         let sites = parse_sites(&[STORAGE_SRC, RUNS_SRC]);
@@ -3759,9 +3800,9 @@ mod details {
             }
         }
         assert!(missing.is_empty(), "uncovered corrupt sites: {missing:?}");
-        // Stale-label check (new in R0b): any (detail, occurrence) pair
-        // that an assert_corrupt names must exist in storage.rs, so a
-        // pin left behind after a reader change cannot silently hide.
+        // Stale-label check: any (detail, occurrence) pair that an
+        // assert_corrupt names must exist in storage.rs or runs.rs, so
+        // a pin left behind after a reader change cannot silently hide.
         let mut stale: Vec<(String, usize)> = asserted.difference(&site_set).cloned().collect();
         stale.sort();
         assert!(stale.is_empty(), "stale assert_corrupt labels: {stale:?}");
