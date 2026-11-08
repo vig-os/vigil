@@ -1756,7 +1756,7 @@ mod details {
     // `Violation::<Variant>` construction expression in `runs.rs`,
     // mapping each variant to its `detail()` string.
     //
-    // The pure classifier (`runs::Classifier`) owns 42 of the 50 sites:
+    // The pure classifier (`runs::Classifier`) owns 42 of the 49 sites:
     // every `apply_checked` detail (ruling 197-d1 point 2, R1), the
     // strict-mode per-segment checks driven by `feed_record` / `finish`
     // / `invalid_opening_line`, the tolerant-mode checks driven by
@@ -1767,19 +1767,25 @@ mod details {
     // `storage.rs` with the addendum-20.1 orchestration (UNREACHABLE
     // for `apply_checked`'s Ok case leaves `classifier.state()=Some`,
     // matched by the UNREACHABLE table row below). The reader shim in
-    // `storage.rs` keeps the remaining 8 sites: the byte-level and
+    // `storage.rs` keeps the remaining 7 sites: the byte-level and
     // file-open checks. `check_attestation` is the single site for
     // `missing or mismatched repair attestation` (ruling 197-d1
     // addendum 7); the reader orders it per path at the position
     // ruling 197-d1 addendum 12 fixes. The total sits at
-    // 50 = 8 in `storage.rs` + 42 in `runs.rs`. The two extra sites
-    // over the 39+9=48 base are: the fold (iii) salvage push adds one
-    // `Violation::CheckpointMmrDiffers` construction site inside
-    // `feed_record_apply_tolerant` (UNREACHABLE for the reader-side
-    // pin gate: exercised by `collector_tests`, no `assert_corrupt`),
-    // and `apply_checked`'s fresh-Mmr genesis fold carries an explicit
-    // `.map_err(|_| Violation::MmrOverflow)?` (UNREACHABLE:
-    // `Mmr::new()` + push of one leaf cannot overflow). The
+    // 49 = 7 in `storage.rs` + 42 in `runs.rs`. The one net extra
+    // site over the 39+9=48 base is the balance of three S3a-era
+    // adds against one S3b1a-round-2 merge: the fold (iii) salvage
+    // push adds one `Violation::CheckpointMmrDiffers` construction
+    // site inside `feed_record_apply_tolerant` (UNREACHABLE for the
+    // reader-side pin gate: exercised by `collector_tests`, no
+    // `assert_corrupt`); `apply_checked`'s fresh-Mmr genesis fold
+    // carries an explicit `.map_err(|_| Violation::MmrOverflow)?`
+    // (UNREACHABLE: `Mmr::new()` + push of one leaf cannot overflow);
+    // and the glue-byte LF check — strict `SegmentBytes::
+    // check_glue_byte_strict` and tolerant `SegmentBytes::next_event`
+    // — behaves identically on the Err path, so the two copies of
+    // `corrupt("bytes glued to complete unterminated record")` merge
+    // into one shared helper `consume_glue_byte` (50 → 49). The
     // `missing head` occurrence 0 is the shared-walk invariant
     // described above; occurrence 1 is `Classifier::finish`'s own
     // construction, pinned by `pin_sc_missing_head_opening_false_*`.
@@ -2615,7 +2621,7 @@ mod details {
         assert_corrupt(
             scc(&o(&d), Some(s), false),
             "bytes glued to complete unterminated record",
-            1,
+            0,
         );
     }
     #[test]
@@ -4408,7 +4414,7 @@ mod details {
         }
         assert_eq!(
             sites.len(),
-            50,
+            49,
             "corrupt-site count changed; update gate explicitly"
         );
     }

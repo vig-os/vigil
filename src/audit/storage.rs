@@ -350,13 +350,16 @@ impl SegmentBytes {
             .expect("SegmentBytes: reader just inserted"))
     }
 
-    /// Eager strict-side glue check (matching `scan_inner`'s original
-    /// pre-events-loop check). On a consumed `\n` the glue byte also
-    /// advances the strict-side `last_offset` / `last_newline` cursors
-    /// (base-identical).
-    pub(crate) fn check_glue_byte_strict(&mut self) -> Result<(), AuditError> {
+    /// Reads and validates the glue byte, if one is expected and has
+    /// not been consumed yet. The strict and tolerant walks share this
+    /// one `corrupt("bytes glued…")` site; the strict-only
+    /// `last_offset` / `last_newline` promotion lives in
+    /// [`check_glue_byte_strict`]. Returns `true` if a `\n` was
+    /// consumed; `false` if nothing was read (EOF) or no glue check
+    /// was pending.
+    fn consume_glue_byte(&mut self) -> Result<bool, AuditError> {
         if self.did_glue_check || !self.needs_glue_check {
-            return Ok(());
+            return Ok(false);
         }
         self.did_glue_check = true;
         let mut byte = [0];
@@ -364,11 +367,22 @@ impl SegmentBytes {
             let reader = self.ensure_reader()?;
             reader.read(&mut byte).map_err(io_error)?
         };
-        if count == 1 {
-            if byte != *b"\n" {
-                return Err(corrupt("bytes glued to complete unterminated record"));
-            }
-            self.offset_cursor += 1;
+        if count == 0 {
+            return Ok(false);
+        }
+        if byte != *b"\n" {
+            return Err(corrupt("bytes glued to complete unterminated record"));
+        }
+        self.offset_cursor += 1;
+        Ok(true)
+    }
+
+    /// Eager strict-side glue check (matching `scan_inner`'s original
+    /// pre-events-loop check). On a consumed `\n` the glue byte also
+    /// advances `last_offset` / `last_newline` (base-identical: strict
+    /// `scan_inner` set both to the post-glue cursor).
+    pub(crate) fn check_glue_byte_strict(&mut self) -> Result<(), AuditError> {
+        if self.consume_glue_byte()? {
             self.last_offset = self.offset_cursor;
             self.last_newline = true;
         }
@@ -382,20 +396,7 @@ impl SegmentBytes {
     /// the glue byte bumps `offset_cursor` but does not touch
     /// `last_offset` / `last_newline`.
     pub(crate) fn next_event(&mut self) -> Result<Option<DecodedLine>, AuditError> {
-        if !self.did_glue_check && self.needs_glue_check {
-            self.did_glue_check = true;
-            let mut byte = [0];
-            let count = {
-                let reader = self.ensure_reader()?;
-                reader.read(&mut byte).map_err(io_error)?
-            };
-            if count == 1 {
-                if byte != *b"\n" {
-                    return Err(corrupt("bytes glued to complete unterminated record"));
-                }
-                self.offset_cursor += 1;
-            }
-        }
+        self.consume_glue_byte()?;
         let mut line = Vec::new();
         let (bytes, newline) = {
             let reader = self.ensure_reader()?;
@@ -414,15 +415,20 @@ impl SegmentBytes {
         }))
     }
 
-    /// `on_feed` for a folded record (strict or tolerant). Advances
-    /// the strict-side cursors; the tolerant shim keeps its own
-    /// `final_offset` / `out_state` and ignores these fields.
+    /// `on_feed` for a folded record (strict Record / strict Duplicate
+    /// / tolerant Record): advances `last_offset` and `last_newline` to
+    /// the post-line cursor. Tolerant `Duplicate` and tolerant
+    /// `NonRecord` do NOT call this (base-identical: the tolerant walk
+    /// left `state.offset` alone across duplicate lines and on fragment
+    /// / unparsable lines).
     pub(crate) fn note_record_fed(&mut self, offset_after: u64, newline: bool) {
         self.last_offset = offset_after;
         self.last_newline = newline;
     }
 
-    /// `on_feed` for a mid-segment fragment or unparsable line.
+    /// `on_feed` for a mid-segment fragment or unparsable line (strict
+    /// `NonRecord` and tolerant `NonRecord`). Base-identical: only
+    /// `state.newline` moved on these lines.
     pub(crate) fn note_newline(&mut self, newline: bool) {
         self.last_newline = newline;
     }
@@ -661,8 +667,6 @@ pub(crate) fn history_segment(
     } else {
         state.as_ref().map_or(0, |s| s.offset)
     };
-    let initial_length = state.as_ref().map_or(0, |s| s.length);
-    let initial_gap = state.as_ref().and_then(|s| s.gap.clone());
     let needs_glue_check = !opening
         && state
             .as_ref()
@@ -674,60 +678,56 @@ pub(crate) fn history_segment(
     // the tolerant walk's own writes land in the same place
     // (base-identical: a single `&mut found` was threaded through
     // both passes).
-    let mut out_state: Option<State> = state.clone();
-    let mut final_offset = initial_offset;
     let found_cell = RefCell::new(found.clone());
     let fc = &found_cell;
     let strict_state = state.clone();
     #[rustfmt::skip]
     let strict = move || scan_inner(file, trail, strict_state, expected, &mut fc.borrow_mut(), ctx);
     // Lazy tolerant byte source. The seek, the glued-byte / LF check,
-    // `read_line` and `decode_line_kind` live inside
-    // [`SegmentBytes::next_event`]; `events` only forwards to it.
+    // `read_line`, `decode_line_kind` AND the tolerant-side byte
+    // bookkeeping (`last_offset` / `last_newline` / `offset_cursor`,
+    // addendum 20.1 / 25.2) all live inside [`SegmentBytes`]; the shim
+    // holds no second copy of these fields.
+    let initial_last_offset = state.as_ref().map_or(initial_offset, |s| s.offset);
+    let initial_last_newline = state.as_ref().is_none_or(|s| s.newline);
     let bytes = RefCell::new(SegmentBytes::new(
         file,
         initial_offset,
         needs_glue_check,
-        initial_offset,
-        true,
+        initial_last_offset,
+        initial_last_newline,
     )?);
     let events = || -> Result<Option<DecodedLine>, AuditError> { bytes.borrow_mut().next_event() };
 
-    // Reader-side `on_feed`: rebuilds the reader's `State` on each
-    // successful record fold (addendum 20.1), using the writer-only
-    // `next_cp_fields` fold that stays on the storage side; the
-    // duplicate arm (addendum 22.1) advances `final_offset` only (so
-    // `s.length` picks up the duplicate's bytes, base-identical) and
-    // leaves `state.offset`/`state.newline` untouched; NonRecord
-    // (fragment/unparsable) updates `state.newline` only.
+    // Reader-side bookkeeping: the pure run state, the writer-only
+    // `cp_time` / `since_cp` fold and the `expected` / `found`
+    // writeback. Byte-level fields (`last_offset` / `last_newline`)
+    // live in [`SegmentBytes`]; the duplicate arm (addendum 22.1)
+    // leaves them alone — base-identical. `final_offset` tracks the
+    // last `offset_after` reported through `on_feed`, matching base's
+    // `s.length = final_offset` on the tolerant epilogue (a glue byte
+    // without any subsequent line does NOT count toward `length`).
+    let mut last_run: Option<RunState> = state.as_ref().map(|s| s.run.clone());
+    let mut cp_time = state.as_ref().map_or(0, |s| s.checkpoint_time);
+    let mut since_cp = state.as_ref().map_or(0, |s| s.since_checkpoint);
+    let mut final_offset = initial_offset;
     let on_feed = |fed: FeedEvent<'_>, offset_after: u64, newline_after: bool| {
         final_offset = offset_after;
         match fed {
             FeedEvent::Record(record, rs) => {
-                let (cp_time, since_cp) = next_cp_fields(
-                    out_state
-                        .as_ref()
-                        .map(|s| (s.checkpoint_time, s.since_checkpoint)),
-                    record,
-                );
-                let head = rs.head;
-                out_state = Some(State {
-                    run: rs.clone(),
-                    offset: offset_after,
-                    length: initial_length,
-                    checkpoint_time: cp_time,
-                    since_checkpoint: since_cp,
-                    newline: newline_after,
-                    gap: initial_gap.clone(),
-                });
-                if expected == Some(head) {
+                (cp_time, since_cp) = next_cp_fields(Some((cp_time, since_cp)), record);
+                last_run = Some(rs.clone());
+                bytes
+                    .borrow_mut()
+                    .note_record_fed(offset_after, newline_after);
+                if expected == Some(rs.head) {
                     *fc.borrow_mut() = Some(record.clone());
                 }
             }
             FeedEvent::Duplicate => {}
             FeedEvent::NonRecord => {
-                if let Some(s) = &mut out_state {
-                    s.newline = newline_after;
+                if last_run.is_some() {
+                    bytes.borrow_mut().note_newline(newline_after);
                 }
             }
         }
@@ -751,11 +751,16 @@ pub(crate) fn history_segment(
         HistorySegmentWalk::Tolerant(outcome) => {
             let outcome = *outcome;
             *run = outcome.run_flag;
-            if let Some(s) = &mut out_state {
-                s.length = final_offset;
-                s.gap = outcome.gap;
-            }
-            Ok(out_state)
+            let bytes = bytes.into_inner();
+            Ok(last_run.map(|run_state| State {
+                run: run_state,
+                offset: bytes.last_offset(),
+                length: final_offset,
+                checkpoint_time: cp_time,
+                since_checkpoint: since_cp,
+                newline: bytes.last_newline(),
+                gap: outcome.gap,
+            }))
         }
     }
 }
