@@ -253,6 +253,13 @@ pub(crate) struct CollectorPos {
 /// typed violations in feed order, and `gap` is the gap hasher the
 /// caller threads forward.
 pub(crate) struct CollectorOutcome {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by #197 R2b S3b's classify iterator and V4a; between S3a and S3b only #[cfg(test)] rows and the reader-side Stop reaction (which rebuilds `State` from classifier.state() through `on_feed`, not from the outcome) read the field"
+        )
+    )]
     pub(crate) state: Option<RunState>,
     pub(crate) run_flag: bool,
     pub(crate) violations: Vec<(CollectorPos, Violation)>,
@@ -262,11 +269,9 @@ pub(crate) struct CollectorOutcome {
 impl std::fmt::Debug for CollectorOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CollectorOutcome")
-            .field("state.is_some", &self.state.is_some())
+            .field("violations", &self.violations)
             .field("run_flag", &self.run_flag)
-            .field("violations.len", &self.violations.len())
-            .field("gap.is_some", &self.gap.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -478,70 +483,45 @@ pub(crate) struct SegmentContext {
     pub(crate) run: bool,
 }
 
-/// Line event produced by the reader's I/O layer and consumed by
-/// [`history_segment`]. The reader ([`super::storage`]) owns the byte-
-/// level walk — the seek, the glued-byte-and-LF check, physical
-/// `read_line`, and dispatch to [`super::lines::classify`] — and yields
-/// each decoded line as a [`DecodedLine`] through the `events` closure.
-/// The shared orchestration owns everything else (addendum 20.1).
+/// Addendum 20.1: a decoded physical line produced by the reader's
+/// I/O layer and consumed by the shared [`history_segment`] walk. The
+/// reader ([`super::storage`]) owns the seek, the glued-byte/LF check,
+/// `read_line` and [`super::lines::classify`]; everything else is in
+/// the shared walk.
 #[derive(Debug)]
 pub(crate) enum LineEventKind {
-    /// A [`super::lines::Line::Record`]`(Ok(..))` payload. Carries the
-    /// decoded records (`record_count == records.len()` is checked by
-    /// the classifier's `multiple records in native audit line` guard).
     Record(Vec<Record>),
-    /// A [`super::lines::Line::Fragment`] payload; carries the raw line
-    /// bytes so [`Classifier::feed_fragment_tolerant`] can extend the
-    /// gap hasher.
     Fragment(Vec<u8>),
-    /// A [`super::lines::Line::Unparsable`] payload.
     Unparsable,
-    /// A [`super::lines::Line::Record`]`(Err(..))` payload (parse-level
-    /// failure that still produced `record` bytes).
     RecordErr,
 }
 
-/// One physical line decoded by the reader's I/O layer, with the bytes
-/// consumed and the terminating LF flag threaded alongside the kind so
-/// the shared [`history_segment`] orchestration can advance the
-/// reader's offset/newline tracking through `on_feed` without touching
-/// I/O itself.
+/// One decoded physical line (kind + post-line offset + newline flag).
+/// `offset_after` and `newline` are the reader-side cursor fields the
+/// shared walk hands back to `on_feed` without touching I/O itself.
 #[derive(Debug)]
 pub(crate) struct DecodedLine {
     pub(crate) kind: LineEventKind,
-    /// File offset after this line was consumed (prior offset + bytes).
     pub(crate) offset_after: u64,
-    /// Whether this line was terminated by a physical LF.
     pub(crate) newline: bool,
 }
 
-/// Ruling 197-d1 addenda 19.1 and 20.1: `history_segment`'s strict-pass-
-/// then-tolerant-fallback-from-saved-state sequence — including the
-/// saved-prior restore, `inherited = run_in || unsealed_boundary`,
-/// per-line feeding, the duplicate-line arm and the end-of-segment
-/// epilogue — is **one** function parameterised by [`Reaction`]. The
-/// reader's shim in `storage.rs` owns only byte-level I/O (seek,
-/// glued-byte/LF check, physical `read_line`, [`super::lines::classify`])
-/// and threads reader-side state (offset, newline, `checkpoint_time`,
-/// `since_checkpoint`, `found`) through `on_feed`; it supplies
-/// decoded-line events through `events` (addendum 20.1).
+/// Ruling 197-d1 addenda 19.1 / 20.1: the ONE `history_segment`
+/// orchestration — saved-prior restore, `inherited = run_in ||
+/// unsealed_boundary`, per-line feeding, the duplicate-line arm, the
+/// end-of-segment epilogue — parameterised by [`Reaction`]. Storage
+/// keeps only byte-level I/O and threads reader-side state through
+/// `on_feed`; it supplies decoded lines through `events`.
 ///
-/// Dispatch: run `strict` first. On `Ok(r)` return [`HistorySegmentWalk::Strict`]
-/// (the collector records **nothing**, matching the reader's `Ok`); on
-/// `AuditErrorKind::CorruptTrail` run the tolerant fallback with
-/// [`Reaction`] and return [`HistorySegmentWalk::Tolerant`]; on any
-/// other strict `Err` (e.g. I/O) propagate unchanged. The tolerant
-/// walk restores `prior_run` as `saved_prior`, computes
-/// `inherited = run_in || unsealed_boundary`, feeds each [`DecodedLine`]
-/// through the Stop or Collect state machine, invokes `on_feed` with the
-/// `(record, run_state)` just folded (`Some`) or with `None` for a
-/// fragment/unparsable (duplicates omit the callback so the reader's
-/// `continue` semantic is preserved), and finishes by calling
-/// `finish_tolerant` (Stop) or `finish_collect` (Collect). A mutant that
-/// touches the dispatch, the saved-prior restore, the `inherited`
-/// computation, or the per-line feed fails **both** a reader pin and a
-/// collector row because the same code drives both.
-#[allow(clippy::too_many_arguments)] // addendum 20.1: this is the ONE orchestration site; splitting it would re-introduce the copy addendum 20.1 forbids.
+/// Dispatch: strict first; `Ok(r)` → [`HistorySegmentWalk::Strict`];
+/// `AuditErrorKind::CorruptTrail` → tolerant fallback with
+/// [`Reaction`] → [`HistorySegmentWalk::Tolerant`]; any other strict
+/// `Err` propagates unchanged. The tolerant walk calls `on_feed` with
+/// the folded `(record, run_state)` (`Some`) or with `None` for
+/// fragment/unparsable; duplicates skip `on_feed` so the reader's
+/// `continue` semantic is preserved. A mutant touching any shared
+/// line fails **both** a reader pin and a collector row.
+#[allow(clippy::too_many_arguments)] // addendum 20.1: ONE orchestration site; splitting re-introduces the forbidden copy.
 pub(crate) fn history_segment<R, Sf, Ef, Of>(
     reaction: Reaction,
     strict: Sf,
@@ -660,20 +640,12 @@ where
 }
 
 /// Result of [`history_segment`]'s shared walk (addenda 19.1 / 20.1).
-/// `Strict(r)` means the strict pass returned `Ok(r)` (reader
-/// propagates `r`; collector records nothing). `Tolerant(outcome)`
-/// means the strict pass returned `CorruptTrail` and the shared
-/// tolerant walk produced `outcome`: under [`Reaction::Stop`] its
-/// `violations` is empty and `state`/`run_flag`/`gap` carry the
-/// reader-side result; under [`Reaction::Collect`] it is the full
-/// [`CollectorOutcome`]. The tolerant payload is `Box`ed to keep the
-/// variants' sizes comparable (clippy `large_enum_variant`).
+/// `Strict(r)` is the strict pass's `Ok(r)`; `Tolerant(outcome)` is
+/// the tolerant fallback's [`CollectorOutcome`] (boxed to equalise
+/// variant sizes for clippy's `large_enum_variant`).
 #[derive(Debug)]
 pub(crate) enum HistorySegmentWalk<R> {
-    /// Strict single-pass classified the whole segment.
     Strict(R),
-    /// Strict returned `CorruptTrail`; the shared walk ran the tolerant
-    /// fallback and produced this [`CollectorOutcome`].
     Tolerant(Box<CollectorOutcome>),
 }
 
