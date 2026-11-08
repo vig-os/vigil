@@ -1748,27 +1748,44 @@ mod details {
     use std::collections::{HashMap, HashSet};
 
     // The gate parses `storage.rs` and `runs.rs` separately with
-    // `syn::parse_file` and collects the `corrupt` call sites across
-    // both in a fixed file order (storage.rs first, then runs.rs), so
-    // the `(detail, occurrence)` keys stay stable.
+    // `syn::parse_file` and collects sites across both in a fixed file
+    // order (storage.rs first, then runs.rs), so the
+    // `(detail, occurrence)` keys stay stable. From R2b S3a onward the
+    // gate is re-keyed per ruling 197-d1 addendum 16 point 4: it
+    // counts every `corrupt("literal")` in `storage.rs` and every
+    // `Violation::<Variant>` construction expression in `runs.rs`,
+    // mapping each variant to its `detail()` string.
     //
-    // The pure classifier (`runs::Classifier`) owns 39 of the 48 sites:
+    // The pure classifier (`runs::Classifier`) owns 42 of the 50 sites:
     // every `apply_checked` detail (ruling 197-d1 point 2, R1), the
     // strict-mode per-segment checks driven by `feed_record` / `finish`
-    // / `invalid_opening_line`, and the tolerant-mode checks driven by
+    // / `invalid_opening_line`, the tolerant-mode checks driven by
     // `feed_record_prepare_tolerant` / `feed_record_apply_tolerant` /
-    // `finish_tolerant` / `feed_record_err_tolerant`. The reader shim
-    // in `storage.rs` keeps the remaining 9 sites: the byte-level and
-    // file-open checks, plus a defence-in-depth `missing head` after
-    // `feed_record_apply_tolerant` (UNREACHABLE: a successful apply
-    // leaves `classifier.state()=Some`, matched by the UNREACHABLE
-    // table row below). `check_attestation` is the single site for
+    // `finish_tolerant` / `feed_record_err_tolerant`, the finish-time
+    // records inside `finish_collect` (addendum 16 point 5), and the
+    // shared-walk `missing head` invariant that moved out of
+    // `storage.rs` with the addendum-20.1 orchestration (UNREACHABLE
+    // for `apply_checked`'s Ok case leaves `classifier.state()=Some`,
+    // matched by the UNREACHABLE table row below). The reader shim in
+    // `storage.rs` keeps the remaining 8 sites: the byte-level and
+    // file-open checks. `check_attestation` is the single site for
     // `missing or mismatched repair attestation` (ruling 197-d1
     // addendum 7); the reader orders it per path at the position
-    // ruling 197-d1 addendum 12 fixes. The `missing head` site that
-    // used to sit after `apply_checked` in the reader is now a
-    // classifier invariant with no inline call, so the total sits at
-    // 48 = 9 in `storage.rs` + 39 in `runs.rs`.
+    // ruling 197-d1 addendum 12 fixes. The total sits at
+    // 50 = 8 in `storage.rs` + 42 in `runs.rs`. The two extra sites
+    // over the 39+9=48 base are: the fold (iii) salvage push adds one
+    // `Violation::CheckpointMmrDiffers` construction site inside
+    // `feed_record_apply_tolerant` (UNREACHABLE for the reader-side
+    // pin gate: exercised by `collector_tests`, no `assert_corrupt`),
+    // and `apply_checked`'s fresh-Mmr genesis fold carries an explicit
+    // `.map_err(|_| Violation::MmrOverflow)?` (UNREACHABLE:
+    // `Mmr::new()` + push of one leaf cannot overflow). The
+    // `missing head` occurrence 0 is the shared-walk invariant
+    // described above; occurrence 1 is `Classifier::finish`'s own
+    // construction, pinned by `pin_sc_missing_head_opening_false_*`.
+    // A renamed variant whose `detail()` is not updated, or a new
+    // `Violation::<X>` variant without a pin, fails the gate
+    // (addendum 16 point 4).
     const STORAGE_SRC: &str = include_str!("storage.rs");
     const RUNS_SRC: &str = include_str!("runs.rs");
     const STORAGE_TESTS_SRC: &str = include_str!("storage_tests.rs");
@@ -1854,6 +1871,21 @@ mod details {
     ) -> Result<Option<State>, AuditError> {
         let mut r = run;
         history_segment(f, TRAIL, state, opening, None, &mut None, &mut r)
+    }
+    /// Addendum 22.1/22.2: history_segment with `expected` + a `found`
+    /// out-parameter, so pins can observe both the returned state and
+    /// the strict-pass partial writes that must survive on the Err path.
+    fn hsc_found(
+        f: &File,
+        state: Option<State>,
+        opening: bool,
+        run: bool,
+        expected: Head,
+    ) -> (Result<Option<State>, AuditError>, Option<Record>) {
+        let mut r = run;
+        let mut found = None;
+        let res = history_segment(f, TRAIL, state, opening, Some(expected), &mut found, &mut r);
+        (res, found)
     }
     fn scc(f: &File, state: Option<State>, opening: bool) -> Result<State, AuditError> {
         scan(f, TRAIL, state, opening, None, &mut None, false)
@@ -1984,6 +2016,192 @@ mod details {
             hsc(&o(&d), None, true, false),
             "missing or mismatched repair attestation",
             0,
+        );
+    }
+    #[test]
+    fn pin_hs_fallback_duplicate_advances_length_through_feed_callback() {
+        // Addendum 22.1: a trailing duplicate flows through the shared
+        // `on_feed` callback as `FeedEvent::Duplicate`, which advances
+        // the walk's `final_offset` (so `s.length` is base-identical)
+        // while leaving `state.offset` and `state.newline` untouched.
+        // Repro: predecessor `scan([cp0, e1, cp2])`, segment file
+        // `[e3, e3]`, `history_segment(opening=true, run=false)`.
+        // Strict fails with `MissingOpeningCheckpoint` (e3 is an entry
+        // on an opening segment), so the tolerant fallback walks both
+        // copies. A mutant that skips `on_feed` on the duplicate arm
+        // leaves `final_offset` at the first copy, so `s.length` equals
+        // the single-record byte count (base gives 2×, head's bug gave 1×).
+        let cp0_rec = cp0();
+        let e1 = entry(&cp0_rec);
+        let mut mmr = seeded(&cp0_rec);
+        mmr.push(e1.hash()).unwrap();
+        let cp2 = cp(2, e1.hash(), &mmr);
+        let pre = Temp::new();
+        w(&pre, &[line(&cp0_rec), line(&e1), line(&cp2)].concat());
+        let pre_state = scc(&o(&pre), None, true).unwrap();
+        assert_eq!(pre_state.run.head.seq, 2);
+        let e3 = Record::new(context(3, cp2.hash()), Entry::new("a", "c", "o")).unwrap();
+        let seg = Temp::new();
+        let seg_bytes = [line(&e3), line(&e3)].concat();
+        let expected_length = seg_bytes.len() as u64;
+        w(&seg, &seg_bytes);
+        let state = hsc(&o(&seg), Some(pre_state), true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.length, expected_length,
+            "duplicate arm must advance the walk cursor past both copies via on_feed",
+        );
+    }
+    #[test]
+    fn pin_hs_found_persists_on_strict_write_before_tolerant_duplicate() {
+        // Addendum 22.2: on the Ok path through the tolerant fallback,
+        // strict's partial `*found` write survives because the two
+        // passes share one buffer (base-identical: a single `&mut found`
+        // was threaded through both passes). Layout: predecessor at e1
+        // (continuation, opening=false); the live file holds
+        // `[cp0, e1, e1_duplicate, unparsable]`. Strict scans from
+        // pred.offset: the duplicate e1 is `Advance::Duplicate`, so
+        // `*found` is set to the duplicate; the trailing unparsable
+        // trips `invalid audit line or opening checkpoint`, so strict
+        // fails with CorruptTrail. The tolerant fallback walks the
+        // same two records: e1 takes the duplicate arm (saved_prior's
+        // head already matches), so `on_feed` is `FeedEvent::Duplicate`
+        // and `found` is NOT re-written; the trailing unparsable
+        // latches `damaged` and the segment finishes Ok. With the
+        // previous two-buffer design, strict's write lived only in a
+        // local that was dropped on `CorruptTrail`, and `found`
+        // returned to the caller as `None` (base gave Some).
+        let cp0_rec = cp0();
+        let e1 = entry(&cp0_rec);
+        let d = Temp::new();
+        w(&d, &[line(&cp0_rec), line(&e1)].concat());
+        let pre_state = scc(&o(&d), None, true).unwrap();
+        append_bytes(&d.0.join("audit.jsonl"), &line(&e1));
+        append_bytes(&d.0.join("audit.jsonl"), b"not json\n");
+        let expected = Head::of(&e1);
+        let (res, found) = hsc_found(&o(&d), Some(pre_state), false, false, expected);
+        assert!(
+            res.is_ok(),
+            "tolerant must finish Ok on fragment-only continuation past e1",
+        );
+        assert_eq!(
+            found.map(|r| r.context.seq),
+            Some(e1.context.seq),
+            "strict's `*found` write must persist across CorruptTrail into tolerant Ok",
+        );
+    }
+    #[test]
+    fn pin_hs_found_persists_on_err_after_strict_partial_write() {
+        // Addendum 22.2: on the Err path, strict's partial `*found`
+        // writes survive. Layout: no predecessor (`opening=true`), the
+        // file holds `[cp0, e1, broken_e2]` where broken_e2 has a
+        // wrong `previous`. Strict folds cp0 (not a match), then e1
+        // (matches; `*found = Some(e1)`), then broken_e2 trips the
+        // hash-link check and strict returns CorruptTrail. The
+        // tolerant fallback walks from the start, hits the same broken
+        // link, and the method returns Err. With the previous
+        // two-buffer design, strict's `*found = Some(e1)` lived only
+        // in the local inside the strict closure and was dropped; now
+        // the shared buffer writes back before the `?` propagates.
+        let cp0_rec = cp0();
+        let e1 = entry(&cp0_rec);
+        let broken = Record::new(context(2, [42; 32]), Entry::new("a", "c", "o")).unwrap();
+        let d = Temp::new();
+        w(&d, &[line(&cp0_rec), line(&e1), line(&broken)].concat());
+        let expected = Head::of(&e1);
+        let (res, found) = hsc_found(&o(&d), None, true, false, expected);
+        assert_eq!(
+            res.err().expect("broken link must propagate").kind(),
+            AuditErrorKind::CorruptTrail,
+        );
+        assert_eq!(
+            found.map(|r| r.context.seq),
+            Some(e1.context.seq),
+            "strict's partial `*found` write must survive on the Err path",
+        );
+    }
+    #[test]
+    fn pin_hs_on_feed_writes_found_on_opening_tolerant_walk_at_seq_max() {
+        // Addendum 22.2 (round-7): on `history_segment(opening=true, *)`
+        // the tolerant fallback's `on_feed(FeedEvent::Record, …)` must
+        // write the matching head back into the shared `found` buffer
+        // when `expected == Some(head)`, including the saturated
+        // `head.seq` end of addendum 15's range. Repro: no predecessor
+        // state, the live file holds a leading JSON fragment
+        // (incomplete object -> `Line::Fragment`) and then an
+        // archived-prefix checkpoint with `context.seq` pinned to the
+        // record builder's ceiling (`i64::MAX as u64`; `Record::build`
+        // rejects anything above that as "sequence exceeds OTLP int64",
+        // so this is the largest `head.seq` the on-disk wire format
+        // admits in the sense of addendum 15's saturated-seq branch)
+        // and `context.previous == genesis` (root-link + pending). The
+        // strict pass fails at the opening fragment with
+        // `invalid audit line or opening checkpoint`, so `scan_inner`
+        // never reaches any record and writes nothing into `found`.
+        // The tolerant fallback restarts at offset 0, folds the
+        // fragment as `FeedEvent::NonRecord` (no `found` write), then
+        // folds the checkpoint; `on_feed` fires as
+        // `FeedEvent::Record(cp_max, rs)` and the storage closure runs
+        // the writeback `*fc.borrow_mut() = Some(record.clone())`.
+        // The segment still finishes with `invalid undamaged segment`
+        // (no damage latched, count=1) so the method returns Err; the
+        // writeback must land before the `?` propagates (addendum 22.2
+        // moves the `found_cell.into_inner()` back to the caller
+        // ahead of `match walk?`). A mutant deleting the writeback,
+        // or negating the `expected == Some(head)` guard, leaves the
+        // shared buffer empty and `found` returns to the caller as
+        // `None`; base's `history_segment` fallback wrote `found`
+        // directly in the same loop, so it stayed `Some(cp_max)`.
+        //
+        // Build the archived-prefix checkpoint directly: the shared
+        // `cp` helper derives `time = 100 + seq`, which overflows at
+        // the saturated-seq ceiling; the storage flow depends on
+        // `context.seq`, not `context.time`.
+        let max_seq = i64::MAX as u64;
+        let fold = genesis_fold();
+        let fields = CheckpointFields::new(
+            fold.size(),
+            fold.root(),
+            fold.peaks().to_vec(),
+            [1; 32],
+            [0; 64],
+        )
+        .unwrap();
+        let cp_max = Record::checkpoint(
+            RecordContext::new(TRAIL, max_seq, 0, "test", Record::genesis(&TRAIL)),
+            fields,
+        )
+        .unwrap();
+        let d = Temp::new();
+        let mut bytes: Vec<u8> = Vec::new();
+        // Line::Fragment: an incomplete JSON object is an EOF parse
+        // error, which `super::lines::classify` reports as `Fragment`.
+        bytes.extend_from_slice(b"{\"torn\":\n");
+        bytes.extend_from_slice(&line(&cp_max));
+        w(&d, &bytes);
+        let expected = Head::of(&cp_max);
+        let (res, found) = hsc_found(&o(&d), None, true, false, expected);
+        assert_eq!(
+            res.err()
+                .expect("opening fragment + undamaged singleton must still propagate")
+                .kind(),
+            AuditErrorKind::CorruptTrail,
+        );
+        assert_eq!(
+            cp_max.context.seq, max_seq,
+            "sanity: the expected head is the saturated-seq branch",
+        );
+        assert_eq!(
+            found.as_ref().map(|r| r.context.seq),
+            Some(max_seq),
+            "`on_feed` must write `found` for `expected == head` at the saturated \
+             seq ceiling on an opening-only tolerant walk (no strict partial write)",
+        );
+        assert_eq!(
+            found.map(|r| Head::of(&r)),
+            Some(expected),
+            "writeback must carry the exact record, not just its seq",
         );
     }
     #[test]
@@ -3417,6 +3635,11 @@ mod details {
 
     const UNREACHABLE: &[(&str, usize, &str)] = &[
         (
+            "checkpoint MMR differs from preceding records",
+            1,
+            "Addendum 16 point 2 (17.3 / 19.2): fold (iii) salvage push in feed_record_apply_tolerant records the Violation into the collector's vector without returning an AuditError; exercised by collector_tests::collector_fold_iii_mismatch_on_history_segment_opening_true_run_false (and its three per-path siblings) and collector_tests::collector_salvage_mmr_includes_the_checkpoint_leaf (no reader-side assert_corrupt).",
+        ),
+        (
             "missing written state",
             0,
             "State::after: apply always sets state=Some on Ok",
@@ -3424,14 +3647,15 @@ mod details {
         (
             "missing head",
             0,
-            "history_segment shim: feed_record_apply_tolerant Ok leaves classifier.state()=Some",
+            "shared `runs::history_segment` walk: `feed_record_apply_tolerant` Ok leaves `classifier.state()=Some` so the defence-in-depth `Violation::MissingHead` construction after the apply is unreachable (addendum 20.1)",
         ),
         // `Classifier::feed_record` returns the new state from
         // `apply_checked` directly; its post-apply follow-up is a
         // classifier invariant with no inline `corrupt("missing head")`
-        // call. The remaining `missing head` sites are
-        // `history_segment`'s (occ 0, UNREACHABLE) and
-        // `runs::Classifier::finish`'s (occ 1, tested by
+        // call. The remaining `missing head` sites are both in
+        // `runs.rs`: occ 0 is the shared `history_segment` walk's
+        // UNREACHABLE defence-in-depth (above) and occ 1 is
+        // `Classifier::finish`'s own construction (tested by
         // `pin_sc_missing_head_opening_false_*`).
         (
             "invalid opening peaks",
@@ -3443,7 +3667,16 @@ mod details {
             0,
             "state=None + non-Checkpoint fires 'missing initial checkpoint' first",
         ),
-        ("MMR overflow", 0, "requires 2^64 leaves"),
+        (
+            "MMR overflow",
+            0,
+            "apply_checked's fresh-Mmr genesis fold: Mmr::new() + push of one leaf cannot overflow size or miss peaks",
+        ),
+        (
+            "MMR overflow",
+            1,
+            "apply_checked's main record fold: requires 2^64 leaves",
+        ),
     ];
 
     // 197-d1 addendum 9: the gate parses Rust with `syn::parse_file`
@@ -3488,18 +3721,68 @@ mod details {
         path.segments.last().map(|s| &s.ident)
     }
 
-    fn parse_sites(sources: &[&str]) -> Vec<(String, usize)> {
-        // Every `ExprCall` whose callee path ends in `corrupt` and
-        // whose first argument is a string literal is a corrupt-site
-        // in the reader. Each source is parsed on its own with
-        // `syn::parse_file` and sites are collected in the caller's
-        // fixed order, so the `(detail, occurrence)` key stays stable
-        // across both files -- the same key
-        // `assert_corrupt(result, "detail", site)` uses.
-        struct Collect {
+    fn parse_sites() -> Vec<(String, usize)> {
+        // Addendum 16 point 4: the gate scans `storage.rs` for every
+        // `corrupt("literal")` call (ExprCall whose callee ends in
+        // `corrupt`, first arg is a string literal) and scans `runs.rs`
+        // for every `Violation::<Variant>` construction expression
+        // (ExprPath whose first segment is `Violation`), mapping each
+        // variant to its `detail()` string via the single source of
+        // truth [`runs::Violation::detail`]. Sites are collected in a
+        // fixed file order (storage.rs first, then runs.rs) so the
+        // `(detail, occurrence)` key stays stable across both files
+        // -- the same key `assert_corrupt(result, "detail", site)` uses.
+        // The pattern binding `v @ Violation::CheckpointMmrDiffers` in
+        // `feed_record_apply_tolerant`'s salvage arm is NOT a
+        // construction expression (patterns are not expressions), so
+        // this scan does not double-count it.
+        use crate::audit::runs::Violation;
+
+        // Addendum 17.5: derive the variant set by syn-parsing
+        // `enum Violation` from `runs.rs` (not from `Violation::ALL`),
+        // and fail unless `ALL` equals it. A variant added to the enum
+        // but missing from `ALL`, with a live construction site and no
+        // pin, fails the gate: the site is counted and the pin is
+        // missing.
+        let parse_enum_variants = |file: &syn::File| -> HashSet<String> {
+            let mut names = HashSet::new();
+            for item in &file.items {
+                if let syn::Item::Enum(e) = item
+                    && e.ident == "Violation"
+                {
+                    for v in &e.variants {
+                        names.insert(v.ident.to_string());
+                    }
+                }
+            }
+            names
+        };
+        let runs_pre: syn::File = syn::parse_file(RUNS_SRC)
+            .expect("coverage gate: runs.rs is not valid Rust (parse_file failed)");
+        let enum_variants: HashSet<String> = parse_enum_variants(&runs_pre);
+        assert!(
+            !enum_variants.is_empty(),
+            "coverage gate: syn-parse of enum Violation yielded no variants",
+        );
+        let all_variants: HashSet<String> =
+            Violation::ALL.iter().map(|v| format!("{v:?}")).collect();
+        assert_eq!(
+            enum_variants, all_variants,
+            "coverage gate: enum Violation's variant set != Violation::ALL \
+             (addendum 17.5: the ALL list must mirror the enum definition)",
+        );
+
+        // Variant-name → detail string. With the ALL==enum cross-check
+        // above, every parsed enum variant also has a runtime detail().
+        let name_to_detail: HashMap<String, &'static str> = Violation::ALL
+            .iter()
+            .map(|v| (format!("{v:?}"), v.detail()))
+            .collect();
+
+        struct CollectStorage {
             raw: Vec<String>,
         }
-        impl<'ast> syn::visit::Visit<'ast> for Collect {
+        impl<'ast> syn::visit::Visit<'ast> for CollectStorage {
             fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
                 if let syn::Expr::Path(p) = &*call.func
                     && path_last_segment(&p.path).is_some_and(|i| i == "corrupt")
@@ -3511,15 +3794,132 @@ mod details {
                 syn::visit::visit_expr_call(self, call);
             }
         }
-        let mut c = Collect { raw: Vec::new() };
-        for source in sources {
-            let file: syn::File = syn::parse_file(source)
-                .expect("coverage gate: a reader source is not valid Rust (parse_file failed)");
-            syn::visit::Visit::visit_file(&mut c, &file);
+
+        // Addendum 17.5: exclude `#[cfg(test)]` code from site counting.
+        // A `Violation::X` construction inside a `#[cfg(test)]` module or
+        // item is a test, not a product site, and must not count.
+        fn attrs_have_cfg_test(attrs: &[syn::Attribute]) -> bool {
+            attrs.iter().any(|a| {
+                a.path().is_ident("cfg")
+                    && a.parse_args::<syn::Meta>().ok().is_some_and(|m| match m {
+                        syn::Meta::Path(p) => p.is_ident("test"),
+                        _ => false,
+                    })
+            })
         }
+
+        struct CollectRuns<'a> {
+            raw: Vec<String>,
+            name_to_detail: &'a HashMap<String, &'static str>,
+            in_pattern: usize,
+            in_cfg_test: usize,
+        }
+        impl<'ast, 'a> syn::visit::Visit<'ast> for CollectRuns<'a> {
+            fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
+                // Two-segment path `Violation::<Variant>`. `Self::X` paths
+                // inside `impl Violation` have `Self` as the first segment
+                // and are therefore skipped (the `const ALL` list and
+                // `fn detail` are the enum's own definition, not call
+                // sites). In syn 2.x `Pat::Path` wraps `ExprPath`, so a
+                // pattern-position `Violation::<Variant>` (as in the fold
+                // (iii) salvage arm `Err(Violation::CheckpointMmrDiffers)
+                // if ... =>`) also reaches this visitor; the `in_pattern`
+                // stack skips those — the salvage arm's pattern is NOT
+                // a construction site (patterns match values, they do
+                // not create them), the ONE construction for the salvage
+                // is the explicit `self.collected.push((.., Violation::X))`
+                // inside the arm body.
+                if self.in_pattern == 0 && self.in_cfg_test == 0 {
+                    let segs = &p.path.segments;
+                    if segs.len() == 2
+                        && segs[0].ident == "Violation"
+                        && let Some(detail) = self.name_to_detail.get(&segs[1].ident.to_string())
+                    {
+                        self.raw.push((*detail).to_string());
+                    }
+                }
+                syn::visit::visit_expr_path(self, p);
+            }
+            fn visit_pat(&mut self, p: &'ast syn::Pat) {
+                self.in_pattern += 1;
+                syn::visit::visit_pat(self, p);
+                self.in_pattern -= 1;
+            }
+            fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+                let bump = attrs_have_cfg_test(&m.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_item_mod(self, m);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+            fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+                let bump = attrs_have_cfg_test(&f.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_item_fn(self, f);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+            fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+                let bump = attrs_have_cfg_test(&i.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_item_impl(self, i);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+            fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+                // Addendum 19.6: a `#[cfg(test)]` fn inside an `impl`
+                // block is an `ImplItemFn`, not an `ItemFn`; without
+                // this visit the gate would count its `Violation::X`
+                // sites as product sites.
+                let bump = attrs_have_cfg_test(&f.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_impl_item_fn(self, f);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+            fn visit_item_const(&mut self, c: &'ast syn::ItemConst) {
+                let bump = attrs_have_cfg_test(&c.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_item_const(self, c);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+        }
+
+        let mut raw: Vec<String> = Vec::new();
+        let storage: syn::File = syn::parse_file(STORAGE_SRC)
+            .expect("coverage gate: storage.rs is not valid Rust (parse_file failed)");
+        let mut cs = CollectStorage { raw: Vec::new() };
+        syn::visit::Visit::visit_file(&mut cs, &storage);
+        raw.extend(cs.raw);
+        let runs: syn::File = syn::parse_file(RUNS_SRC)
+            .expect("coverage gate: runs.rs is not valid Rust (parse_file failed)");
+        let mut cr = CollectRuns {
+            raw: Vec::new(),
+            name_to_detail: &name_to_detail,
+            in_pattern: 0,
+            in_cfg_test: 0,
+        };
+        syn::visit::Visit::visit_file(&mut cr, &runs);
+        raw.extend(cr.raw);
+
         let mut counts: HashMap<String, usize> = HashMap::new();
-        c.raw
-            .into_iter()
+        raw.into_iter()
             .map(|d| {
                 let n = *counts.get(&d).unwrap_or(&0);
                 counts.insert(d.clone(), n + 1);
@@ -3781,11 +4181,13 @@ mod details {
 
     #[test]
     fn coverage_gate_pins_every_corrupt_site() {
-        // Fixed file order: storage.rs first (9 sites), then runs.rs
-        // (39 sites). Each source is parsed on its own with
-        // `syn::parse_file`, so neither file needs to be syntactically
-        // concatenable with the other.
-        let sites = parse_sites(&[STORAGE_SRC, RUNS_SRC]);
+        // Fixed file order: storage.rs first (8 corrupt-literal sites),
+        // then runs.rs (42 `Violation::<X>` construction sites, re-keyed
+        // per addendum 16 point 4). Each source is parsed on its own
+        // with `syn::parse_file`, so neither file needs to be
+        // syntactically concatenable with the other.
+        use crate::audit::runs::Violation;
+        let sites = parse_sites();
         let site_set: HashSet<(String, usize)> = sites.iter().cloned().collect();
         let asserted: HashSet<(String, usize)> =
             parse_assertions(STORAGE_TESTS_SRC).into_iter().collect();
@@ -3800,6 +4202,27 @@ mod details {
             }
         }
         assert!(missing.is_empty(), "uncovered corrupt sites: {missing:?}");
+        // Addendum 20.2: per-variant coverage. Every `Violation`
+        // variant must have at least one construction site AND an
+        // asserting pin (or at least one UNREACHABLE entry); a variant
+        // added to `enum Violation`, `ALL` and `detail()` with no
+        // site and no pin fails the gate here (G3).
+        let site_details: HashSet<String> = site_set.iter().map(|(d, _)| d.clone()).collect();
+        let pinned_details: HashSet<String> = asserted.iter().map(|(d, _)| d.clone()).collect();
+        let unreach_details: HashSet<String> = unreach.iter().map(|(d, _)| d.clone()).collect();
+        let mut variant_missing: Vec<&'static str> = Vec::new();
+        for v in Violation::ALL.iter().copied() {
+            let d = v.detail();
+            let has_site = site_details.contains(d);
+            let covered = pinned_details.contains(d) || unreach_details.contains(d);
+            if !has_site || !covered {
+                variant_missing.push(d);
+            }
+        }
+        assert!(
+            variant_missing.is_empty(),
+            "per-variant coverage (addendum 20.2) failed: {variant_missing:?}"
+        );
         // Stale-label check: any (detail, occurrence) pair that an
         // assert_corrupt names must exist in storage.rs or runs.rs, so
         // a pin left behind after a reader change cannot silently hide.
@@ -3815,7 +4238,7 @@ mod details {
         }
         assert_eq!(
             sites.len(),
-            48,
+            50,
             "corrupt-site count changed; update gate explicitly"
         );
     }
