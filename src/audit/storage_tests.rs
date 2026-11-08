@@ -1756,32 +1756,34 @@ mod details {
     // `Violation::<Variant>` construction expression in `runs.rs`,
     // mapping each variant to its `detail()` string.
     //
-    // The pure classifier (`runs::Classifier`) owns 41 of the 50 sites:
+    // The pure classifier (`runs::Classifier`) owns 42 of the 50 sites:
     // every `apply_checked` detail (ruling 197-d1 point 2, R1), the
     // strict-mode per-segment checks driven by `feed_record` / `finish`
     // / `invalid_opening_line`, the tolerant-mode checks driven by
     // `feed_record_prepare_tolerant` / `feed_record_apply_tolerant` /
-    // `finish_tolerant` / `feed_record_err_tolerant`, and the finish-
-    // time records inside `finish_collect` (addendum 16 point 5). The
-    // reader shim in `storage.rs` keeps the remaining 9 sites: the
-    // byte-level and file-open checks, plus a defence-in-depth
-    // `missing head` after `feed_record_apply_tolerant` (UNREACHABLE:
-    // a successful apply leaves `classifier.state()=Some`, matched by
-    // the UNREACHABLE table row below). `check_attestation` is the
-    // single site for `missing or mismatched repair attestation`
-    // (ruling 197-d1 addendum 7); the reader orders it per path at the
-    // position ruling 197-d1 addendum 12 fixes. The `missing head`
-    // site that used to sit after `apply_checked` in the reader is now
-    // a classifier invariant with no inline call, so the total sits at
-    // 50 = 9 in `storage.rs` + 41 in `runs.rs`. The extra site
-    // over the 39+9=48 base is: the fold (iii) salvage push adds
-    // one `Violation::CheckpointMmrDiffers` construction site inside
+    // `finish_tolerant` / `feed_record_err_tolerant`, the finish-time
+    // records inside `finish_collect` (addendum 16 point 5), and the
+    // shared-walk `missing head` invariant that moved out of
+    // `storage.rs` with the addendum-20.1 orchestration (UNREACHABLE
+    // for `apply_checked`'s Ok case leaves `classifier.state()=Some`,
+    // matched by the UNREACHABLE table row below). The reader shim in
+    // `storage.rs` keeps the remaining 8 sites: the byte-level and
+    // file-open checks. `check_attestation` is the single site for
+    // `missing or mismatched repair attestation` (ruling 197-d1
+    // addendum 7); the reader orders it per path at the position
+    // ruling 197-d1 addendum 12 fixes. The total sits at
+    // 50 = 8 in `storage.rs` + 42 in `runs.rs`. The two extra sites
+    // over the 39+9=48 base are: the fold (iii) salvage push adds one
+    // `Violation::CheckpointMmrDiffers` construction site inside
     // `feed_record_apply_tolerant` (UNREACHABLE for the reader-side
     // pin gate: exercised by `collector_tests`, no `assert_corrupt`),
-    // and `apply_checked`'s fresh-Mmr genesis fold now carries an
-    // explicit `.map_err(|_| Violation::MmrOverflow)?` (UNREACHABLE:
-    // `Mmr::new()` + push of one leaf cannot overflow). A renamed
-    // variant whose `detail()` is not updated, or a new
+    // and `apply_checked`'s fresh-Mmr genesis fold carries an explicit
+    // `.map_err(|_| Violation::MmrOverflow)?` (UNREACHABLE:
+    // `Mmr::new()` + push of one leaf cannot overflow). The
+    // `missing head` occurrence 0 is the shared-walk invariant
+    // described above; occurrence 1 is `Classifier::finish`'s own
+    // construction, pinned by `pin_sc_missing_head_opening_false_*`.
+    // A renamed variant whose `detail()` is not updated, or a new
     // `Violation::<X>` variant without a pin, fails the gate
     // (addendum 16 point 4).
     const STORAGE_SRC: &str = include_str!("storage.rs");
@@ -3444,14 +3446,15 @@ mod details {
         (
             "missing head",
             0,
-            "history_segment shim: feed_record_apply_tolerant Ok leaves classifier.state()=Some",
+            "shared `runs::history_segment` walk: `feed_record_apply_tolerant` Ok leaves `classifier.state()=Some` so the defence-in-depth `Violation::MissingHead` construction after the apply is unreachable (addendum 20.1)",
         ),
         // `Classifier::feed_record` returns the new state from
         // `apply_checked` directly; its post-apply follow-up is a
         // classifier invariant with no inline `corrupt("missing head")`
-        // call. The remaining `missing head` sites are
-        // `history_segment`'s (occ 0, UNREACHABLE) and
-        // `runs::Classifier::finish`'s (occ 1, tested by
+        // call. The remaining `missing head` sites are both in
+        // `runs.rs`: occ 0 is the shared `history_segment` walk's
+        // UNREACHABLE defence-in-depth (above) and occ 1 is
+        // `Classifier::finish`'s own construction (tested by
         // `pin_sc_missing_head_opening_false_*`).
         (
             "invalid opening peaks",

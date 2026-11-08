@@ -11,8 +11,8 @@ use super::{
     AuditError, AuditErrorKind, Record,
     format::{Kind, validation::MAX_PAYLOAD_BYTES},
     runs::{
-        self, Advance, Classifier, HistorySegmentDispatch, Mode as ClassifierMode, Reaction,
-        RunState, SegmentContext, TolerantPrep,
+        self, Advance, Classifier, DecodedLine, HistorySegmentWalk, LineEventKind,
+        Mode as ClassifierMode, Reaction, RunState, SegmentContext,
     },
 };
 use crate::rotate::Directory;
@@ -317,6 +317,18 @@ fn initial_record(
 // checkpoint's claimed peaks.
 /// Folds a sealed predecessor without resetting state at damaged run boundaries.
 /// The caller must validate a successor with `scan_staged` or `scan_closing`.
+///
+/// Ruling 197-d1 addenda 19.1 and 20.1: the strict-pass-then-tolerant-
+/// fallback-from-saved-state sequence — including the saved-prior
+/// restore, `inherited = *run || unsealed_boundary`, per-line feeding,
+/// the duplicate-line arm and the end-of-segment epilogue — is ONE
+/// function in `runs::history_segment`, parameterised by [`Reaction`].
+/// This shim owns **only** byte-level I/O (seek, glued-byte / LF check,
+/// physical `read_line`, [`super::lines::classify`]) plus the writer-
+/// only `next_cp_fields` fold and the `found` out-parameter. The reader
+/// calls it with [`Reaction::Stop`]; the collector's `history_segment`
+/// entry (collector_tests in `runs.rs`, #197 R2b S3b beyond) calls the
+/// same function with [`Reaction::Collect`].
 pub(crate) fn history_segment(
     file: &File,
     trail: [u8; 16],
@@ -334,135 +346,148 @@ pub(crate) fn history_segment(
         genesis: false,
         run: *run,
     };
-    // Addendum 19.1: history_segment's strict-pass-then-tolerant-fallback
-    // sequence is ONE function in runs.rs, parameterised by Reaction. The
-    // reader calls it with Reaction::Stop; the collector's history_segment
-    // entry (in #[cfg(test)] rows and #197 R2b S3b) calls it with
-    // Reaction::Collect. On strict Ok the reader returns the strict state;
-    // on strict CorruptTrail the tolerant fallback runs below. Any other
-    // strict Err (e.g. I/O) propagates unchanged.
-    match runs::history_segment::<State, _>(Reaction::Stop, || {
-        scan_inner(file, trail, state.clone(), expected, found, ctx)
-    })? {
-        HistorySegmentDispatch::Strict(next) => {
-            *run = false;
-            return Ok(Some(next));
-        }
-        HistorySegmentDispatch::Tolerant(_) => {}
-    }
-    // Fallback rescan from the **saved segment-start state**. The shim
-    // threads a tolerant-mode `runs::Classifier` for every per-record and
-    // finish-time check; `check_attestation` runs at the reader's per-path
-    // position on both branches (ruling 197-d1 addenda 7 and 12): the
-    // Duplicate branch calls it directly, the General branch calls it
-    // between `prepare` and `apply`.
-    let inherited = *run || unsealed_boundary;
-    let saved_prior = state.as_ref().map(|s| s.run.clone());
-    let mut classifier = Classifier::new_tolerant(saved_prior, ctx, inherited);
-    let mut state = state;
-    let mut file = file.try_clone().map_err(io_error)?;
-    let mut offset = if opening {
+    let prior_run = state.as_ref().map(|s| s.run.clone());
+    let initial_offset = if opening {
         0
     } else {
         state.as_ref().map_or(0, |s| s.offset)
     };
-    file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
-    let mut reader = BufReader::new(file);
-    if !opening
+    let initial_length = state.as_ref().map_or(0, |s| s.length);
+    let initial_gap = state.as_ref().and_then(|s| s.gap.clone());
+    let needs_glue_check = !opening
         && state
             .as_ref()
-            .is_some_and(|s| !s.newline && s.gap.is_none())
-    {
-        let mut byte = [0];
-        if reader.read(&mut byte).map_err(io_error)? == 1 {
-            if byte != *b"\n" {
-                return Err(corrupt("bytes glued to complete unterminated record"));
+            .is_some_and(|s| !s.newline && s.gap.is_none());
+
+    // Reader-side state threaded through `on_feed` and the strict
+    // closure. Two separate `found` buffers (one for the strict pass,
+    // one for the tolerant walk) keep the captures aliasing-free; the
+    // walk result selects which to propagate to the out-parameter.
+    let mut out_state: Option<State> = state.clone();
+    let mut final_offset = initial_offset;
+    let initial_found = found.clone();
+    let strict_initial_found = initial_found.clone();
+    let strict_state = state.clone();
+    let strict = move || -> Result<(State, Option<Record>), AuditError> {
+        let mut strict_found = strict_initial_found;
+        let s = scan_inner(file, trail, strict_state, expected, &mut strict_found, ctx)?;
+        Ok((s, strict_found))
+    };
+    // Lazy tolerant events iterator: the seek, the glued-byte / LF
+    // check and physical `read_line` live only in this closure. The
+    // decoded line event carries the file bytes + the terminating LF
+    // flag and is consumed by `runs::history_segment`.
+    let tolerant_file = file.try_clone().map_err(io_error)?;
+    let mut tolerant_reader_opt: Option<BufReader<File>> = None;
+    let mut tolerant_offset = initial_offset;
+    let mut did_glue_check = false;
+    let events = move || -> Result<Option<DecodedLine>, AuditError> {
+        let reader = match tolerant_reader_opt.as_mut() {
+            Some(r) => r,
+            None => {
+                let mut f = tolerant_file.try_clone().map_err(io_error)?;
+                f.seek(SeekFrom::Start(initial_offset)).map_err(io_error)?;
+                tolerant_reader_opt = Some(BufReader::new(f));
+                tolerant_reader_opt
+                    .as_mut()
+                    .expect("just inserted BufReader")
             }
-            offset += 1;
+        };
+        if !did_glue_check && needs_glue_check {
+            did_glue_check = true;
+            let mut byte = [0];
+            if reader.read(&mut byte).map_err(io_error)? == 1 {
+                if byte != *b"\n" {
+                    return Err(corrupt("bytes glued to complete unterminated record"));
+                }
+                tolerant_offset += 1;
+            }
         }
-    }
-    loop {
         let mut line = Vec::new();
-        let (bytes, newline) = read_line(&mut reader, &mut line)?;
+        let (bytes, newline) = read_line(reader, &mut line)?;
         if bytes == 0 {
-            break;
+            return Ok(None);
         }
         #[cfg(test)]
         SCANNED.with(|n| n.set(n.get() + bytes));
-        offset += bytes as u64;
+        tolerant_offset += bytes as u64;
         let payload = line.strip_suffix(b"\n").unwrap_or(&line);
-        let classification = super::lines::classify(payload);
-        let records = match classification {
-            super::lines::Line::Record(Ok(records)) => records,
-            super::lines::Line::Fragment => {
-                classifier.feed_fragment_tolerant(&line);
-                if let Some(s) = &mut state {
-                    s.newline = newline;
-                }
-                continue;
-            }
-            super::lines::Line::Unparsable(_) => {
-                classifier.feed_unparsable_tolerant();
-                if let Some(s) = &mut state {
-                    s.newline = newline;
-                }
-                continue;
-            }
-            super::lines::Line::Record(Err(_)) => {
-                classifier.feed_record_err_tolerant()?;
-                unreachable!("feed_record_err_tolerant always errors");
-            }
+        let kind = match super::lines::classify(payload) {
+            super::lines::Line::Record(Ok(records)) => LineEventKind::Record(records),
+            super::lines::Line::Fragment => LineEventKind::Fragment(line),
+            super::lines::Line::Unparsable(_) => LineEventKind::Unparsable,
+            super::lines::Line::Record(Err(_)) => LineEventKind::RecordErr,
         };
-        let record_count = records.len();
-        let record = &records[0];
-        // Addendum 19.1 / 17.2: the Duplicate arm (prepare -> take_gap ->
-        // check_attestation -> skip-apply) is shared with the collector's
-        // `feed_record_collect` through `feed_record_tolerant_entry`. On
-        // `Duplicate`, continue without updating `state.offset` /
-        // `state.newline`; on `General`, run `feed_record_apply_tolerant`.
-        let prep = classifier.feed_record_tolerant_entry(record, record_count, trail)?;
-        if matches!(prep, TolerantPrep::Duplicate) {
-            continue;
-        }
-        classifier.feed_record_apply_tolerant(record)?;
-        let Some(run_state) = classifier.state() else {
-            return Err(corrupt("missing head"));
-        };
-        let head = run_state.head;
-        let new_run = run_state.clone();
-        // The reader rebuilds `State`'s writer-only fields through the shared
-        // `next_cp_fields` helper so the three fold sites (`scan_inner`,
-        // `apply_checked` and this fallback) stay identical on every input;
-        // the classifier owns the `RunState`.
-        let (cp_time, since_cp) = next_cp_fields(
-            state
-                .as_ref()
-                .map(|s| (s.checkpoint_time, s.since_checkpoint)),
-            record,
-        );
-        let (length_prev, gap_prev) = state
-            .as_ref()
-            .map_or((0, None), |s| (s.length, s.gap.clone()));
-        state = Some(State {
-            run: new_run,
-            offset,
-            length: length_prev,
-            checkpoint_time: cp_time,
-            since_checkpoint: since_cp,
+        Ok(Some(DecodedLine {
+            kind,
+            offset_after: tolerant_offset,
             newline,
-            gap: gap_prev,
-        });
-        if expected == Some(head) {
-            *found = Some(record.clone());
+        }))
+    };
+
+    // Reader-side `on_feed`: rebuilds the reader's `State` on each
+    // successful record fold (addendum 20.1), using the writer-only
+    // `next_cp_fields` fold that stays on the storage side, and
+    // updates `newline` only for a fragment/unparsable; duplicates
+    // skip `on_feed` entirely so the reader's prior `continue`
+    // semantic is preserved.
+    let mut tol_found: Option<Record> = initial_found;
+    let on_feed = |fed: Option<(&Record, &RunState)>, offset_after: u64, newline_after: bool| {
+        final_offset = offset_after;
+        if let Some((record, rs)) = fed {
+            let (cp_time, since_cp) = next_cp_fields(
+                out_state
+                    .as_ref()
+                    .map(|s| (s.checkpoint_time, s.since_checkpoint)),
+                record,
+            );
+            let head = rs.head;
+            out_state = Some(State {
+                run: rs.clone(),
+                offset: offset_after,
+                length: initial_length,
+                checkpoint_time: cp_time,
+                since_checkpoint: since_cp,
+                newline: newline_after,
+                gap: initial_gap.clone(),
+            });
+            if expected == Some(head) {
+                tol_found = Some(record.clone());
+            }
+        } else if let Some(s) = &mut out_state {
+            s.newline = newline_after;
+        }
+    };
+
+    let walk = runs::history_segment::<(State, Option<Record>), _, _, _>(
+        Reaction::Stop,
+        strict,
+        events,
+        prior_run,
+        ctx,
+        unsealed_boundary,
+        *run,
+        trail,
+        on_feed,
+    )?;
+
+    match walk {
+        HistorySegmentWalk::Strict((next, strict_found)) => {
+            *run = false;
+            *found = strict_found;
+            Ok(Some(next))
+        }
+        HistorySegmentWalk::Tolerant(outcome) => {
+            let outcome = *outcome;
+            *run = outcome.run_flag;
+            if let Some(s) = &mut out_state {
+                s.length = final_offset;
+                s.gap = outcome.gap;
+            }
+            *found = tol_found;
+            Ok(out_state)
         }
     }
-    let outcome = classifier.finish_tolerant()?;
-    *run = outcome.run_flag;
-    if let Some(s) = &mut state {
-        s.length = offset;
-        s.gap = outcome.gap;
-    }
-    Ok(state)
 }
 /// Validates a staging successor, requiring a genesis link without a predecessor
 /// and an immediate resume when the predecessor history ends inside a run.

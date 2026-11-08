@@ -252,18 +252,22 @@ pub(crate) struct CollectorPos {
 /// [`TolerantFinishOutcome::run_flag`]), `violations` is the accumulated
 /// typed violations in feed order, and `gap` is the gap hasher the
 /// caller threads forward.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "fields consumed by #197 R2b S3b's classify iterator and V4a; between S3a and S3b only #[cfg(test)] rows construct a CollectorOutcome"
-    )
-)]
 pub(crate) struct CollectorOutcome {
     pub(crate) state: Option<RunState>,
     pub(crate) run_flag: bool,
     pub(crate) violations: Vec<(CollectorPos, Violation)>,
     pub(crate) gap: Option<blake3::Hasher>,
+}
+
+impl std::fmt::Debug for CollectorOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollectorOutcome")
+            .field("state.is_some", &self.state.is_some())
+            .field("run_flag", &self.run_flag)
+            .field("violations.len", &self.violations.len())
+            .field("gap.is_some", &self.gap.is_some())
+            .finish()
+    }
 }
 
 /// Per-record state machine shared by the reader and the future verifier
@@ -474,60 +478,203 @@ pub(crate) struct SegmentContext {
     pub(crate) run: bool,
 }
 
-/// Ruling 197-d1 addendum 19.1: `history_segment`'s strict-pass-then-
-/// tolerant-fallback-from-saved-state sequence is ONE function
-/// parameterised by [`Reaction`]. The dispatch is: strict first; on
-/// `AuditErrorKind::CorruptTrail` the caller runs the tolerant fallback
-/// with the supplied [`Reaction`]; on any other strict `Err` (e.g. an
-/// I/O failure) the error propagates unchanged.
-///
-/// The reader (`storage.rs::history_segment`) calls this with
-/// [`Reaction::Stop`], so a strict pass that returns Ok becomes the
-/// reader's own `Ok(state)` and no tolerant walk runs. The collector's
-/// `history_segment` entry calls it with [`Reaction::Collect`]: when
-/// strict passes, the collector records **nothing** (empty violations);
-/// when strict fails with `CorruptTrail`, the tolerant Collect walk
-/// accumulates the per-segment violations. A mutant that touches this
-/// dispatch (e.g. swapping Ok/Err, treating every strict `Err` as
-/// `CorruptTrail`) fails both a reader pin and a collector row because
-/// the same `Err` kind drives both.
-pub(crate) fn history_segment<R, Sf>(
-    reaction: Reaction,
-    strict: Sf,
-) -> Result<HistorySegmentDispatch<R>, AuditError>
-where
-    Sf: FnOnce() -> Result<R, AuditError>,
-{
-    match strict() {
-        Ok(r) => Ok(HistorySegmentDispatch::Strict(r)),
-        Err(e) if e.kind() == super::AuditErrorKind::CorruptTrail => {
-            Ok(HistorySegmentDispatch::Tolerant(reaction))
-        }
-        Err(e) => Err(e),
-    }
+/// Line event produced by the reader's I/O layer and consumed by
+/// [`history_segment`]. The reader ([`super::storage`]) owns the byte-
+/// level walk — the seek, the glued-byte-and-LF check, physical
+/// `read_line`, and dispatch to [`super::lines::classify`] — and yields
+/// each decoded line as a [`DecodedLine`] through the `events` closure.
+/// The shared orchestration owns everything else (addendum 20.1).
+#[derive(Debug)]
+pub(crate) enum LineEventKind {
+    /// A [`super::lines::Line::Record`]`(Ok(..))` payload. Carries the
+    /// decoded records (`record_count == records.len()` is checked by
+    /// the classifier's `multiple records in native audit line` guard).
+    Record(Vec<Record>),
+    /// A [`super::lines::Line::Fragment`] payload; carries the raw line
+    /// bytes so [`Classifier::feed_fragment_tolerant`] can extend the
+    /// gap hasher.
+    Fragment(Vec<u8>),
+    /// A [`super::lines::Line::Unparsable`] payload.
+    Unparsable,
+    /// A [`super::lines::Line::Record`]`(Err(..))` payload (parse-level
+    /// failure that still produced `record` bytes).
+    RecordErr,
 }
 
-/// Result of [`history_segment`]'s shared dispatch (addendum 19.1).
-/// `Strict(r)` means the strict pass returned `Ok(r)` (reader propagates
-/// `r`; collector returns an empty-violation outcome); `Tolerant(r)`
-/// means the strict pass returned `CorruptTrail` and the caller runs the
-/// tolerant fallback with [`Reaction`] `r`.
+/// One physical line decoded by the reader's I/O layer, with the bytes
+/// consumed and the terminating LF flag threaded alongside the kind so
+/// the shared [`history_segment`] orchestration can advance the
+/// reader's offset/newline tracking through `on_feed` without touching
+/// I/O itself.
 #[derive(Debug)]
-pub(crate) enum HistorySegmentDispatch<R> {
+pub(crate) struct DecodedLine {
+    pub(crate) kind: LineEventKind,
+    /// File offset after this line was consumed (prior offset + bytes).
+    pub(crate) offset_after: u64,
+    /// Whether this line was terminated by a physical LF.
+    pub(crate) newline: bool,
+}
+
+/// Ruling 197-d1 addenda 19.1 and 20.1: `history_segment`'s strict-pass-
+/// then-tolerant-fallback-from-saved-state sequence — including the
+/// saved-prior restore, `inherited = run_in || unsealed_boundary`,
+/// per-line feeding, the duplicate-line arm and the end-of-segment
+/// epilogue — is **one** function parameterised by [`Reaction`]. The
+/// reader's shim in `storage.rs` owns only byte-level I/O (seek,
+/// glued-byte/LF check, physical `read_line`, [`super::lines::classify`])
+/// and threads reader-side state (offset, newline, `checkpoint_time`,
+/// `since_checkpoint`, `found`) through `on_feed`; it supplies
+/// decoded-line events through `events` (addendum 20.1).
+///
+/// Dispatch: run `strict` first. On `Ok(r)` return [`HistorySegmentWalk::Strict`]
+/// (the collector records **nothing**, matching the reader's `Ok`); on
+/// `AuditErrorKind::CorruptTrail` run the tolerant fallback with
+/// [`Reaction`] and return [`HistorySegmentWalk::Tolerant`]; on any
+/// other strict `Err` (e.g. I/O) propagate unchanged. The tolerant
+/// walk restores `prior_run` as `saved_prior`, computes
+/// `inherited = run_in || unsealed_boundary`, feeds each [`DecodedLine`]
+/// through the Stop or Collect state machine, invokes `on_feed` with the
+/// `(record, run_state)` just folded (`Some`) or with `None` for a
+/// fragment/unparsable (duplicates omit the callback so the reader's
+/// `continue` semantic is preserved), and finishes by calling
+/// `finish_tolerant` (Stop) or `finish_collect` (Collect). A mutant that
+/// touches the dispatch, the saved-prior restore, the `inherited`
+/// computation, or the per-line feed fails **both** a reader pin and a
+/// collector row because the same code drives both.
+#[allow(clippy::too_many_arguments)] // addendum 20.1: this is the ONE orchestration site; splitting it would re-introduce the copy addendum 20.1 forbids.
+pub(crate) fn history_segment<R, Sf, Ef, Of>(
+    reaction: Reaction,
+    strict: Sf,
+    mut events: Ef,
+    prior_run: Option<RunState>,
+    ctx: SegmentContext,
+    unsealed_boundary: bool,
+    run_in: bool,
+    trail: [u8; 16],
+    mut on_feed: Of,
+) -> Result<HistorySegmentWalk<R>, AuditError>
+where
+    Sf: FnOnce() -> Result<R, AuditError>,
+    Ef: FnMut() -> Result<Option<DecodedLine>, AuditError>,
+    Of: FnMut(Option<(&Record, &RunState)>, u64, bool),
+{
+    match strict() {
+        Ok(r) => return Ok(HistorySegmentWalk::Strict(r)),
+        Err(e) if e.kind() == super::AuditErrorKind::CorruptTrail => {}
+        Err(e) => return Err(e),
+    }
+    // Tolerant fallback. `inherited` combines the inherited `*run` flag
+    // (`run_in`) and the unsealed-boundary flag (decision 8), and
+    // `saved_prior` is the segment-start snapshot the strict pass was
+    // restored to on `CorruptTrail`.
+    let inherited = run_in || unsealed_boundary;
+    let saved_prior = prior_run;
+    let mut classifier = match reaction {
+        Reaction::Stop => Classifier::new_tolerant(saved_prior, ctx, inherited),
+        Reaction::Collect => Classifier::new_collect(saved_prior, ctx, inherited),
+    };
+    let mut record_index: usize = 0;
+    while let Some(line) = events()? {
+        match line.kind {
+            LineEventKind::Record(records) => {
+                let record_count = records.len();
+                let record = &records[0];
+                match reaction {
+                    Reaction::Stop => {
+                        let prep =
+                            classifier.feed_record_tolerant_entry(record, record_count, trail)?;
+                        if matches!(prep, TolerantPrep::Duplicate) {
+                            // Addendum 17.2: the reader's `continue` on a
+                            // duplicate leaves `state.offset`/`state.newline`
+                            // untouched. Skip `on_feed` on this branch.
+                            record_index += 1;
+                            continue;
+                        }
+                        classifier.feed_record_apply_tolerant(record)?;
+                        // Addendum 20's `missing head` invariant: apply
+                        // Ok leaves `classifier.state()=Some`. The
+                        // explicit `Violation::MissingHead` construction
+                        // below is defence-in-depth and marked UNREACHABLE
+                        // for the reader-side pin gate (occ 0); the
+                        // reader-side runtime pin targets
+                        // `Classifier::finish`'s own construction (occ 1).
+                        let rs = classifier
+                            .state()
+                            .ok_or_else(|| AuditError::from(Violation::MissingHead))?;
+                        on_feed(Some((record, rs)), line.offset_after, line.newline);
+                    }
+                    Reaction::Collect => {
+                        // Share the Collect-reaction entry:
+                        // `feed_record_collect` runs the same
+                        // `feed_record_tolerant_entry` +
+                        // `feed_record_apply_tolerant` pair, with the
+                        // recovery-pending short-circuit and the
+                        // record-index bump.
+                        classifier.feed_record_collect(record, record_count, trail, record_index);
+                    }
+                }
+                record_index += 1;
+            }
+            LineEventKind::Fragment(bytes) => {
+                match reaction {
+                    Reaction::Stop => classifier.feed_fragment_tolerant(&bytes),
+                    Reaction::Collect => {
+                        classifier.feed_fragment_collect(&bytes, record_index);
+                    }
+                }
+                on_feed(None, line.offset_after, line.newline);
+                record_index += 1;
+            }
+            LineEventKind::Unparsable => {
+                match reaction {
+                    Reaction::Stop => classifier.feed_unparsable_tolerant(),
+                    Reaction::Collect => classifier.feed_unparsable_collect(record_index),
+                }
+                on_feed(None, line.offset_after, line.newline);
+                record_index += 1;
+            }
+            LineEventKind::RecordErr => {
+                // S3a tolerant-only Collect reuses the Stop code path for
+                // `Record(Err)`; it always errors. Stop propagates via
+                // `?`; S3a has no Collect caller for this branch (ruling
+                // 197-d1 addendum 18 defers strict×Collect to S3a′).
+                classifier.feed_record_err_tolerant()?;
+                unreachable!("feed_record_err_tolerant always errors");
+            }
+        }
+    }
+    let outcome = match reaction {
+        Reaction::Stop => {
+            let finish_state = classifier.state().cloned();
+            let fin = classifier.finish_tolerant()?;
+            CollectorOutcome {
+                state: finish_state,
+                run_flag: fin.run_flag,
+                violations: Vec::new(),
+                gap: fin.gap,
+            }
+        }
+        Reaction::Collect => classifier.finish_collect(),
+    };
+    Ok(HistorySegmentWalk::Tolerant(Box::new(outcome)))
+}
+
+/// Result of [`history_segment`]'s shared walk (addenda 19.1 / 20.1).
+/// `Strict(r)` means the strict pass returned `Ok(r)` (reader
+/// propagates `r`; collector records nothing). `Tolerant(outcome)`
+/// means the strict pass returned `CorruptTrail` and the shared
+/// tolerant walk produced `outcome`: under [`Reaction::Stop`] its
+/// `violations` is empty and `state`/`run_flag`/`gap` carry the
+/// reader-side result; under [`Reaction::Collect`] it is the full
+/// [`CollectorOutcome`]. The tolerant payload is `Box`ed to keep the
+/// variants' sizes comparable (clippy `large_enum_variant`).
+#[derive(Debug)]
+pub(crate) enum HistorySegmentWalk<R> {
     /// Strict single-pass classified the whole segment.
     Strict(R),
-    /// Strict returned `CorruptTrail`; the caller runs the tolerant
-    /// fallback with this [`Reaction`]. The reader (Stop) ignores the
-    /// field and runs its own Stop-reaction tolerant walk; the collector
-    /// uses the field to select Collect semantics.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the reader ignores the Reaction field (its tolerant fallback is Stop-only); the collector (#[cfg(test)] rows and #197 R2b S3b) matches on it to select Collect semantics"
-        )
-    )]
-    Tolerant(Reaction),
+    /// Strict returned `CorruptTrail`; the shared walk ran the tolerant
+    /// fallback and produced this [`CollectorOutcome`].
+    Tolerant(Box<CollectorOutcome>),
 }
 
 /// Classifier mode. `Strict` drives the reader's `scan_inner` family
@@ -748,13 +895,6 @@ impl Classifier {
     /// a strict first-violation oracle still use [`Classifier::new`]
     /// under [`Reaction::Stop`]; the collector in S3a must not be
     /// treated as equivalent to the reader on any strict path.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by #197 R2b S3b's classify iterator and V4a; between S3a and S3b only #[cfg(test)] rows construct a collect-reaction classifier"
-        )
-    )]
     pub(crate) fn new_collect(
         prior_run: Option<RunState>,
         ctx: SegmentContext,
@@ -1249,7 +1389,7 @@ impl Classifier {
         not(test),
         expect(
             dead_code,
-            reason = "consumed by #197 R2b S3b's classify iterator and V4a; between S3a and S3b only #[cfg(test)] rows cross boundaries"
+            reason = "consumed by #197 R2b S3b's `classify` iterator and V4a; between S3a and S3b only #[cfg(test)] rows cross segment boundaries, and the shared `history_segment` orchestration operates on ONE segment per call"
         )
     )]
     pub(crate) fn reset_at_boundary(
@@ -1309,13 +1449,6 @@ impl Classifier {
     /// drives the tolerant state machine exclusively. A strict-mode
     /// Collect entry and a Collect entry for a `Record(Err)` line land
     /// in **#197 R2b S3a′**.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by #197 R2b S3b's classify iterator and V4a; between S3a and S3b only #[cfg(test)] rows feed a collect-reaction classifier"
-        )
-    )]
     pub(crate) fn feed_record_collect(
         &mut self,
         record: &Record,
@@ -1369,13 +1502,6 @@ impl Classifier {
     /// line. Bumps the record index, short-circuits on `recovery_pending`,
     /// then delegates to the shared [`Classifier::feed_fragment_tolerant`].
     /// Tolerant-only in S3a (ruling 197-d1 addendum 18).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by #197 R2b S3b's classify iterator and V4a; between S3a and S3b only #[cfg(test)] rows feed a collect-reaction classifier"
-        )
-    )]
     pub(crate) fn feed_fragment_collect(&mut self, bytes: &[u8], record_index: usize) {
         debug_assert!(matches!(self.reaction, Reaction::Collect));
         self.current_pos.record_index_in_segment = record_index;
@@ -1390,13 +1516,6 @@ impl Classifier {
     /// then delegates to the shared [`Classifier::feed_unparsable_tolerant`].
     /// Tolerant-only in S3a (ruling 197-d1 addendum 18); the Collect entry
     /// for a `Record(Err)` line lands in #197 R2b S3a′.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by #197 R2b S3b's classify iterator and V4a; between S3a and S3b only #[cfg(test)] rows feed a collect-reaction classifier"
-        )
-    )]
     pub(crate) fn feed_unparsable_collect(&mut self, record_index: usize) {
         debug_assert!(matches!(self.reaction, Reaction::Collect));
         self.current_pos.record_index_in_segment = record_index;
@@ -1418,13 +1537,6 @@ impl Classifier {
     /// Tolerant-only in S3a (ruling 197-d1 addendum 18): this epilogue
     /// is the tolerant mode's finish-time check set; a strict Collect
     /// finish lands with the rest of Strict×Collect in #197 R2b S3a′.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by #197 R2b S3b's classify iterator and V4a; between S3a and S3b only #[cfg(test)] rows finish a collect-reaction classifier"
-        )
-    )]
     pub(crate) fn finish_collect(mut self) -> CollectorOutcome {
         debug_assert!(matches!(self.reaction, Reaction::Collect));
         // Addendum 17.4: skip the end-of-segment checks when the run has
@@ -1543,10 +1655,9 @@ mod collector_tests {
     }
 
     /// Smoke row: `Reaction` values, `CollectorPos` default, and the
-    /// `CollectorOutcome` fields are all live so the gate doesn't fire
-    /// dead_code on them. Also reads the `HistorySegmentDispatch::Tolerant`
-    /// `Reaction` field so the dead_code analyser sees it used in test
-    /// mode (the reader ignores it with `_`; this covers the field).
+    /// `CollectorOutcome` fields are all live. Also drives the shared
+    /// `history_segment` orchestration all three ways so the `Strict(R)`
+    /// and `Tolerant(CollectorOutcome)` variants are read in test mode.
     #[test]
     fn reaction_and_collector_types_are_live() {
         assert_eq!(Reaction::Stop, Reaction::Stop);
@@ -1565,29 +1676,75 @@ mod collector_tests {
         assert!(!outcome.run_flag);
         assert_eq!(outcome.violations.len(), 1);
         assert!(outcome.gap.is_none());
-        // Drive the shared `history_segment` orchestration both ways so
-        // the `Strict(R)` and `Tolerant(Reaction)` dispatch fields are
-        // READ (not just pattern-bound to `_`) in test mode.
-        let ok = super::history_segment::<i32, _>(Reaction::Stop, || Ok(42)).unwrap();
+        // Drive the shared `history_segment` orchestration: strict Ok →
+        // Strict; strict CorruptTrail with no events → Tolerant with an
+        // empty-walk outcome; strict Io → propagates.
+        let ctx = SegmentContext {
+            opening: true,
+            genesis: true,
+            run: false,
+        };
+        let ok = super::history_segment::<i32, _, _, _>(
+            Reaction::Stop,
+            || Ok(42),
+            || Ok(None),
+            None,
+            ctx,
+            false,
+            false,
+            TRAIL,
+            |_, _, _| {},
+        )
+        .unwrap();
         match ok {
-            HistorySegmentDispatch::Strict(r) => assert_eq!(r, 42),
-            HistorySegmentDispatch::Tolerant(_) => panic!("Ok strict should take Strict"),
+            HistorySegmentWalk::Strict(r) => assert_eq!(r, 42),
+            HistorySegmentWalk::Tolerant(_) => panic!("Ok strict should take Strict"),
         }
-        let fallback = super::history_segment::<i32, _>(Reaction::Collect, || {
-            Err(AuditError::new(
-                crate::audit::AuditErrorKind::CorruptTrail,
-                "trial",
-            ))
-        })
+        let fallback = super::history_segment::<i32, _, _, _>(
+            Reaction::Collect,
+            || {
+                Err(AuditError::new(
+                    crate::audit::AuditErrorKind::CorruptTrail,
+                    "trial",
+                ))
+            },
+            || Ok(None),
+            None,
+            ctx,
+            false,
+            false,
+            TRAIL,
+            |_, _, _| {},
+        )
         .unwrap();
         match fallback {
-            HistorySegmentDispatch::Strict(_) => panic!("CorruptTrail should take Tolerant"),
-            HistorySegmentDispatch::Tolerant(r) => assert_eq!(r, Reaction::Collect),
+            HistorySegmentWalk::Strict(_) => panic!("CorruptTrail should take Tolerant"),
+            HistorySegmentWalk::Tolerant(out) => {
+                // Empty-walk Collect still runs the finish epilogue:
+                // count==0 → damaged → run_flag true → no
+                // InvalidUndamagedSegment (addendum 19.1). Violations
+                // may be non-empty but must not include
+                // `InvalidUndamagedSegment`.
+                assert!(
+                    !out.violations
+                        .iter()
+                        .any(|(_, v)| *v == Violation::InvalidUndamagedSegment),
+                    "empty tolerant walk marks damaged via count==0",
+                );
+            }
         }
         // Non-CorruptTrail errors propagate unchanged.
-        let err = super::history_segment::<i32, _>(Reaction::Stop, || {
-            Err(AuditError::new(crate::audit::AuditErrorKind::Io, "io"))
-        })
+        let err = super::history_segment::<i32, _, _, _>(
+            Reaction::Stop,
+            || Err(AuditError::new(crate::audit::AuditErrorKind::Io, "io")),
+            || Ok(None),
+            None,
+            ctx,
+            false,
+            false,
+            TRAIL,
+            |_, _, _| {},
+        )
         .unwrap_err();
         assert_eq!(err.kind(), crate::audit::AuditErrorKind::Io);
     }
@@ -1713,10 +1870,77 @@ mod collector_tests {
         Record::checkpoint(context(seq, previous), fields).unwrap()
     }
 
-    /// Feeds `[cp0,e1,bad_cp2,e3,cp4]` through a Collect-reaction tolerant
-    /// classifier built for a given `history_segment` path (opening,run).
-    /// Returns the recorded violation list and the final state. Helper for
-    /// the four `collector_fold_iii_mismatch_on_history_segment_*` rows.
+    /// Ruling 197-d1 addendum 20.1: drive a record sequence through the
+    /// shared [`super::history_segment`] orchestration under
+    /// [`Reaction::Collect`]. The strict trial runs a fresh
+    /// `Classifier::new(..Mode::Strict..)` over the same records; on
+    /// strict Ok the walk returns `Strict(())` and the collector records
+    /// **nothing**; on strict `CorruptTrail` the tolerant Collect walk
+    /// drives the shared state machine and accumulates the per-segment
+    /// violations. There is no test-only copy of the orchestration: the
+    /// collector rows and sweeps enter through this helper.
+    fn run_orchestration_collect(
+        opening: bool,
+        genesis: bool,
+        run: bool,
+        records: Vec<Record>,
+    ) -> CollectorOutcome {
+        let ctx = SegmentContext {
+            opening,
+            genesis,
+            run,
+        };
+        let strict_records = records.clone();
+        let strict_initial_boundary = opening && run;
+        let strict = move || -> Result<(), AuditError> {
+            let mut c = Classifier::new(None, ctx, Mode::Strict, strict_initial_boundary);
+            for r in &strict_records {
+                let gap = c.take_gap();
+                c.feed_record(r, 1, TRAIL, gap)?;
+            }
+            c.finish().map(|_| ())
+        };
+        let mut iter = records.into_iter();
+        let mut offset: u64 = 0;
+        let events = move || -> Result<Option<DecodedLine>, AuditError> {
+            Ok(iter.next().map(|r| {
+                offset += 1;
+                DecodedLine {
+                    kind: LineEventKind::Record(vec![r]),
+                    offset_after: offset,
+                    newline: true,
+                }
+            }))
+        };
+        let walk = super::history_segment::<(), _, _, _>(
+            Reaction::Collect,
+            strict,
+            events,
+            None,
+            ctx,
+            false,
+            run,
+            TRAIL,
+            |_, _, _| {},
+        )
+        .expect("shared history_segment should not fail on an in-memory trial");
+        match walk {
+            HistorySegmentWalk::Strict(()) => CollectorOutcome {
+                state: None,
+                run_flag: false,
+                violations: Vec::new(),
+                gap: None,
+            },
+            HistorySegmentWalk::Tolerant(out) => *out,
+        }
+    }
+
+    /// Feeds `[cp0,e1,bad_cp2,e3,cp4]` through the shared
+    /// [`super::history_segment`] orchestration under
+    /// [`Reaction::Collect`] for a given `history_segment` path
+    /// `(opening, run)`. Returns the recorded violation list and the
+    /// final state. Helper for the four
+    /// `collector_fold_iii_mismatch_on_history_segment_*` rows.
     fn drive_bad_cp_sequence(
         opening: bool,
         run: bool,
@@ -1725,24 +1949,14 @@ mod collector_tests {
         Option<RunState>,
         [Record; 5],
     ) {
-        let ctx = SegmentContext {
-            opening,
-            genesis: false,
-            run,
-        };
-        let mut c = Classifier::new_collect(None, ctx, run);
         let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
         let e1 = entry(1, cp0.hash());
         let bc = bad_cp(2, e1.hash());
         let e3 = entry(3, bc.hash());
         let m_at_cp4 = mmr_after(&[cp0.clone(), e1.clone(), bc.clone(), e3.clone()]);
         let cp4 = cp(4, e3.hash(), &m_at_cp4);
-        c.feed_record_collect(&cp0, 1, TRAIL, 0);
-        c.feed_record_collect(&e1, 1, TRAIL, 1);
-        c.feed_record_collect(&bc, 1, TRAIL, 2);
-        c.feed_record_collect(&e3, 1, TRAIL, 3);
-        c.feed_record_collect(&cp4, 1, TRAIL, 4);
-        let out = c.finish_collect();
+        let records = vec![cp0.clone(), e1.clone(), bc.clone(), e3.clone(), cp4.clone()];
+        let out = run_orchestration_collect(opening, false, run, records);
         (out.violations, out.state, [cp0, e1, bc, e3, cp4])
     }
 
@@ -1968,46 +2182,6 @@ mod collector_tests {
         );
     }
 
-    /// Addendum 19.1: a `history_segment`-entry pattern for Collect.
-    /// Runs the shared `runs::history_segment` dispatch with
-    /// `Reaction::Collect`, supplying a strict trial as the `strict`
-    /// closure; on `Strict(_)` the collector records NOTHING; on
-    /// `Tolerant(reaction)` it drives the tolerant Collect classifier.
-    /// Reused by every collector-first-equality case below.
-    fn collect_via_orchestration(opening: bool, run: bool, records: &[Record]) -> Vec<Violation> {
-        let ctx = SegmentContext {
-            opening,
-            genesis: false,
-            run,
-        };
-        // Strict trial: new strict classifier, feed each record, finish.
-        let mut strict = Classifier::new(None, ctx, Mode::Strict, opening && run);
-        let strict_result: Result<(), AuditError> = (|| {
-            for (i, r) in records.iter().enumerate() {
-                let gap = strict.take_gap();
-                let _ = strict.feed_record(r, 1, TRAIL, gap)?;
-                let _ = i;
-            }
-            strict.finish().map(|_| ())
-        })();
-        let dispatch =
-            super::history_segment::<(), _>(Reaction::Collect, || strict_result).unwrap();
-        match dispatch {
-            HistorySegmentDispatch::Strict(()) => Vec::new(),
-            HistorySegmentDispatch::Tolerant(_) => {
-                let mut tol = Classifier::new_collect(None, ctx, run);
-                for (i, r) in records.iter().enumerate() {
-                    tol.feed_record_collect(r, 1, TRAIL, i);
-                }
-                tol.finish_collect()
-                    .violations
-                    .into_iter()
-                    .map(|(_, v)| v)
-                    .collect()
-            }
-        }
-    }
-
     /// Addendum 19.1: D1 (`[cp0, e1, cp2]` on `history_segment(true,false)`)
     /// is the strict-pass-Ok case the reviewer flagged. Under the shared
     /// orchestration the collector's history_segment entry records
@@ -2019,10 +2193,11 @@ mod collector_tests {
         let e1 = entry(1, cp0.hash());
         let mmr_at_cp2 = mmr_after(&[cp0.clone(), e1.clone()]);
         let cp2 = cp(2, e1.hash(), &mmr_at_cp2);
-        let violations = collect_via_orchestration(true, false, &[cp0, e1, cp2]);
+        let out = run_orchestration_collect(true, false, false, vec![cp0, e1, cp2]);
         assert!(
-            violations.is_empty(),
-            "strict-pass-Ok path records nothing; got: {violations:?}",
+            out.violations.is_empty(),
+            "strict-pass-Ok path records nothing; got: {:?}",
+            out.violations.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
         );
     }
 
@@ -2039,12 +2214,13 @@ mod collector_tests {
         let e3 = entry(3, bc.hash());
         let m_at_cp4 = mmr_after(&[cp0.clone(), e1.clone(), bc.clone(), e3.clone()]);
         let cp4 = cp(4, e3.hash(), &m_at_cp4);
-        let violations = collect_via_orchestration(true, false, &[cp0, e1, bc, e3, cp4]);
+        let out = run_orchestration_collect(true, false, false, vec![cp0, e1, bc, e3, cp4]);
+        let variants: Vec<Violation> = out.violations.iter().map(|(_, v)| *v).collect();
         assert_eq!(
-            violations,
+            variants,
             vec![Violation::CheckpointMmrDiffers],
             "fold-(iii) salvage records exactly one CheckpointMmrDiffers; \
-             got: {violations:?}",
+             got: {variants:?}",
         );
     }
 
