@@ -3770,15 +3770,23 @@ mod details {
             .unwrap();
     }
 
-    /// SB2 glue across segments, refresh rotate: the cached-file
-    /// prelude's trailing record was unterminated; a `\n` is appended
-    /// before the rotation. The prelude's lazy tolerant glue check
-    /// inside `SegmentBytes::next_event` consumes that `\n` cleanly,
-    /// so the tolerant walk proceeds. Even so, strict wins on this
-    /// layout (the appended LF completes the cp0 record cleanly), and
-    /// refresh-rotate returns Ok. Pins `(offset, length, newline)` of
-    /// the final live `State` after the rotate path. A dropped glue
-    /// check (MA2) would see a leading unexpected byte and error.
+    /// SB2 glue across segments, refresh rotate: the cached live
+    /// ends without LF on cp0, and is rotated into seg_0 as-is. The
+    /// fresh live carries a cp1 opening that links to cp0. On
+    /// refresh, the rotate branch walks the prelude first (seg_0's
+    /// unterminated cp0 bytes), which the shared `SegmentSource`
+    /// yields before listing newer segments; the trailing live is
+    /// then scanned as its own opening segment. Pins the FINAL
+    /// `(offset, length, newline, gap)` tuple from the live scan,
+    /// which must land exactly at the end of cp1 with a trailing LF.
+    /// Kills the byte-bookkeeping mutants on the live-segment scan:
+    /// `MA3` (`note_record_fed` offset off-by-one) and `MA3b`
+    /// (`offset_cursor` off-by-one) move `offset` and `length` away
+    /// from the pinned cp1 line length; `NRF1` (drops the
+    /// `last_newline` write) leaves `newline = false` from the
+    /// prelude's unterminated state; `NRF2` (drops the `last_offset`
+    /// write) leaves `offset = 1471` (the prelude cursor) instead
+    /// of the cp1 record boundary.
     #[test]
     fn sb2_glue_across_segments_refresh_rotate_ok() {
         let d = Temp::new();
@@ -3788,9 +3796,9 @@ mod details {
         assert!(cached_bytes.pop() == Some(b'\n'));
         fs::write(d.0.join("audit.jsonl"), &cached_bytes).unwrap();
         let reader = TrailReader::open(&d.0, TRAIL, None).unwrap();
-        // Complete the cached record with `\n`, rotate it, build a new
-        // live with a cp1-based opening.
-        append_bytes(&d.0.join("audit.jsonl"), b"\n");
+        // Rotate the unterminated cached file as-is; the prelude
+        // intentionally ends without LF so the refresh-rotate walk
+        // enters its glue-check branch on the prelude segment.
         fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
         let opening = cp(1, f.hash(), &seeded(&f));
         fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
@@ -3864,27 +3872,31 @@ mod details {
             .unwrap();
     }
 
-    /// SB4 fragment at a segment END, exercised through the
-    /// multi-segment `history_segment` tolerant fallback:
-    /// `[cp0, "{\"torn\":\n"]`. The strict scan fails on the
-    /// fragment, so the walk enters the tolerant fallback which
-    /// decodes `{"torn":\n` as `Line::Fragment`, tracks a repair
-    /// gap and returns Ok with `state.gap.is_some()`. If
-    /// `SegmentBytes::next_event` routed Fragment as Unparsable
-    /// (MA4), the tolerant walk would emit the pinned detail
-    /// `"unparsable line before complete record"` and this test
-    /// would see Err, not the pinned Ok+gap tuple.
+    /// SB4 fragment at a segment END, exercised through a real
+    /// multi-segment path: `seg_0 = [cp0, "{\"torn\":"]` (fragment
+    /// without LF at the end of the sealed segment) plus a cp1 live.
+    /// `TrailReader::open` walks seg_0 first through
+    /// `history_segment`, which lands a repair gap with `newline=
+    /// false`; the trailing live then enters its own scan with a
+    /// pending resume from the unterminated boundary and no resume
+    /// declaration follows. Pins the exact detail
+    /// `"resume checkpoint lacks its declaration"`. Under `MA4`
+    /// (Fragment routed as Unparsable) seg_0's walk would error
+    /// with `"invalid audit line or opening checkpoint"` and this
+    /// pin would miss.
     #[test]
     fn sb4_fragment_at_segment_end_multi_segment() {
         let f = cp0();
-        let fragment = b"{\"torn\":\n";
+        let fragment = b"{\"torn\":";
         let d = Temp::new();
-        w(&d, &[line(&f), fragment.to_vec()].concat());
-        let state = hsc(&o(&d), None, true, false)
-            .expect("Ok")
-            .expect("state=Some once cp0 folds");
-        assert!(state.gap.is_some(), "fragment at end sets gap");
-        assert!(state.newline);
+        fs::write(segment(&d.0, 0), [line(&f), fragment.to_vec()].concat()).unwrap();
+        let cp1_rec = cp(1, f.hash(), &seeded(&f));
+        fs::write(d.0.join("audit.jsonl"), line(&cp1_rec)).unwrap();
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "resume checkpoint lacks its declaration",
+            0,
+        );
     }
 
     /// SB4 fragment at a segment START, exercised through the
@@ -3960,6 +3972,63 @@ mod details {
         let res = hsc(&o(&d), Some(s), false, true).expect("history_segment Ok");
         let state = res.expect("Some(state) when the initial state was Some");
         assert_eq!(state.length, unterm_len + 10);
+    }
+
+    /// MH5 killer: on a strict refresh over an unterminated state
+    /// with no new bytes, `consume_glue_byte` must return `Ok(false)`
+    /// (count=0 at EOF), NOT `Ok(true)`. The merged helper's EOF
+    /// branch feeds `check_glue_byte_strict`, so returning `true` on
+    /// EOF would promote `last_newline` to `true` through the
+    /// strict-side glue promotion while leaving `offset_cursor`
+    /// unchanged; the state would appear terminated and a later
+    /// refresh would stop checking for glue bytes. Pins
+    /// `(offset, length, newline)` first with no new bytes, so the
+    /// mutant's spurious `last_newline = true` flips the pinned
+    /// `false`. Then appends an `x` byte and refreshes again: the
+    /// base reader errors with `bytes glued to complete unterminated
+    /// record` because the glue byte must be LF.
+    #[test]
+    fn mh5_strict_glue_eof_returns_false() {
+        let (d, s, _f) = state_unterminated();
+        let unterm_len = s.offset;
+        let after = scc(&o(&d), Some(s.clone()), false).expect("scan Ok at EOF");
+        assert_eq!(after.offset, unterm_len);
+        assert_eq!(after.length, unterm_len);
+        assert!(!after.newline);
+        append_bytes(&d.0.join("audit.jsonl"), b"x");
+        assert_corrupt(
+            scc(&o(&d), Some(after), false),
+            "bytes glued to complete unterminated record",
+            0,
+        );
+    }
+
+    /// SCN1 killer: on a strict path, `scan_inner` builds
+    /// `State { length: bytes.offset_cursor() }`, not
+    /// `bytes.last_offset()`. The two diverge when a Fragment is
+    /// decoded on an opening segment with a sealed predecessor in
+    /// scope: strict's `feed_fragment` extends the gap hasher and
+    /// returns Ok (the fragment is NOT an opening-line violation
+    /// here, because a complete record is in scope), so the walk
+    /// finishes with `last_offset` at the record boundary but
+    /// `offset_cursor` past the fragment bytes. Layout:
+    /// `[cp0, "{\"torn\":"]` (fragment at end, no LF). Pins
+    /// `offset = len(cp0)` (last_offset at the record boundary)
+    /// and `length = len(cp0) + 8` (cursor past the fragment).
+    /// Under SCN1 (`length: last_offset()`), length would collapse
+    /// to `len(cp0)` and this test would fail.
+    #[test]
+    fn scn1_strict_fragment_length_is_offset_cursor() {
+        let f = cp0();
+        let fragment = b"{\"torn\":";
+        let d = Temp::new();
+        w(&d, &[line(&f), fragment.to_vec()].concat());
+        let s = scc(&o(&d), None, true).expect("strict Ok with gap after fragment");
+        let cp0_len = line(&f).len() as u64;
+        assert_eq!(s.offset, cp0_len);
+        assert_eq!(s.length, cp0_len + fragment.len() as u64);
+        assert!(!s.newline);
+        assert!(s.gap.is_some());
     }
 
     // ---- Coverage gate --------------------------------------------------
