@@ -506,6 +506,28 @@ pub(crate) struct DecodedLine {
     pub(crate) newline: bool,
 }
 
+/// Addendum 22.1 / 20.1: event kind handed to `history_segment`'s
+/// `on_feed` callback. `Record` is a successful fold; `Duplicate` is a
+/// tolerant-mode duplicate line (base-identical: advance the stream
+/// cursor for `s.length` but leave `state.offset` / `state.newline`
+/// alone); `NonRecord` is a fragment or unparsable line.
+pub(crate) enum FeedEvent<'a> {
+    Record(&'a Record, &'a RunState),
+    Duplicate,
+    NonRecord,
+}
+
+/// Addendum 22.4 / 20.1: segment-shape inputs to the shared
+/// [`history_segment`] walk, grouped so the function signature stays at
+/// five arguments without a `#[allow(clippy::too_many_arguments)]`.
+pub(crate) struct HistorySegmentArgs {
+    pub(crate) ctx: SegmentContext,
+    pub(crate) prior_run: Option<RunState>,
+    pub(crate) unsealed_boundary: bool,
+    pub(crate) run_in: bool,
+    pub(crate) trail: [u8; 16],
+}
+
 /// Ruling 197-d1 addenda 19.1 / 20.1: the ONE `history_segment`
 /// orchestration — saved-prior restore, `inherited = run_in ||
 /// unsealed_boundary`, per-line feeding, the duplicate-line arm, the
@@ -517,26 +539,22 @@ pub(crate) struct DecodedLine {
 /// `AuditErrorKind::CorruptTrail` → tolerant fallback with
 /// [`Reaction`] → [`HistorySegmentWalk::Tolerant`]; any other strict
 /// `Err` propagates unchanged. The tolerant walk calls `on_feed` with
-/// the folded `(record, run_state)` (`Some`) or with `None` for
-/// fragment/unparsable; duplicates skip `on_feed` so the reader's
-/// `continue` semantic is preserved. A mutant touching any shared
-/// line fails **both** a reader pin and a collector row.
-#[allow(clippy::too_many_arguments)] // addendum 20.1: ONE orchestration site; splitting re-introduces the forbidden copy.
+/// [`FeedEvent::Record`] on a folded line, [`FeedEvent::Duplicate`] on
+/// the duplicate-line arm (addendum 22.1: base advances the stream
+/// cursor so `s.length` is byte-identical) and [`FeedEvent::NonRecord`]
+/// on a fragment or unparsable line. A mutant touching any shared line
+/// fails **both** a reader pin and a collector row.
 pub(crate) fn history_segment<R, Sf, Ef, Of>(
     reaction: Reaction,
+    args: HistorySegmentArgs,
     strict: Sf,
     mut events: Ef,
-    prior_run: Option<RunState>,
-    ctx: SegmentContext,
-    unsealed_boundary: bool,
-    run_in: bool,
-    trail: [u8; 16],
     mut on_feed: Of,
 ) -> Result<HistorySegmentWalk<R>, AuditError>
 where
     Sf: FnOnce() -> Result<R, AuditError>,
     Ef: FnMut() -> Result<Option<DecodedLine>, AuditError>,
-    Of: FnMut(Option<(&Record, &RunState)>, u64, bool),
+    Of: FnMut(FeedEvent<'_>, u64, bool),
 {
     match strict() {
         Ok(r) => return Ok(HistorySegmentWalk::Strict(r)),
@@ -544,14 +562,14 @@ where
         Err(e) => return Err(e),
     }
     // Tolerant fallback. `inherited` combines the inherited `*run` flag
-    // (`run_in`) and the unsealed-boundary flag (decision 8), and
-    // `saved_prior` is the segment-start snapshot the strict pass was
-    // restored to on `CorruptTrail`.
-    let inherited = run_in || unsealed_boundary;
-    let saved_prior = prior_run;
+    // (`run_in`) and the unsealed-boundary flag (decision 8); `prior_run`
+    // is the segment-start snapshot the strict pass was restored to on
+    // `CorruptTrail`.
+    let (ctx, trail) = (args.ctx, args.trail);
+    let inherited = args.run_in || args.unsealed_boundary;
     let mut classifier = match reaction {
-        Reaction::Stop => Classifier::new_tolerant(saved_prior, ctx, inherited),
-        Reaction::Collect => Classifier::new_collect(saved_prior, ctx, inherited),
+        Reaction::Stop => Classifier::new_tolerant(args.prior_run, ctx, inherited),
+        Reaction::Collect => Classifier::new_collect(args.prior_run, ctx, inherited),
     };
     let mut record_index: usize = 0;
     while let Some(line) = events()? {
@@ -564,9 +582,12 @@ where
                         let prep =
                             classifier.feed_record_tolerant_entry(record, record_count, trail)?;
                         if matches!(prep, TolerantPrep::Duplicate) {
-                            // Addendum 17.2: the reader's `continue` on a
-                            // duplicate leaves `state.offset`/`state.newline`
-                            // untouched. Skip `on_feed` on this branch.
+                            // Addendum 22.1: the duplicate arm advances
+                            // the stream cursor (so `s.length` is
+                            // byte-identical to base) but leaves
+                            // `state.offset` and `state.newline`
+                            // untouched (addendum 17.2).
+                            on_feed(FeedEvent::Duplicate, line.offset_after, line.newline);
                             record_index += 1;
                             continue;
                         }
@@ -581,7 +602,11 @@ where
                         let rs = classifier
                             .state()
                             .ok_or_else(|| AuditError::from(Violation::MissingHead))?;
-                        on_feed(Some((record, rs)), line.offset_after, line.newline);
+                        on_feed(
+                            FeedEvent::Record(record, rs),
+                            line.offset_after,
+                            line.newline,
+                        );
                     }
                     Reaction::Collect => {
                         // Share the Collect-reaction entry:
@@ -602,7 +627,7 @@ where
                         classifier.feed_fragment_collect(&bytes, record_index);
                     }
                 }
-                on_feed(None, line.offset_after, line.newline);
+                on_feed(FeedEvent::NonRecord, line.offset_after, line.newline);
                 record_index += 1;
             }
             LineEventKind::Unparsable => {
@@ -610,7 +635,7 @@ where
                     Reaction::Stop => classifier.feed_unparsable_tolerant(),
                     Reaction::Collect => classifier.feed_unparsable_collect(record_index),
                 }
-                on_feed(None, line.offset_after, line.newline);
+                on_feed(FeedEvent::NonRecord, line.offset_after, line.newline);
                 record_index += 1;
             }
             LineEventKind::RecordErr => {
@@ -1656,15 +1681,18 @@ mod collector_tests {
             genesis: true,
             run: false,
         };
+        let empty_args = || HistorySegmentArgs {
+            ctx,
+            prior_run: None,
+            unsealed_boundary: false,
+            run_in: false,
+            trail: TRAIL,
+        };
         let ok = super::history_segment::<i32, _, _, _>(
             Reaction::Stop,
+            empty_args(),
             || Ok(42),
             || Ok(None),
-            None,
-            ctx,
-            false,
-            false,
-            TRAIL,
             |_, _, _| {},
         )
         .unwrap();
@@ -1674,6 +1702,7 @@ mod collector_tests {
         }
         let fallback = super::history_segment::<i32, _, _, _>(
             Reaction::Collect,
+            empty_args(),
             || {
                 Err(AuditError::new(
                     crate::audit::AuditErrorKind::CorruptTrail,
@@ -1681,11 +1710,6 @@ mod collector_tests {
                 ))
             },
             || Ok(None),
-            None,
-            ctx,
-            false,
-            false,
-            TRAIL,
             |_, _, _| {},
         )
         .unwrap();
@@ -1708,13 +1732,9 @@ mod collector_tests {
         // Non-CorruptTrail errors propagate unchanged.
         let err = super::history_segment::<i32, _, _, _>(
             Reaction::Stop,
+            empty_args(),
             || Err(AuditError::new(crate::audit::AuditErrorKind::Io, "io")),
             || Ok(None),
-            None,
-            ctx,
-            false,
-            false,
-            TRAIL,
             |_, _, _| {},
         )
         .unwrap_err();
@@ -1857,15 +1877,33 @@ mod collector_tests {
         run: bool,
         records: Vec<Record>,
     ) -> CollectorOutcome {
+        run_orchestration_collect_with(opening, genesis, run, records, None, false)
+    }
+
+    /// Addendum 22.3: a Collect-reaction driver that threads a
+    /// non-empty `prior_run` and `unsealed_boundary`. The default
+    /// helper above calls this with `None`/`false`; the mutant-killer
+    /// rows for the shared walk (`inherited = run_in` and
+    /// `saved_prior = None`) pass a non-empty prior and
+    /// `unsealed_boundary = true` so the mutants fail a collector row.
+    fn run_orchestration_collect_with(
+        opening: bool,
+        genesis: bool,
+        run: bool,
+        records: Vec<Record>,
+        prior_run: Option<RunState>,
+        unsealed_boundary: bool,
+    ) -> CollectorOutcome {
         let ctx = SegmentContext {
             opening,
             genesis,
             run,
         };
         let strict_records = records.clone();
-        let strict_initial_boundary = opening && run;
+        let strict_initial_boundary = (opening && run) || unsealed_boundary;
+        let strict_prior = prior_run.clone();
         let strict = move || -> Result<(), AuditError> {
-            let mut c = Classifier::new(None, ctx, Mode::Strict, strict_initial_boundary);
+            let mut c = Classifier::new(strict_prior, ctx, Mode::Strict, strict_initial_boundary);
             for r in &strict_records {
                 let gap = c.take_gap();
                 c.feed_record(r, 1, TRAIL, gap)?;
@@ -1886,13 +1924,15 @@ mod collector_tests {
         };
         let walk = super::history_segment::<(), _, _, _>(
             Reaction::Collect,
+            HistorySegmentArgs {
+                ctx,
+                prior_run,
+                unsealed_boundary,
+                run_in: run,
+                trail: TRAIL,
+            },
             strict,
             events,
-            None,
-            ctx,
-            false,
-            run,
-            TRAIL,
             |_, _, _| {},
         )
         .expect("shared history_segment should not fail on an in-memory trial");
@@ -2151,6 +2191,53 @@ mod collector_tests {
                 .any(|(_, v)| *v == Violation::MissingOrMismatchedAttestation),
             "duplicate-arm share: missing attestation recorded; violations={:?}",
             out.violations.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Addendum 22.3 (fix 3): a single killing row for the two shared-walk
+    /// mutants (`inherited = run_in` and `saved_prior = None`). Prior rows
+    /// drove the shared walk with `prior_run=None` + `unsealed_boundary=false`,
+    /// which left both mutants invisible on every collector row. Here the
+    /// walk runs with `prior_run=Some(cp0.run)` + `unsealed_boundary=true`,
+    /// `run_in=false`, and records `[cp1, e2]`. The exact collected list
+    /// is `[(1, FirstSuccessorLacksImmediateResume)]`:
+    /// cp1 is the first record; `inherited=true` and the first-record trial
+    /// apply against `saved_prior=Some(cp0.run)` succeeds, so `closing`
+    /// latches true; e2 is the second record; `count==1 && closing` with
+    /// e2 not a resume fires `FirstSuccessorLacksImmediateResume` at index 1.
+    /// Mutant `inherited = run_in` drops `unsealed_boundary`: `inherited=false`,
+    /// `closing=false`, the second record folds without the resume check,
+    /// and the epilogue records `InvalidUndamagedSegment` instead.
+    /// Mutant `saved_prior = None` drops the prior: the first-record trial
+    /// applies cp1 as genesis and fails (`InitialCheckpointDoesNotLinkGenesis`),
+    /// so `closing=false`, and `inherited && is_cp && !closing` records
+    /// `FirstSuccessorDoesNotCloseRun` at index 0 instead.
+    #[test]
+    fn collector_shared_walk_mutants_fail_on_prior_and_unsealed_boundary() {
+        let cp0_rec = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        let ctx0 = SegmentContext {
+            opening: true,
+            genesis: false,
+            run: false,
+        };
+        let mut c0 = Classifier::new(None, ctx0, Mode::Strict, false);
+        c0.feed_record(&cp0_rec, 1, TRAIL, None).unwrap();
+        let cp0_run = c0.state().expect("cp0 fold").clone();
+        let m_at_cp1 = mmr_after(std::slice::from_ref(&cp0_rec));
+        let cp1 = cp(1, cp0_rec.hash(), &m_at_cp1);
+        let e2 = entry(2, cp1.hash());
+        let out =
+            run_orchestration_collect_with(true, false, false, vec![cp1, e2], Some(cp0_run), true);
+        let variants: Vec<(usize, Violation)> = out
+            .violations
+            .iter()
+            .map(|(p, v)| (p.record_index_in_segment, *v))
+            .collect();
+        assert_eq!(
+            variants,
+            vec![(1, Violation::FirstSuccessorLacksImmediateResume)],
+            "exact first-equality list; drops of `unsealed_boundary` or \
+             `saved_prior` change this list",
         );
     }
 

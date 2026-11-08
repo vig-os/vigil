@@ -1872,6 +1872,21 @@ mod details {
         let mut r = run;
         history_segment(f, TRAIL, state, opening, None, &mut None, &mut r)
     }
+    /// Addendum 22.1/22.2: history_segment with `expected` + a `found`
+    /// out-parameter, so pins can observe both the returned state and
+    /// the strict-pass partial writes that must survive on the Err path.
+    fn hsc_found(
+        f: &File,
+        state: Option<State>,
+        opening: bool,
+        run: bool,
+        expected: Head,
+    ) -> (Result<Option<State>, AuditError>, Option<Record>) {
+        let mut r = run;
+        let mut found = None;
+        let res = history_segment(f, TRAIL, state, opening, Some(expected), &mut found, &mut r);
+        (res, found)
+    }
     fn scc(f: &File, state: Option<State>, opening: bool) -> Result<State, AuditError> {
         scan(f, TRAIL, state, opening, None, &mut None, false)
     }
@@ -2001,6 +2016,109 @@ mod details {
             hsc(&o(&d), None, true, false),
             "missing or mismatched repair attestation",
             0,
+        );
+    }
+    #[test]
+    fn pin_hs_fallback_duplicate_advances_length_through_feed_callback() {
+        // Addendum 22.1: a trailing duplicate flows through the shared
+        // `on_feed` callback as `FeedEvent::Duplicate`, which advances
+        // the walk's `final_offset` (so `s.length` is base-identical)
+        // while leaving `state.offset` and `state.newline` untouched.
+        // Repro: predecessor `scan([cp0, e1, cp2])`, segment file
+        // `[e3, e3]`, `history_segment(opening=true, run=false)`.
+        // Strict fails with `MissingOpeningCheckpoint` (e3 is an entry
+        // on an opening segment), so the tolerant fallback walks both
+        // copies. A mutant that skips `on_feed` on the duplicate arm
+        // leaves `final_offset` at the first copy, so `s.length` equals
+        // the single-record byte count (base gives 2×, head's bug gave 1×).
+        let cp0_rec = cp0();
+        let e1 = entry(&cp0_rec);
+        let mut mmr = seeded(&cp0_rec);
+        mmr.push(e1.hash()).unwrap();
+        let cp2 = cp(2, e1.hash(), &mmr);
+        let pre = Temp::new();
+        w(&pre, &[line(&cp0_rec), line(&e1), line(&cp2)].concat());
+        let pre_state = scc(&o(&pre), None, true).unwrap();
+        assert_eq!(pre_state.run.head.seq, 2);
+        let e3 = Record::new(context(3, cp2.hash()), Entry::new("a", "c", "o")).unwrap();
+        let seg = Temp::new();
+        let seg_bytes = [line(&e3), line(&e3)].concat();
+        let expected_length = seg_bytes.len() as u64;
+        w(&seg, &seg_bytes);
+        let state = hsc(&o(&seg), Some(pre_state), true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.length, expected_length,
+            "duplicate arm must advance the walk cursor past both copies via on_feed",
+        );
+    }
+    #[test]
+    fn pin_hs_found_persists_on_strict_write_before_tolerant_duplicate() {
+        // Addendum 22.2: on the Ok path through the tolerant fallback,
+        // strict's partial `*found` write survives because the two
+        // passes share one buffer (base-identical: a single `&mut found`
+        // was threaded through both passes). Layout: predecessor at e1
+        // (continuation, opening=false); the live file holds
+        // `[cp0, e1, e1_duplicate, unparsable]`. Strict scans from
+        // pred.offset: the duplicate e1 is `Advance::Duplicate`, so
+        // `*found` is set to the duplicate; the trailing unparsable
+        // trips `invalid audit line or opening checkpoint`, so strict
+        // fails with CorruptTrail. The tolerant fallback walks the
+        // same two records: e1 takes the duplicate arm (saved_prior's
+        // head already matches), so `on_feed` is `FeedEvent::Duplicate`
+        // and `found` is NOT re-written; the trailing unparsable
+        // latches `damaged` and the segment finishes Ok. With the
+        // previous two-buffer design, strict's write lived only in a
+        // local that was dropped on `CorruptTrail`, and `found`
+        // returned to the caller as `None` (base gave Some).
+        let cp0_rec = cp0();
+        let e1 = entry(&cp0_rec);
+        let d = Temp::new();
+        w(&d, &[line(&cp0_rec), line(&e1)].concat());
+        let pre_state = scc(&o(&d), None, true).unwrap();
+        append_bytes(&d.0.join("audit.jsonl"), &line(&e1));
+        append_bytes(&d.0.join("audit.jsonl"), b"not json\n");
+        let expected = Head::of(&e1);
+        let (res, found) = hsc_found(&o(&d), Some(pre_state), false, false, expected);
+        assert!(
+            res.is_ok(),
+            "tolerant must finish Ok on fragment-only continuation past e1",
+        );
+        assert_eq!(
+            found.map(|r| r.context.seq),
+            Some(e1.context.seq),
+            "strict's `*found` write must persist across CorruptTrail into tolerant Ok",
+        );
+    }
+    #[test]
+    fn pin_hs_found_persists_on_err_after_strict_partial_write() {
+        // Addendum 22.2: on the Err path, strict's partial `*found`
+        // writes survive. Layout: no predecessor (`opening=true`), the
+        // file holds `[cp0, e1, broken_e2]` where broken_e2 has a
+        // wrong `previous`. Strict folds cp0 (not a match), then e1
+        // (matches; `*found = Some(e1)`), then broken_e2 trips the
+        // hash-link check and strict returns CorruptTrail. The
+        // tolerant fallback walks from the start, hits the same broken
+        // link, and the method returns Err. With the previous
+        // two-buffer design, strict's `*found = Some(e1)` lived only
+        // in the local inside the strict closure and was dropped; now
+        // the shared buffer writes back before the `?` propagates.
+        let cp0_rec = cp0();
+        let e1 = entry(&cp0_rec);
+        let broken = Record::new(context(2, [42; 32]), Entry::new("a", "c", "o")).unwrap();
+        let d = Temp::new();
+        w(&d, &[line(&cp0_rec), line(&e1), line(&broken)].concat());
+        let expected = Head::of(&e1);
+        let (res, found) = hsc_found(&o(&d), None, true, false, expected);
+        assert_eq!(
+            res.err().expect("broken link must propagate").kind(),
+            AuditErrorKind::CorruptTrail,
+        );
+        assert_eq!(
+            found.map(|r| r.context.seq),
+            Some(e1.context.seq),
+            "strict's partial `*found` write must survive on the Err path",
         );
     }
     #[test]

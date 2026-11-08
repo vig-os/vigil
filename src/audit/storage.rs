@@ -11,12 +11,13 @@ use super::{
     AuditError, AuditErrorKind, Record,
     format::{Kind, validation::MAX_PAYLOAD_BYTES},
     runs::{
-        self, Advance, Classifier, DecodedLine, HistorySegmentWalk, LineEventKind,
-        Mode as ClassifierMode, Reaction, RunState, SegmentContext,
+        self, Advance, Classifier, DecodedLine, FeedEvent, HistorySegmentArgs, HistorySegmentWalk,
+        LineEventKind, Mode as ClassifierMode, Reaction, RunState, SegmentContext,
     },
 };
 use crate::rotate::Directory;
 use rustix::fs::{self as rfs, Mode, OFlags};
+use std::cell::RefCell;
 use std::{
     fs::File,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
@@ -360,19 +361,18 @@ pub(crate) fn history_segment(
             .is_some_and(|s| !s.newline && s.gap.is_none());
 
     // Reader-side state threaded through `on_feed` and the strict
-    // closure. Two separate `found` buffers (one for the strict pass,
-    // one for the tolerant walk) keep the captures aliasing-free; the
-    // walk result selects which to propagate to the out-parameter.
+    // closure. Addendum 22.2: `found_cell` is the ONE shared buffer so
+    // the strict pass's partial writes survive on `CorruptTrail` and
+    // the tolerant walk's own writes land in the same place
+    // (base-identical: a single `&mut found` was threaded through
+    // both passes).
     let mut out_state: Option<State> = state.clone();
     let mut final_offset = initial_offset;
-    let initial_found = found.clone();
-    let strict_initial_found = initial_found.clone();
+    let found_cell = RefCell::new(found.clone());
+    let fc = &found_cell;
     let strict_state = state.clone();
-    let strict = move || -> Result<(State, Option<Record>), AuditError> {
-        let mut strict_found = strict_initial_found;
-        let s = scan_inner(file, trail, strict_state, expected, &mut strict_found, ctx)?;
-        Ok((s, strict_found))
-    };
+    #[rustfmt::skip]
+    let strict = move || scan_inner(file, trail, strict_state, expected, &mut fc.borrow_mut(), ctx);
     // Lazy tolerant events iterator: the seek, the glued-byte / LF
     // check and physical `read_line` live only in this closure. The
     // decoded line event carries the file bytes + the terminating LF
@@ -427,54 +427,57 @@ pub(crate) fn history_segment(
 
     // Reader-side `on_feed`: rebuilds the reader's `State` on each
     // successful record fold (addendum 20.1), using the writer-only
-    // `next_cp_fields` fold that stays on the storage side, and
-    // updates `newline` only for a fragment/unparsable; duplicates
-    // skip `on_feed` entirely so the reader's prior `continue`
-    // semantic is preserved.
-    let mut tol_found: Option<Record> = initial_found;
-    let on_feed = |fed: Option<(&Record, &RunState)>, offset_after: u64, newline_after: bool| {
+    // `next_cp_fields` fold that stays on the storage side; the
+    // duplicate arm (addendum 22.1) advances `final_offset` only (so
+    // `s.length` picks up the duplicate's bytes, base-identical) and
+    // leaves `state.offset`/`state.newline` untouched; NonRecord
+    // (fragment/unparsable) updates `state.newline` only.
+    let on_feed = |fed: FeedEvent<'_>, offset_after: u64, newline_after: bool| {
         final_offset = offset_after;
-        if let Some((record, rs)) = fed {
-            let (cp_time, since_cp) = next_cp_fields(
-                out_state
-                    .as_ref()
-                    .map(|s| (s.checkpoint_time, s.since_checkpoint)),
-                record,
-            );
-            let head = rs.head;
-            out_state = Some(State {
-                run: rs.clone(),
-                offset: offset_after,
-                length: initial_length,
-                checkpoint_time: cp_time,
-                since_checkpoint: since_cp,
-                newline: newline_after,
-                gap: initial_gap.clone(),
-            });
-            if expected == Some(head) {
-                tol_found = Some(record.clone());
+        match fed {
+            FeedEvent::Record(record, rs) => {
+                let (cp_time, since_cp) = next_cp_fields(
+                    out_state
+                        .as_ref()
+                        .map(|s| (s.checkpoint_time, s.since_checkpoint)),
+                    record,
+                );
+                let head = rs.head;
+                out_state = Some(State {
+                    run: rs.clone(),
+                    offset: offset_after,
+                    length: initial_length,
+                    checkpoint_time: cp_time,
+                    since_checkpoint: since_cp,
+                    newline: newline_after,
+                    gap: initial_gap.clone(),
+                });
+                if expected == Some(head) {
+                    *fc.borrow_mut() = Some(record.clone());
+                }
             }
-        } else if let Some(s) = &mut out_state {
-            s.newline = newline_after;
+            FeedEvent::Duplicate => {}
+            FeedEvent::NonRecord => {
+                if let Some(s) = &mut out_state {
+                    s.newline = newline_after;
+                }
+            }
         }
     };
 
-    let walk = runs::history_segment::<(State, Option<Record>), _, _, _>(
-        Reaction::Stop,
-        strict,
-        events,
-        prior_run,
-        ctx,
-        unsealed_boundary,
-        *run,
-        trail,
-        on_feed,
-    )?;
-
-    match walk {
-        HistorySegmentWalk::Strict((next, strict_found)) => {
+    #[rustfmt::skip]
+    let walk_args = HistorySegmentArgs { ctx, prior_run, unsealed_boundary, run_in: *run, trail };
+    let walk =
+        runs::history_segment::<State, _, _, _>(Reaction::Stop, walk_args, strict, events, on_feed);
+    // Addendum 22.2: writeback `found` BEFORE propagating Err, so the
+    // strict pass's partial writes survive on `CorruptTrail` and on a
+    // tolerant-side Err. Base threaded `&mut found` directly through
+    // both passes, so a partial write at record N was visible to the
+    // caller even when record N+1 broke the fold.
+    *found = found_cell.into_inner();
+    match walk? {
+        HistorySegmentWalk::Strict(next) => {
             *run = false;
-            *found = strict_found;
             Ok(Some(next))
         }
         HistorySegmentWalk::Tolerant(outcome) => {
@@ -484,7 +487,6 @@ pub(crate) fn history_segment(
                 s.length = final_offset;
                 s.gap = outcome.gap;
             }
-            *found = tol_found;
             Ok(out_state)
         }
     }
