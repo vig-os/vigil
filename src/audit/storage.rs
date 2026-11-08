@@ -455,6 +455,7 @@ pub(crate) struct SegmentSource<'dir> {
     plan: Vec<PlanStep>,
     cursor: usize,
     cached: Option<File>,
+    pending: Option<PendingRotateAfter>,
     newest: Option<PathBuf>,
 }
 
@@ -471,6 +472,17 @@ enum PlanStep {
     /// The live file (`audit.jsonl`), opened writable = true
     /// (`scan_closing`).
     ClosingLive,
+}
+
+/// Refresh-rotate: inputs captured at construction so `segments_after`
+/// can be called **after** the prelude is yielded. Base walked the
+/// prelude first and only then listed the newer segments, so any error
+/// surfacing from the listing (`rotated_names_at`, `statat`, EACCES
+/// from a `chmod 0300` directory) must come out of the second
+/// `next_segment` call, not the first.
+struct PendingRotateAfter {
+    old: std::fs::Metadata,
+    sealed_before: Option<PathBuf>,
 }
 
 /// A segment the source has just yielded. The caller's loop picks the
@@ -499,6 +511,7 @@ impl<'dir> SegmentSource<'dir> {
             plan,
             cursor: 0,
             cached: None,
+            pending: None,
             newest,
         })
     }
@@ -512,38 +525,49 @@ impl<'dir> SegmentSource<'dir> {
             plan: vec![PlanStep::CachedLive],
             cursor: 0,
             cached: Some(cached),
+            pending: None,
             newest: None,
         })
     }
 
-    /// `refresh` rotated branch: the cached-file prelude, then the
-    /// `segments_after` list, then the live file. The `newest` tag
-    /// mirrors base's `segments_after` return (the newest rotated name
-    /// observed, used to update `Cache::sealed_before`).
+    /// `refresh` rotated branch: yield the cached-file prelude first,
+    /// then call `segments_after` lazily (so a directory listing error
+    /// surfaces AFTER the prelude's own walk, not before), then the
+    /// live file. Base-identical: `fn refresh` ran
+    /// `history_segment(&cache.file, …)` first and only then called
+    /// `segments_after(dir, cache)`.
     pub(crate) fn for_refresh_rotate(dir: &'dir File, cache: &Cache) -> Result<Self, AuditError> {
         let cached = cache.file.try_clone().map_err(io_error)?;
-        let (names, newest) = segments_after(dir, cache)?;
-        let mut plan = Vec::with_capacity(names.len() + 2);
-        plan.push(PlanStep::CachedPrelude);
-        plan.extend(names.into_iter().map(PlanStep::Rotated));
-        plan.push(PlanStep::ClosingLive);
+        let old = cache.file.metadata().map_err(io_error)?;
         Ok(Self {
             dir,
-            plan,
+            plan: vec![PlanStep::CachedPrelude],
             cursor: 0,
             cached: Some(cached),
-            newest,
+            pending: Some(PendingRotateAfter {
+                old,
+                sealed_before: cache.sealed_before.clone(),
+            }),
+            newest: None,
         })
     }
 
     /// Lazy base-order open. The first open error surfaces where it did
     /// at base: a corrupt rotated segment N aborts before segment N+1
-    /// is opened (addendum 25.2 / fact 5).
+    /// is opened (addendum 25.2 / fact 5). On refresh rotate the
+    /// `segments_after` listing itself runs lazily — after the prelude
+    /// has been yielded — so a listing error surfaces at the second
+    /// call, not the first.
     pub(crate) fn next_segment(&mut self) -> Result<Option<SegmentRead>, AuditError> {
-        let idx = self.cursor;
-        if idx >= self.plan.len() {
+        if self.cursor >= self.plan.len()
+            && let Some(pending) = self.pending.take()
+        {
+            self.expand_rotate_after(pending)?;
+        }
+        if self.cursor >= self.plan.len() {
             return Ok(None);
         }
+        let idx = self.cursor;
         self.cursor = idx + 1;
         match &self.plan[idx] {
             PlanStep::CachedPrelude => {
@@ -575,6 +599,18 @@ impl<'dir> SegmentSource<'dir> {
                 Ok(Some(SegmentRead::Live(file)))
             }
         }
+    }
+
+    /// Append the rotated-name steps and the closing-live step to the
+    /// plan, running `segments_after` lazily so its errors surface
+    /// after the prelude's own walk (fact 5 / addendum 25.2).
+    fn expand_rotate_after(&mut self, pending: PendingRotateAfter) -> Result<(), AuditError> {
+        let (names, newest) = segments_after_from(self.dir, &pending.old, &pending.sealed_before)?;
+        self.plan.reserve(names.len() + 1);
+        self.plan.extend(names.into_iter().map(PlanStep::Rotated));
+        self.plan.push(PlanStep::ClosingLive);
+        self.newest = newest;
+        Ok(())
     }
 
     /// The newest rotated name observed when the plan was built; used
@@ -883,8 +919,20 @@ fn segments_after(
     cache: &Cache,
 ) -> Result<(Vec<PathBuf>, Option<PathBuf>), AuditError> {
     let old = cache.file.metadata().map_err(io_error)?;
+    segments_after_from(dir, &old, &cache.sealed_before)
+}
+
+/// `segments_after` with the cache's `(old, sealed_before)` passed
+/// directly, so [`SegmentSource::for_refresh_rotate`] can capture them
+/// at construction and defer the actual listing until after the
+/// prelude has been yielded.
+fn segments_after_from(
+    dir: &File,
+    old: &std::fs::Metadata,
+    sealed_before: &Option<PathBuf>,
+) -> Result<(Vec<PathBuf>, Option<PathBuf>), AuditError> {
     let names = crate::rotate::rotated_names_at(dir, "audit").map_err(io_error)?;
-    let mut boundary = cache.sealed_before.clone();
+    let mut boundary = sealed_before.clone();
     for name in &names {
         let metadata = rfs::statat(dir, name, rfs::AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|e| io_error(e.into()))?;
