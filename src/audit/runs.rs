@@ -797,13 +797,20 @@ where
                 (Mode::Strict, Reaction::Stop) => {
                     let gap = classifier.take_gap();
                     let advance = classifier.feed_record(record, record_count, trail, gap)?;
-                    // On `Advance::Record` `feed_record` sets
-                    // `self.state = Some(next)`; on `Advance::Duplicate`
-                    // state is unchanged but Duplicate requires state
-                    // to be Some (the duplicate check guards on it).
-                    // So on an Ok outcome, state is Some. `.expect()`
-                    // is the invariant; no `Violation::MissingHead`
-                    // construction is added at this site (addendum 20.1).
+                    // Invariant: `classifier.state()` is `Some` after any
+                    // Ok return of [`Classifier::feed_record`]. Proof:
+                    // `feed_record`'s Ok(`Advance::Record`) branch sets
+                    // `self.state = Some(next)` (runs.rs
+                    // `feed_record`'s `self.state = Some(next);`);
+                    // `feed_record`'s Ok(`Advance::Duplicate`) branch
+                    // only fires inside the `let Some(mut next) = next_opt
+                    // else { ... }` where `apply_checked` returned
+                    // `Ok(None)`, which itself requires `head == s.head`
+                    // on `prior: Option<&RunState>`, so prior (and hence
+                    // `self.state`) was already `Some(_)`. No
+                    // `Violation::MissingHead` construction is added at
+                    // this site (addendum 20.1 keeps the gate at a
+                    // single finish-time site).
                     let rs = classifier
                         .state()
                         .expect("strict feed_record Ok implies state=Some");
@@ -1578,8 +1585,33 @@ impl Classifier {
         };
         let Some(mut next) = next else {
             // Collector-style identical duplicate reaching the general branch
-            // (should not occur because the duplicate short-circuit guards
-            // against it, but preserve the invariant).
+            // is UNREACHABLE on the tolerant walk and `count += 1` here is
+            // dead. Proof: for `apply_checked` to return `Ok(None)` it
+            // requires `head == state.head` (the collector-style duplicate
+            // short-circuit above the main `apply_checked`), i.e. the same
+            // hash AND the same seq. On the tolerant walk the only call
+            // path that reaches `feed_record_apply_tolerant` with this
+            // state is `TolerantPrep::General`, which
+            // `feed_record_prepare_tolerant` returns only when the record
+            // is NOT the duplicate short-circuit (`allow_dup &&
+            // state.head == head` → `TolerantPrep::Duplicate`, handled by
+            // the caller via `continue`). The only `General` escape with
+            // `state.head == head` is `allow_dup = false`, which happens
+            // when `first || (closing && count == 1)`. In both those
+            // cases `record.context.seq <= state.head.seq` (because
+            // `head.seq == state.head.seq`), and the next check in
+            // `feed_record_prepare_tolerant` rejects with
+            // `Violation::SequenceDidNotIncrease` before ever reaching
+            // `feed_record_apply_tolerant`. Strict's `feed_record` has
+            // no equivalent fall-through: strict's own duplicate branch
+            // returns `Advance::Duplicate` directly and does not touch a
+            // `count` counter. The branch is kept (and `count` bumped)
+            // so the tolerant invariant stays local rather than
+            // depending on the caller chain. Removing this `count += 1`
+            // has no observable effect on any pin or row (stated in the
+            // PR body's M4 note); S3b's `classify` iterator will drop
+            // the branch when the iterator obviates the duplicate
+            // short-circuit.
             self.first = false;
             self.count += 1;
             return Ok(());
@@ -3048,13 +3080,18 @@ mod collector_tests {
             HistorySegmentWalk::Tolerant(o) => *o,
             HistorySegmentWalk::Strict(()) => panic!("CorruptTrail trial forces tolerant"),
         };
-        assert!(
-            out.violations
-                .iter()
-                .any(|(p, v)| *v == Violation::InvalidRecordInSealedRun
-                    && p.record_index_in_segment == 2),
-            "tolerant Collect Record(Err) records sealed-run detail; violations={:?}",
-            out.violations.iter().map(|(_, v)| *v).collect::<Vec<_>>()
+        // Exact-list equality (brief B2): any mutant that drops the
+        // Record(Err) Collect entry, recovers past recovery_pending,
+        // or mis-tags the detail/index changes the list.
+        let got: Vec<(usize, Violation)> = out
+            .violations
+            .iter()
+            .map(|(p, v)| (p.record_index_in_segment, *v))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(2, Violation::InvalidRecordInSealedRun)],
+            "exact first-equality list for tolerant Collect Record(Err)",
         );
     }
 
@@ -3113,18 +3150,33 @@ mod collector_tests {
             HistorySegmentWalk::Tolerant(o) => *o,
             HistorySegmentWalk::Strict(()) => panic!("CorruptTrail trial forces tolerant"),
         };
-        // X recorded InvalidRecordInSealedRun (not latched by
-        // recovery_pending in this specific flow, since the
-        // feed_record_err_tolerant path through on_violation DOES latch
-        // recovery_pending). The key assertion: the collector observed
-        // X and continued the walk (reached event 4).
-        let found_x = out.violations.iter().any(|(p, v)| {
-            *v == Violation::InvalidRecordInSealedRun && p.record_index_in_segment == 2
-        });
-        assert!(
-            found_x,
-            "X recorded InvalidRecordInSealedRun; violations={:?}",
-            out.violations.iter().map(|(_, v)| *v).collect::<Vec<_>>()
+        // Exact-list equality (brief B2): the correct point-4 behaviour
+        // is that X at index 2 records exactly `InvalidRecordInSealedRun`
+        // and latches `recovery_pending` through `on_violation`, so e3
+        // at index 3 is a no-op and the finish-time epilogue is skipped.
+        // The walk itself DID continue through the events() loop past X
+        // (feed_record_collect was invoked for e3, and simply returned
+        // because of recovery_pending). This is the brief's "continued
+        // past X" assertion: the walk kept pulling events, as opposed
+        // to propagating Err out of history_segment on the Record(Err).
+        //
+        // Named killer MSW1 (drop the `recovery_pending` latch in
+        // `on_violation`): X records `InvalidRecordInSealedRun` but
+        // recovery_pending stays false; e3 at index 3 then exercises
+        // the sealed-seq gap check and records
+        // `SequenceGapInSealedRun`, and the finish-time epilogue
+        // records `InvalidUndamagedSegment` (!damaged && !run_flag).
+        // Both branches differ from the exact list below → exit 101.
+        let got: Vec<(usize, Violation)> = out
+            .violations
+            .iter()
+            .map(|(p, v)| (p.record_index_in_segment, *v))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(2, Violation::InvalidRecordInSealedRun)],
+            "exact list (walk continued past X via events() loop; \
+             recovery_pending latches e3 and skips the epilogue)",
         );
     }
 
@@ -3157,20 +3209,25 @@ mod collector_tests {
         );
     }
 
-    /// SC7 (strict Collect `saved_prior=None` neutralised on single
-    /// segment): strict scan_segment runs one segment, so the
-    /// `saved_prior=None` mutant on `reset_at_boundary` is NOT
-    /// expressible here (addendum 24 flexibility: strict single-pass
-    /// has no `reset_at_boundary` in a single segment). Instead, pin
-    /// the interchange with `initial_boundary_resume=true` producing
-    /// the strict reader's `UnclosedSegmentLacksResume` at the right
-    /// position on `[cp0, cp1]` where cp1 is not a resume.
+    /// SC7 (strict Collect `initial_boundary_resume` wiring): strict
+    /// `scan_segment` runs one segment, so the `saved_prior=None` mutant
+    /// on `reset_at_boundary` (M5) is NOT expressible here (addendum 24
+    /// flexibility: strict single-pass has no `reset_at_boundary` in a
+    /// single segment). M5's own killing row is
+    /// [`sc_m5_reset_at_boundary_carries_saved_prior`], which drives a
+    /// multi-segment tolerant Collect walk through `reset_at_boundary`.
+    ///
+    /// This row pins the *single* strict-side violation
+    /// `initial_boundary_resume = true` emits on `[cp1]` opened over a
+    /// sealed prior, and kills the M-shared-walk-2 mutant that always
+    /// zeros `initial_boundary_resume` on entry to
+    /// [`Classifier::new_collect_strict`]: the correct code records
+    /// `ResumeCheckpointLacksDeclaration` at index 0 via
+    /// `finish_strict_check`, and the mutant records nothing (empty
+    /// list) because `boundary_resume` is false throughout and the
+    /// strict finish-time check does not fire.
     #[test]
     fn sc7_strict_collect_initial_boundary_resume_fires() {
-        // A sealed prior where we re-open with initial_boundary_resume=true
-        // requires the first successor to be an immediate
-        // `vigil.audit.resume`. A non-resume checkpoint fires
-        // `UnclosedSegmentLacksResume`.
         let ctx = SegmentContext {
             opening: true,
             genesis: false,
@@ -3187,29 +3244,41 @@ mod collector_tests {
         m_at_cp1.push(cp0.hash()).unwrap();
         let cp1 = cp(1, cp0.hash(), &m_at_cp1);
         let out = run_scan_segment_collect(ctx, Some(cp0_run), true, vec![cp1]);
-        let variants: Vec<Violation> = out.violations.iter().map(|(_, v)| *v).collect();
-        // What the code actually yields on this layout: cp1 duplicates
-        // the predecessor cp0 at head/seq=0 vs cp1.seq=1; strict's
-        // duplicate check fires no error because seqs differ, so cp1
-        // folds. The finish-time check then records
-        // `ResumeCheckpointLacksDeclaration` because `boundary_resume`
-        // was never cleared (cp1 is not an `audit.resume` entry, and
-        // the strict path's `self.boundary_resume` guard requires
-        // `!self.first` for the UnclosedSegmentLacksResume check).
-        // Either variant proves `initial_boundary_resume` is wired.
-        assert!(
-            variants.contains(&Violation::ResumeCheckpointLacksDeclaration)
-                || variants.contains(&Violation::UnclosedSegmentLacksResume),
-            "initial_boundary_resume=true wires the strict-side boundary check; got {variants:?}"
+        // Trace the single correct violation: cp1 is a checkpoint with
+        // `seq=1 > prior.seq=0` and `previous==prior.head.hash`, so
+        // strict `feed_record` folds it (first=true at entry, so the
+        // `!self.first` guard on the `UnclosedSegmentLacksResume`
+        // check skips). `boundary_resume` is left set (`!self.first`
+        // guard on the clear also requires `!first`). No more events,
+        // so `finish_collect_strict` runs `finish_strict_check`:
+        // `boundary_resume` is still true → `ResumeCheckpointLacksDeclaration`.
+        let got: Vec<(usize, Violation)> = out
+            .violations
+            .iter()
+            .map(|(p, v)| (p.record_index_in_segment, *v))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(0, Violation::ResumeCheckpointLacksDeclaration)],
+            "exact strict-collect list: initial_boundary_resume=true routes \
+             to finish_strict_check at record_index=0",
         );
     }
 
-    /// SC8 (strict sealed-seq `<=`→`<` collector row): the strict
-    /// `apply_checked` seq check is NOT expressible here as `<=`→`<`
-    /// in the strict single-pass (strict's genesis logic differs).
-    /// Instead this row pins strict Collect on a record whose seq does
-    /// not strictly increase vs the predecessor, producing the exact
-    /// strict detail.
+    /// SC8 (strict sealed-seq `<=`→`<` collector row kills M7). The
+    /// shared `apply_checked` seq guard `head.seq <= s.head.seq`
+    /// (runs.rs ~352) IS expressible via Collect on the strict path:
+    /// a record whose `seq` equals the predecessor's (but whose hash
+    /// differs) hits exactly this comparison. The exact collected list
+    /// is `[(1, Violation::RecordRolledBack)]` on `[cp0, entry(seq=0,
+    /// prev=cp0.hash)]`.
+    ///
+    /// Mutant M7 (`<=` → `<` in `apply_checked`): `0 < 0` is false, so
+    /// the rollback branch is skipped. `previous == s.head.hash` and
+    /// `pending_resume=false`, so the next check (`seq != s.head.seq +
+    /// 1`) fires on an Entry record and returns
+    /// `Violation::SequenceGapWithoutCheckpoint` instead. The exact
+    /// list differs → exit 101.
     #[test]
     fn sc8_strict_collect_seq_did_not_increase() {
         let ctx = SegmentContext {
@@ -3218,16 +3287,20 @@ mod collector_tests {
             run: false,
         };
         let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
-        // Second record: same seq as cp0 (seq=0). Strict's apply_checked
-        // records a rollback (seq did not increase).
+        // Second record: same seq as cp0 (seq=0) but a different hash.
         let dup_like = entry(0, cp0.hash());
         let out = run_scan_segment_collect(ctx, None, false, vec![cp0, dup_like]);
-        let variants: Vec<Violation> = out.violations.iter().map(|(_, v)| *v).collect();
-        assert!(
-            variants
-                .iter()
-                .any(|v| matches!(v, Violation::RecordRolledBack)),
-            "strict Collect seq-did-not-increase variant; got {variants:?}"
+        let got: Vec<(usize, Violation)> = out
+            .violations
+            .iter()
+            .map(|(p, v)| (p.record_index_in_segment, *v))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, Violation::RecordRolledBack)],
+            "exact strict-collect list: `<=` guard fires RecordRolledBack \
+             at record_index=1; M7 `<` would fall through to \
+             SequenceGapWithoutCheckpoint",
         );
     }
 
@@ -3286,10 +3359,95 @@ mod collector_tests {
             |_, _, _| {},
         )
         .unwrap();
-        let variants: Vec<Violation> = out.violations.iter().map(|(_, v)| *v).collect();
+        // Exact-list equality (brief B2): the torn gap after cp0
+        // populates the gap hasher; cp1 arrives with `repaired=None`
+        // so `check_attestation(Some(digest), None)` returns
+        // `MissingOrMismatchedAttestation`, recorded at record_index=2.
+        // Any mutant that removes `check_attestation` from strict
+        // `feed_record` would fall through to `apply_checked` and
+        // either succeed (empty violations list) or fail with a
+        // different detail; both change the exact list.
+        let got: Vec<(usize, Violation)> = out
+            .violations
+            .iter()
+            .map(|(p, v)| (p.record_index_in_segment, *v))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(2, Violation::MissingOrMismatchedAttestation)],
+            "exact strict-collect list for torn gap + unattested successor",
+        );
+    }
+
+    /// SC-M5 (brief B1): the `saved_prior = self.state.clone()`
+    /// assignment inside [`Classifier::reset_at_boundary`] (runs.rs
+    /// ~1732) is required for the NEXT segment's first-record trial to
+    /// see the preserved predecessor state. Mutant M5
+    /// (`saved_prior = None`) drops this, so the next segment's trial
+    /// treats cp2 as genesis, fails
+    /// `InitialCheckpointDoesNotLinkGenesis`, `closing=false`, and
+    /// `inherited && is_cp && !broken && !closing` records
+    /// `FirstSuccessorDoesNotCloseRun` at (seg=1, idx=0) instead of
+    /// the correct `FirstSuccessorLacksImmediateResume` at (seg=1, idx=1).
+    ///
+    /// Segment 0 is `[cp0, e1]` with `inherited=false`, so its epilogue
+    /// records `(0, 1, InvalidUndamagedSegment)` (!damaged && !run_flag
+    /// at boundary). That first entry is identical between correct and
+    /// mutant runs; the second entry is what diverges, proving the
+    /// `saved_prior` carry-forward is load-bearing.
+    #[test]
+    fn sc_m5_reset_at_boundary_carries_saved_prior() {
+        let ctx0 = SegmentContext {
+            opening: true,
+            genesis: true,
+            run: false,
+        };
+        let mut c = Classifier::new_collect(None, ctx0, false);
+        let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        let e1 = entry(1, cp0.hash());
+        c.feed_record_collect(&cp0, 1, TRAIL, 0);
+        c.feed_record_collect(&e1, 1, TRAIL, 1);
         assert!(
-            variants.contains(&Violation::MissingOrMismatchedAttestation),
-            "strict Collect missing attestation; got {variants:?}"
+            !c.recovery_pending,
+            "segment 0 scans clean (no in-line violation)"
+        );
+        // Cross boundary with inherited=true (unsealed-boundary flavour).
+        // The boundary runs segment 0's epilogue and records
+        // InvalidUndamagedSegment because run_flag=false (inherited=false
+        // at new_collect) and damaged=false after cp0+e1.
+        let ctx1 = SegmentContext {
+            opening: true,
+            genesis: false,
+            run: false,
+        };
+        c.reset_at_boundary(ctx1, true, 1);
+        // Segment 1: cp2 continues the MMR from segment 0; e2 is a
+        // non-resume successor.
+        let mmr_at_cp2 = {
+            let mut m = Mmr::new();
+            m.push(cp0.hash()).unwrap();
+            m.push(e1.hash()).unwrap();
+            m
+        };
+        let cp2 = cp(2, e1.hash(), &mmr_at_cp2);
+        let e2 = entry(3, cp2.hash());
+        c.feed_record_collect(&cp2, 1, TRAIL, 0);
+        c.feed_record_collect(&e2, 1, TRAIL, 1);
+        let out = c.finish_collect();
+        let got: Vec<(usize, usize, Violation)> = out
+            .violations
+            .iter()
+            .map(|(p, v)| (p.segment_index, p.record_index_in_segment, *v))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 1, Violation::InvalidUndamagedSegment),
+                (1, 1, Violation::FirstSuccessorLacksImmediateResume),
+            ],
+            "exact cross-boundary list: reset_at_boundary's `saved_prior = \
+             self.state.clone()` is required; mutant `saved_prior = None` \
+             would flip segment-1 entry to (1, 0, FirstSuccessorDoesNotCloseRun)",
         );
     }
 }

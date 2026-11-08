@@ -247,6 +247,23 @@ pub(super) fn corrupt(detail: &str) -> AuditError {
 fn io_error(error: io::Error) -> AuditError {
     AuditError::new(AuditErrorKind::Io, error.to_string())
 }
+/// Ruling 197-d1 addendum 24.3 / 20.1: the ONE `Line` -> `LineEventKind`
+/// decode, used by both `history_segment`'s tolerant-fallback event
+/// closure and `scan_inner`'s strict event closure. A mutant that
+/// changes this mapping fails BOTH a tolerant `history_segment` reader
+/// pin and a strict `scan` reader pin.
+fn decode_line_kind(line: Vec<u8>) -> LineEventKind {
+    let classified = {
+        let payload = line.strip_suffix(b"\n").unwrap_or(&line);
+        super::lines::classify(payload)
+    };
+    match classified {
+        super::lines::Line::Record(Ok(records)) => LineEventKind::Record(records),
+        super::lines::Line::Fragment => LineEventKind::Fragment(line),
+        super::lines::Line::Unparsable(_) => LineEventKind::Unparsable,
+        super::lines::Line::Record(Err(_)) => LineEventKind::RecordErr,
+    }
+}
 pub(crate) fn existing(dir: &File, name: &Path, writable: bool) -> Result<File, AuditError> {
     let access = if writable {
         OFlags::RDWR | OFlags::APPEND
@@ -411,15 +428,8 @@ pub(crate) fn history_segment(
         #[cfg(test)]
         SCANNED.with(|n| n.set(n.get() + bytes));
         tolerant_offset += bytes as u64;
-        let payload = line.strip_suffix(b"\n").unwrap_or(&line);
-        let kind = match super::lines::classify(payload) {
-            super::lines::Line::Record(Ok(records)) => LineEventKind::Record(records),
-            super::lines::Line::Fragment => LineEventKind::Fragment(line),
-            super::lines::Line::Unparsable(_) => LineEventKind::Unparsable,
-            super::lines::Line::Record(Err(_)) => LineEventKind::RecordErr,
-        };
         Ok(Some(DecodedLine {
-            kind,
+            kind: decode_line_kind(line),
             offset_after: tolerant_offset,
             newline,
         }))
@@ -814,15 +824,8 @@ fn scan_inner(
         #[cfg(test)]
         SCANNED.with(|n| n.set(n.get() + count));
         offset += count as u64;
-        let payload = line.strip_suffix(b"\n").unwrap_or(&line);
-        let kind = match super::lines::classify(payload) {
-            super::lines::Line::Record(Ok(records)) => LineEventKind::Record(records),
-            super::lines::Line::Fragment => LineEventKind::Fragment(line),
-            super::lines::Line::Unparsable(_) => LineEventKind::Unparsable,
-            super::lines::Line::Record(Err(_)) => LineEventKind::RecordErr,
-        };
         Ok(Some(DecodedLine {
-            kind,
+            kind: decode_line_kind(line),
             offset_after: offset,
             newline,
         }))
@@ -871,9 +874,14 @@ fn scan_inner(
         events,
         on_feed,
     )?;
-    // Under `Reaction::Stop`, `scan_segment` returns `state=Some` via
-    // `classifier.finish()` (which errors with `Violation::MissingHead`
-    // on `None`); the `.expect()` is the shim-side invariant.
+    // Invariant: under `Reaction::Stop` an Ok `scan_segment` returns
+    // `state = Some(_)`. Proof: the Ok(Reaction::Stop) branch of
+    // `scan_segment` wraps `classifier.finish()?` into
+    // `ScanSegmentOutcome { state: Some(finished.state), .. }`
+    // (runs.rs `scan_segment`), and `Classifier::finish`'s own invariant
+    // (runs.rs `finish`) rejects a `state = None` path with
+    // `Violation::MissingHead` before returning Ok — so any Ok out of
+    // `scan_segment` under Stop carries `Some(_)`.
     let run = outcome
         .state
         .expect("scan_segment Ok under Reaction::Stop implies state=Some");
