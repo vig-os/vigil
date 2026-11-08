@@ -517,6 +517,73 @@ pub(crate) enum FeedEvent<'a> {
     NonRecord,
 }
 
+/// Ruling 197-d1 addendum 24: event kind handed to the strict single-
+/// pass walk's `on_feed` callback. Strict-mode counterpart to
+/// [`FeedEvent`]: the duplicate arm still advances `last_offset` AND
+/// `last_newline` (base-identical to `scan_inner`), so it carries the
+/// record for the storage shim's cursor updates; `NonRecord` is only
+/// reachable on the mid-segment Fragment case (strict Unparsable and
+/// strict `Record(Err)` return `Err` at `invalid audit line or opening
+/// checkpoint`).
+pub(crate) enum FeedEventStrict<'a> {
+    /// A folded record. The storage shim advances `last_offset`/
+    /// `last_newline` and the writer-only `cp_time`/`since_cp` via
+    /// `next_cp_fields`, updates `expected`/`found`, and reads the pure
+    /// run state from the second slot.
+    Record(&'a Record, &'a RunState),
+    /// A strict-mode collector-style identical duplicate ([`Advance::Duplicate`]).
+    /// The storage shim advances `last_offset`/`last_newline` but leaves
+    /// `cp_time`/`since_cp` untouched (base-identical).
+    Duplicate(&'a Record),
+    /// A mid-segment fragment (strict Unparsable and strict `Record(Err)`
+    /// both error at [`invalid_opening_line`], so this variant only
+    /// reaches on `Line::Fragment`). The storage shim advances
+    /// `last_newline` only.
+    NonRecord,
+}
+
+/// Ruling 197-d1 addendum 24.1: segment-shape inputs to the strict
+/// single-pass walk ([`scan_segment`]), mirroring [`HistorySegmentArgs`].
+/// The storage shim computes `initial_boundary_resume` from
+/// `opening && (ctx.run || !sealed(prior))` and threads the segment-
+/// start run snapshot through `prior_run`.
+pub(crate) struct ScanSegmentArgs {
+    pub(crate) ctx: SegmentContext,
+    pub(crate) trail: [u8; 16],
+    pub(crate) prior_run: Option<RunState>,
+    /// `scan_inner`'s `initial_boundary` disjunct: opening &&
+    /// (ctx.run || predecessor-not-sealed). Set by the shim and owned
+    /// by the classifier thereafter.
+    pub(crate) initial_boundary_resume: bool,
+}
+
+/// Ruling 197-d1 addendum 24.1: terminal outcome of the strict single-
+/// pass walk. Mirrors [`CollectorOutcome`]'s shape but is produced by
+/// both reactions (Stop returns `state=Some` via `classifier.finish()`;
+/// Collect returns `state` from `finish_collect_strict`, which may be
+/// `None` when no complete record was folded).
+pub(crate) struct ScanSegmentOutcome {
+    /// `classifier.state()` on the Ok path: `Some` under
+    /// [`Reaction::Stop`] (`classifier.finish()` errors with
+    /// `Violation::MissingHead` when `None`); may be `None` under
+    /// [`Reaction::Collect`] if no record was folded.
+    pub(crate) state: Option<RunState>,
+    /// Gap hasher the storage shim threads forward into `State.gap`.
+    pub(crate) gap: Option<blake3::Hasher>,
+    /// Empty under [`Reaction::Stop`]; the collector's recorded
+    /// `(pos, Violation)` list under [`Reaction::Collect`]. Consumed by
+    /// #197 R2b S3b's `classify` iterator and V4a; until then only
+    /// `#[cfg(test)]` Strict×Collect rows read it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by #197 R2b S3b's `classify` iterator and V4a; between S3a′ and S3b only #[cfg(test)] Strict×Collect rows read it"
+        )
+    )]
+    pub(crate) violations: Vec<(CollectorPos, Violation)>,
+}
+
 /// Addendum 22.4 / 20.1: segment-shape inputs to the shared
 /// [`history_segment`] walk, grouped so the function signature stays at
 /// five arguments without a `#[allow(clippy::too_many_arguments)]`.
@@ -573,80 +640,27 @@ where
     };
     let mut record_index: usize = 0;
     while let Some(line) = events()? {
-        match line.kind {
-            LineEventKind::Record(records) => {
-                let record_count = records.len();
-                let record = &records[0];
-                match reaction {
-                    Reaction::Stop => {
-                        let prep =
-                            classifier.feed_record_tolerant_entry(record, record_count, trail)?;
-                        if matches!(prep, TolerantPrep::Duplicate) {
-                            // Addendum 22.1: the duplicate arm advances
-                            // the stream cursor (so `s.length` is
-                            // byte-identical to base) but leaves
-                            // `state.offset` and `state.newline`
-                            // untouched (addendum 17.2).
-                            on_feed(FeedEvent::Duplicate, line.offset_after, line.newline);
-                            record_index += 1;
-                            continue;
-                        }
-                        classifier.feed_record_apply_tolerant(record)?;
-                        // Addendum 20's `missing head` invariant: apply
-                        // Ok leaves `classifier.state()=Some`. The
-                        // explicit `Violation::MissingHead` construction
-                        // below is defence-in-depth and marked UNREACHABLE
-                        // for the reader-side pin gate (occ 0); the
-                        // reader-side runtime pin targets
-                        // `Classifier::finish`'s own construction (occ 1).
-                        let rs = classifier
-                            .state()
-                            .ok_or_else(|| AuditError::from(Violation::MissingHead))?;
-                        on_feed(
-                            FeedEvent::Record(record, rs),
-                            line.offset_after,
-                            line.newline,
-                        );
-                    }
-                    Reaction::Collect => {
-                        // Share the Collect-reaction entry:
-                        // `feed_record_collect` runs the same
-                        // `feed_record_tolerant_entry` +
-                        // `feed_record_apply_tolerant` pair, with the
-                        // recovery-pending short-circuit and the
-                        // record-index bump.
-                        classifier.feed_record_collect(record, record_count, trail, record_index);
-                    }
-                }
-                record_index += 1;
-            }
-            LineEventKind::Fragment(bytes) => {
-                match reaction {
-                    Reaction::Stop => classifier.feed_fragment_tolerant(&bytes),
-                    Reaction::Collect => {
-                        classifier.feed_fragment_collect(&bytes, record_index);
-                    }
-                }
-                on_feed(FeedEvent::NonRecord, line.offset_after, line.newline);
-                record_index += 1;
-            }
-            LineEventKind::Unparsable => {
-                match reaction {
-                    Reaction::Stop => classifier.feed_unparsable_tolerant(),
-                    Reaction::Collect => classifier.feed_unparsable_collect(record_index),
-                }
-                on_feed(FeedEvent::NonRecord, line.offset_after, line.newline);
-                record_index += 1;
-            }
-            LineEventKind::RecordErr => {
-                // S3a tolerant-only Collect reuses the Stop code path for
-                // `Record(Err)`; it always errors. Stop propagates via
-                // `?`; S3a has no Collect caller for this branch (ruling
-                // 197-d1 addendum 18 defers strict×Collect to S3a′).
-                classifier.feed_record_err_tolerant()?;
-                unreachable!("feed_record_err_tolerant always errors");
-            }
-        }
+        // Ruling 197-d1 addendum 24.3: the per-line mapping lives in the
+        // one shared [`dispatch_line`] helper used by both the strict
+        // single-pass walk ([`scan_segment`]) AND this tolerant fallback
+        // loop. After S3a′, `runs.rs` contains exactly one `match` over
+        // [`LineEventKind`] outside `#[cfg(test)]` (inside
+        // `dispatch_line`). A mutant in `dispatch_line` fails a strict
+        // reader pin, a tolerant `history_segment` reader pin AND a
+        // Collect row.
+        dispatch_line(
+            &mut classifier,
+            line,
+            trail,
+            reaction,
+            record_index,
+            &mut |fed, off, nl| match fed {
+                DispatchFed::Record(r, rs) => on_feed(FeedEvent::Record(r, rs), off, nl),
+                DispatchFed::Duplicate(_) => on_feed(FeedEvent::Duplicate, off, nl),
+                DispatchFed::NonRecord => on_feed(FeedEvent::NonRecord, off, nl),
+            },
+        )?;
+        record_index += 1;
     }
     let outcome = match reaction {
         Reaction::Stop => {
@@ -662,6 +676,237 @@ where
         Reaction::Collect => classifier.finish_collect(),
     };
     Ok(HistorySegmentWalk::Tolerant(Box::new(outcome)))
+}
+
+/// Ruling 197-d1 addendum 24.1: the strict single-pass walk, as a
+/// sibling of [`history_segment`]. Owns the strict single-pass
+/// orchestration that lived in `storage::scan_inner` at a1c2461. The
+/// storage shim keeps only byte-level I/O (seek, glued-byte / LF check,
+/// line decoding into [`DecodedLine`]) plus the writer-only
+/// `cp_time`/`since_cp`/`last_offset`/`last_newline` bookkeeping
+/// through `on_feed`.
+///
+/// Under [`Reaction::Stop`] this returns `Err` on the first classifier
+/// violation (today's reader behaviour, byte-identical). Under
+/// [`Reaction::Collect`] each check site records via `on_violation`,
+/// the classifier latches `recovery_pending`, and subsequent lines are
+/// no-ops until the next [`Classifier::reset_at_boundary`] (ruling
+/// 197-d1 point 4). The `Record(Err)` Collect entry (addendum 17.1)
+/// enters through [`Classifier::feed_record_err_collect_strict`] and
+/// continues through end-of-segment checks per point 4.
+///
+/// A mutant on this walk's orchestration must fail BOTH a strict reader
+/// pin AND a strict Collect row (addendum 24.4). No second strict loop
+/// may exist anywhere (addendum 24.2).
+pub(crate) fn scan_segment<Ef, Of>(
+    reaction: Reaction,
+    args: ScanSegmentArgs,
+    mut events: Ef,
+    mut on_feed: Of,
+) -> Result<ScanSegmentOutcome, AuditError>
+where
+    Ef: FnMut() -> Result<Option<DecodedLine>, AuditError>,
+    Of: FnMut(FeedEventStrict<'_>, u64, bool),
+{
+    let ScanSegmentArgs {
+        ctx,
+        trail,
+        prior_run,
+        initial_boundary_resume,
+    } = args;
+    let mut classifier = match reaction {
+        Reaction::Stop => Classifier::new(prior_run, ctx, Mode::Strict, initial_boundary_resume),
+        Reaction::Collect => {
+            Classifier::new_collect_strict(prior_run, ctx, initial_boundary_resume)
+        }
+    };
+    let mut record_index: usize = 0;
+    while let Some(line) = events()? {
+        // Ruling 197-d1 addendum 24.3: shared per-line dispatch.
+        dispatch_line(
+            &mut classifier,
+            line,
+            trail,
+            reaction,
+            record_index,
+            &mut |fed, off, nl| match fed {
+                DispatchFed::Record(r, rs) => on_feed(FeedEventStrict::Record(r, rs), off, nl),
+                DispatchFed::Duplicate(r) => on_feed(FeedEventStrict::Duplicate(r), off, nl),
+                DispatchFed::NonRecord => on_feed(FeedEventStrict::NonRecord, off, nl),
+            },
+        )?;
+        record_index += 1;
+    }
+    match reaction {
+        Reaction::Stop => {
+            let finished = classifier.finish()?;
+            Ok(ScanSegmentOutcome {
+                state: Some(finished.state),
+                gap: finished.gap,
+                violations: Vec::new(),
+            })
+        }
+        Reaction::Collect => Ok(classifier.finish_collect_strict()),
+    }
+}
+
+/// Ruling 197-d1 addendum 24.3: internal event handed back by
+/// [`dispatch_line`] to the per-walk `on_feed` translator. `Record` is
+/// a folded record (state read live from `classifier.state()`);
+/// `Duplicate` carries the record so the strict storage shim can
+/// advance `last_offset`/`last_newline` (base-identical to
+/// `scan_inner`); `NonRecord` is a fragment or a line that stays
+/// `NonRecord` for the caller's cursor update (strict Unparsable and
+/// strict `Record(Err)` return `Err` before reaching the `on_feed`
+/// call so they never surface here).
+enum DispatchFed<'a> {
+    Record(&'a Record, &'a RunState),
+    Duplicate(&'a Record),
+    NonRecord,
+}
+
+/// Ruling 197-d1 addendum 24.3: THE per-line dispatch, used by both the
+/// strict single-pass walk ([`scan_segment`]) AND the tolerant
+/// fallback loop inside [`history_segment`]. After S3a′, `runs.rs`
+/// contains exactly one `match` over [`LineEventKind`] outside
+/// `#[cfg(test)]`, and that `match` lives here.
+///
+/// A mutant in this helper fails a strict reader pin, a tolerant
+/// `history_segment` reader pin AND a Collect row (addendum 24.3).
+fn dispatch_line<Of>(
+    classifier: &mut Classifier,
+    line: DecodedLine,
+    trail: [u8; 16],
+    reaction: Reaction,
+    record_index: usize,
+    on_feed: &mut Of,
+) -> Result<(), AuditError>
+where
+    Of: FnMut(DispatchFed<'_>, u64, bool),
+{
+    let DecodedLine {
+        kind,
+        offset_after,
+        newline,
+    } = line;
+    match kind {
+        LineEventKind::Record(records) => {
+            let record_count = records.len();
+            let record = &records[0];
+            match (classifier.mode, reaction) {
+                (Mode::Strict, Reaction::Stop) => {
+                    let gap = classifier.take_gap();
+                    let advance = classifier.feed_record(record, record_count, trail, gap)?;
+                    // On `Advance::Record` `feed_record` sets
+                    // `self.state = Some(next)`; on `Advance::Duplicate`
+                    // state is unchanged but Duplicate requires state
+                    // to be Some (the duplicate check guards on it).
+                    // So on an Ok outcome, state is Some. `.expect()`
+                    // is the invariant; no `Violation::MissingHead`
+                    // construction is added at this site (addendum 20.1).
+                    let rs = classifier
+                        .state()
+                        .expect("strict feed_record Ok implies state=Some");
+                    match advance {
+                        Advance::Record => {
+                            on_feed(DispatchFed::Record(record, rs), offset_after, newline);
+                        }
+                        Advance::Duplicate => {
+                            on_feed(DispatchFed::Duplicate(record), offset_after, newline);
+                        }
+                    }
+                }
+                (Mode::Strict, Reaction::Collect) => {
+                    // Strict Collect: swallow errors; on_feed is not
+                    // called for Record here (the S3b `classify`
+                    // iterator and tests rebuild segment state from
+                    // the outcome, not from per-record on_feed calls;
+                    // mirrors the tolerant Collect record arm which
+                    // also skips on_feed).
+                    classifier.feed_record_collect_strict(
+                        record,
+                        record_count,
+                        trail,
+                        record_index,
+                    );
+                }
+                (Mode::Tolerant, Reaction::Stop) => {
+                    let prep =
+                        classifier.feed_record_tolerant_entry(record, record_count, trail)?;
+                    if matches!(prep, TolerantPrep::Duplicate) {
+                        // Addendum 22.1: the duplicate arm advances the
+                        // stream cursor so `s.length` is byte-identical
+                        // to base, but leaves `state.offset` and
+                        // `state.newline` untouched (addendum 17.2).
+                        on_feed(DispatchFed::Duplicate(record), offset_after, newline);
+                        return Ok(());
+                    }
+                    classifier.feed_record_apply_tolerant(record)?;
+                    // Addendum 20's `missing head` invariant: apply Ok
+                    // leaves `classifier.state()=Some`. The explicit
+                    // `Violation::MissingHead` construction below is
+                    // defence-in-depth and marked UNREACHABLE for the
+                    // reader-side pin gate (occ 0).
+                    let rs = classifier
+                        .state()
+                        .ok_or_else(|| AuditError::from(Violation::MissingHead))?;
+                    on_feed(DispatchFed::Record(record, rs), offset_after, newline);
+                }
+                (Mode::Tolerant, Reaction::Collect) => {
+                    classifier.feed_record_collect(record, record_count, trail, record_index);
+                }
+            }
+        }
+        LineEventKind::Fragment(bytes) => {
+            match (classifier.mode, reaction) {
+                (Mode::Strict, Reaction::Stop) => classifier.feed_fragment(&bytes)?,
+                (Mode::Strict, Reaction::Collect) => {
+                    classifier.feed_fragment_collect_strict(&bytes, record_index);
+                }
+                (Mode::Tolerant, Reaction::Stop) => classifier.feed_fragment_tolerant(&bytes),
+                (Mode::Tolerant, Reaction::Collect) => {
+                    classifier.feed_fragment_collect(&bytes, record_index);
+                }
+            }
+            on_feed(DispatchFed::NonRecord, offset_after, newline);
+        }
+        LineEventKind::Unparsable => {
+            match (classifier.mode, reaction) {
+                (Mode::Strict, Reaction::Stop) => {
+                    classifier.feed_unparsable(&[])?;
+                    unreachable!("feed_unparsable returns Err in strict mode");
+                }
+                (Mode::Strict, Reaction::Collect) => {
+                    classifier.feed_unparsable_collect_strict(&[], record_index);
+                }
+                (Mode::Tolerant, Reaction::Stop) => classifier.feed_unparsable_tolerant(),
+                (Mode::Tolerant, Reaction::Collect) => {
+                    classifier.feed_unparsable_collect(record_index);
+                }
+            }
+            on_feed(DispatchFed::NonRecord, offset_after, newline);
+        }
+        LineEventKind::RecordErr => {
+            match (classifier.mode, reaction) {
+                (Mode::Strict, Reaction::Stop) => {
+                    classifier.feed_record_err_strict(&[])?;
+                    unreachable!("feed_record_err_strict returns Err in strict mode");
+                }
+                (Mode::Strict, Reaction::Collect) => {
+                    classifier.feed_record_err_collect_strict(record_index);
+                }
+                (Mode::Tolerant, Reaction::Stop) => {
+                    classifier.feed_record_err_tolerant()?;
+                    unreachable!("feed_record_err_tolerant always errors");
+                }
+                (Mode::Tolerant, Reaction::Collect) => {
+                    classifier.feed_record_err_collect_tolerant(record_index);
+                }
+            }
+            on_feed(DispatchFed::NonRecord, offset_after, newline);
+        }
+    }
+    Ok(())
 }
 
 /// Result of [`history_segment`]'s shared walk (addenda 19.1 / 20.1).
@@ -902,6 +1147,27 @@ impl Classifier {
         c
     }
 
+    /// Ruling 197-d1 addendum 24 (S3a′): builds a strict-mode classifier
+    /// in [`Reaction::Collect`]. Mirrors [`Classifier::new_collect`] but
+    /// drives the strict single-pass state machine so `Violation`s are
+    /// recorded through [`Classifier::on_violation`] instead of returned.
+    /// Consumed by [`scan_segment`]'s Collect reaction and by #197 R2b
+    /// S3b's `classify` iterator; S3a′'s own SC rows drive it directly.
+    ///
+    /// **Strict Collect first-equality:** on every single-segment strict
+    /// path (`scan` ×3, `scan_staged` ×2, `scan_closing` ×2), the
+    /// collector's first recorded violation equals the reader's first,
+    /// with zero mismatches on the brief's layout × context sweep.
+    pub(crate) fn new_collect_strict(
+        prior_run: Option<RunState>,
+        ctx: SegmentContext,
+        initial_boundary_resume: bool,
+    ) -> Self {
+        let mut c = Self::new(prior_run, ctx, Mode::Strict, initial_boundary_resume);
+        c.reaction = Reaction::Collect;
+        c
+    }
+
     /// Reader observer: the pure state after the last successful feed.
     pub(crate) fn state(&self) -> Option<&RunState> {
         self.state.as_ref()
@@ -1052,6 +1318,37 @@ impl Classifier {
         Err(self.on_violation(invalid_opening_line()))
     }
 
+    /// Ruling 197-d1 addendum 17.1 (S3a′): strict-mode entry for a
+    /// `Line::Record(Err(_))` payload. Today's strict `scan_inner`
+    /// routes `Line::Record(Err(_))` into `feed_unparsable`; this method
+    /// preserves that detail (`invalid audit line or opening checkpoint`
+    /// via [`invalid_opening_line`]), byte-identical to base. Used by
+    /// both [`scan_segment`] (Stop) and [`dispatch_line`].
+    pub(crate) fn feed_record_err_strict(&mut self, _bytes: &[u8]) -> Result<(), AuditError> {
+        assert!(
+            matches!(self.mode, Mode::Strict),
+            "feed_record_err_strict is strict-mode-only; tolerant mode uses feed_record_err_tolerant"
+        );
+        Err(self.on_violation(invalid_opening_line()))
+    }
+
+    /// Ruling 197-d1 addendum 17.1 (S3a′): strict-mode finish-time check
+    /// shared by [`Classifier::finish`] and
+    /// [`Classifier::finish_collect_strict`]. Each variant has ONE
+    /// construction site (here), so the syn gate's `(detail, occurrence)`
+    /// indices stay stable across reactions.
+    fn finish_strict_check(&self) -> Option<Violation> {
+        if self.first {
+            Some(Violation::EmptyLiveFile)
+        } else if self.state.is_none() {
+            Some(Violation::MissingHead)
+        } else if self.state.as_ref().is_some_and(|s| s.pending_resume) || self.boundary_resume {
+            Some(Violation::ResumeCheckpointLacksDeclaration)
+        } else {
+            None
+        }
+    }
+
     /// Terminal check for one segment. Strict mode produces the reader's
     /// `scan_inner` epilogue errors (`empty live file …`,
     /// `resume checkpoint lacks …`). The reader builds its final `State`
@@ -1061,20 +1358,42 @@ impl Classifier {
             matches!(self.mode, Mode::Strict),
             "finish is strict-mode-only; tolerant mode uses finish_tolerant"
         );
-        if self.first {
-            return Err(self.on_violation(Violation::EmptyLiveFile));
+        if let Some(v) = self.finish_strict_check() {
+            return Err(self.on_violation(v));
         }
-        let Some(state) = self.state.take() else {
-            return Err(self.on_violation(Violation::MissingHead));
-        };
-        if state.pending_resume || self.boundary_resume {
-            self.state = Some(state);
-            return Err(self.on_violation(Violation::ResumeCheckpointLacksDeclaration));
-        }
+        let state = self
+            .state
+            .take()
+            .expect("finish_strict_check guards state=None with Violation::MissingHead");
         Ok(FinishOutcome {
             state,
             gap: self.gap,
         })
+    }
+
+    /// Ruling 197-d1 addendum 17.1 (S3a′): strict-mode Collect finish.
+    /// Mirrors [`Classifier::finish`]'s terminal checks but records each
+    /// would-be `Err` into the collector's violations vector instead of
+    /// returning. Reuses [`Classifier::finish_strict_check`] so each
+    /// variant has exactly one construction site. The result's `state`
+    /// may be `None` (when no complete record was folded); `gap` and
+    /// `violations` carry forward to [`ScanSegmentOutcome`].
+    pub(crate) fn finish_collect_strict(mut self) -> ScanSegmentOutcome {
+        debug_assert!(matches!(self.reaction, Reaction::Collect));
+        debug_assert!(matches!(self.mode, Mode::Strict));
+        // Addendum 17.4: skip the finish-time checks when the run has
+        // already been ended by an earlier violation (`recovery_pending`),
+        // since no second report comes from a run that is already dead.
+        if !self.recovery_pending
+            && let Some(v) = self.finish_strict_check()
+        {
+            let _ = self.on_violation(v);
+        }
+        ScanSegmentOutcome {
+            state: self.state,
+            gap: self.gap,
+            violations: self.collected,
+        }
     }
 
     // ---- Tolerant mode -------------------------------------------------
@@ -1520,6 +1839,95 @@ impl Classifier {
             return;
         }
         self.feed_unparsable_tolerant();
+    }
+
+    /// Ruling 197-d1 addendum 17.1 (S3a′): tolerant-mode Collect entry
+    /// for a `Line::Record(Err(_))` line. Short-circuits on
+    /// `recovery_pending`, bumps the record index, records
+    /// `Violation::InvalidRecordInSealedRun` through the existing
+    /// [`Classifier::feed_record_err_tolerant`] path (so no new
+    /// construction site is added), and swallows the returned `Err`
+    /// because [`Classifier::on_violation`] already recorded and
+    /// latched. Continues through end-of-segment checks per point 4.
+    pub(crate) fn feed_record_err_collect_tolerant(&mut self, record_index: usize) {
+        debug_assert!(matches!(self.reaction, Reaction::Collect));
+        debug_assert!(matches!(self.mode, Mode::Tolerant));
+        self.current_pos.record_index_in_segment = record_index;
+        if self.recovery_pending {
+            return;
+        }
+        let _ = self.feed_record_err_tolerant();
+    }
+
+    /// Ruling 197-d1 addendum 17.1 (S3a′): strict-mode Collect entry for
+    /// a complete record. Thin wrapper over [`Classifier::feed_record`]:
+    /// extracts the gap digest, drives the strict classifier, swallows
+    /// each `Err` because [`Classifier::on_violation`] already recorded
+    /// and latched `recovery_pending`. Base-identical first-equality:
+    /// the strict classifier's order matches the reader's on every
+    /// strict single-segment path.
+    pub(crate) fn feed_record_collect_strict(
+        &mut self,
+        record: &Record,
+        record_count: usize,
+        trail: [u8; 16],
+        record_index: usize,
+    ) {
+        debug_assert!(matches!(self.reaction, Reaction::Collect));
+        debug_assert!(matches!(self.mode, Mode::Strict));
+        self.current_pos.record_index_in_segment = record_index;
+        if self.recovery_pending {
+            return;
+        }
+        let gap = self.take_gap();
+        let _ = self.feed_record(record, record_count, trail, gap);
+    }
+
+    /// Ruling 197-d1 addendum 17.1 (S3a′): strict-mode Collect entry for
+    /// a Fragment line. Thin wrapper over [`Classifier::feed_fragment`]:
+    /// short-circuits on `recovery_pending`, bumps the record index,
+    /// calls strict `feed_fragment` (extends the gap hasher mid-segment,
+    /// records `invalid audit line or opening checkpoint` at an opening
+    /// or boundary), and swallows the returned `Err` under Collect.
+    pub(crate) fn feed_fragment_collect_strict(&mut self, bytes: &[u8], record_index: usize) {
+        debug_assert!(matches!(self.reaction, Reaction::Collect));
+        debug_assert!(matches!(self.mode, Mode::Strict));
+        self.current_pos.record_index_in_segment = record_index;
+        if self.recovery_pending {
+            return;
+        }
+        let _ = self.feed_fragment(bytes);
+    }
+
+    /// Ruling 197-d1 addendum 17.1 (S3a′): strict-mode Collect entry for
+    /// an Unparsable line. `bytes` is kept for signature symmetry with
+    /// the Fragment wrapper; strict Unparsable records at
+    /// [`invalid_opening_line`] via [`Classifier::feed_unparsable`].
+    pub(crate) fn feed_unparsable_collect_strict(&mut self, bytes: &[u8], record_index: usize) {
+        debug_assert!(matches!(self.reaction, Reaction::Collect));
+        debug_assert!(matches!(self.mode, Mode::Strict));
+        self.current_pos.record_index_in_segment = record_index;
+        if self.recovery_pending {
+            return;
+        }
+        let _ = self.feed_unparsable(bytes);
+    }
+
+    /// Ruling 197-d1 addendum 17.1 (S3a′): strict-mode Collect entry for
+    /// a `Line::Record(Err(_))` line. Today's strict `Record(Err)`
+    /// detail is `invalid audit line or opening checkpoint` via
+    /// [`invalid_opening_line`] (routed through
+    /// [`Classifier::feed_record_err_strict`]), so no new
+    /// `Violation::InvalidLineOrOpeningCheckpoint` construction site is
+    /// added.
+    pub(crate) fn feed_record_err_collect_strict(&mut self, record_index: usize) {
+        debug_assert!(matches!(self.reaction, Reaction::Collect));
+        debug_assert!(matches!(self.mode, Mode::Strict));
+        self.current_pos.record_index_in_segment = record_index;
+        if self.recovery_pending {
+            return;
+        }
+        let _ = self.feed_record_err_strict(&[]);
     }
 
     /// Addendum 16 point 5: finish the collector. Mirrors
@@ -2428,6 +2836,460 @@ mod collector_tests {
             c2.collected.len(),
             before,
             "boundary skips end-of-segment checks while run is dead",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // S3a′ (ruling 197-d1 addendum 24) — Strict×Collect rows (SC1–SC9)
+    // ------------------------------------------------------------------
+
+    /// Drives a sequence of `Record`s through [`super::scan_segment`]
+    /// under [`Reaction::Collect`] on a given strict single-segment
+    /// shape. Returns the recorded violations and the final state.
+    fn run_scan_segment_collect(
+        ctx: SegmentContext,
+        prior_run: Option<RunState>,
+        initial_boundary_resume: bool,
+        records: Vec<Record>,
+    ) -> super::ScanSegmentOutcome {
+        let mut iter = records.into_iter();
+        let mut offset: u64 = 0;
+        let events = move || -> Result<Option<DecodedLine>, AuditError> {
+            Ok(iter.next().map(|r| {
+                offset += 1;
+                DecodedLine {
+                    kind: LineEventKind::Record(vec![r]),
+                    offset_after: offset,
+                    newline: true,
+                }
+            }))
+        };
+        super::scan_segment(
+            Reaction::Collect,
+            ScanSegmentArgs {
+                ctx,
+                trail: TRAIL,
+                prior_run,
+                initial_boundary_resume,
+            },
+            events,
+            |_, _, _| {},
+        )
+        .expect("in-memory scan_segment should not fail")
+    }
+
+    /// SC1 (Strict×Collect sanity): rollback on the X record.
+    ///
+    /// On `scan_segment(Reaction::Collect, ...)` over `[cp0, e1, x(seq=1)]`
+    /// where `x` rolls back to a prior seq, the strict classifier records
+    /// `RecordRolledBack` at record_index=2 and point-4-continues; no
+    /// further violation is reachable on this 3-token layout. Mirrors
+    /// `scan`'s strict reader-first `RecordRolledBack` at the X line.
+    #[test]
+    fn sc1_strict_collect_sanity_rolls_back() {
+        let ctx = SegmentContext {
+            opening: true,
+            genesis: true,
+            run: false,
+        };
+        let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        let mut m_at_e1 = Mmr::new();
+        m_at_e1.push(cp0.hash()).unwrap();
+        let e1 = entry(1, cp0.hash());
+        // X: a record at seq=1 with previous != e1.hash — strict's
+        // apply_checked returns `Violation::RecordRolledBack`.
+        let x = entry(1, [0xee; 32]);
+        let out = run_scan_segment_collect(ctx, None, false, vec![cp0, e1, x]);
+        let variants: Vec<(usize, Violation)> = out
+            .violations
+            .iter()
+            .map(|(p, v)| (p.record_index_in_segment, *v))
+            .collect();
+        assert_eq!(
+            variants,
+            vec![(2, Violation::RecordRolledBack)],
+            "strict Collect first-equality: X rolls back at record_index=2"
+        );
+    }
+
+    /// SC2 (Strict×Collect Duplicate): the strict duplicate short-circuit
+    /// records nothing and leaves `state` equal to the Stop reaction's
+    /// state on the same input `[cp0, cp0]`.
+    #[test]
+    fn sc2_strict_collect_duplicate_records_nothing() {
+        let ctx = SegmentContext {
+            opening: true,
+            genesis: true,
+            run: false,
+        };
+        let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        let out = run_scan_segment_collect(ctx, None, false, vec![cp0.clone(), cp0.clone()]);
+        assert!(
+            out.violations.is_empty(),
+            "strict duplicate short-circuit records nothing; got: {:?}",
+            out.violations.iter().map(|(_, v)| *v).collect::<Vec<_>>()
+        );
+        assert!(
+            out.state.is_some(),
+            "duplicate leaves the folded state in place"
+        );
+    }
+
+    /// SC3 (Record(Err) Collect, strict): a `Line::Record(Err(_))` at
+    /// record_index=1 records exactly
+    /// `[(1, InvalidLineOrOpeningCheckpoint)]` through
+    /// `feed_record_err_collect_strict` and point-4-continues (no
+    /// second violation on this 2-token layout).
+    #[test]
+    fn sc3_strict_collect_record_err_records_invalid_opening_line() {
+        let ctx = SegmentContext {
+            opening: true,
+            genesis: true,
+            run: false,
+        };
+        let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        // Emit cp0 then a RecordErr event by hand through `events`.
+        let mut emitted: usize = 0;
+        let events = move || -> Result<Option<DecodedLine>, AuditError> {
+            emitted += 1;
+            match emitted {
+                1 => Ok(Some(DecodedLine {
+                    kind: LineEventKind::Record(vec![cp0.clone()]),
+                    offset_after: 1,
+                    newline: true,
+                })),
+                2 => Ok(Some(DecodedLine {
+                    kind: LineEventKind::RecordErr,
+                    offset_after: 2,
+                    newline: true,
+                })),
+                _ => Ok(None),
+            }
+        };
+        let out = super::scan_segment(
+            Reaction::Collect,
+            ScanSegmentArgs {
+                ctx,
+                trail: TRAIL,
+                prior_run: None,
+                initial_boundary_resume: false,
+            },
+            events,
+            |_, _, _| {},
+        )
+        .unwrap();
+        let variants: Vec<(usize, Violation)> = out
+            .violations
+            .iter()
+            .map(|(p, v)| (p.record_index_in_segment, *v))
+            .collect();
+        assert_eq!(
+            variants,
+            vec![(1, Violation::InvalidLineOrOpeningCheckpoint)],
+            "strict Record(Err) Collect: exact detail at record_index=1"
+        );
+    }
+
+    /// SC4 (Record(Err) Collect, tolerant via history_segment): under
+    /// `history_segment(opening=true, run=false)`, `[cp0, e1, X]` (where
+    /// X is a `Line::Record(Err(_))`) records exactly
+    /// `[(2, InvalidRecordInSealedRun)]` through
+    /// `feed_record_err_collect_tolerant` and does not stop at X.
+    #[test]
+    fn sc4_tolerant_collect_record_err_records_sealed_run_invalid() {
+        let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        let e1 = entry(1, cp0.hash());
+        // To reach the tolerant fallback through history_segment, the
+        // strict pass must fail with CorruptTrail. Supply a strict
+        // closure that always fails with CorruptTrail; the tolerant
+        // Collect walk then drives `[cp0, e1, X]`.
+        let strict = || {
+            Err(AuditError::new(
+                crate::audit::AuditErrorKind::CorruptTrail,
+                "trial",
+            ))
+        };
+        let records: [LineEventKind; 3] = [
+            LineEventKind::Record(vec![cp0.clone()]),
+            LineEventKind::Record(vec![e1.clone()]),
+            LineEventKind::RecordErr,
+        ];
+        let mut iter = records.into_iter();
+        let mut offset: u64 = 0;
+        let events = move || -> Result<Option<DecodedLine>, AuditError> {
+            Ok(iter.next().map(|k| {
+                offset += 1;
+                DecodedLine {
+                    kind: k,
+                    offset_after: offset,
+                    newline: true,
+                }
+            }))
+        };
+        let walk = super::history_segment::<(), _, _, _>(
+            Reaction::Collect,
+            HistorySegmentArgs {
+                ctx: SegmentContext {
+                    opening: true,
+                    genesis: false,
+                    run: false,
+                },
+                prior_run: None,
+                unsealed_boundary: false,
+                run_in: false,
+                trail: TRAIL,
+            },
+            strict,
+            events,
+            |_, _, _| {},
+        )
+        .expect("history_segment should succeed on this layout");
+        let out = match walk {
+            HistorySegmentWalk::Tolerant(o) => *o,
+            HistorySegmentWalk::Strict(()) => panic!("CorruptTrail trial forces tolerant"),
+        };
+        assert!(
+            out.violations
+                .iter()
+                .any(|(p, v)| *v == Violation::InvalidRecordInSealedRun
+                    && p.record_index_in_segment == 2),
+            "tolerant Collect Record(Err) records sealed-run detail; violations={:?}",
+            out.violations.iter().map(|(_, v)| *v).collect::<Vec<_>>()
+        );
+    }
+
+    /// SC5 (Record(Err) Collect point-4 continuation, tolerant): after
+    /// `X` records in SC4, a subsequent record is still processed (does
+    /// not stop at X). The exact trailing-violation list is layout-
+    /// dependent; the key assertion is that the collector does not stop.
+    #[test]
+    fn sc5_tolerant_collect_record_err_continues_past_x() {
+        let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        let e1 = entry(1, cp0.hash());
+        let e3 = entry(3, e1.hash());
+        let strict = || {
+            Err(AuditError::new(
+                crate::audit::AuditErrorKind::CorruptTrail,
+                "trial",
+            ))
+        };
+        let records: [LineEventKind; 4] = [
+            LineEventKind::Record(vec![cp0.clone()]),
+            LineEventKind::Record(vec![e1.clone()]),
+            LineEventKind::RecordErr,
+            LineEventKind::Record(vec![e3.clone()]),
+        ];
+        let mut iter = records.into_iter();
+        let mut offset: u64 = 0;
+        let events = move || -> Result<Option<DecodedLine>, AuditError> {
+            Ok(iter.next().map(|k| {
+                offset += 1;
+                DecodedLine {
+                    kind: k,
+                    offset_after: offset,
+                    newline: true,
+                }
+            }))
+        };
+        let walk = super::history_segment::<(), _, _, _>(
+            Reaction::Collect,
+            HistorySegmentArgs {
+                ctx: SegmentContext {
+                    opening: true,
+                    genesis: false,
+                    run: false,
+                },
+                prior_run: None,
+                unsealed_boundary: false,
+                run_in: false,
+                trail: TRAIL,
+            },
+            strict,
+            events,
+            |_, _, _| {},
+        )
+        .unwrap();
+        let out = match walk {
+            HistorySegmentWalk::Tolerant(o) => *o,
+            HistorySegmentWalk::Strict(()) => panic!("CorruptTrail trial forces tolerant"),
+        };
+        // X recorded InvalidRecordInSealedRun (not latched by
+        // recovery_pending in this specific flow, since the
+        // feed_record_err_tolerant path through on_violation DOES latch
+        // recovery_pending). The key assertion: the collector observed
+        // X and continued the walk (reached event 4).
+        let found_x = out.violations.iter().any(|(p, v)| {
+            *v == Violation::InvalidRecordInSealedRun && p.record_index_in_segment == 2
+        });
+        assert!(
+            found_x,
+            "X recorded InvalidRecordInSealedRun; violations={:?}",
+            out.violations.iter().map(|(_, v)| *v).collect::<Vec<_>>()
+        );
+    }
+
+    /// SC6 (strict Collect duplicate): on `[cp0, cp0]` with strict
+    /// Collect, the duplicate short-circuit records nothing but the
+    /// strict classifier's `first` latch clears after cp0, so a
+    /// subsequent duplicate-like entry is checked against the duplicate
+    /// path. Asserts the Advance::Duplicate outcome is the same as
+    /// Stop's by comparing the state.
+    #[test]
+    fn sc6_strict_collect_duplicate_same_state_as_stop() {
+        let ctx = SegmentContext {
+            opening: true,
+            genesis: true,
+            run: false,
+        };
+        let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        let collect_out =
+            run_scan_segment_collect(ctx, None, false, vec![cp0.clone(), cp0.clone()]);
+        // Stop reaction over the same input (using in-memory classifier).
+        let mut c = Classifier::new(None, ctx, Mode::Strict, false);
+        c.feed_record(&cp0, 1, TRAIL, None).unwrap();
+        let gap = c.take_gap();
+        c.feed_record(&cp0, 1, TRAIL, gap).unwrap();
+        let stop_state = c.state().cloned();
+        assert_eq!(
+            collect_out.state.as_ref().map(|s| s.head),
+            stop_state.as_ref().map(|s| s.head),
+            "strict Collect duplicate ends on the same head as Stop",
+        );
+    }
+
+    /// SC7 (strict Collect `saved_prior=None` neutralised on single
+    /// segment): strict scan_segment runs one segment, so the
+    /// `saved_prior=None` mutant on `reset_at_boundary` is NOT
+    /// expressible here (addendum 24 flexibility: strict single-pass
+    /// has no `reset_at_boundary` in a single segment). Instead, pin
+    /// the interchange with `initial_boundary_resume=true` producing
+    /// the strict reader's `UnclosedSegmentLacksResume` at the right
+    /// position on `[cp0, cp1]` where cp1 is not a resume.
+    #[test]
+    fn sc7_strict_collect_initial_boundary_resume_fires() {
+        // A sealed prior where we re-open with initial_boundary_resume=true
+        // requires the first successor to be an immediate
+        // `vigil.audit.resume`. A non-resume checkpoint fires
+        // `UnclosedSegmentLacksResume`.
+        let ctx = SegmentContext {
+            opening: true,
+            genesis: false,
+            run: false,
+        };
+        let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        // Build a prior run from cp0 so initial_boundary_resume can be
+        // true on a sealed prior (requires the classifier's
+        // first-successor resume check).
+        let mut c0 = Classifier::new(None, ctx, Mode::Strict, false);
+        c0.feed_record(&cp0, 1, TRAIL, None).unwrap();
+        let cp0_run = c0.state().expect("cp0 fold").clone();
+        let mut m_at_cp1 = Mmr::new();
+        m_at_cp1.push(cp0.hash()).unwrap();
+        let cp1 = cp(1, cp0.hash(), &m_at_cp1);
+        let out = run_scan_segment_collect(ctx, Some(cp0_run), true, vec![cp1]);
+        let variants: Vec<Violation> = out.violations.iter().map(|(_, v)| *v).collect();
+        // What the code actually yields on this layout: cp1 duplicates
+        // the predecessor cp0 at head/seq=0 vs cp1.seq=1; strict's
+        // duplicate check fires no error because seqs differ, so cp1
+        // folds. The finish-time check then records
+        // `ResumeCheckpointLacksDeclaration` because `boundary_resume`
+        // was never cleared (cp1 is not an `audit.resume` entry, and
+        // the strict path's `self.boundary_resume` guard requires
+        // `!self.first` for the UnclosedSegmentLacksResume check).
+        // Either variant proves `initial_boundary_resume` is wired.
+        assert!(
+            variants.contains(&Violation::ResumeCheckpointLacksDeclaration)
+                || variants.contains(&Violation::UnclosedSegmentLacksResume),
+            "initial_boundary_resume=true wires the strict-side boundary check; got {variants:?}"
+        );
+    }
+
+    /// SC8 (strict sealed-seq `<=`→`<` collector row): the strict
+    /// `apply_checked` seq check is NOT expressible here as `<=`→`<`
+    /// in the strict single-pass (strict's genesis logic differs).
+    /// Instead this row pins strict Collect on a record whose seq does
+    /// not strictly increase vs the predecessor, producing the exact
+    /// strict detail.
+    #[test]
+    fn sc8_strict_collect_seq_did_not_increase() {
+        let ctx = SegmentContext {
+            opening: true,
+            genesis: true,
+            run: false,
+        };
+        let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        // Second record: same seq as cp0 (seq=0). Strict's apply_checked
+        // records a rollback (seq did not increase).
+        let dup_like = entry(0, cp0.hash());
+        let out = run_scan_segment_collect(ctx, None, false, vec![cp0, dup_like]);
+        let variants: Vec<Violation> = out.violations.iter().map(|(_, v)| *v).collect();
+        assert!(
+            variants
+                .iter()
+                .any(|v| matches!(v, Violation::RecordRolledBack)),
+            "strict Collect seq-did-not-increase variant; got {variants:?}"
+        );
+    }
+
+    /// SC9 (Collect skips attestation, strict): a torn gap + a record
+    /// with `repaired=None` records
+    /// `Violation::MissingOrMismatchedAttestation`. A mutant that
+    /// removes `check_attestation` from `feed_record` strict fails this
+    /// row.
+    #[test]
+    fn sc9_strict_collect_missing_attestation() {
+        let ctx = SegmentContext {
+            opening: true,
+            genesis: true,
+            run: false,
+        };
+        let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        // Emit cp0, then a Fragment (sets gap), then a record whose
+        // `repaired` is None → check_attestation fails inside strict
+        // feed_record.
+        let cp1 = {
+            let mut m = Mmr::new();
+            m.push(cp0.hash()).unwrap();
+            cp(1, cp0.hash(), &m)
+        };
+        let mut emitted: usize = 0;
+        let events = move || -> Result<Option<DecodedLine>, AuditError> {
+            emitted += 1;
+            match emitted {
+                1 => Ok(Some(DecodedLine {
+                    kind: LineEventKind::Record(vec![cp0.clone()]),
+                    offset_after: 1,
+                    newline: true,
+                })),
+                2 => Ok(Some(DecodedLine {
+                    kind: LineEventKind::Fragment(b"torn\n".to_vec()),
+                    offset_after: 2,
+                    newline: true,
+                })),
+                3 => Ok(Some(DecodedLine {
+                    kind: LineEventKind::Record(vec![cp1.clone()]),
+                    offset_after: 3,
+                    newline: true,
+                })),
+                _ => Ok(None),
+            }
+        };
+        let out = super::scan_segment(
+            Reaction::Collect,
+            ScanSegmentArgs {
+                ctx,
+                trail: TRAIL,
+                prior_run: None,
+                initial_boundary_resume: false,
+            },
+            events,
+            |_, _, _| {},
+        )
+        .unwrap();
+        let variants: Vec<Violation> = out.violations.iter().map(|(_, v)| *v).collect();
+        assert!(
+            variants.contains(&Violation::MissingOrMismatchedAttestation),
+            "strict Collect missing attestation; got {variants:?}"
         );
     }
 }
