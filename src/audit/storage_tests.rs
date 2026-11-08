@@ -3631,6 +3631,29 @@ mod details {
         assert!(state.is_none(), "no complete record in seg0 to carry state");
     }
 
+    /// S3a′ S2 (ruling 197-d1 addendum 17.1): strict Stop
+    /// `Line::Record(Err(_))` preserves today's detail
+    /// (`invalid audit line or opening checkpoint`), which is the
+    /// same detail `feed_unparsable` emits via `invalid_opening_line()`.
+    /// The refactor routes `Record(Err)` into
+    /// `Classifier::feed_record_err_strict`, which reuses that helper;
+    /// no new construction site is added.
+    #[test]
+    fn pin_sc_record_err_strict_reuses_invalid_opening_line_detail() {
+        let d = Temp::new();
+        let f = cp0();
+        // Append a record-err: a line that parses as JSON but is not a
+        // valid vigil record. `super::lines::classify` on such a
+        // payload returns `Line::Record(Err(_))`.
+        let bad = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{}]}]}]}"#;
+        w(&d, &[line(&f), bad.to_vec(), b"\n".to_vec()].concat());
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "invalid audit line or opening checkpoint",
+            0,
+        );
+    }
+
     // ---- Coverage gate --------------------------------------------------
 
     const UNREACHABLE: &[(&str, usize, &str)] = &[
