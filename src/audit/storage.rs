@@ -552,12 +552,12 @@ impl<'dir> SegmentSource<'dir> {
         })
     }
 
-    /// Lazy base-order open. The first open error surfaces where it did
-    /// at base: a corrupt rotated segment N aborts before segment N+1
-    /// is opened (addendum 25.2 / fact 5). On refresh rotate the
-    /// `segments_after` listing itself runs lazily — after the prelude
-    /// has been yielded — so a listing error surfaces at the second
-    /// call, not the first.
+    /// Lazy base-order open. Each file is opened only inside the
+    /// matching `next_segment` call, so a corrupt rotated segment N
+    /// aborts the walk before segment N+1 is opened (addendum 25.2).
+    /// On refresh rotate the `segments_after` listing itself runs
+    /// lazily — after the prelude has been yielded — so a listing
+    /// error surfaces at the second call, not the first.
     pub(crate) fn next_segment(&mut self) -> Result<Option<SegmentRead>, AuditError> {
         if self.cursor >= self.plan.len()
             && let Some(pending) = self.pending.take()
@@ -603,7 +603,8 @@ impl<'dir> SegmentSource<'dir> {
 
     /// Append the rotated-name steps and the closing-live step to the
     /// plan, running `segments_after` lazily so its errors surface
-    /// after the prelude's own walk (fact 5 / addendum 25.2).
+    /// after the prelude's own walk (addendum 25.2: on refresh rotate
+    /// the prelude walks first, then the newer segments are listed).
     fn expand_rotate_after(&mut self, pending: PendingRotateAfter) -> Result<(), AuditError> {
         let (names, newest) = segments_after_from(self.dir, &pending.old, &pending.sealed_before)?;
         self.plan.reserve(names.len() + 1);
@@ -737,34 +738,28 @@ pub(crate) fn history_segment(
 
     // Reader-side bookkeeping: the pure run state, the writer-only
     // `cp_time` / `since_cp` fold and the `expected` / `found`
-    // writeback. Byte-level fields (`last_offset` / `last_newline`)
-    // live in [`SegmentBytes`]; the duplicate arm (addendum 22.1)
-    // leaves them alone — base-identical. `final_offset` tracks the
-    // last `offset_after` reported through `on_feed`, matching base's
-    // `s.length = final_offset` on the tolerant epilogue (a glue byte
-    // without any subsequent line does NOT count toward `length`).
+    // writeback. Byte-level fields (`last_offset` / `last_newline`
+    // and the walk's end-of-segment byte cursor) live in
+    // [`SegmentBytes`]; the duplicate arm (addendum 22.1) leaves
+    // `last_offset` / `last_newline` alone — base-identical.
     let mut last_run: Option<RunState> = state.as_ref().map(|s| s.run.clone());
     let mut cp_time = state.as_ref().map_or(0, |s| s.checkpoint_time);
     let mut since_cp = state.as_ref().map_or(0, |s| s.since_checkpoint);
-    let mut final_offset = initial_offset;
-    let on_feed = |fed: FeedEvent<'_>, offset_after: u64, newline_after: bool| {
-        final_offset = offset_after;
-        match fed {
-            FeedEvent::Record(record, rs) => {
-                (cp_time, since_cp) = next_cp_fields(Some((cp_time, since_cp)), record);
-                last_run = Some(rs.clone());
-                bytes
-                    .borrow_mut()
-                    .note_record_fed(offset_after, newline_after);
-                if expected == Some(rs.head) {
-                    *fc.borrow_mut() = Some(record.clone());
-                }
+    let on_feed = |fed: FeedEvent<'_>, offset_after: u64, newline_after: bool| match fed {
+        FeedEvent::Record(record, rs) => {
+            (cp_time, since_cp) = next_cp_fields(Some((cp_time, since_cp)), record);
+            last_run = Some(rs.clone());
+            bytes
+                .borrow_mut()
+                .note_record_fed(offset_after, newline_after);
+            if expected == Some(rs.head) {
+                *fc.borrow_mut() = Some(record.clone());
             }
-            FeedEvent::Duplicate => {}
-            FeedEvent::NonRecord => {
-                if last_run.is_some() {
-                    bytes.borrow_mut().note_newline(newline_after);
-                }
+        }
+        FeedEvent::Duplicate => {}
+        FeedEvent::NonRecord => {
+            if last_run.is_some() {
+                bytes.borrow_mut().note_newline(newline_after);
             }
         }
     };
@@ -791,7 +786,7 @@ pub(crate) fn history_segment(
             Ok(last_run.map(|run_state| State {
                 run: run_state,
                 offset: bytes.last_offset(),
-                length: final_offset,
+                length: bytes.offset_cursor(),
                 checkpoint_time: cp_time,
                 since_checkpoint: since_cp,
                 newline: bytes.last_newline(),
