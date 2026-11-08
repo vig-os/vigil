@@ -1368,6 +1368,11 @@ impl Classifier {
         if let Some(v) = self.finish_strict_check() {
             return Err(self.on_violation(v));
         }
+        // Invariant: `self.state` is `Some(_)` once
+        // `finish_strict_check` returns `None`. Proof: that helper
+        // returns `Some(Violation::MissingHead)` on the exact condition
+        // `self.state.is_none()` and we just early-returned when it was
+        // `Some(_)`, so here `self.state.is_some()` is guaranteed.
         let state = self
             .state
             .take()
@@ -3096,9 +3101,27 @@ mod collector_tests {
     }
 
     /// SC5 (Record(Err) Collect point-4 continuation, tolerant): after
-    /// `X` records in SC4, a subsequent record is still processed (does
-    /// not stop at X). The exact trailing-violation list is layout-
-    /// dependent; the key assertion is that the collector does not stop.
+    /// `X` records in SC4, the tolerant `history_segment` loop MUST keep
+    /// pulling events past the `Record(Err)` line. On the 4-event input
+    /// `[cp0, e1, X, e3]` the loop body runs 4 times (all 4 events are
+    /// consumed through the `events()` closure), X at index 2 records
+    /// exactly `InvalidRecordInSealedRun`, and e3 at index 3 is a no-op
+    /// through the `recovery_pending` latch.
+    ///
+    /// Two assertions, both required (brief B1 and B2):
+    /// - **Continuation (B1):** the `events()` closure returned `Some` 4
+    ///   times. Kills **MSTOP** (break after `record_index += 1` on
+    ///   `Record(Err)`): under MSTOP only 3 events are consumed (loop
+    ///   body breaks after X), so `events_consumed == 3 != 4`.
+    /// - **Exact list (B2):** `[(2, InvalidRecordInSealedRun)]`. Kills
+    ///   **MSW1** (drop the `recovery_pending` latch in `on_violation`):
+    ///   X records `InvalidRecordInSealedRun` but `recovery_pending`
+    ///   stays false; e3 at index 3 then exercises the sealed-seq gap
+    ///   check and records `SequenceGapInSealedRun`, and the finish-time
+    ///   epilogue records `InvalidUndamagedSegment`. Also kills **M9**
+    ///   (`Record(Err)` Collect tolerant routes through
+    ///   `feed_record_err_tolerant` which returns `Err`): the walk then
+    ///   propagates `Err` out of `history_segment` instead of recording.
     #[test]
     fn sc5_tolerant_collect_record_err_continues_past_x() {
         let cp0 = cp(0, Record::genesis(&TRAIL), &Mmr::new());
@@ -3118,9 +3141,17 @@ mod collector_tests {
         ];
         let mut iter = records.into_iter();
         let mut offset: u64 = 0;
-        let events = move || -> Result<Option<DecodedLine>, AuditError> {
+        // Count events consumed from the events() closure. A `Some`
+        // return means the loop body will run for that line; MSTOP's
+        // `break` after `record_index += 1` on `Record(Err)` stops the
+        // loop before the 4th `events()` call, so `consumed` reaches
+        // only 3 under MSTOP and 4 on the correct code.
+        let consumed = std::cell::Cell::new(0usize);
+        let consumed_ref = &consumed;
+        let events = || -> Result<Option<DecodedLine>, AuditError> {
             Ok(iter.next().map(|k| {
                 offset += 1;
+                consumed_ref.set(consumed_ref.get() + 1);
                 DecodedLine {
                     kind: k,
                     offset_after: offset,
@@ -3150,23 +3181,22 @@ mod collector_tests {
             HistorySegmentWalk::Tolerant(o) => *o,
             HistorySegmentWalk::Strict(()) => panic!("CorruptTrail trial forces tolerant"),
         };
-        // Exact-list equality (brief B2): the correct point-4 behaviour
-        // is that X at index 2 records exactly `InvalidRecordInSealedRun`
+        // Continuation (B1): the walk MUST NOT stop at the Record(Err).
+        // All 4 events are consumed; MSTOP breaks after X and consumes
+        // only 3, failing this assertion.
+        assert_eq!(
+            consumed.get(),
+            4,
+            "events() closure consumed only {} of 4 events; the \
+             history_segment loop stopped at Record(Err) instead of \
+             continuing past it (kills MSTOP)",
+            consumed.get(),
+        );
+        // Exact-list equality (B2): the correct point-4 behaviour is
+        // that X at index 2 records exactly `InvalidRecordInSealedRun`
         // and latches `recovery_pending` through `on_violation`, so e3
-        // at index 3 is a no-op and the finish-time epilogue is skipped.
-        // The walk itself DID continue through the events() loop past X
-        // (feed_record_collect was invoked for e3, and simply returned
-        // because of recovery_pending). This is the brief's "continued
-        // past X" assertion: the walk kept pulling events, as opposed
-        // to propagating Err out of history_segment on the Record(Err).
-        //
-        // Named killer MSW1 (drop the `recovery_pending` latch in
-        // `on_violation`): X records `InvalidRecordInSealedRun` but
-        // recovery_pending stays false; e3 at index 3 then exercises
-        // the sealed-seq gap check and records
-        // `SequenceGapInSealedRun`, and the finish-time epilogue
-        // records `InvalidUndamagedSegment` (!damaged && !run_flag).
-        // Both branches differ from the exact list below → exit 101.
+        // at index 3 is a no-op and the finish-time epilogue is
+        // skipped.
         let got: Vec<(usize, Violation)> = out
             .violations
             .iter()
