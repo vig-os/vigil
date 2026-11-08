@@ -2122,6 +2122,89 @@ mod details {
         );
     }
     #[test]
+    fn pin_hs_on_feed_writes_found_on_opening_tolerant_walk_at_seq_max() {
+        // Addendum 22.2 (round-7): on `history_segment(opening=true, *)`
+        // the tolerant fallback's `on_feed(FeedEvent::Record, …)` must
+        // write the matching head back into the shared `found` buffer
+        // when `expected == Some(head)`, including the saturated
+        // `head.seq` end of addendum 15's range. Repro: no predecessor
+        // state, the live file holds a leading JSON fragment
+        // (incomplete object -> `Line::Fragment`) and then an
+        // archived-prefix checkpoint with `context.seq` pinned to the
+        // record builder's ceiling (`i64::MAX as u64`; `Record::build`
+        // rejects anything above that as "sequence exceeds OTLP int64",
+        // so this is the largest `head.seq` the on-disk wire format
+        // admits in the sense of addendum 15's saturated-seq branch)
+        // and `context.previous == genesis` (root-link + pending). The
+        // strict pass fails at the opening fragment with
+        // `invalid audit line or opening checkpoint`, so `scan_inner`
+        // never reaches any record and writes nothing into `found`.
+        // The tolerant fallback restarts at offset 0, folds the
+        // fragment as `FeedEvent::NonRecord` (no `found` write), then
+        // folds the checkpoint; `on_feed` fires as
+        // `FeedEvent::Record(cp_max, rs)` and the storage closure runs
+        // the writeback `*fc.borrow_mut() = Some(record.clone())`.
+        // The segment still finishes with `invalid undamaged segment`
+        // (no damage latched, count=1) so the method returns Err; the
+        // writeback must land before the `?` propagates (addendum 22.2
+        // moves the `found_cell.into_inner()` back to the caller
+        // ahead of `match walk?`). A mutant deleting the writeback,
+        // or negating the `expected == Some(head)` guard, leaves the
+        // shared buffer empty and `found` returns to the caller as
+        // `None`; base's `history_segment` fallback wrote `found`
+        // directly in the same loop, so it stayed `Some(cp_max)`.
+        //
+        // Build the archived-prefix checkpoint directly: the shared
+        // `cp` helper derives `time = 100 + seq`, which overflows at
+        // the saturated-seq ceiling; the storage flow depends on
+        // `context.seq`, not `context.time`.
+        let max_seq = i64::MAX as u64;
+        let fold = genesis_fold();
+        let fields = CheckpointFields::new(
+            fold.size(),
+            fold.root(),
+            fold.peaks().to_vec(),
+            [1; 32],
+            [0; 64],
+        )
+        .unwrap();
+        let cp_max = Record::checkpoint(
+            RecordContext::new(TRAIL, max_seq, 0, "test", Record::genesis(&TRAIL)),
+            fields,
+        )
+        .unwrap();
+        let d = Temp::new();
+        let mut bytes: Vec<u8> = Vec::new();
+        // Line::Fragment: an incomplete JSON object is an EOF parse
+        // error, which `super::lines::classify` reports as `Fragment`.
+        bytes.extend_from_slice(b"{\"torn\":\n");
+        bytes.extend_from_slice(&line(&cp_max));
+        w(&d, &bytes);
+        let expected = Head::of(&cp_max);
+        let (res, found) = hsc_found(&o(&d), None, true, false, expected);
+        assert_eq!(
+            res.err()
+                .expect("opening fragment + undamaged singleton must still propagate")
+                .kind(),
+            AuditErrorKind::CorruptTrail,
+        );
+        assert_eq!(
+            cp_max.context.seq, max_seq,
+            "sanity: the expected head is the saturated-seq branch",
+        );
+        assert_eq!(
+            found.as_ref().map(|r| r.context.seq),
+            Some(max_seq),
+            "`on_feed` must write `found` for `expected == head` at the saturated \
+             seq ceiling on an opening-only tolerant walk (no strict partial write)",
+        );
+        assert_eq!(
+            found.map(|r| Head::of(&r)),
+            Some(expected),
+            "writeback must carry the exact record, not just its seq",
+        );
+    }
+    #[test]
     fn pin_hs_fallback_duplicate_leaves_offset_at_first_copy() {
         // A complete identical duplicate takes `history_segment`'s
         // duplicate branch and `continue`s without updating
