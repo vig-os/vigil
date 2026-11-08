@@ -11,8 +11,8 @@ use super::{
     AuditError, AuditErrorKind, Record,
     format::{Kind, validation::MAX_PAYLOAD_BYTES},
     runs::{
-        self, Advance, Classifier, DecodedLine, FeedEvent, HistorySegmentArgs, HistorySegmentWalk,
-        LineEventKind, Mode as ClassifierMode, Reaction, RunState, SegmentContext,
+        self, DecodedLine, FeedEvent, FeedEventStrict, HistorySegmentArgs, HistorySegmentWalk,
+        LineEventKind, Reaction, RunState, ScanSegmentArgs, SegmentContext,
     },
 };
 use crate::rotate::Directory;
@@ -247,6 +247,23 @@ pub(super) fn corrupt(detail: &str) -> AuditError {
 fn io_error(error: io::Error) -> AuditError {
     AuditError::new(AuditErrorKind::Io, error.to_string())
 }
+/// Ruling 197-d1 addendum 24.3 / 20.1: the ONE `Line` -> `LineEventKind`
+/// decode, used by both `history_segment`'s tolerant-fallback event
+/// closure and `scan_inner`'s strict event closure. A mutant that
+/// changes this mapping fails BOTH a tolerant `history_segment` reader
+/// pin and a strict `scan` reader pin.
+fn decode_line_kind(line: Vec<u8>) -> LineEventKind {
+    let classified = {
+        let payload = line.strip_suffix(b"\n").unwrap_or(&line);
+        super::lines::classify(payload)
+    };
+    match classified {
+        super::lines::Line::Record(Ok(records)) => LineEventKind::Record(records),
+        super::lines::Line::Fragment => LineEventKind::Fragment(line),
+        super::lines::Line::Unparsable(_) => LineEventKind::Unparsable,
+        super::lines::Line::Record(Err(_)) => LineEventKind::RecordErr,
+    }
+}
 pub(crate) fn existing(dir: &File, name: &Path, writable: bool) -> Result<File, AuditError> {
     let access = if writable {
         OFlags::RDWR | OFlags::APPEND
@@ -411,15 +428,8 @@ pub(crate) fn history_segment(
         #[cfg(test)]
         SCANNED.with(|n| n.set(n.get() + bytes));
         tolerant_offset += bytes as u64;
-        let payload = line.strip_suffix(b"\n").unwrap_or(&line);
-        let kind = match super::lines::classify(payload) {
-            super::lines::Line::Record(Ok(records)) => LineEventKind::Record(records),
-            super::lines::Line::Fragment => LineEventKind::Fragment(line),
-            super::lines::Line::Unparsable(_) => LineEventKind::Unparsable,
-            super::lines::Line::Record(Err(_)) => LineEventKind::RecordErr,
-        };
         Ok(Some(DecodedLine {
-            kind,
+            kind: decode_line_kind(line),
             offset_after: tolerant_offset,
             newline,
         }))
@@ -748,6 +758,18 @@ pub(crate) fn scan(
     )
 }
 
+/// Ruling 197-d1 addendum 24.1: `scan_inner` is now a thin shim over
+/// [`runs::scan_segment`]. The shim performs byte-level I/O only (file
+/// clone + seek + glued-byte / LF check + `BufReader` setup + physical
+/// `read_line` + [`super::lines::classify`] into a [`DecodedLine`]),
+/// computes `initial_boundary_resume` (opening && (ctx.run ||
+/// predecessor-not-sealed)), and threads the writer-only State fields
+/// through the strict `on_feed` callback. All strict segment-level and
+/// per-record classification lives in `runs::scan_segment` (addendum
+/// 24.2: "No second strict loop may exist anywhere"); `history_segment`
+/// composes through this shim, so a single strict walk serves every
+/// reader path (`scan` ×3, `scan_staged` ×2, `scan_closing` ×2,
+/// `history_segment`'s strict pass).
 fn scan_inner(
     file: &File,
     trail: [u8; 16],
@@ -756,24 +778,6 @@ fn scan_inner(
     found: &mut Option<Record>,
     context: SegmentContext,
 ) -> Result<State, AuditError> {
-    // Strict-mode `scan_inner` is a thin shim over `runs::Classifier`. The
-    // shim performs byte-level I/O (reading a physical line, the byte-glue
-    // check for an unterminated predecessor, `offset`/`newline`/`length`
-    // bookkeeping, and the three writer-only State fields), threads a
-    // `runs::Classifier` for every segment-level per-record check, and
-    // hands the finalized gap digest to `runs::Classifier::feed_record`,
-    // which itself calls `runs::check_attestation` at the reader's per-path
-    // position (ruling 197-d1 addenda 7 and 12). The classifier's strict
-    // path owns:
-    //   - multiple records in native audit line
-    //   - trail identity differs from marker
-    //   - opening checkpoint duplicates predecessor
-    //   - missing opening checkpoint
-    //   - unclosed segment lacks matching immediate resume
-    //   - invalid audit line or opening checkpoint (Fragment@first/boundary, Unparsable)
-    //   - empty live file or missing opening checkpoint
-    //   - resume checkpoint lacks its declaration
-    //   - every `apply_checked` detail (R1).
     let mut file = file.try_clone().map_err(io_error)?;
     let start = if context.opening {
         0
@@ -790,7 +794,7 @@ fn scan_inner(
     // `boundary_resume` starts set at an opening that either opens a run or
     // follows an unsealed predecessor; the first successor must then be an
     // immediate `vigil.audit.resume`.
-    let initial_boundary =
+    let initial_boundary_resume =
         context.opening && (context.run || state.as_ref().is_some_and(|s| !sealed(s)));
     if !context.opening
         && let Some(s) = &state
@@ -810,67 +814,85 @@ fn scan_inner(
         }
     }
     let prior_run = state.map(|s| s.run);
-    let mut classifier =
-        Classifier::new(prior_run, context, ClassifierMode::Strict, initial_boundary);
-    loop {
+    // Decoded line event producer: physical `read_line` + `classify`.
+    let events = || -> Result<Option<DecodedLine>, AuditError> {
         let mut line = Vec::new();
         let (count, newline) = read_line(&mut reader, &mut line)?;
         if count == 0 {
-            break;
+            return Ok(None);
         }
         #[cfg(test)]
         SCANNED.with(|n| n.set(n.get() + count));
         offset += count as u64;
-        let payload = line.strip_suffix(b"\n").unwrap_or(&line);
-        match super::lines::classify(payload) {
-            super::lines::Line::Record(Ok(records)) => {
-                let record_count = records.len();
-                if record_count != 1 {
-                    // The classifier returns `multiple records in native audit
-                    // line` ahead of every other check; attestation is unused.
-                    classifier.feed_record(&records[0], record_count, trail, None)?;
-                    unreachable!("feed_record returns Err when count != 1");
-                }
-                let record = &records[0];
-                // Pass the current gap digest into `feed_record`; the
-                // classifier runs `check_attestation` at the reader's
-                // per-path position (ruling 197-d1 addendum 12: between
-                // `missing opening checkpoint` and `unclosed segment lacks
-                // matching immediate resume`).
-                let gap_digest = classifier.take_gap();
-                let advance = classifier.feed_record(record, 1, trail, gap_digest)?;
-                if expected == classifier.state().map(|s| s.head) {
-                    *found = Some(record.clone());
-                }
-                // A Duplicate leaves the writer-only fields untouched; a
-                // Record folds the record through `next_cp_fields`.
-                // Offset/newline advance on both paths.
-                if matches!(advance, Advance::Record) {
-                    (cp_time, since_cp) = next_cp_fields(Some((cp_time, since_cp)), record);
-                }
-                last_offset = offset;
-                last_newline = newline;
+        Ok(Some(DecodedLine {
+            kind: decode_line_kind(line),
+            offset_after: offset,
+            newline,
+        }))
+    };
+    // Reader-side `on_feed`: advances `last_offset`/`last_newline`, the
+    // writer-only `cp_time`/`since_cp` via `next_cp_fields`, and the
+    // `expected`/`found` out-parameter. Duplicate leaves `cp_time`/`since_cp`
+    // untouched (base-identical to `scan_inner`'s `Advance::Duplicate`),
+    // but the `found` writeback fires on BOTH advances (base: the
+    // `*found = Some(record.clone())` branch was AFTER the match and ran
+    // regardless of `Advance::Record` vs `Advance::Duplicate`).
+    let on_feed = |fed: FeedEventStrict<'_>, offset_after: u64, newline: bool| match fed {
+        FeedEventStrict::Record(record, rs) => {
+            (cp_time, since_cp) = next_cp_fields(Some((cp_time, since_cp)), record);
+            if expected == Some(rs.head) {
+                *found = Some(record.clone());
             }
-            super::lines::Line::Fragment => {
-                classifier.feed_fragment(&line)?;
-                last_newline = newline;
-            }
-            super::lines::Line::Unparsable(_) | super::lines::Line::Record(Err(_)) => {
-                classifier.feed_unparsable(&line)?;
-                // feed_unparsable always returns Err in strict mode; unreachable.
-                unreachable!("feed_unparsable returns Err in strict mode");
-            }
+            last_offset = offset_after;
+            last_newline = newline;
         }
-    }
-    let finished = classifier.finish()?;
+        FeedEventStrict::Duplicate(record) => {
+            // Base-identical: the duplicate branch still writes `found`
+            // when the classifier's state head matches `expected`. The
+            // state did NOT change on `Advance::Duplicate`, so we read
+            // the predecessor head via the just-folded record (whose
+            // head equals the preserved state's head by definition of
+            // duplicate).
+            if expected == Some(Head::of(record)) {
+                *found = Some(record.clone());
+            }
+            last_offset = offset_after;
+            last_newline = newline;
+        }
+        FeedEventStrict::NonRecord => {
+            last_newline = newline;
+        }
+    };
+    let outcome = runs::scan_segment(
+        Reaction::Stop,
+        ScanSegmentArgs {
+            ctx: context,
+            trail,
+            prior_run,
+            initial_boundary_resume,
+        },
+        events,
+        on_feed,
+    )?;
+    // Invariant: under `Reaction::Stop` an Ok `scan_segment` returns
+    // `state = Some(_)`. Proof: the Ok(Reaction::Stop) branch of
+    // `scan_segment` wraps `classifier.finish()?` into
+    // `ScanSegmentOutcome { state: Some(finished.state), .. }`
+    // (runs.rs `scan_segment`), and `Classifier::finish`'s own invariant
+    // (runs.rs `finish`) rejects a `state = None` path with
+    // `Violation::MissingHead` before returning Ok — so any Ok out of
+    // `scan_segment` under Stop carries `Some(_)`.
+    let run = outcome
+        .state
+        .expect("scan_segment Ok under Reaction::Stop implies state=Some");
     Ok(State {
-        run: finished.state,
+        run,
         offset: last_offset,
         length: offset,
         checkpoint_time: cp_time,
         since_checkpoint: since_cp,
         newline: last_newline,
-        gap: finished.gap,
+        gap: outcome.gap,
     })
 }
 fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<(), AuditError> {
