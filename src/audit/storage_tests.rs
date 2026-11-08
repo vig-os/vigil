@@ -3980,11 +3980,12 @@ mod details {
 
     #[test]
     fn coverage_gate_pins_every_corrupt_site() {
-        // Fixed file order: storage.rs first (9 corrupt-literal sites),
-        // then runs.rs (41 `Violation::<X>` construction sites, re-keyed
+        // Fixed file order: storage.rs first (8 corrupt-literal sites),
+        // then runs.rs (42 `Violation::<X>` construction sites, re-keyed
         // per addendum 16 point 4). Each source is parsed on its own
         // with `syn::parse_file`, so neither file needs to be
         // syntactically concatenable with the other.
+        use crate::audit::runs::Violation;
         let sites = parse_sites();
         let site_set: HashSet<(String, usize)> = sites.iter().cloned().collect();
         let asserted: HashSet<(String, usize)> =
@@ -4000,6 +4001,27 @@ mod details {
             }
         }
         assert!(missing.is_empty(), "uncovered corrupt sites: {missing:?}");
+        // Addendum 20.2: per-variant coverage. Every `Violation`
+        // variant must have at least one construction site AND an
+        // asserting pin (or at least one UNREACHABLE entry); a variant
+        // added to `enum Violation`, `ALL` and `detail()` with no
+        // site and no pin fails the gate here (G3).
+        let site_details: HashSet<String> = site_set.iter().map(|(d, _)| d.clone()).collect();
+        let pinned_details: HashSet<String> = asserted.iter().map(|(d, _)| d.clone()).collect();
+        let unreach_details: HashSet<String> = unreach.iter().map(|(d, _)| d.clone()).collect();
+        let mut variant_missing: Vec<&'static str> = Vec::new();
+        for v in Violation::ALL.iter().copied() {
+            let d = v.detail();
+            let has_site = site_details.contains(d);
+            let covered = pinned_details.contains(d) || unreach_details.contains(d);
+            if !has_site || !covered {
+                variant_missing.push(d);
+            }
+        }
+        assert!(
+            variant_missing.is_empty(),
+            "per-variant coverage (addendum 20.2) failed: {variant_missing:?}"
+        );
         // Stale-label check: any (detail, occurrence) pair that an
         // assert_corrupt names must exist in storage.rs or runs.rs, so
         // a pin left behind after a reader change cannot silently hide.
