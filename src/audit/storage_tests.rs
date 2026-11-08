@@ -3654,6 +3654,153 @@ mod details {
         );
     }
 
+    // ---- S3b1a: SegmentSource / SegmentBytes pins ----------------------
+    // Ruling 197-d1 addendum 25.2 + S3b1a brief: byte-source properties
+    // that S3b1b will rely on. Each row must pass at base `320a7d9` and
+    // at head (this PR changes no behaviour). Together they pin the
+    // laziness of `SegmentSource::next_segment`, the cross-segment glue
+    // byte check, the `on_feed` offset bookkeeping across refresh-append,
+    // and `decode_line_kind`'s Fragment-vs-Unparsable mapping.
+
+    fn fifo_segment(d: &Temp, id: usize) {
+        assert!(
+            Command::new("mkfifo")
+                .arg(segment(&d.0, id))
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// SB1 live-open order: a corrupt rotated_0 (seg_only concat) plus a
+    /// non-regular rotated_1 (FIFO) sits in the directory. `TrailReader
+    /// ::open` must surface **seg_0's** `invalid audit record in sealed
+    /// run`, not a `nonregular trail file` from eagerly probing seg_1.
+    /// Kills MA1 (eager open-up-front) because eager would error on
+    /// seg_1's open before seg_0's tolerant walk runs.
+    #[test]
+    fn sb1_liveopen_base_order_short_circuits_on_segment_0_error() {
+        let d = seg_only(concat(&[&cp0()], b"{}\n"));
+        fifo_segment(&d, 1);
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "invalid audit record in sealed run",
+            0,
+        );
+    }
+
+    /// SB1 refresh-rotate order: the cached file (prelude) contains the
+    /// same corrupt tail. Even with a later rotated segment in place,
+    /// the prelude walk surfaces its error first. Kills MA5 (prelude
+    /// skipped) because skipping the prelude would reach the (valid)
+    /// live file and return Ok instead of the pinned Err.
+    #[test]
+    fn sb1_refresh_rotate_prelude_walks_before_later_segments() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        // Append corrupt bytes to the cached inode BEFORE rotating, so
+        // the renamed file (soon-to-be prelude) carries them. The
+        // reader's descriptor keeps pointing to the same inode.
+        append_bytes(&d.0.join("audit.jsonl"), b"{}\n");
+        fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+        // Fresh live with a cp0-based opening keeps refresh in the
+        // rotate branch (different inode, valid live). Without the
+        // prelude walk, refresh would return Ok on this layout.
+        let opening = cp(1, first.hash(), &seeded(&first));
+        fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
+        assert_corrupt(
+            reader.with_current(|_| Ok(()), |_, _, _| Ok(())),
+            "invalid audit record in sealed run",
+            0,
+        );
+    }
+
+    /// SB2 glue across segments: `pin_sc_glued_byte` (strict / scan) and
+    /// `pin_hs_glued_byte` (tolerant / history_segment) already pin the
+    /// glue-byte check when the inherited state is unterminated (addendum
+    /// 25.2 glue). Both call sites now live in `SegmentBytes`
+    /// (`check_glue_byte_strict` and `next_event`'s lazy glue branch),
+    /// so a mutant that drops either firing fails the cited pin. This
+    /// stub row documents the citation; it does not add a new pin.
+    #[test]
+    fn sb2_glue_across_segments_cited() {
+        // Nothing to assert here. See `pin_sc_glued_byte` and
+        // `pin_hs_glued_byte` above.
+    }
+
+    /// SB3 refresh-append bookkeeping: after each refresh-append, pin
+    /// the exact [`State`] field tuple (`offset`, `length`, `newline`,
+    /// `gap`). An off-by-one in `SegmentBytes::note_record_fed` moves
+    /// `offset` away from the record boundary; a wrong `offset_cursor`
+    /// bump breaks `length`. Kills MA3.
+    #[test]
+    fn sb3_refresh_append_bookkeeping_pins_state() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let first_len = line(&first).len() as u64;
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, s| {
+                    assert_eq!(s.offset, first_len);
+                    assert_eq!(s.length, first_len);
+                    assert!(s.newline);
+                    assert!(s.gap.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let e1 = entry(&first);
+        let e1_len = line(&e1).len() as u64;
+        append(&d.0.join("audit.jsonl"), &e1);
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, s| {
+                    assert_eq!(s.offset, first_len + e1_len);
+                    assert_eq!(s.length, first_len + e1_len);
+                    assert!(s.newline);
+                    assert!(s.gap.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let e2 = entry(&e1);
+        let e2_len = line(&e2).len() as u64;
+        append(&d.0.join("audit.jsonl"), &e2);
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, s| {
+                    assert_eq!(s.offset, first_len + e1_len + e2_len);
+                    assert_eq!(s.length, first_len + e1_len + e2_len);
+                    assert!(s.newline);
+                    assert!(s.gap.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    /// SB4 fragment vs unparsable decoding: covered by the existing
+    /// strict and tolerant fragment pins. A Fragment-maps-to-Unparsable
+    /// mutant (MA4) in [`decode_line_kind`] shifts the firing detail
+    /// from the fragment path to the unparsable path, which breaks
+    /// `pin_hs_unparsable_before_complete` (tolerant, fragment-at-segment-
+    /// start layout flipping its outcome), `pin_sc_trail_identity_after_
+    /// pending_fragment` (strict, fragment-at-segment-end before a
+    /// successful record), and `pin_open_fallback_unparsable_before_
+    /// complete_record` (open-fallback live-path decoding). Documenting
+    /// the citation here; the pins themselves live upstream.
+    #[test]
+    fn sb4_fragment_decoding_cited() {
+        // Nothing to assert here. See `pin_hs_unparsable_before_complete`,
+        // `pin_sc_trail_identity_after_pending_fragment`,
+        // `pin_open_fallback_unparsable_before_complete_record`.
+    }
+
     // ---- Coverage gate --------------------------------------------------
 
     const UNREACHABLE: &[(&str, usize, &str)] = &[
