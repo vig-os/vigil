@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-10-09T14:07:47Z
-updated: 2026-11-04T02:45:24Z
+updated: 2026-11-07T23:01:50Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/vigil/issues/20
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-11-04T08:43:08.080Z
+synced: 2026-11-08T08:41:14.696Z
 ---
 
 # [Issue 20]: [Dependency Dashboard](https://github.com/vig-os/vigil/issues/20)
@@ -24,7 +24,9 @@ This issue lists Renovate updates and detected dependencies. Read the [Dependenc
 
 The following updates are currently rate-limited. To force their creation now, click on a checkbox below.
 
+ - [ ] <!-- unlimit-branch=renovate/flate2-1.x-lockfile -->build(cargo): update rust crate flate2 to v1.1.11
  - [ ] <!-- unlimit-branch=renovate/syn-3.x -->build(cargo): update rust crate syn to v3
+ - [ ] <!-- create-all-rate-limited-prs -->🔐 **Create all rate-limited PRs at once** 🔐
 
 ## Open
 
@@ -68,7 +70,7 @@ The following updates have all been created. To force a retry/rebase of any, cli
  - `tracing-log 0.2`
  - `rustix 1.1.5` → [Updates: `1.1.5`]
  - `allocation-counter 0.8.1`
- - `flate2 1`
+ - `flate2 1` → [Updates: `1`]
  - `criterion 0.8.2`
  - `proptest 1` → [Updates: `1`]
  - `log 0.4` → [Updates: `0.4`]
@@ -80,18 +82,8 @@ The following updates have all been created. To force a retry/rebase of any, cli
 </blockquote>
 </details>
 
-<details><summary>github-actions (20)</summary>
+<details><summary>github-actions (6)</summary>
 <blockquote>
-
-<details><summary>.github/actions/setup-devkit-toolchain/action.yml</summary>
-
-
-</details>
-
-<details><summary>.github/workflows/abandon-release.yml</summary>
-
-
-</details>
 
 <details><summary>.github/workflows/ci-extension.yml (8)</summary>
 
@@ -106,42 +98,12 @@ The following updates have all been created. To force a retry/rebase of any, cli
 
 </details>
 
-<details><summary>.github/workflows/ci.yml</summary>
-
-
-</details>
-
-<details><summary>.github/workflows/codeql.yml</summary>
-
-
-</details>
-
-<details><summary>.github/workflows/devkit-upgrade.yml</summary>
-
-
-</details>
-
-<details><summary>.github/workflows/prepare-hotfix.yml</summary>
-
-
-</details>
-
 <details><summary>.github/workflows/prepare-release-extension.yml (4)</summary>
 
  - `actions/create-github-app-token v3@bcd2ba49218906704ab6c1aa796996da409d3eb1` → [Updates: `v3`]
  - `actions/checkout v7.0.1@3d3c42e5aac5ba805825da76410c181273ba90b1`
  - `vig-os/commit-action v0.3.3@7ba7e1ae17547813e708d4cc6a771a09f978f724`
  - `ubuntu 26.04`
-
-</details>
-
-<details><summary>.github/workflows/prepare-release.yml</summary>
-
-
-</details>
-
-<details><summary>.github/workflows/promote-release.yml</summary>
-
 
 </details>
 
@@ -152,29 +114,9 @@ The following updates have all been created. To force a retry/rebase of any, cli
 
 </details>
 
-<details><summary>.github/workflows/release-core.yml</summary>
-
-
-</details>
-
 <details><summary>.github/workflows/release-extension.yml (1)</summary>
 
  - `ubuntu 26.04`
-
-</details>
-
-<details><summary>.github/workflows/release-publish.yml</summary>
-
-
-</details>
-
-<details><summary>.github/workflows/release.yml</summary>
-
-
-</details>
-
-<details><summary>.github/workflows/scorecard.yml</summary>
-
 
 </details>
 
@@ -189,16 +131,6 @@ The following updates have all been created. To force a retry/rebase of any, cli
 
  - `actions/checkout v7.0.1@3d3c42e5aac5ba805825da76410c181273ba90b1`
  - `actions/checkout v7.0.1@3d3c42e5aac5ba805825da76410c181273ba90b1`
-
-</details>
-
-<details><summary>.github/workflows/sync-issues.yml</summary>
-
-
-</details>
-
-<details><summary>.github/workflows/sync-main-to-dev.yml</summary>
-
 
 </details>
 

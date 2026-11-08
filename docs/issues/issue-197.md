@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-11-03T10:18:01Z
-updated: 2026-11-05T08:15:46Z
+updated: 2026-11-08T02:01:50Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/197
-comments: 18
+comments: 20
 labels: priority:medium
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-05T09:02:39.888Z
+synced: 2026-11-08T08:41:14.218Z
 ---
 
 # [Issue 197]: [refactor(audit): extract the reader's run classification into one shared pure module (#13 V4 prerequisite)](https://github.com/vig-os/vigil/issues/197)
@@ -358,5 +358,42 @@ _Posted on November 5, 2026 at 08:15 AM_
     2. **The gate requires coverage per variant.** Every `Violation` variant has at least one construction site **and** a pin, or a proven UNREACHABLE entry. A variant added to the enum, `ALL` and `detail()` with no site and no pin (G3) fails the gate with exit 101.
     3. **19.2 precedence.** First-equality (the collector's first equals the reader's first) takes precedence. "Exactly `[(2, CheckpointMmrDiffers)]`, no derived violation" applies on every path where no earlier violation precedes the bad checkpoint. On `history_segment(true,true)` the reader's earlier first violation (`FirstSuccessorLacksImmediateResume` at 1) stands, and is pinned.
     - **Size:** if moving the walk takes non-test code beyond ~400 lines, stop with `BLOCKED: size <N>` for an owner decision (as in addendum 14). Don't keep a partial share to fit.
+
+
+---
+
+# [Comment #19]() by [gerchowl]()
+
+_Posted on November 8, 2026 at 12:46 AM_
+
+
+### Addendum 21 to ruling 197-d1 (owner decision 2026-11-08: S3a may exceed ~400 lines)
+21. **PR #206 (R2b S3a) may land at up to about 450 non-test code lines.**
+    - The addendum-20 shared walk (I/O boundary in `storage.rs`, one orchestration function in `runs.rs`) came to +438 after aggressive trimming.
+    - Splitting it would land a half-shared walk on dev, which is exactly the drift addendum 20 forbids. The owner accepted the larger PR, as for S2 (addendum 14).
+    - Proof is unchanged: the implementer's own reader differential, the first-equality sweep through the shared function, the walk mutants failing both sides, the gate G1–G3, then a fresh review.
+
+
+---
+
+# [Comment #20]() by [gerchowl]()
+
+_Posted on November 8, 2026 at 02:01 AM_
+
+
+### Addendum 22 to ruling 197-d1 (owner decision 2026-11-08: an exceptional 4th fix round for PR #206)
+22. **PR #206 (R2b S3a) gets one exceptional 4th fix round with a fixed list, and the size cap rises to about 480 non-test code lines.**
+    - Review 3 at 5455114 found two reader changes in `history_segment`:
+      - a trailing duplicate under-reports the segment length (1172 vs 2344): the duplicate arm skips the feed callback, so `final_offset` is not advanced;
+      - `found` differs from base after a strict pass, on Ok paths (sealed `DU`) and on Err paths.
+    - It also found that two walk mutants (`inherited`, `saved_prior`) survive the collector rows, because those rows pass empty prior state. And the PR body overclaimed: no real differential was run, mutant coverage was claimed for "both sides", and +468 was described as within ~450.
+    - The collector first-equality held (0 mismatches over 40,992 cases), as did the gate and the precedence row.
+    - Round 4 fixes exactly:
+      1. the duplicate arm advances the offset through the shared feed callback, byte-identical to base;
+      2. `found` matches base exactly on Ok and Err paths;
+      3. collector rows exercise a non-empty prior and an unsealed boundary, so the `inherited` and `saved_prior` mutants fail a collector row too;
+      4. an argument struct replaces `#[allow(clippy::too_many_arguments)]`;
+      5. the implementer runs the reader differential and the first-equality sweep and posts the real numbers, and the PR body is corrected.
+    - **No 5th round.** A blocker outside this list goes back to the owner.
 
 
