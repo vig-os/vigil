@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-11-03T10:18:01Z
-updated: 2026-11-08T02:01:50Z
+updated: 2026-11-09T03:35:24Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/197
-comments: 20
+comments: 28
 labels: priority:medium
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-08T08:41:14.218Z
+synced: 2026-11-09T09:15:01.059Z
 ---
 
 # [Issue 197]: [refactor(audit): extract the reader's run classification into one shared pure module (#13 V4 prerequisite)](https://github.com/vig-os/vigil/issues/197)
@@ -395,5 +395,168 @@ _Posted on November 8, 2026 at 02:01 AM_
       4. an argument struct replaces `#[allow(clippy::too_many_arguments)]`;
       5. the implementer runs the reader differential and the first-equality sweep and posts the real numbers, and the PR body is corrected.
     - **No 5th round.** A blocker outside this list goes back to the owner.
+
+
+---
+
+# [Comment #21]() by [gerchowl]()
+
+_Posted on November 8, 2026 at 12:06 PM_
+
+
+### Addendum 23 to ruling 197-d1 (owner decision 2026-11-08: a micro round for PR #206, tests and PR body only)
+23. **PR #206 (R2b S3a) gets one micro round, limited to tests and the PR body, before merge.**
+    - Re-review 4 at 9ee267d proved the code itself:
+      - the reviewer's own sha256 reader differential: 163,968 rows (1,464 layouts × 7 contexts × 16 paths), 0 mismatches against base f454928;
+      - first-equality 0 mismatches over 40,992 rows;
+      - M1–M9 and G1–G3 all killed;
+      - churn +475 (within ~480);
+      - CI green.
+    - It found two false claims in the PR body:
+      - B1: the `--all-features` counts are said to be in CI Summary. They aren't, and the real counts are 994 passed / 5 ignored.
+      - B2: the mutants are said to cover every round-4 line. But mutating the `on_feed` `found` writeback for `head.seq == u64::MAX` in `storage.rs` leaves the whole suite green.
+    - The micro round:
+      1. adds ONE pin that kills that mutant and passes on base f454928, with **no non-test code change**;
+      2. corrects the PR body.
+      
+      A fresh reviewer checks only that delta, then the PR merges.
+    - There is still no further round. Anything else becomes a follow-up issue.
+
+
+---
+
+# [Comment #22]() by [gerchowl]()
+
+_Posted on November 8, 2026 at 01:04 PM_
+
+R2b S3a merged in #206 (a1c2461). The proof of record is the independent re-review 4: a sha256 reader differential over 163,968 rows (1,464 layouts × 7 contexts × 16 reader paths) with 0 mismatches against base; collector first-equality 0 mismatches over 40,992 rows; mutants M1–M9, G1–G3 and F1 all killed; +475 non-test code lines (addenda 21–23). Next is **S3a′** (addendum 18: Strict×Collect, the `Record(Err)` Collect entry, the remaining 17.6 killing rows, and the strict first-equality sweep), which starts from a proven prototype.
+
+---
+
+# [Comment #23]() by [gerchowl]()
+
+_Posted on November 8, 2026 at 01:10 PM_
+
+
+### Addendum 24 to ruling 197-d1 (S3a′: how Strict×Collect reaches the strict scan paths)
+24. **The strict single-pass walk moves into `runs::scan_segment`, a sibling of `runs::history_segment` (option A). The two are composed, not copied.**
+    - At a1c2461:
+      - `scan`, `scan_staged` and `scan_closing` run `storage.rs::scan_inner`'s own event loop;
+      - `history_segment`'s strict pass is that same `scan_inner` (`storage.rs:375`).
+      
+      The strict walk is therefore still orchestration living in `storage.rs`, which addendum 20.1 forbids. S3a′ moves it to `runs.rs`.
+    - Addendum 20's threat model is **drift between copies of one walk**, not the number of functions. The strict-only walk and the strict-then-tolerant-fallback walk have different shapes. Folding both into one function behind shape flags (option B, an estimated ~300+ lines) widens the branching and the mutant surface for no gain against drift. Option C (a Collect copy of the loop) remains forbidden (19.1, 20.1).
+    - **Binding for S3a′:**
+      1. **`runs::scan_segment(reaction, ScanSegmentArgs, events, on_feed)`** owns the strict single-pass orchestration for both reactions. `storage.rs::scan_inner` keeps only byte I/O (the seek, glued-byte and LF checks, line decoding into `DecodedLine` events) and the writer-field bookkeeping through `on_feed`.
+      2. **Composition:** `runs::history_segment`'s strict pass reaches `scan_segment`, through the `scan_inner` shim or directly. No second strict loop may exist anywhere.
+      3. **One dispatch:** the per-line mapping from a decoded line event to a classifier call (`Record` / `RecordErr` / fragment / unparsable, and the reaction-specific swallow after `recovery_pending`) exists **once**, as a shared helper used by both walks. Divergent copies of it are the drift this ruling forbids.
+      4. **Proof per walk:** mutants on `scan_segment`'s orchestration must fail **both** a strict reader pin and a strict Collect row. The 20.1 requirement for `history_segment` is unchanged.
+      5. **First-equality:** the sweep covers `scan` ×3, staged ×2, closing ×2 and `history_segment` ×4 through the shared functions, × every layout of length ≤ 3 × 7 contexts. It requires 0 mismatches. Any remaining exclusion must be reported with a proof that it is an equality or out of scope (multi-segment = S3b).
+      6. The size target stays at **≤ ~400 non-test code lines** (the planner estimated ~+175).
+
+
+---
+
+# [Comment #24]() by [gerchowl]()
+
+_Posted on November 8, 2026 at 04:20 PM_
+
+R2b S3a′ merged in #210 (320a7d9), per addendum 24. `runs::scan_segment` now owns the strict single-pass walk; `history_segment`'s strict pass composes it; `dispatch_line` is the single per-line dispatch; and `storage.rs` keeps only byte I/O and decoding. Strict×Collect and the `Record(Err)` Collect entry landed. Independent review proof: a sha256 reader differential over 163,968 rows (1,464 layouts × 7 contexts × 16 paths) with 0 differences against base; first-equality 0 mismatches over 71,736 strict and 40,992 `history_segment` rows, with **no exclusions left** (every `Record(Err)` row now equal); 20 mutants killed, M4 documented as unreachable; +254 net non-test code lines. Next is **S3b**: the `classify` iterator, multi-segment first-equality, and the V4a walk.
+
+---
+
+# [Comment #25]() by [gerchowl]()
+
+_Posted on November 8, 2026 at 04:34 PM_
+
+### Addendum 25 to ruling 197-d1 (S3b: the shape of `classify`; architect ruling on the S3b plan's design questions)
+25. **`classify` is the one multi-segment orchestration; `storage.rs` supplies only segment bytes.** The S3b plan proposed a `SegmentWalker` trait whose `storage.rs` implementations each pick a per-segment walk (sealed with an `opening` flag, closing, staged, append) and call it. That puts orchestration policy back into `storage.rs`, which contradicts 20.1. It also cannot chain different walker types through one `IntoIterator<Item: SegmentWalker>`.
+    1. **Q1, one loop (accepted).** `runs::classify` holds the only loop over segments. Every multi-segment reader path reaches it: live open, open fallback and refresh ×3 (append, rotate, append+rotate). After S3b1, `storage.rs` contains no loop over segments and no per-path segment sequencing.
+    2. **Q2, the boundary (ruled).** Per 20.1, `storage.rs` provides one *segment source*. It lists the segments, opens each file **lazily, in base order** (so I/O and open errors surface exactly where they do today), and yields each segment's decoded line-event stream plus the `on_feed` byte bookkeeping. All of the following belong to `classify` in `runs.rs`:
+       - which per-segment walk runs (`history_segment` with its `opening`/`genesis` flags, or `scan_segment` for closing, staged or append);
+       - the order of segments for each path;
+       - the threading of `state`, `found` and `run`;
+       - the `HeadMismatch` decision.
+       
+       They are selected by a typed description of the reader path, not by booleans scattered through `storage.rs`. Use no `Box<dyn …>` and no trait whose implementations choose a walk.
+    3. **Rows are value pins.** Once the reader calls `classify`, a row that compares `classify` against the reader at the same head is a tautology and kills nothing. The rows are:
+       - reader pins with literal expected outcomes on each multi-segment path;
+       - Collect rows with the exact `[(segment, record, Violation)]` lists.
+       
+       Byte-identity to base is proven by the base-vs-head reader differential, run by the reviewer as the prover of record.
+    4. **Mutants are behaviour-changing.** Each mutant on `classify` fails a reader pin **and** a Collect row (19.3, 24.4). Structural properties have no behavioural mutant: "no segment loop in `storage.rs`" and "no path bypasses `classify`". They are enforced by a structural check (an extension of the syn gate or a source test) that has its own mutant giving exit 101. An equivalent mutant is never listed as killed.
+    5. **No forward-only items.** Every item and field lands in the PR that consumes and proves it, with no `expect(dead_code)` kept for later use. The V4a-facing run and segment reports land in S3b2 unless S3b1's Collect proof needs them.
+    6. **Size.** S3b1 stays at **≤ ~400** non-test code lines. Over that, stop with `BLOCKED: size <N>` (addendum 14). The gate's site count is measured at base and stays unchanged unless a site is added, and any added site counts with its pin.
+
+
+---
+
+# [Comment #26]() by [gerchowl]()
+
+_Posted on November 9, 2026 at 02:34 AM_
+
+
+### Addendum 26 to ruling 197-d1 (owner decision 2026-11-09: PR #211 comment-only micro round)
+26. PR #211 (S3b1a) has used its 3 fix rounds. Re-review 3 proved the code:
+    - the reader is byte-identical to base over 163,968 cases;
+    - first-equality shows 0 mismatches over 112,728 rows;
+    - every mutant in scope is killed;
+    - the gates pass, with the syn gate at 49.
+    
+    What remains is test doc comments that claim kills that don't happen. The owner grants an exceptional **comment-only** 4th round, like addendum 23:
+    - remove the false NRF1 sentence in `sb2_glue_across_segments_refresh_rotate_ok`;
+    - remove the false MA4 sentence in `sb4_fragment_at_segment_end_multi_segment`;
+    - correct the SCN1 row doc ("with a sealed predecessor in scope");
+    - update the stale `final_offset` mentions in the test comments.
+    
+    The round changes no code. Then a narrow re-review checks that the delta is comments only and that CI is green, and the PR merges. The architect has already corrected the PR body to the reviewer's measurements.
+
+
+---
+
+# [Comment #27]() by [gerchowl]()
+
+_Posted on November 9, 2026 at 03:09 AM_
+
+**S3b1a landed** as PR #211 (e1c45a3). It is a behaviour-preserving extraction of the segment byte source (`SegmentSource` / `SegmentBytes`) in `storage.rs`, following addenda 20.1 and 25.2.
+
+What the independent review measured:
+- **Reader differential:** byte-identical to base over 163,968 cases.
+- **First-equality:** 0 mismatches over 112,728 rows.
+- **Mutants:** all in scope are killed.
+- **Syn gate:** 49 sites, because the duplicate glued-byte site was merged into one helper.
+- **Churn:** +198 net non-test lines.
+
+Next is **S3b1b**: `runs::classify` takes over the segment loops (addendum 25).
+
+Tracked separately: two mutants on the rotated-segment `sealed_before` bookkeeping (MX6/EX3) survive the suite and the differential. They appear to predate #211, and are being probed at base before any issue is filed.
+
+
+---
+
+# [Comment #28]() by [gerchowl]()
+
+_Posted on November 9, 2026 at 03:35 AM_
+
+### Addendum 27 to ruling 197-d1 (S3b1b: architect ruling on the implementer brief's open points)
+27. The S3b1b planner built a working prototype of `classify` at e1c45a3 that wires `Reaction::Stop` only. It compiles, the storage filter passes 176, the reader differential shows 0 differences over 163,968 rows, and it adds +66 net non-test code lines. Its brief left four points open or wrong. They are ruled here.
+    1. **`HeadMismatch` under Collect is a trail-level outcome, not a per-record `Violation`.** A `Violation` is tied to a segment and a record (S3a), and a missing expected head has neither. `ClassifyOutput` carries `head_mismatch: bool`.
+       - Under Stop, `classify` returns `Err(HeadMismatch)` exactly where the reader does today.
+       - Under Collect, it sets the flag after the last segment and keeps every collected violation.
+       - Only `ReaderPath::LiveOpen` with `expected: Some(_)` can set it.
+       - No `Violation` variant is added. The construction site moves from `storage.rs` into `runs.rs`, so the syn gate total stays at **49**. Measure it at base and at head; any change needs a reason and a pin.
+    2. **A Collect-only mutant has no reader pin.** Stop cannot observe the Collect-side tagging or recording: segment index, record index, dropping the last segment's violations, or the head-mismatch flag under Collect. A reader pin listed as killing such a mutant is a false kill claim (25.4).
+       - These mutants need **two Collect-side killers**: the named exact-list Collect row and either a second Collect row or the first-equality sweep.
+       - Every mutant that changes Stop behaviour still needs a reader pin **and** a Collect row.
+       - Every listed killer must be shown failing with exit 101 on that mutant; a killer that was never run is not listed.
+    3. **"No path bypasses `classify`" is checked structurally, not just "no loop".** The source test enforces three things:
+       - (a) no `for`/`while`/`loop` in `storage.rs` contains a call to a walker (`history_segment`, `scan`, `scan_closing`, `scan_staged`, `scan_segment`);
+       - (b) `initial_record` and `refresh` each call `classify` and call no walker directly;
+       - (c) every remaining walker call site in non-test `storage.rs` code matches an explicit allowlist of (calling fn → count) measured at head. The test's doc states why each site is allowed.
+       
+       An extra mutant, a one-shot direct `scan(...)` in the same-inode branch of `refresh` with no loop around it, must give exit 101.
+    4. **Rows are literal and base-measured.**
+       - Every reader pin's expected `Err` kind and detail, or its `Ok` tuple, is taken from running that row at base e1c45a3, and the row passes there. The detail strings the brief proposed are the planner's guesses until measured.
+       - Every Collect row asserts a complete literal list, with no `...`. Its first entry agrees with the base reader's outcome for that layout.
 
 
