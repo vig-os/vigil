@@ -4708,4 +4708,245 @@ mod details {
             "corrupt-site count changed; update gate explicitly"
         );
     }
+
+    /// Addendum 27.3 structural gate: `storage.rs` must not contain any
+    /// `for` / `while` / `loop` whose body calls a segment walker, and
+    /// `initial_record` / `refresh` must each call `classify` and call
+    /// no walker directly. Every remaining walker call in non-test
+    /// `storage.rs` matches an explicit allowlist (fn → count) measured
+    /// at head, with the reason documented. The static gate cannot
+    /// prove dynamic reachability; the behavioural mutants prove
+    /// runtime behaviour.
+    #[test]
+    fn coverage_gate_no_segment_loop_in_storage_rs() {
+        /// Last segment of every path identifying a per-segment walk.
+        /// If a loop body in `storage.rs` calls one of these, drift is
+        /// back and this gate fails (addendum 27.3a).
+        const WALKER_NAMES: &[&str] = &[
+            "history_segment",
+            "scan_segment",
+            "scan_closing",
+            "scan_staged",
+            "scan",
+        ];
+
+        /// Allowed one-shot walker call sites in non-test `storage.rs`,
+        /// measured at head (addendum 27.3c). Keyed by the enclosing
+        /// fn and the walker name (the last path segment of the
+        /// callee), with the count of unlooped call sites inside that
+        /// fn. These are the storage shims composing into their inner
+        /// `runs::*` counterparts.
+        const ALLOWED: &[(&str, &str, usize, &str)] = &[
+            (
+                "history_segment",
+                "history_segment",
+                1,
+                "storage::history_segment composes into runs::history_segment once; the strict-pass closure stays one call",
+            ),
+            (
+                "scan_inner",
+                "scan_segment",
+                1,
+                "scan_inner composes into runs::scan_segment once; the per-reader-path strict walk",
+            ),
+        ];
+
+        fn path_last_ident(path: &syn::Path) -> Option<String> {
+            path.segments.last().map(|s| s.ident.to_string())
+        }
+
+        fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+            attrs.iter().any(|a| {
+                a.path().is_ident("cfg")
+                    && a.parse_args::<syn::Meta>().ok().is_some_and(|m| match m {
+                        syn::Meta::Path(p) => p.is_ident("test"),
+                        _ => false,
+                    })
+            })
+        }
+
+        /// Collects a hit whenever an `ExprCall` targets a path whose
+        /// last segment is a walker name. `inside_loop` says whether
+        /// the containing walk is inside a for/while/loop body (so the
+        /// gate fires), and also which enclosing fn we are in for the
+        /// allowlist bookkeeping.
+        struct WalkerVisitor<'a> {
+            inside_loop_depth: usize,
+            in_test_depth: usize,
+            fn_stack: Vec<String>,
+            /// (fn_name, walker, count) for every one-shot (non-loop)
+            /// walker call outside `#[cfg(test)]`.
+            allow_counts: std::collections::HashMap<(String, String), usize>,
+            /// (fn_name, walker) for every call inside a for/while/loop
+            /// body outside `#[cfg(test)]`. One hit here fails the gate.
+            looped: Vec<(String, String)>,
+            /// Set of fn names (outside `#[cfg(test)]`) that call
+            /// `classify`. Used for (27.3b): `initial_record` /
+            /// `refresh` must each call `classify`.
+            classify_callers: std::collections::HashSet<String>,
+            walker_names: &'a [&'a str],
+        }
+
+        impl<'a, 'ast> syn::visit::Visit<'ast> for WalkerVisitor<'a> {
+            fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+                let bump = is_cfg_test(&m.attrs);
+                if bump {
+                    self.in_test_depth += 1;
+                }
+                syn::visit::visit_item_mod(self, m);
+                if bump {
+                    self.in_test_depth -= 1;
+                }
+            }
+            fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+                let bump = is_cfg_test(&f.attrs);
+                if bump {
+                    self.in_test_depth += 1;
+                }
+                self.fn_stack.push(f.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, f);
+                self.fn_stack.pop();
+                if bump {
+                    self.in_test_depth -= 1;
+                }
+            }
+            fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+                let bump = is_cfg_test(&f.attrs);
+                if bump {
+                    self.in_test_depth += 1;
+                }
+                self.fn_stack.push(f.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, f);
+                self.fn_stack.pop();
+                if bump {
+                    self.in_test_depth -= 1;
+                }
+            }
+            fn visit_expr_for_loop(&mut self, f: &'ast syn::ExprForLoop) {
+                self.inside_loop_depth += 1;
+                syn::visit::visit_expr_for_loop(self, f);
+                self.inside_loop_depth -= 1;
+            }
+            fn visit_expr_while(&mut self, w: &'ast syn::ExprWhile) {
+                self.inside_loop_depth += 1;
+                syn::visit::visit_expr_while(self, w);
+                self.inside_loop_depth -= 1;
+            }
+            fn visit_expr_loop(&mut self, l: &'ast syn::ExprLoop) {
+                self.inside_loop_depth += 1;
+                syn::visit::visit_expr_loop(self, l);
+                self.inside_loop_depth -= 1;
+            }
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                if let syn::Expr::Path(path_expr) = &*call.func
+                    && let Some(last) = path_last_ident(&path_expr.path)
+                    && self.in_test_depth == 0
+                {
+                    let fn_name = self.fn_stack.last().cloned().unwrap_or_default();
+                    if last == "classify" {
+                        self.classify_callers.insert(fn_name.clone());
+                    }
+                    if self.walker_names.contains(&last.as_str()) {
+                        if self.inside_loop_depth > 0 {
+                            self.looped.push((fn_name, last));
+                        } else {
+                            *self.allow_counts.entry((fn_name, last)).or_insert(0) += 1;
+                        }
+                    }
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+            fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+                // Method calls like `foo.scan()` cannot be a walker
+                // (walkers are free fns) but a `self.scan(...)` inside
+                // an impl would read with the same identifier; be
+                // defensive and still flag loop occurrences.
+                let last = m.method.to_string();
+                if self.in_test_depth == 0
+                    && self.walker_names.contains(&last.as_str())
+                    && self.inside_loop_depth > 0
+                {
+                    let fn_name = self.fn_stack.last().cloned().unwrap_or_default();
+                    self.looped.push((fn_name, last));
+                }
+                syn::visit::visit_expr_method_call(self, m);
+            }
+        }
+
+        let storage: syn::File = syn::parse_file(STORAGE_SRC)
+            .expect("structural gate: storage.rs is not valid Rust (parse_file failed)");
+        let mut v = WalkerVisitor {
+            inside_loop_depth: 0,
+            in_test_depth: 0,
+            fn_stack: Vec::new(),
+            allow_counts: std::collections::HashMap::new(),
+            looped: Vec::new(),
+            classify_callers: std::collections::HashSet::new(),
+            walker_names: WALKER_NAMES,
+        };
+        syn::visit::Visit::visit_file(&mut v, &storage);
+
+        // 27.3a: no walker call inside any for/while/loop body.
+        assert!(
+            v.looped.is_empty(),
+            "storage.rs must not contain a `for`/`while`/`loop` whose body calls \
+             `history_segment` / `scan_segment` / `scan_closing` / `scan_staged` / `scan`; \
+             offenders: {:?}",
+            v.looped
+        );
+
+        // 27.3b: `initial_record` and `refresh` each call `classify`.
+        for caller in ["initial_record", "refresh"] {
+            assert!(
+                v.classify_callers.contains(caller),
+                "storage.rs: fn `{caller}` must call `classify` (addendum 27.3b)"
+            );
+        }
+
+        // 27.3b: `initial_record` and `refresh` must call no walker
+        // directly outside a loop either.
+        for caller in ["initial_record", "refresh"] {
+            for walker in WALKER_NAMES {
+                let count = v
+                    .allow_counts
+                    .get(&(caller.to_string(), (*walker).to_string()))
+                    .copied()
+                    .unwrap_or(0);
+                assert_eq!(
+                    count, 0,
+                    "storage.rs: fn `{caller}` must not call walker `{walker}` directly \
+                     (addendum 27.3b); every segment walk goes through `classify`"
+                );
+            }
+        }
+
+        // 27.3c: every remaining walker call site in non-test
+        // storage.rs matches the allowlist exactly.
+        let allowed_set: std::collections::HashMap<(String, String), usize> = ALLOWED
+            .iter()
+            .map(|(outer, walker, count, _)| {
+                (((*outer).to_string(), (*walker).to_string()), *count)
+            })
+            .collect();
+        for (key, count) in &v.allow_counts {
+            let expected = allowed_set.get(key).copied();
+            assert_eq!(
+                expected,
+                Some(*count),
+                "storage.rs: unexpected walker call site (fn → walker → count): \
+                 ({:?}, {}); update the allowlist with a documented reason \
+                 (addendum 27.3c)",
+                key,
+                count
+            );
+        }
+        for (key, expected_count) in &allowed_set {
+            let found = v.allow_counts.get(key).copied().unwrap_or(0);
+            assert_eq!(
+                found, *expected_count,
+                "storage.rs: allowlisted walker site ({:?}) expected count {} but found {}",
+                key, expected_count, found
+            );
+        }
+    }
 }
