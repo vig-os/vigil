@@ -2028,15 +2028,17 @@ mod details {
     fn pin_hs_fallback_duplicate_advances_length_through_feed_callback() {
         // Addendum 22.1: a trailing duplicate flows through the shared
         // `on_feed` callback as `FeedEvent::Duplicate`, which advances
-        // the walk's `final_offset` (so `s.length` is base-identical)
-        // while leaving `state.offset` and `state.newline` untouched.
-        // Repro: predecessor `scan([cp0, e1, cp2])`, segment file
-        // `[e3, e3]`, `history_segment(opening=true, run=false)`.
-        // Strict fails with `MissingOpeningCheckpoint` (e3 is an entry
-        // on an opening segment), so the tolerant fallback walks both
+        // the `SegmentBytes` offset cursor (so `s.length` is base-
+        // identical) while leaving `state.offset` and `state.newline`
+        // untouched. Repro: predecessor `scan([cp0, e1, cp2])`,
+        // segment file `[e3, e3]`,
+        // `history_segment(opening=true, run=false)`. Strict fails
+        // with `MissingOpeningCheckpoint` (e3 is an entry on an
+        // opening segment), so the tolerant fallback walks both
         // copies. A mutant that skips `on_feed` on the duplicate arm
-        // leaves `final_offset` at the first copy, so `s.length` equals
-        // the single-record byte count (base gives 2×, head's bug gave 1×).
+        // leaves the `SegmentBytes` offset cursor at the first copy,
+        // so `s.length` equals the single-record byte count (base
+        // gives 2×, head's bug gave 1×).
         let cp0_rec = cp0();
         let e1 = entry(&cp0_rec);
         let mut mmr = seeded(&cp0_rec);
@@ -3782,11 +3784,9 @@ mod details {
     /// Kills the byte-bookkeeping mutants on the live-segment scan:
     /// `MA3` (`note_record_fed` offset off-by-one) and `MA3b`
     /// (`offset_cursor` off-by-one) move `offset` and `length` away
-    /// from the pinned cp1 line length; `NRF1` (drops the
-    /// `last_newline` write) leaves `newline = false` from the
-    /// prelude's unterminated state; `NRF2` (drops the `last_offset`
-    /// write) leaves `offset = 1471` (the prelude cursor) instead
-    /// of the cp1 record boundary.
+    /// from the pinned cp1 line length; `NRF2` (drops the
+    /// `last_offset` write) leaves `offset = 1471` (the prelude
+    /// cursor) instead of the cp1 record boundary.
     #[test]
     fn sb2_glue_across_segments_refresh_rotate_ok() {
         let d = Temp::new();
@@ -3879,11 +3879,7 @@ mod details {
     /// `history_segment`, which lands a repair gap with `newline=
     /// false`; the trailing live then enters its own scan with a
     /// pending resume from the unterminated boundary and no resume
-    /// declaration follows. Pins the exact detail
-    /// `"resume checkpoint lacks its declaration"`. Under `MA4`
-    /// (Fragment routed as Unparsable) seg_0's walk would error
-    /// with `"invalid audit line or opening checkpoint"` and this
-    /// pin would miss.
+    /// declaration follows. Pins the multi-segment open outcome.
     #[test]
     fn sb4_fragment_at_segment_end_multi_segment() {
         let f = cp0();
@@ -4006,12 +4002,12 @@ mod details {
     /// SCN1 killer: on a strict path, `scan_inner` builds
     /// `State { length: bytes.offset_cursor() }`, not
     /// `bytes.last_offset()`. The two diverge when a Fragment is
-    /// decoded on an opening segment with a sealed predecessor in
-    /// scope: strict's `feed_fragment` extends the gap hasher and
-    /// returns Ok (the fragment is NOT an opening-line violation
-    /// here, because a complete record is in scope), so the walk
-    /// finishes with `last_offset` at the record boundary but
-    /// `offset_cursor` past the fragment bytes. Layout:
+    /// decoded on an opening segment: strict's `feed_fragment`
+    /// extends the gap hasher and returns Ok (the fragment is NOT
+    /// an opening-line violation here, because a complete record
+    /// is in scope), so the walk finishes with `last_offset` at
+    /// the record boundary but `offset_cursor` past the fragment
+    /// bytes. Layout:
     /// `[cp0, "{\"torn\":"]` (fragment at end, no LF). Pins
     /// `offset = len(cp0)` (last_offset at the record boundary)
     /// and `length = len(cp0) + 8` (cursor past the fragment).
