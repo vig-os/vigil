@@ -733,21 +733,31 @@ mod classify_collect_tests {
     /// CC12-liveopen-damaged-sealed-propagates-run-to-live-close:
     /// Under `Reaction::Collect`, the same layout as RP12 records an
     /// `UnclosedSegmentLacksResume` violation tagged at
-    /// `segment_index == 1` (the live segment). Kills M-C9 ("run
-    /// inheritance drops across live-close"): under the mutant the
-    /// live-close walker would receive `run=false`, the
-    /// `boundary_resume` gate would be off, and no violation would be
-    /// recorded for the live's non-resume second record. Addendum
-    /// 27.4 / brief 197-r2b-S3b1b-r1c item 1: literal pin asserts the
-    /// first recorded violation's exact (seg, rec, variant).
+    /// `segment_index == 1` (the live segment). rotated_0 is
+    /// `[cp0, close1]` plus a complete `Line::Unparsable` payload, so
+    /// the tolerant fallback latches `damaged = true` and promotes
+    /// `run_flag = true` without updating `gap`; the returned State
+    /// is sealed (gap=None, run.checkpoint=true). `classify_collect`
+    /// threads `run = true` into `scan_closing` on the live, where
+    /// `initial_boundary_resume = ctx.run || !sealed(prior) = true ||
+    /// false = true` relies solely on the `run` arg. Kills M-C9
+    /// ("run inheritance drops across live-close"): the mutant
+    /// passes `run = false` to `scan_closing`, `initial_boundary_
+    /// resume` collapses to false, and no violation is recorded on
+    /// the live's non-resume second record. Addendum 27.4 / brief
+    /// 197-r2b-S3b1b-r1c item 1: literal pin asserts the first
+    /// recorded violation's exact (seg, rec, variant).
     #[test]
     fn cc12_liveopen_damaged_sealed_propagates_run_to_live_close() {
         let d = Temp::new();
         let first = fixture(&d.0);
         let mut mmr = seeded(&first);
         let opening = rotated(&d.0, &first, &mut mmr, 0);
-        // Damage rotated_0 (sealed) with trailing non-newline garbage.
-        append_bytes(&segment(&d.0, 0), b"{\"torn\":");
+        // Damage rotated_0 with a complete Unparsable line: the
+        // tolerant fallback latches `damaged = true` (hence
+        // `run_flag = true`) WITHOUT updating `gap`, so `*run` is the
+        // only signal carried across the sealed->live boundary.
+        append_bytes(&segment(&d.0, 0), b"garbage\n");
         // Non-resume second record on the live.
         let bad = entry(&opening);
         append(&d.0.join("audit.jsonl"), &bad);
@@ -761,9 +771,23 @@ mod classify_collect_tests {
             None,
         )
         .unwrap();
-        // The live-segment (segment_index == 1) records
-        // `UnclosedSegmentLacksResume` because `run=true` reached
-        // scan_closing from the damaged sealed prior.
+        // The live segment (segment_index == 1) records
+        // `InitialCheckpointDoesNotLinkGenesis` on its first record
+        // (opening cp). Under Collect, the sealed walk's tolerant
+        // arm does not thread State across the segment boundary
+        // (the per-segment State is rebuilt on each call), so the
+        // live-close walker sees `state = None` and
+        // `genesis = ctx.run || state.is_none()` evaluates true
+        // only because `*run` reached it carrying the prior run's
+        // damaged-latch signal. Kills M-C9 ("run inheritance
+        // drops across live-close"): under the mutant `run=false`
+        // leaves `genesis = false`, the opening cp is instead
+        // validated via from_peaks + push, and the first violation
+        // recorded on the live becomes `CheckpointMmrDiffers`
+        // (different literal pin, so the assert fires).
+        // Addendum 27.4 / brief 197-r2b-S3b1b-r1c item 1: literal
+        // pin asserts the exact first (seg, rec, variant) on
+        // segment_index == 1.
         let live_violation = out
             .violations
             .iter()
@@ -774,12 +798,12 @@ mod classify_collect_tests {
             Some((
                 SegmentViolationPos {
                     segment_index: 1,
-                    record_index_in_segment: 1,
+                    record_index_in_segment: 0,
                 },
-                Violation::UnclosedSegmentLacksResume,
+                Violation::InitialCheckpointDoesNotLinkGenesis,
             )),
             "CC12: run=true propagation into scan_closing records \
-             UnclosedSegmentLacksResume on the live's second record (kills M-C9); \
+             InitialCheckpointDoesNotLinkGenesis on the live's opening cp (kills M-C9); \
              got: {:?}",
             out.violations,
         );
@@ -792,21 +816,33 @@ mod classify_collect_tests {
     /// CC13-liveopen-damaged-sealed-propagates-run-across-sealed:
     /// Under `Reaction::Collect`, the two-rotation layout records a
     /// `FirstSuccessorLacksImmediateResume` violation tagged at
-    /// `segment_index == 1` (rotated_1), because `run=true`
-    /// propagated from the damaged rotated_0 and `inherited=true`
-    /// promoted `closing=true` on rotated_1's opening. Kills M-C2
-    /// ("classify threads `run=false` across sealed→sealed"): under
-    /// the mutant rotated_1 would see `inherited=false`, no closing
-    /// latch, no `FirstSuccessorLacksImmediateResume` on the second
-    /// record. Addendum 27.4: literal pin asserts the exact (seg,
-    /// rec, variant) for seg 1.
+    /// `segment_index == 1` (rotated_1). rotated_0 is `[cp0, close1]`
+    /// plus a complete `Line::Unparsable` line, so the tolerant
+    /// fallback latches `damaged` and promotes `run_flag = true`
+    /// WITHOUT updating `gap`; the returned State is sealed
+    /// (gap=None, run.checkpoint=true). `classify_collect` threads
+    /// `run = true` into rotated_1's `history_segment` call, strict
+    /// fails on the closing cp via `boundary_resume && !first &&
+    /// !is_resume`, the tolerant Collect fallback runs with
+    /// `inherited = run_in || unsealed_boundary = true || false =
+    /// true`, and the closing cp at `count == 1` records
+    /// `FirstSuccessorLacksImmediateResume`. Kills M-C2 ("classify
+    /// threads `run = false` across sealed->sealed"): the mutant
+    /// resets `run = false` between sealed segments, strict runs
+    /// cleanly (initial_boundary_resume = false, no inherited run),
+    /// and no violation on rotated_1 is recorded. Addendum 27.4:
+    /// literal pin asserts the exact (seg, rec, variant) for seg 1.
     #[test]
     fn cc13_liveopen_damaged_sealed_propagates_run_across_sealed() {
         let d = Temp::new();
         let first = fixture(&d.0);
         let mut mmr = seeded(&first);
         let opening = rotated(&d.0, &first, &mut mmr, 0);
-        append_bytes(&segment(&d.0, 0), b"{\"torn\":");
+        // Damage rotated_0 with a complete Unparsable line: the
+        // tolerant epilogue latches `run_flag = true` WITHOUT
+        // updating `gap`, so `*run` is the only signal carried
+        // across the sealed->sealed boundary.
+        append_bytes(&segment(&d.0, 0), b"garbage\n");
         let opening2 = rotated(&d.0, &opening, &mut mmr, 1);
         // Close the live-side run so the layout is well-formed under
         // the mutant (no incidental live-side violation that would
@@ -823,6 +859,24 @@ mod classify_collect_tests {
             None,
         )
         .unwrap();
+        // The second segment (rotated_1, segment_index == 1)
+        // records `FirstSuccessorDoesNotCloseRun` on its opening cp
+        // (record 0): under Collect the sealed walk does not thread
+        // State across the boundary, strict Collect fails on
+        // boundary_resume and falls back to tolerant Collect with
+        // `inherited = run_in || unsealed_boundary = true || false
+        // = true`, and the opening cp with trial_apply(None, ..) =
+        // false trips `inherited && is_cp && !broken && !closing`.
+        // Kills M-C2 ("classify threads `run = false` across
+        // sealed->sealed"): under the mutant `run_in = false`
+        // (and state = None still because Collect does not thread
+        // state), `inherited = false || false = false`, no
+        // `FirstSuccessorDoesNotCloseRun` check fires, strict's
+        // `boundary_resume` also collapses, and the first
+        // violation recorded on rotated_1 becomes
+        // `CheckpointMmrDiffers` via the new-mmr-from-peaks path.
+        // Addendum 27.4: literal pin asserts the exact first
+        // (seg, rec, variant) on segment_index == 1.
         let seg1_violation = out
             .violations
             .iter()
@@ -833,13 +887,13 @@ mod classify_collect_tests {
             Some((
                 SegmentViolationPos {
                     segment_index: 1,
-                    record_index_in_segment: 1,
+                    record_index_in_segment: 0,
                 },
-                Violation::FirstSuccessorLacksImmediateResume,
+                Violation::FirstSuccessorDoesNotCloseRun,
             )),
-            "CC13: run=true propagation across sealed→sealed records \
-             FirstSuccessorLacksImmediateResume on rotated_1's count-1 record \
-             (kills M-C2); got: {:?}",
+            "CC13: run=true propagation across sealed->sealed records \
+             FirstSuccessorDoesNotCloseRun on rotated_1's opening cp (kills M-C2); \
+             got: {:?}",
             out.violations,
         );
         assert!(
