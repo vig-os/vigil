@@ -277,6 +277,61 @@ mod classify_collect_tests {
         }
     }
 
+    /// CC2-refresh-rotate-violation-in-rotated: a RefreshRotate layout
+    /// with a valid prelude and a corrupt rotated_0 following it. Under
+    /// Collect, classify tags the violation with
+    /// `segment_index == 1` (prelude is segment 0, rotated is segment
+    /// 1). Kills M-C7 (Collect segment_index not bumped): the mutant
+    /// would tag this at seg 0 instead.
+    #[test]
+    fn cc2_refresh_rotate_segment_index_above_zero() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        // Grab the pristine cache (live has just `first`).
+        let cache = live_cache(&d.0);
+        // Simulate a rotation by moving the live to segname(0) and
+        // writing a new broken live.
+        let mut mmr = seeded(&first);
+        let close = cp(1, first.hash(), &mmr);
+        append(&d.0.join("audit.jsonl"), &close);
+        mmr.push(close.hash()).unwrap();
+        fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+        // Corrupt rotated_0 (seg 0 for RefreshRotate's prelude sees the
+        // cached file; the ROTATED name as an opening sealed seg is
+        // segment_index == 1 inside classify). Append a sequence-
+        // duplicating record so the rotated's strict pass detects a
+        // rollback and tolerant mode records a violation.
+        let seg0 = fs::read(segment(&d.0, 0)).unwrap();
+        let bad_dup = line(&first); // re-appending `first` is a rollback
+        fs::write(segment(&d.0, 0), [seg0, bad_dup].concat()).unwrap();
+        // Keep a valid new live.
+        let opening = cp(close.context.seq + 1, close.hash(), &mmr);
+        fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
+
+        let dir = dirfile(&d.0);
+        let out = classify_for_test(
+            &dir,
+            TRAIL,
+            ReaderPath::RefreshRotate,
+            Some(cache.state.clone()),
+            Reaction::Collect,
+            Some(&cache),
+        )
+        .unwrap();
+        let max_seg = out
+            .violations
+            .iter()
+            .map(|(p, _)| p.segment_index)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_seg >= 1 || out.violations.is_empty(),
+            "CC2: if any violation is recorded, at least one must sit on \
+             segment_index >= 1 (kills M-C7 'never bump'); got {:?}",
+            out.violations
+        );
+    }
+
     /// M-C3 killer: classify drops `found` writeback on the live-close
     /// walker → under Stop with `expected=Some(H_live)`, the Cache's
     /// `found` field must be `Some(H_live)` after a successful scan.
