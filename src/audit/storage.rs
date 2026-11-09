@@ -90,9 +90,32 @@ impl State {
 }
 pub(crate) struct Cache {
     // Last sealed name observed when this live descriptor was acquired.
-    pub(crate) sealed_before: Option<PathBuf>,
-    pub(crate) file: File,
-    pub(crate) state: State,
+    pub(super) sealed_before: Option<PathBuf>,
+    pub(super) file: File,
+    pub(super) state: State,
+}
+
+impl Cache {
+    /// Test-only accessor so cross-module test code
+    /// (`runs::classify_tests`) can clone the cached `State` into a
+    /// classify args struct without widening the field to
+    /// `pub(crate)`. Brief 197-r2b-S3b1b-r1c item 7.
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> &State {
+        &self.state
+    }
+
+    /// Test-only constructor so the CC rows can assemble a `Cache`
+    /// from a reader-produced `(state, file, sealed_before)` triple
+    /// without widening the fields. Brief item 7.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(state: State, file: File, sealed_before: Option<PathBuf>) -> Self {
+        Self {
+            state,
+            file,
+            sealed_before,
+        }
+    }
 }
 
 /// Retains the old live descriptor across rotations, preventing inode reuse.
@@ -644,10 +667,9 @@ fn initial_record(
     #[cfg(test)]
     FULL_FOLDS.with(|count| count.set(count.get() + 1));
     let mut source = SegmentSource::for_live_open(dir)?;
-    let out = runs::classify(
+    let out = runs::classify_stop(
         runs::ClassifyArgs {
             trail,
-            reaction: runs::Reaction::Stop,
             prior_state: None,
         },
         runs::ReaderPath::LiveOpen { expected },
@@ -854,6 +876,78 @@ pub(crate) fn scan_closing(
         },
     )
 }
+/// Addendum 27.1 Stop-wrapper for the live-close walker. Under
+/// `Reaction::Stop` an Ok [`scan_closing`] always returns
+/// `state = Some(_)` (scan_inner invariant: finish() wraps a folded
+/// state), so the wrapper extracts the State at this walker-shim
+/// level and hands `runs::classify_stop` a typed `State` rather than
+/// an `Option<State>` to eyeball. No new corrupt site, no new
+/// `Violation` variant, no change in behaviour.
+pub(crate) fn scan_closing_stop(
+    file: &File,
+    trail: [u8; 16],
+    state: Option<State>,
+    expected: Option<Head>,
+    found: &mut Option<Record>,
+    run: bool,
+) -> Result<State, AuditError> {
+    let (state, _) = scan_closing(Reaction::Stop, file, trail, state, expected, found, run)?;
+    Ok(state.expect("scan_closing Stop implies state=Some"))
+}
+/// Addendum 27.1 Stop-wrapper for the refresh-append scan walker.
+/// See [`scan_closing_stop`] for rationale.
+pub(crate) fn scan_stop(
+    file: &File,
+    trail: [u8; 16],
+    state: Option<State>,
+    opening: bool,
+    expected: Option<Head>,
+    found: &mut Option<Record>,
+    genesis: bool,
+) -> Result<State, AuditError> {
+    let (state, _) = scan(
+        Reaction::Stop,
+        file,
+        trail,
+        state,
+        opening,
+        expected,
+        found,
+        genesis,
+    )?;
+    Ok(state.expect("scan Stop implies state=Some"))
+}
+/// Addendum 27.1 Stop-wrapper for the sealed-segment walker. Unlike
+/// [`scan_closing_stop`] / [`scan_stop`], `history_segment` under
+/// `Reaction::Stop` may return `state = None`: the tolerant fallback
+/// is still the Stop reader's second pass when strict detects
+/// `CorruptTrail`, and if the fallback folds no record, the per-
+/// segment state is `None`. The pre-S3b1b `initial_record` /
+/// `refresh` loops threaded this `Option<State>` through to the next
+/// segment; `runs::classify_stop` does the same. No violations are
+/// emitted under Stop, so the second half of `SegmentOutcome`
+/// stays empty and is dropped here.
+pub(crate) fn history_segment_stop(
+    file: &File,
+    trail: [u8; 16],
+    state: Option<State>,
+    opening: bool,
+    expected: Option<Head>,
+    found: &mut Option<Record>,
+    run: &mut bool,
+) -> Result<Option<State>, AuditError> {
+    let (state, _) = history_segment(
+        Reaction::Stop,
+        file,
+        trail,
+        state,
+        opening,
+        expected,
+        found,
+        run,
+    )?;
+    Ok(state)
+}
 fn sealed(state: &State) -> bool {
     // A complete JSON checkpoint without LF is still a record (ADR-0005 d5).
     state.run.checkpoint && state.gap.is_none() && !state.run.pending_resume
@@ -983,10 +1077,9 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
         }
         if old.len() > cache.state.length {
             let mut source = SegmentSource::for_refresh_append(dir, cache)?;
-            let out = runs::classify(
+            let out = runs::classify_stop(
                 runs::ClassifyArgs {
                     trail,
-                    reaction: runs::Reaction::Stop,
                     prior_state: Some(cache.state.clone()),
                 },
                 runs::ReaderPath::RefreshAppend,
@@ -1000,10 +1093,9 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
         return Err(corrupt("old live descriptor was truncated"));
     }
     let mut source = SegmentSource::for_refresh_rotate(dir, cache)?;
-    let out = runs::classify(
+    let out = runs::classify_stop(
         runs::ClassifyArgs {
             trail,
-            reaction: runs::Reaction::Stop,
             prior_state: Some(cache.state.clone()),
         },
         runs::ReaderPath::RefreshRotate,

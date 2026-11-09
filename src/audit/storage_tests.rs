@@ -4749,6 +4749,24 @@ mod details {
                 1,
                 "scan_inner composes into runs::scan_segment once; the per-reader-path strict walk",
             ),
+            (
+                "scan_closing_stop",
+                "scan_closing",
+                1,
+                "addendum 27.1 Stop-wrapper: runs::classify_stop's live-close call; wraps `scan_closing(Reaction::Stop,...)` to hand the caller a typed `State`",
+            ),
+            (
+                "scan_stop",
+                "scan",
+                1,
+                "addendum 27.1 Stop-wrapper: runs::classify_stop's refresh-append call; wraps `scan(Reaction::Stop,...)` to hand the caller a typed `State`",
+            ),
+            (
+                "history_segment_stop",
+                "history_segment",
+                1,
+                "addendum 27.1 Stop-wrapper: runs::classify_stop's sealed-segment call; wraps `history_segment(Reaction::Stop,...)` to hand the caller a typed `State`",
+            ),
         ];
 
         fn path_last_ident(path: &syn::Path) -> Option<String> {
@@ -4843,7 +4861,7 @@ mod details {
                     && self.in_test_depth == 0
                 {
                     let fn_name = self.fn_stack.last().cloned().unwrap_or_default();
-                    if last == "classify" {
+                    if last == "classify_stop" || last == "classify_collect" {
                         self.classify_callers.insert(fn_name.clone());
                     }
                     if self.walker_names.contains(&last.as_str()) {
@@ -4895,11 +4913,14 @@ mod details {
             v.looped
         );
 
-        // 27.3b: `initial_record` and `refresh` each call `classify`.
+        // 27.3b: `initial_record` and `refresh` each call `classify_stop`
+        // (addendum 27.1 split: Stop callers go through classify_stop,
+        // Collect through classify_collect; both are counted here as the
+        // orchestrator entry points).
         for caller in ["initial_record", "refresh"] {
             assert!(
                 v.classify_callers.contains(caller),
-                "storage.rs: fn `{caller}` must call `classify` (addendum 27.3b)"
+                "storage.rs: fn `{caller}` must call `classify_stop` / `classify_collect` (addendum 27.3b)"
             );
         }
 
