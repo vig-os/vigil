@@ -1756,7 +1756,7 @@ mod details {
     // `Violation::<Variant>` construction expression in `runs.rs`,
     // mapping each variant to its `detail()` string.
     //
-    // The pure classifier (`runs::Classifier`) owns 42 of the 50 sites:
+    // The pure classifier (`runs::Classifier`) owns 42 of the 49 sites:
     // every `apply_checked` detail (ruling 197-d1 point 2, R1), the
     // strict-mode per-segment checks driven by `feed_record` / `finish`
     // / `invalid_opening_line`, the tolerant-mode checks driven by
@@ -1767,19 +1767,25 @@ mod details {
     // `storage.rs` with the addendum-20.1 orchestration (UNREACHABLE
     // for `apply_checked`'s Ok case leaves `classifier.state()=Some`,
     // matched by the UNREACHABLE table row below). The reader shim in
-    // `storage.rs` keeps the remaining 8 sites: the byte-level and
+    // `storage.rs` keeps the remaining 7 sites: the byte-level and
     // file-open checks. `check_attestation` is the single site for
     // `missing or mismatched repair attestation` (ruling 197-d1
     // addendum 7); the reader orders it per path at the position
     // ruling 197-d1 addendum 12 fixes. The total sits at
-    // 50 = 8 in `storage.rs` + 42 in `runs.rs`. The two extra sites
-    // over the 39+9=48 base are: the fold (iii) salvage push adds one
-    // `Violation::CheckpointMmrDiffers` construction site inside
-    // `feed_record_apply_tolerant` (UNREACHABLE for the reader-side
-    // pin gate: exercised by `collector_tests`, no `assert_corrupt`),
-    // and `apply_checked`'s fresh-Mmr genesis fold carries an explicit
-    // `.map_err(|_| Violation::MmrOverflow)?` (UNREACHABLE:
-    // `Mmr::new()` + push of one leaf cannot overflow). The
+    // 49 = 7 in `storage.rs` + 42 in `runs.rs`. The one net extra
+    // site over the 39+9=48 base is the balance of three S3a-era
+    // adds against one S3b1a-round-2 merge: the fold (iii) salvage
+    // push adds one `Violation::CheckpointMmrDiffers` construction
+    // site inside `feed_record_apply_tolerant` (UNREACHABLE for the
+    // reader-side pin gate: exercised by `collector_tests`, no
+    // `assert_corrupt`); `apply_checked`'s fresh-Mmr genesis fold
+    // carries an explicit `.map_err(|_| Violation::MmrOverflow)?`
+    // (UNREACHABLE: `Mmr::new()` + push of one leaf cannot overflow);
+    // and the glue-byte LF check — strict `SegmentBytes::
+    // check_glue_byte_strict` and tolerant `SegmentBytes::next_event`
+    // — behaves identically on the Err path, so the two copies of
+    // `corrupt("bytes glued to complete unterminated record")` merge
+    // into one shared helper `consume_glue_byte` (50 → 49). The
     // `missing head` occurrence 0 is the shared-walk invariant
     // described above; occurrence 1 is `Classifier::finish`'s own
     // construction, pinned by `pin_sc_missing_head_opening_false_*`.
@@ -2022,15 +2028,17 @@ mod details {
     fn pin_hs_fallback_duplicate_advances_length_through_feed_callback() {
         // Addendum 22.1: a trailing duplicate flows through the shared
         // `on_feed` callback as `FeedEvent::Duplicate`, which advances
-        // the walk's `final_offset` (so `s.length` is base-identical)
-        // while leaving `state.offset` and `state.newline` untouched.
-        // Repro: predecessor `scan([cp0, e1, cp2])`, segment file
-        // `[e3, e3]`, `history_segment(opening=true, run=false)`.
-        // Strict fails with `MissingOpeningCheckpoint` (e3 is an entry
-        // on an opening segment), so the tolerant fallback walks both
+        // the `SegmentBytes` offset cursor (so `s.length` is base-
+        // identical) while leaving `state.offset` and `state.newline`
+        // untouched. Repro: predecessor `scan([cp0, e1, cp2])`,
+        // segment file `[e3, e3]`,
+        // `history_segment(opening=true, run=false)`. Strict fails
+        // with `MissingOpeningCheckpoint` (e3 is an entry on an
+        // opening segment), so the tolerant fallback walks both
         // copies. A mutant that skips `on_feed` on the duplicate arm
-        // leaves `final_offset` at the first copy, so `s.length` equals
-        // the single-record byte count (base gives 2×, head's bug gave 1×).
+        // leaves the `SegmentBytes` offset cursor at the first copy,
+        // so `s.length` equals the single-record byte count (base
+        // gives 2×, head's bug gave 1×).
         let cp0_rec = cp0();
         let e1 = entry(&cp0_rec);
         let mut mmr = seeded(&cp0_rec);
@@ -2615,7 +2623,7 @@ mod details {
         assert_corrupt(
             scc(&o(&d), Some(s), false),
             "bytes glued to complete unterminated record",
-            1,
+            0,
         );
     }
     #[test]
@@ -3654,6 +3662,371 @@ mod details {
         );
     }
 
+    // ---- S3b1a: SegmentSource / SegmentBytes pins ----------------------
+    // Ruling 197-d1 addendum 25.2 + S3b1a brief: byte-source properties
+    // that S3b1b will rely on. Each row must pass at base `320a7d9` and
+    // at head (this PR changes no behaviour). Together they pin the
+    // laziness of `SegmentSource::next_segment`, the cross-segment glue
+    // byte check, the `on_feed` offset bookkeeping across refresh-append,
+    // and `decode_line_kind`'s Fragment-vs-Unparsable mapping.
+
+    fn fifo_segment(d: &Temp, id: usize) {
+        assert!(
+            Command::new("mkfifo")
+                .arg(segment(&d.0, id))
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// SB1 live-open order: a corrupt rotated_0 (seg_only concat) plus a
+    /// non-regular rotated_1 (FIFO) sits in the directory. `TrailReader
+    /// ::open` must surface **seg_0's** `invalid audit record in sealed
+    /// run`, not a `nonregular trail file` from eagerly probing seg_1.
+    /// Kills MA1 (eager open-up-front) because eager would error on
+    /// seg_1's open before seg_0's tolerant walk runs.
+    #[test]
+    fn sb1_liveopen_base_order_short_circuits_on_segment_0_error() {
+        let d = seg_only(concat(&[&cp0()], b"{}\n"));
+        fifo_segment(&d, 1);
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "invalid audit record in sealed run",
+            0,
+        );
+    }
+
+    /// SB1 refresh-rotate order: the prelude walk surfaces its own
+    /// `invalid audit record in sealed run` BEFORE `segments_after`
+    /// runs its directory listing. Proves addendum 25.2: on
+    /// `refresh-rotate`, the base order is "walk prelude first, then
+    /// list newer segments". Kills MA5 (prelude skipped: refresh would
+    /// reach the valid live and return Ok instead of the pinned Err)
+    /// AND the B1 regression where `for_refresh_rotate` listed
+    /// `segments_after` eagerly at construction time — because with
+    /// `chmod 0300` the directory can't be listed, so eager listing
+    /// would surface `Io Permission denied` before the prelude walk
+    /// ever started.
+    #[test]
+    fn sb1_refresh_rotate_prelude_walks_before_segments_after() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        // Append corrupt bytes to the cached inode BEFORE rotating, so
+        // the renamed file (soon-to-be prelude) carries them. The
+        // reader's descriptor keeps pointing to the same inode.
+        append_bytes(&d.0.join("audit.jsonl"), b"{}\n");
+        fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+        // Fresh live with a cp1-based opening keeps refresh in the
+        // rotate branch (different inode). Then `chmod 0300` on the
+        // directory makes any later `rotated_names_at` / `statat` fail
+        // with EACCES, so the two orderings surface distinct errors:
+        // prelude-first → the corrupt-prelude's `CorruptTrail`;
+        // segments_after-first → `Io Permission denied`.
+        let opening = cp(1, first.hash(), &seeded(&first));
+        fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
+        fs::set_permissions(&d.0, fs::Permissions::from_mode(0o300)).unwrap();
+        let r = reader.with_current(|_| Ok(()), |_, _, _| Ok(()));
+        fs::set_permissions(&d.0, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_corrupt(r, "invalid audit record in sealed run", 0);
+    }
+
+    /// SB2 glue across segments, live open: an unterminated-last
+    /// rotated segment followed by a terminated live file whose
+    /// opening is a fresh checkpoint linking to rotated_0's head.
+    /// Base-identical: `history_segment(opening=true)` and
+    /// `scan_closing(opening=true)` both run with
+    /// `needs_glue_check=false` at the segment boundary (opening=true
+    /// forces a fresh offset), so live-open returns Ok with the
+    /// cache's final `State` fully pinned. A SegmentBytes bookkeeping
+    /// drift (MA3-style) that produced the wrong `offset` or
+    /// `length` across the transition would move the pinned tuple.
+    #[test]
+    fn sb2_glue_across_segments_live_open_ok() {
+        let d = Temp::new();
+        let f = cp0();
+        // rotated_0 ends without LF on cp0.
+        let mut seg0 = line(&f);
+        assert!(seg0.pop() == Some(b'\n'));
+        fs::write(segment(&d.0, 0), &seg0).unwrap();
+        // Live file: fresh opening checkpoint cp1 linked to cp0's
+        // hash, so the opening check succeeds across the segment
+        // transition.
+        let opening = cp(1, f.hash(), &seeded(&f));
+        fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
+        let reader = TrailReader::open(&d.0, TRAIL, None).unwrap();
+        let live_len = line(&opening).len() as u64;
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, s| {
+                    assert_eq!(s.offset, live_len);
+                    assert_eq!(s.length, live_len);
+                    assert!(s.newline);
+                    assert!(s.gap.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    /// SB2 glue across segments, refresh rotate: the cached live
+    /// ends without LF on cp0, and is rotated into seg_0 as-is. The
+    /// fresh live carries a cp1 opening that links to cp0. On
+    /// refresh, the rotate branch walks the prelude first (seg_0's
+    /// unterminated cp0 bytes), which the shared `SegmentSource`
+    /// yields before listing newer segments; the trailing live is
+    /// then scanned as its own opening segment. Pins the FINAL
+    /// `(offset, length, newline, gap)` tuple from the live scan,
+    /// which must land exactly at the end of cp1 with a trailing LF.
+    /// Kills the byte-bookkeeping mutants on the live-segment scan:
+    /// `MA3` (`note_record_fed` offset off-by-one) and `MA3b`
+    /// (`offset_cursor` off-by-one) move `offset` and `length` away
+    /// from the pinned cp1 line length; `NRF2` (drops the
+    /// `last_offset` write) leaves `offset = 1471` (the prelude
+    /// cursor) instead of the cp1 record boundary.
+    #[test]
+    fn sb2_glue_across_segments_refresh_rotate_ok() {
+        let d = Temp::new();
+        // Seed cached state with an unterminated cp0.
+        let f = cp0();
+        let mut cached_bytes = line(&f);
+        assert!(cached_bytes.pop() == Some(b'\n'));
+        fs::write(d.0.join("audit.jsonl"), &cached_bytes).unwrap();
+        let reader = TrailReader::open(&d.0, TRAIL, None).unwrap();
+        // Rotate the unterminated cached file as-is; the prelude
+        // intentionally ends without LF so the refresh-rotate walk
+        // enters its glue-check branch on the prelude segment.
+        fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+        let opening = cp(1, f.hash(), &seeded(&f));
+        fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
+        let live_len = line(&opening).len() as u64;
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, s| {
+                    assert_eq!(s.offset, live_len);
+                    assert_eq!(s.length, live_len);
+                    assert!(s.newline);
+                    assert!(s.gap.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    /// SB3 refresh-append bookkeeping: after each refresh-append, pin
+    /// the exact [`State`] field tuple (`offset`, `length`, `newline`,
+    /// `gap`). An off-by-one in `SegmentBytes::note_record_fed` moves
+    /// `offset` away from the record boundary; a wrong `offset_cursor`
+    /// bump breaks `length`. Kills MA3.
+    #[test]
+    fn sb3_refresh_append_bookkeeping_pins_state() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let first_len = line(&first).len() as u64;
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, s| {
+                    assert_eq!(s.offset, first_len);
+                    assert_eq!(s.length, first_len);
+                    assert!(s.newline);
+                    assert!(s.gap.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let e1 = entry(&first);
+        let e1_len = line(&e1).len() as u64;
+        append(&d.0.join("audit.jsonl"), &e1);
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, s| {
+                    assert_eq!(s.offset, first_len + e1_len);
+                    assert_eq!(s.length, first_len + e1_len);
+                    assert!(s.newline);
+                    assert!(s.gap.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let e2 = entry(&e1);
+        let e2_len = line(&e2).len() as u64;
+        append(&d.0.join("audit.jsonl"), &e2);
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, s| {
+                    assert_eq!(s.offset, first_len + e1_len + e2_len);
+                    assert_eq!(s.length, first_len + e1_len + e2_len);
+                    assert!(s.newline);
+                    assert!(s.gap.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    /// SB4 fragment at a segment END, exercised through a real
+    /// multi-segment path: `seg_0 = [cp0, "{\"torn\":"]` (fragment
+    /// without LF at the end of the sealed segment) plus a cp1 live.
+    /// `TrailReader::open` walks seg_0 first through
+    /// `history_segment`, which lands a repair gap with `newline=
+    /// false`; the trailing live then enters its own scan with a
+    /// pending resume from the unterminated boundary and no resume
+    /// declaration follows. Pins the multi-segment open outcome.
+    #[test]
+    fn sb4_fragment_at_segment_end_multi_segment() {
+        let f = cp0();
+        let fragment = b"{\"torn\":";
+        let d = Temp::new();
+        fs::write(segment(&d.0, 0), [line(&f), fragment.to_vec()].concat()).unwrap();
+        let cp1_rec = cp(1, f.hash(), &seeded(&f));
+        fs::write(d.0.join("audit.jsonl"), line(&cp1_rec)).unwrap();
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "resume checkpoint lacks its declaration",
+            0,
+        );
+    }
+
+    /// SB4 fragment at a segment START, exercised through the
+    /// multi-segment `history_segment` tolerant fallback over a
+    /// predecessor sealed-state: a fragment is the FIRST tolerant-
+    /// decoded line of the second call. Layout: the first `hsc` on
+    /// `[cp0]` yields a sealed state; the second `hsc` on
+    /// `[fragment, cp0]` reads `{"torn":\n` as its first line,
+    /// which must decode as Fragment and start a repair gap, so
+    /// when the tolerant walk then folds a duplicate cp0 (seq=0)
+    /// the sealed-run seq check fires and the pinned detail is
+    /// `"record sequence did not increase inside sealed run"`
+    /// (occurrence 0). Under MA4 the first line would decode as
+    /// Unparsable and this layout's error would flip to
+    /// `"unparsable line before complete record"`.
+    #[test]
+    fn sb4_fragment_at_segment_start_multi_segment() {
+        let f = cp0();
+        let d_a = Temp::new();
+        w(&d_a, &line(&f));
+        let state_a = hsc(&o(&d_a), None, true, false)
+            .expect("seg a Ok")
+            .expect("state=Some");
+        let fragment = b"{\"torn\":\n";
+        let d_b = Temp::new();
+        w(&d_b, &[fragment.to_vec(), line(&f)].concat());
+        assert_corrupt(
+            hsc(&o(&d_b), Some(state_a), true, false),
+            "record sequence did not increase inside sealed run",
+            0,
+        );
+    }
+
+    /// MX2 / MX3 killer: on a strict path, the glue byte must set
+    /// BOTH `last_offset` and `last_newline` to `(offset_cursor,
+    /// true)`. Pins `(offset, length, newline) = (1472, 1472, true)`
+    /// (the head value for `state_unterminated` → append `"\n"` →
+    /// `scan(opening=false)`), then appends an attested entry and
+    /// confirms the next `scan` returns Ok. Mutants that drop the
+    /// `last_newline = true` write (MX2) or the `last_offset =
+    /// offset_cursor` write (MX3) would move the pinned tuple away
+    /// from `(X+1, X+1, true)`.
+    #[test]
+    fn mx2_mx3_strict_glue_sets_last_offset_and_last_newline() {
+        let (d, s, f) = state_unterminated();
+        let unterm_len = s.offset;
+        append_bytes(&d.0.join("audit.jsonl"), b"\n");
+        let after = scc(&o(&d), Some(s.clone()), false).unwrap();
+        assert_eq!(after.offset, unterm_len + 1);
+        assert_eq!(after.length, unterm_len + 1);
+        assert!(after.newline);
+        let e1 = entry(&f);
+        append_bytes(&d.0.join("audit.jsonl"), &line(&e1));
+        let again = scc(&o(&d), Some(after), false).expect("scan continues Ok");
+        assert_eq!(again.length, unterm_len + 1 + line(&e1).len() as u64);
+    }
+
+    /// MX4 killer: on a tolerant path, the lazy glue-byte branch of
+    /// `SegmentBytes::next_event` must bump `offset_cursor` after a
+    /// successful `\n`. Layout: an unterminated cp0, then append
+    /// `"\nnot json\n"`, then `history_segment(opening=false, run=true)`.
+    /// The glue byte `\n` consumes one byte, the unparsable
+    /// `"not json\n"` consumes the rest. Pins
+    /// `length = unterm_len + 10` (9 bytes of `not json\n` plus the
+    /// glue byte). A mutant that drops the `offset_cursor += 1`
+    /// after the tolerant glue-byte check (MX4) would record
+    /// `length = unterm_len + 9`.
+    #[test]
+    fn mx4_tolerant_glue_bumps_offset_cursor() {
+        let (d, s, _f) = state_unterminated();
+        let unterm_len = s.offset;
+        append_bytes(&d.0.join("audit.jsonl"), b"\nnot json\n");
+        let res = hsc(&o(&d), Some(s), false, true).expect("history_segment Ok");
+        let state = res.expect("Some(state) when the initial state was Some");
+        assert_eq!(state.length, unterm_len + 10);
+    }
+
+    /// MH5 killer: on a strict refresh over an unterminated state
+    /// with no new bytes, `consume_glue_byte` must return `Ok(false)`
+    /// (count=0 at EOF), NOT `Ok(true)`. The merged helper's EOF
+    /// branch feeds `check_glue_byte_strict`, so returning `true` on
+    /// EOF would promote `last_newline` to `true` through the
+    /// strict-side glue promotion while leaving `offset_cursor`
+    /// unchanged; the state would appear terminated and a later
+    /// refresh would stop checking for glue bytes. Pins
+    /// `(offset, length, newline)` first with no new bytes, so the
+    /// mutant's spurious `last_newline = true` flips the pinned
+    /// `false`. Then appends an `x` byte and refreshes again: the
+    /// base reader errors with `bytes glued to complete unterminated
+    /// record` because the glue byte must be LF.
+    #[test]
+    fn mh5_strict_glue_eof_returns_false() {
+        let (d, s, _f) = state_unterminated();
+        let unterm_len = s.offset;
+        let after = scc(&o(&d), Some(s.clone()), false).expect("scan Ok at EOF");
+        assert_eq!(after.offset, unterm_len);
+        assert_eq!(after.length, unterm_len);
+        assert!(!after.newline);
+        append_bytes(&d.0.join("audit.jsonl"), b"x");
+        assert_corrupt(
+            scc(&o(&d), Some(after), false),
+            "bytes glued to complete unterminated record",
+            0,
+        );
+    }
+
+    /// SCN1 killer: on a strict path, `scan_inner` builds
+    /// `State { length: bytes.offset_cursor() }`, not
+    /// `bytes.last_offset()`. The two diverge when a Fragment is
+    /// decoded on an opening segment: strict's `feed_fragment`
+    /// extends the gap hasher and returns Ok (the fragment is NOT
+    /// an opening-line violation here, because a complete record
+    /// is in scope), so the walk finishes with `last_offset` at
+    /// the record boundary but `offset_cursor` past the fragment
+    /// bytes. Layout:
+    /// `[cp0, "{\"torn\":"]` (fragment at end, no LF). Pins
+    /// `offset = len(cp0)` (last_offset at the record boundary)
+    /// and `length = len(cp0) + 8` (cursor past the fragment).
+    /// Under SCN1 (`length: last_offset()`), length would collapse
+    /// to `len(cp0)` and this test would fail.
+    #[test]
+    fn scn1_strict_fragment_length_is_offset_cursor() {
+        let f = cp0();
+        let fragment = b"{\"torn\":";
+        let d = Temp::new();
+        w(&d, &[line(&f), fragment.to_vec()].concat());
+        let s = scc(&o(&d), None, true).expect("strict Ok with gap after fragment");
+        let cp0_len = line(&f).len() as u64;
+        assert_eq!(s.offset, cp0_len);
+        assert_eq!(s.length, cp0_len + fragment.len() as u64);
+        assert!(!s.newline);
+        assert!(s.gap.is_some());
+    }
+
     // ---- Coverage gate --------------------------------------------------
 
     const UNREACHABLE: &[(&str, usize, &str)] = &[
@@ -4261,7 +4634,7 @@ mod details {
         }
         assert_eq!(
             sites.len(),
-            50,
+            49,
             "corrupt-site count changed; update gate explicitly"
         );
     }
