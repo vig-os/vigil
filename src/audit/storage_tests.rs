@@ -4950,3 +4950,237 @@ mod details {
         }
     }
 }
+
+/// Named reader pins for the multi-segment `runs::classify`
+/// orchestration (ruling 197-d1 addendum 25.3, brief R2b S3b1b round 1
+/// continuation). Each row builds a layout and asserts the literal
+/// reader outcome (exact `Err` kind, `Ok` head, or `State` shape).
+///
+/// Addendum 27.4: every expected kind / detail string is measured by
+/// running the row at base e1c45a3 **and** at head; these rows pass at
+/// both, so a mutant that changes `classify`'s behaviour makes the row
+/// fail with exit 101 (addendum 25.4). The reader goes through
+/// `classify` under `Reaction::Stop`; the structural gate
+/// `coverage_gate_no_segment_loop_in_storage_rs` guarantees this is the
+/// only multi-segment path, so these rows are reader-side
+/// classify-behaviour pins, not tautologies.
+mod classify_reader_pins {
+    use super::*;
+
+    /// RP1-liveopen-ok-single-segment: single checkpoint + live close;
+    /// reader returns Ok with the head set to the live's last record.
+    /// Kills M-C3 (dropping `found` writeback on the live-close walker)
+    /// and M-C10 (dropping the final-segment violations under Collect,
+    /// which shares the Stop-side `found` threading).
+    #[test]
+    fn rp1_liveopen_ok_single_segment() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        assert_eq!(head(&reader), Head::of(&first));
+        // An explicit expected head that matches must also round-trip:
+        // the `found` writeback on `scan_closing` is what makes
+        // TrailReader::open return Ok instead of HeadMismatch. M-C3
+        // would turn this into Err(HeadMismatch).
+        assert!(TrailReader::open(&d.0, TRAIL, Some(Head::of(&first))).is_ok());
+    }
+
+    /// RP3-liveopen-err-headmismatch: valid trail but `expected=Some(_)`
+    /// with a head not present anywhere. Reader returns
+    /// `Err(HeadMismatch)` (addendum 27.1 moves the construction site
+    /// from `storage.rs:653` into `classify`; the kind stays unchanged).
+    /// Kills M-C4 (`LiveOpen` HeadMismatch suppressed).
+    #[test]
+    fn rp3_liveopen_err_headmismatch() {
+        let d = Temp::new();
+        let _first = fixture(&d.0);
+        let absent = Head {
+            seq: 42,
+            hash: [0xee; 32],
+        };
+        bad(
+            TrailReader::open(&d.0, TRAIL, Some(absent)),
+            AuditErrorKind::HeadMismatch,
+        );
+    }
+
+    /// RP4-liveopen-ok-rotated-plus-live: rotated_0 complete sealed
+    /// segment + live with an opening. Reader returns Ok and the state
+    /// reflects the live's latest record. Kills M-C1 (classify segment
+    /// loop skips the first sealed segment) and M-C9 (run inheritance
+    /// drops across live-close): both would break the Ok state after
+    /// rotation.
+    #[test]
+    fn rp4_liveopen_ok_rotated_plus_live() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        assert_eq!(head(&open(&d.0)), Head::of(&opening));
+    }
+
+    /// RP7-refresh-append-ok: cache a live file, then append; refresh
+    /// reaches `classify(RefreshAppend)` and returns Ok. Kills M-C5
+    /// (HeadMismatch leaked to refresh paths): under that mutant the
+    /// refresh would spuriously `Err(HeadMismatch)`.
+    #[test]
+    fn rp7_refresh_append_ok() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let second = entry(&first);
+        append(&d.0.join("audit.jsonl"), &second);
+        assert_eq!(head(&reader), Head::of(&second));
+        // Refresh must succeed with no spurious HeadMismatch.
+        reader
+            .with_current(|_| Ok(()), |_, _, _| Ok(()))
+            .expect("RP7: refresh-append must be Ok");
+    }
+
+    /// RP9-refresh-rotate-ok-prelude-plus-live: an open reader sees an
+    /// in-flight rotation and refreshes through the rotated branch.
+    /// Reader returns Ok with the head on the new live. Kills M-C2
+    /// (classify threads `run=false` across sealed→sealed) and M-C6
+    /// (`SealedPrelude` treated as `SealedOpening`): both would break
+    /// the prelude/next-run threading.
+    #[test]
+    fn rp9_refresh_rotate_ok_prelude_plus_live() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        // The lagging reader must now see the rotated segment + the new
+        // live via the RefreshRotate `classify` path.
+        assert_eq!(head(&reader), Head::of(&opening));
+    }
+
+    /// RP11-refresh-append+rotate-ok: cache a live, append, then
+    /// rotate. Reader refreshes twice and reaches the new live. Kills
+    /// M-C2 (`run=false` across sealed→sealed) by requiring that run
+    /// state threads through the appended-then-rotated transition.
+    #[test]
+    fn rp11_refresh_append_then_rotate_ok() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let second = entry(&first);
+        append(&d.0.join("audit.jsonl"), &second);
+        let mut mmr = seeded(&first);
+        mmr.push(second.hash()).unwrap();
+        let opening = rotated(&d.0, &second, &mut mmr, 0);
+        assert_eq!(head(&reader), Head::of(&opening));
+    }
+
+    /// RP5-openfallback-err-rotated-nonincreasing-seq: rotated_0 has a
+    /// corrupt run with a non-increasing sequence. The reader rejects
+    /// with CorruptTrail from the rotated segment. Candidate killer for
+    /// M-C7 (Collect `segment_index` not bumped) via the propagated
+    /// detail shape — see runs_classify_tests for the primary Collect
+    /// killer.
+    #[test]
+    fn rp5_openfallback_err_rotated_nonincreasing_seq() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let mut mmr = seeded(&first);
+        let _ = rotated(&d.0, &first, &mut mmr, 0);
+        // Corrupt rotated_0: duplicate its opening record so sequence
+        // doesn't strictly increase inside the sealed run.
+        let bytes = fs::read(segment(&d.0, 0)).unwrap();
+        let doubled = [bytes, line(&first)].concat();
+        fs::write(segment(&d.0, 0), doubled).unwrap();
+        reject(TrailReader::open(&d.0, TRAIL, None));
+    }
+
+    /// RP2-liveopen-err-missing-initial-checkpoint: live-only, first
+    /// record is a non-checkpoint entry. Reader rejects with
+    /// `CorruptTrail` (the detail is the reader's byte-identical
+    /// `missing initial checkpoint` / `missing opening checkpoint`;
+    /// here we assert the kind and that `open` fails, which is what the
+    /// mutant table consumes — a kind flip is the kill signal).
+    #[test]
+    fn rp2_liveopen_err_missing_initial_checkpoint() {
+        let d = Temp::new();
+        let first = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        let bad_first = entry(&first);
+        write_records(&d.0, &[&bad_first]);
+        corrupt_open(&d.0);
+    }
+
+    /// RP6-openfallback-err-live-after-valid-rotated: rotated_0 is a
+    /// complete sealed run. The live file has bytes glued to an
+    /// unterminated record: cut the trailing LF off the opening and
+    /// append more bytes, so a later LF appears inside what looks like
+    /// a single line. The reader rejects with CorruptTrail. This pins
+    /// the glue-byte check that fires after the final live segment is
+    /// opened inside `classify`.
+    #[test]
+    fn rp6_openfallback_err_live_glued() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let mut mmr = seeded(&first);
+        let _ = rotated(&d.0, &first, &mut mmr, 0);
+        // Truncate the live file's trailing LF, then append garbage
+        // ending in a newline: on refresh/re-open the reader detects
+        // "bytes glued to complete unterminated record" (R0b pin).
+        let path = d.0.join("audit.jsonl");
+        let length = fs::metadata(&path).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(length - 1)
+            .unwrap();
+        append_bytes(&path, b"garbage\n");
+        corrupt_open(&d.0);
+    }
+
+    /// RP10-refresh-rotate-err-prelude-glued-bytes: refresh after a
+    /// rotation finds the prelude (cached live re-read as sealed) with
+    /// glued bytes; reader rejects via the prelude's
+    /// `history_segment(opening=false)` walk inside `classify`.
+    #[test]
+    fn rp10_refresh_rotate_err_prelude_glued() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let mut mmr = seeded(&first);
+        // Corrupt the live with a glued fragment before rotation.
+        append_bytes(&d.0.join("audit.jsonl"), b"{\"torn\":");
+        // Now rotate manually: this produces an invalid prelude once
+        // the reader refreshes through the RefreshRotate path.
+        let close = cp(first.context.seq + 1, first.hash(), &mmr);
+        append(&d.0.join("audit.jsonl"), &close);
+        mmr.push(close.hash()).unwrap();
+        fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+        let opening = cp(close.context.seq + 1, close.hash(), &mmr);
+        fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
+        reject(reader.with_current(|_| Ok(()), |_, _, _| Ok(())));
+    }
+
+    /// RP8-refresh-append-err-live-shrank: cached live at length L,
+    /// same inode but file shrank. `fn refresh` still catches this
+    /// before entering `classify` (brief: "this one does not enter
+    /// `classify`; it keeps the same `storage::refresh`-level check").
+    #[test]
+    fn rp8_refresh_append_err_live_shrank() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let second = entry(&first);
+        append(&d.0.join("audit.jsonl"), &second);
+        // Refresh once so the reader's cached state advances past
+        // `[first]`.
+        reader.with_current(|_| Ok(()), |_, _, _| Ok(())).unwrap();
+        // Now truncate the live file.
+        let path = d.0.join("audit.jsonl");
+        let length = fs::metadata(&path).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(length - 10)
+            .unwrap();
+        reject(reader.with_current(|_| Ok(()), |_, _, _| Ok(())));
+    }
+}
