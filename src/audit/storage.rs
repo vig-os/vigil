@@ -90,9 +90,9 @@ impl State {
 }
 pub(crate) struct Cache {
     // Last sealed name observed when this live descriptor was acquired.
-    sealed_before: Option<PathBuf>,
-    file: File,
-    state: State,
+    pub(crate) sealed_before: Option<PathBuf>,
+    pub(crate) file: File,
+    pub(crate) state: State,
 }
 
 /// Retains the old live descriptor across rotations, preventing inode reuse.

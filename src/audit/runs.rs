@@ -801,9 +801,12 @@ pub(crate) struct ClassifyOutput {
     /// the `#[cfg(test)]` CC rows + first-equality sweep in this
     /// slice; Stop callers (`initial_record`/`refresh`) ignore it
     /// since it is always empty under Stop.
-    #[expect(
-        dead_code,
-        reason = "read by #[cfg(test)] CC rows and the first-equality sweep in this slice; consumed by V4a in #197 R2b S3b2"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by #[cfg(test)] CC rows and the first-equality sweep in this slice; consumed by V4a in #197 R2b S3b2"
+        )
     )]
     pub(crate) violations: Vec<(SegmentViolationPos, Violation)>,
     /// `source.newest()` after the plan finished expanding; the caller
@@ -816,9 +819,12 @@ pub(crate) struct ClassifyOutput {
     /// under [`Reaction::Collect`] the flag is set after the last
     /// segment and every collected violation is kept. No `Violation`
     /// variant is added — the syn gate stays at 49.
-    #[expect(
-        dead_code,
-        reason = "read by the Collect CC10/CC11 head-mismatch rows; consumed by V4a in #197 R2b S3b2"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by the Collect CC10/CC11 head-mismatch rows; consumed by V4a in #197 R2b S3b2"
+        )
     )]
     pub(crate) head_mismatch: bool,
 }
@@ -3698,3 +3704,40 @@ mod collector_tests {
         );
     }
 }
+
+/// Test-only helper that drives [`classify`] directly from a directory.
+/// Used by the CC rows and the first-equality sweep (addendum 25.3). Not
+/// exposed to non-test callers: `initial_record` / `refresh` are the
+/// only non-test entry points.
+#[cfg(test)]
+pub(crate) fn classify_for_test(
+    dir: &std::fs::File,
+    trail: [u8; 16],
+    path: ReaderPath,
+    prior_state: Option<State>,
+    reaction: Reaction,
+    cache: Option<&storage::Cache>,
+) -> Result<ClassifyOutput, AuditError> {
+    let mut source = match path {
+        ReaderPath::LiveOpen { .. } => SegmentSource::for_live_open(dir)?,
+        ReaderPath::RefreshAppend => {
+            SegmentSource::for_refresh_append(dir, cache.expect("RefreshAppend needs cache"))?
+        }
+        ReaderPath::RefreshRotate => {
+            SegmentSource::for_refresh_rotate(dir, cache.expect("RefreshRotate needs cache"))?
+        }
+    };
+    classify(
+        ClassifyArgs {
+            trail,
+            reaction,
+            prior_state,
+        },
+        path,
+        &mut source,
+    )
+}
+
+#[cfg(test)]
+#[path = "runs_classify_tests.rs"]
+mod classify_tests;
