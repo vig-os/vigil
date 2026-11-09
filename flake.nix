@@ -10,7 +10,7 @@
     # "Home-manager modules - versioning & release policy"). The pin must match
     # DEVKIT_VERSION in .vig-os; with DEVKIT_FLAKE_PIN_ADVANCE=true, devkit
     # upgrades (`install.sh --force`) advance it together with flake.lock.
-    vigos.url = "github:vig-os/devkit?ref=1.18.0";
+    vigos.url = "github:vig-os/devkit?ref=1.19.0";
     # Follow vigos's pinned nixpkgs + flake-utils so your tools match the
     # toolchain exactly (one resolved nixpkgs, no drift).
     nixpkgs.follows = "vigos/nixpkgs";
