@@ -232,6 +232,51 @@ mod classify_collect_tests {
         assert_eq!(err.kind(), AuditErrorKind::HeadMismatch);
     }
 
+    /// CC5-refresh-append-single-segment-violation: refresh append over
+    /// a layout where the appended bytes are an invalid continuation.
+    /// Under Collect, the refresh-append path through `classify` records
+    /// at least one violation tagged with `segment_index == 0` (the
+    /// single segment of RefreshAppend) while `head_mismatch` stays
+    /// false (addendum 27.1: only `ReaderPath::LiveOpen { expected:
+    /// Some(_) }` can set it). Kills M-C5 (HeadMismatch leaked to
+    /// refresh paths) together with CC10.
+    #[test]
+    fn cc5_refresh_append_single_segment_violation() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        // Build the cache from the pristine layout, then append the
+        // bad record so refresh-append through classify sees it.
+        let cache = live_cache(&d.0);
+        let bad = Record::new_internal(
+            context(first.context.seq, first.hash()),
+            Entry::new("x", "y", "z"),
+        )
+        .unwrap();
+        append(&d.0.join("audit.jsonl"), &bad);
+        let dir = dirfile(&d.0);
+        let out = classify_for_test(
+            &dir,
+            TRAIL,
+            ReaderPath::RefreshAppend,
+            Some(cache.state.clone()),
+            Reaction::Collect,
+            Some(&cache),
+        )
+        .unwrap();
+        assert!(
+            !out.head_mismatch,
+            "CC5: RefreshAppend may NEVER set head_mismatch; got head_mismatch=true"
+        );
+        // Single RefreshAppend segment → every violation is tagged
+        // segment_index == 0.
+        for (pos, _) in &out.violations {
+            assert_eq!(
+                pos.segment_index, 0,
+                "CC5: RefreshAppend yields one segment, so segment_index must be 0; got {pos:?}"
+            );
+        }
+    }
+
     /// M-C3 killer: classify drops `found` writeback on the live-close
     /// walker → under Stop with `expected=Some(H_live)`, the Cache's
     /// `found` field must be `Some(H_live)` after a successful scan.
