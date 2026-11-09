@@ -718,6 +718,135 @@ mod classify_collect_tests {
         assert_eq!(found.hash(), second.hash());
         assert_eq!(found.context.seq, second.context.seq);
     }
+
+    /// Helper: append raw bytes to the given file path (test-only).
+    fn append_bytes(path: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    /// CC12-liveopen-damaged-sealed-propagates-run-to-live-close:
+    /// Under `Reaction::Collect`, the same layout as RP12 records an
+    /// `UnclosedSegmentLacksResume` violation tagged at
+    /// `segment_index == 1` (the live segment). Kills M-C9 ("run
+    /// inheritance drops across live-close"): under the mutant the
+    /// live-close walker would receive `run=false`, the
+    /// `boundary_resume` gate would be off, and no violation would be
+    /// recorded for the live's non-resume second record. Addendum
+    /// 27.4 / brief 197-r2b-S3b1b-r1c item 1: literal pin asserts the
+    /// first recorded violation's exact (seg, rec, variant).
+    #[test]
+    fn cc12_liveopen_damaged_sealed_propagates_run_to_live_close() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        // Damage rotated_0 (sealed) with trailing non-newline garbage.
+        append_bytes(&segment(&d.0, 0), b"{\"torn\":");
+        // Non-resume second record on the live.
+        let bad = entry(&opening);
+        append(&d.0.join("audit.jsonl"), &bad);
+
+        let dir = dirfile(&d.0);
+        let out = classify_for_test_collect(
+            &dir,
+            TRAIL,
+            ReaderPath::LiveOpen { expected: None },
+            None,
+            None,
+        )
+        .unwrap();
+        // The live-segment (segment_index == 1) records
+        // `UnclosedSegmentLacksResume` because `run=true` reached
+        // scan_closing from the damaged sealed prior.
+        let live_violation = out
+            .violations
+            .iter()
+            .find(|(p, _)| p.segment_index == 1)
+            .cloned();
+        assert_eq!(
+            live_violation,
+            Some((
+                SegmentViolationPos {
+                    segment_index: 1,
+                    record_index_in_segment: 1,
+                },
+                Violation::UnclosedSegmentLacksResume,
+            )),
+            "CC12: run=true propagation into scan_closing records \
+             UnclosedSegmentLacksResume on the live's second record (kills M-C9); \
+             got: {:?}",
+            out.violations,
+        );
+        assert!(
+            !out.head_mismatch,
+            "CC12: LiveOpen with expected=None never sets head_mismatch"
+        );
+    }
+
+    /// CC13-liveopen-damaged-sealed-propagates-run-across-sealed:
+    /// Under `Reaction::Collect`, the two-rotation layout records a
+    /// `FirstSuccessorLacksImmediateResume` violation tagged at
+    /// `segment_index == 1` (rotated_1), because `run=true`
+    /// propagated from the damaged rotated_0 and `inherited=true`
+    /// promoted `closing=true` on rotated_1's opening. Kills M-C2
+    /// ("classify threads `run=false` across sealed→sealed"): under
+    /// the mutant rotated_1 would see `inherited=false`, no closing
+    /// latch, no `FirstSuccessorLacksImmediateResume` on the second
+    /// record. Addendum 27.4: literal pin asserts the exact (seg,
+    /// rec, variant) for seg 1.
+    #[test]
+    fn cc13_liveopen_damaged_sealed_propagates_run_across_sealed() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        append_bytes(&segment(&d.0, 0), b"{\"torn\":");
+        let opening2 = rotated(&d.0, &opening, &mut mmr, 1);
+        // Close the live-side run so the layout is well-formed under
+        // the mutant (no incidental live-side violation that would
+        // confuse the assertion).
+        let close3 = cp(opening2.context.seq + 1, opening2.hash(), &mmr);
+        append(&d.0.join("audit.jsonl"), &close3);
+
+        let dir = dirfile(&d.0);
+        let out = classify_for_test_collect(
+            &dir,
+            TRAIL,
+            ReaderPath::LiveOpen { expected: None },
+            None,
+            None,
+        )
+        .unwrap();
+        let seg1_violation = out
+            .violations
+            .iter()
+            .find(|(p, _)| p.segment_index == 1)
+            .cloned();
+        assert_eq!(
+            seg1_violation,
+            Some((
+                SegmentViolationPos {
+                    segment_index: 1,
+                    record_index_in_segment: 1,
+                },
+                Violation::FirstSuccessorLacksImmediateResume,
+            )),
+            "CC13: run=true propagation across sealed→sealed records \
+             FirstSuccessorLacksImmediateResume on rotated_1's count-1 record \
+             (kills M-C2); got: {:?}",
+            out.violations,
+        );
+        assert!(
+            !out.head_mismatch,
+            "CC13: LiveOpen with expected=None never sets head_mismatch"
+        );
+    }
 }
 
 // ============================================================

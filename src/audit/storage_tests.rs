@@ -5204,4 +5204,70 @@ mod classify_reader_pins {
             .unwrap();
         reject(reader.with_current(|_| Ok(()), |_, _, _| Ok(())));
     }
+
+    /// RP12-liveopen-damaged-sealed-propagates-run-across-live-close:
+    /// A LiveOpen layout where rotated_0 is a complete sealed run plus
+    /// trailing non-newline garbage. The sealed segment's strict pass
+    /// errors on the garbage line, the tolerant fallback folds the two
+    /// checkpoints (state ends sealed on the closing cp) and the
+    /// unparsable line latches `damaged`, so the tolerant epilogue
+    /// promotes `run_flag = true`. `classify_stop` threads that
+    /// `run=true` across the live-close walker. With `run=true`,
+    /// `scan_closing`'s `initial_boundary_resume` is set and the
+    /// live's non-resume second record trips strict's
+    /// `boundary_resume && !first && !is_resume` check. Kills M-C9
+    /// ("run inheritance drops across live-close"): under the mutant
+    /// `run=false` would be passed to `scan_closing`, the boundary
+    /// resume gate would be off, and the layout would be accepted
+    /// instead of rejected.
+    #[test]
+    fn rp12_liveopen_damaged_sealed_propagates_run_to_live_close() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        // Damage rotated_0 with trailing non-newline garbage so the
+        // tolerant fallback runs and the epilogue latches
+        // `run_flag = true` via the `damaged` path.
+        append_bytes(&segment(&d.0, 0), b"{\"torn\":");
+        // Add a non-resume second record to the live so `run=true`
+        // observably trips `UnclosedSegmentLacksResume`.
+        append(&d.0.join("audit.jsonl"), &entry(&opening));
+        corrupt_open(&d.0);
+    }
+
+    /// RP13-liveopen-damaged-sealed-propagates-run-across-sealed:
+    /// A LiveOpen layout with TWO rotated segments. rotated_0 ends on
+    /// a sealed closing checkpoint plus trailing non-newline garbage
+    /// (so the tolerant fallback latches `run_flag = true`).
+    /// rotated_1 is a well-formed sealed run (opening + closing).
+    /// `classify_stop` threads `run=true` from rotated_0 into
+    /// rotated_1's `history_segment_stop`; `inherited = run_in ||
+    /// unsealed_boundary = true` promotes `closing = true` so the
+    /// closing cp at `count == 1` without an immediate resume trips
+    /// `FirstSuccessorLacksImmediateResume`. Kills M-C2 ("classify
+    /// threads `run=false` across sealed→sealed"): under the mutant
+    /// `run=false` would be passed into rotated_1, `inherited` would
+    /// be false, no `FirstSuccessorLacksImmediateResume` check would
+    /// fire, and the layout would be accepted.
+    #[test]
+    fn rp13_liveopen_damaged_sealed_propagates_run_across_sealed() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        // Damage rotated_0: run_flag=true must propagate across the
+        // sealed→sealed boundary.
+        append_bytes(&segment(&d.0, 0), b"{\"torn\":");
+        // Second rotation builds rotated_1 = [opening, close] and
+        // leaves a new opening in live.
+        let opening2 = rotated(&d.0, &opening, &mut mmr, 1);
+        // Close the new live-side run so that under the mutant (where
+        // every segment is accepted) the reader still reaches a
+        // sealed state and returns Ok, making the mutant's effect
+        // observable as Ok vs. Err rather than two different Errs.
+        let close3 = cp(opening2.context.seq + 1, opening2.hash(), &mmr);
+        append(&d.0.join("audit.jsonl"), &close3);
+        corrupt_open(&d.0);
+    }
 }
