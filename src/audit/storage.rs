@@ -11,10 +11,21 @@ use super::{
     AuditError, AuditErrorKind, Record,
     format::{Kind, validation::MAX_PAYLOAD_BYTES},
     runs::{
-        self, DecodedLine, FeedEvent, FeedEventStrict, HistorySegmentArgs, HistorySegmentWalk,
-        LineEventKind, Reaction, RunState, ScanSegmentArgs, SegmentContext,
+        self, CollectorPos, DecodedLine, FeedEvent, FeedEventStrict, HistorySegmentArgs,
+        HistorySegmentWalk, LineEventKind, Reaction, RunState, ScanSegmentArgs, SegmentContext,
+        Violation,
     },
 };
+
+/// Addendum 27.1: per-segment Collect return of the three shims
+/// (`history_segment`, `scan`, `scan_closing`). Under
+/// [`Reaction::Stop`] the vector is empty and the Option is always
+/// `Some`; under [`Reaction::Collect`] the vector carries the inner
+/// classifier's `(CollectorPos, Violation)` list and the Option may be
+/// `None` when no record was folded. `classify` in `runs.rs` pairs the
+/// positions with its own segment index to build
+/// `(SegmentViolationPos, Violation)`.
+pub(crate) type SegmentOutcome = (Option<State>, Vec<(CollectorPos, Violation)>);
 use crate::rotate::Directory;
 use rustix::fs::{self as rfs, Mode, OFlags};
 use std::cell::RefCell;
@@ -632,35 +643,23 @@ fn initial_record(
 ) -> Result<(Cache, Option<Record>), AuditError> {
     #[cfg(test)]
     FULL_FOLDS.with(|count| count.set(count.get() + 1));
-    let mut chain = None;
-    let mut found = None;
-    let mut run = false;
     let mut source = SegmentSource::for_live_open(dir)?;
-    let (file, state) = loop {
-        match source.next_segment()? {
-            Some(SegmentRead::Sealed { file, .. }) => {
-                chain = history_segment(&file, trail, chain, true, expected, &mut found, &mut run)?;
-            }
-            Some(SegmentRead::Live(file)) => {
-                let state = scan_closing(&file, trail, chain, expected, &mut found, run)?;
-                break (file, state);
-            }
-            None => unreachable!("SegmentSource::for_live_open always yields a Live segment"),
-        }
-    };
-    if expected.is_some() && found.is_none() {
-        return Err(AuditError::new(
-            AuditErrorKind::HeadMismatch,
-            "expected head absent or different",
-        ));
-    }
+    let out = runs::classify(
+        runs::ClassifyArgs {
+            trail,
+            reaction: runs::Reaction::Stop,
+            prior_state: None,
+        },
+        runs::ReaderPath::LiveOpen { expected },
+        &mut source,
+    )?;
     Ok((
         Cache {
-            file,
-            state,
-            sealed_before: source.newest().map(Path::to_path_buf),
+            file: out.live_file,
+            state: out.final_state,
+            sealed_before: out.sealed_before,
         },
-        found,
+        out.found,
     ))
 }
 // Normal segments keep the single-pass strict path. Only damaged history, or
@@ -681,7 +680,12 @@ fn initial_record(
 /// calls it with [`Reaction::Stop`]; the collector's `history_segment`
 /// entry (collector_tests in `runs.rs`, #197 R2b S3b beyond) calls the
 /// same function with [`Reaction::Collect`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "addendum 27.1 adds a Reaction parameter to the base-order shim; bundling into a struct for one call site adds churn without clarity"
+)]
 pub(crate) fn history_segment(
+    reaction: Reaction,
     file: &File,
     trail: [u8; 16],
     state: Option<State>,
@@ -689,7 +693,7 @@ pub(crate) fn history_segment(
     expected: Option<Head>,
     found: &mut Option<Record>,
     run: &mut bool,
-) -> Result<Option<State>, AuditError> {
+) -> Result<SegmentOutcome, AuditError> {
     // Decision 8 still applies when a malformed suffix makes the successor
     // enter the run fallback: a linking opening cannot defer its declaration.
     let unsealed_boundary = opening && state.as_ref().is_some_and(|s| !sealed(s));
@@ -718,8 +722,13 @@ pub(crate) fn history_segment(
     let found_cell = RefCell::new(found.clone());
     let fc = &found_cell;
     let strict_state = state.clone();
+    // Addendum 27.1: the strict pass runs under `Reaction::Stop` even
+    // under outer Collect — base's strict pass short-circuits on any
+    // violation and then the tolerant fallback records. Only the
+    // tolerant fallback below sees the outer reaction.
     #[rustfmt::skip]
-    let strict = move || scan_inner(file, trail, strict_state, expected, &mut fc.borrow_mut(), ctx);
+    let strict = move || scan_inner(Reaction::Stop, file, trail, strict_state, expected, &mut fc.borrow_mut(), ctx)
+        .map(|(s, _)| s.expect("scan_inner Stop implies state=Some"));
     // Lazy tolerant byte source. The seek, the glued-byte / LF check,
     // `read_line`, `decode_line_kind` AND the tolerant-side byte
     // bookkeeping (`last_offset` / `last_newline` / `offset_cursor`,
@@ -767,7 +776,7 @@ pub(crate) fn history_segment(
     #[rustfmt::skip]
     let walk_args = HistorySegmentArgs { ctx, prior_run, unsealed_boundary, run_in: *run, trail };
     let walk =
-        runs::history_segment::<State, _, _, _>(Reaction::Stop, walk_args, strict, events, on_feed);
+        runs::history_segment::<State, _, _, _>(reaction, walk_args, strict, events, on_feed);
     // Addendum 22.2: writeback `found` BEFORE propagating Err, so the
     // strict pass's partial writes survive on `CorruptTrail` and on a
     // tolerant-side Err. Base threaded `&mut found` directly through
@@ -777,21 +786,25 @@ pub(crate) fn history_segment(
     match walk? {
         HistorySegmentWalk::Strict(next) => {
             *run = false;
-            Ok(Some(next))
+            Ok((Some(next), Vec::new()))
         }
         HistorySegmentWalk::Tolerant(outcome) => {
             let outcome = *outcome;
             *run = outcome.run_flag;
             let bytes = bytes.into_inner();
-            Ok(last_run.map(|run_state| State {
-                run: run_state,
-                offset: bytes.last_offset(),
-                length: bytes.offset_cursor(),
-                checkpoint_time: cp_time,
-                since_checkpoint: since_cp,
-                newline: bytes.last_newline(),
-                gap: outcome.gap,
-            }))
+            let violations = outcome.violations;
+            Ok((
+                last_run.map(|run_state| State {
+                    run: run_state,
+                    offset: bytes.last_offset(),
+                    length: bytes.offset_cursor(),
+                    checkpoint_time: cp_time,
+                    since_checkpoint: since_cp,
+                    newline: bytes.last_newline(),
+                    gap: outcome.gap,
+                }),
+                violations,
+            ))
         }
     }
 }
@@ -803,7 +816,8 @@ pub(crate) fn scan_staged(
     state: Option<State>,
     run: bool,
 ) -> Result<State, AuditError> {
-    scan_inner(
+    let (state, _) = scan_inner(
+        Reaction::Stop,
         file,
         trail,
         state,
@@ -814,17 +828,20 @@ pub(crate) fn scan_staged(
             genesis: true,
             run,
         },
-    )
+    )?;
+    Ok(state.expect("scan_staged Stop implies state=Some"))
 }
-fn scan_closing(
+pub(crate) fn scan_closing(
+    reaction: Reaction,
     file: &File,
     trail: [u8; 16],
     state: Option<State>,
     expected: Option<Head>,
     found: &mut Option<Record>,
     run: bool,
-) -> Result<State, AuditError> {
+) -> Result<SegmentOutcome, AuditError> {
     scan_inner(
+        reaction,
         file,
         trail,
         state,
@@ -960,71 +977,42 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
             io_error(e.into())
         }
     })?;
-    let mut found = None;
     if (old.dev(), old.ino()) == (live.st_dev as u64, live.st_ino as u64) {
         if old.len() < cache.state.length {
             return Err(corrupt("live file shrank below cached length"));
         }
         if old.len() > cache.state.length {
             let mut source = SegmentSource::for_refresh_append(dir, cache)?;
-            let Some(SegmentRead::Live(file)) = source.next_segment()? else {
-                unreachable!("for_refresh_append yields exactly one Live segment");
-            };
-            cache.state = scan(
-                &file,
-                trail,
-                Some(cache.state.clone()),
-                false,
-                None,
-                &mut found,
-                false,
+            let out = runs::classify(
+                runs::ClassifyArgs {
+                    trail,
+                    reaction: runs::Reaction::Stop,
+                    prior_state: Some(cache.state.clone()),
+                },
+                runs::ReaderPath::RefreshAppend,
+                &mut source,
             )?;
+            cache.state = out.final_state;
         }
         return Ok(());
     }
     if old.len() < cache.state.length {
         return Err(corrupt("old live descriptor was truncated"));
     }
-    let mut run = false;
     let mut source = SegmentSource::for_refresh_rotate(dir, cache)?;
-    let Some(SegmentRead::Sealed {
-        file: prelude,
-        prelude: true,
-    }) = source.next_segment()?
-    else {
-        unreachable!("for_refresh_rotate yields the cached-file prelude first");
-    };
-    let mut state = history_segment(
-        &prelude,
-        trail,
-        Some(cache.state.clone()),
-        false,
-        None,
-        &mut found,
-        &mut run,
+    let out = runs::classify(
+        runs::ClassifyArgs {
+            trail,
+            reaction: runs::Reaction::Stop,
+            prior_state: Some(cache.state.clone()),
+        },
+        runs::ReaderPath::RefreshRotate,
+        &mut source,
     )?;
-    let (file, final_state) = loop {
-        match source.next_segment()? {
-            Some(SegmentRead::Sealed {
-                file,
-                prelude: false,
-            }) => {
-                state = history_segment(&file, trail, state, true, None, &mut found, &mut run)?;
-            }
-            Some(SegmentRead::Live(file)) => {
-                let s = scan_closing(&file, trail, state, None, &mut found, run)?;
-                break (file, s);
-            }
-            Some(SegmentRead::Sealed { prelude: true, .. }) => {
-                unreachable!("for_refresh_rotate yields prelude only at position 0");
-            }
-            None => unreachable!("for_refresh_rotate always yields a Live segment at the end"),
-        }
-    };
     *cache = Cache {
-        file,
-        state: final_state,
-        sealed_before: source.newest().map(Path::to_path_buf),
+        file: out.live_file,
+        state: out.final_state,
+        sealed_before: out.sealed_before,
     };
     Ok(())
 }
@@ -1062,7 +1050,12 @@ const MAX_READ_BYTES: u64 = MAX_PAYLOAD_BYTES as u64 + 2; // LF plus one excess 
 /// Bounded reads: each payload is capped even when it is only a fragment.
 /// `genesis` requires a root link when no predecessor exists (staging settlement).
 /// Otherwise decision 2 permits a self-contained archived prefix checkpoint.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "addendum 27.1 adds a Reaction parameter to the base-order shim"
+)]
 pub(crate) fn scan(
+    reaction: Reaction,
     file: &File,
     trail: [u8; 16],
     state: Option<State>,
@@ -1070,8 +1063,9 @@ pub(crate) fn scan(
     expected: Option<Head>,
     found: &mut Option<Record>,
     genesis: bool,
-) -> Result<State, AuditError> {
+) -> Result<SegmentOutcome, AuditError> {
     scan_inner(
+        reaction,
         file,
         trail,
         state,
@@ -1098,13 +1092,14 @@ pub(crate) fn scan(
 /// reader path (`scan` ×3, `scan_staged` ×2, `scan_closing` ×2,
 /// `history_segment`'s strict pass).
 fn scan_inner(
+    reaction: Reaction,
     file: &File,
     trail: [u8; 16],
     state: Option<State>,
     expected: Option<Head>,
     found: &mut Option<Record>,
     context: SegmentContext,
-) -> Result<State, AuditError> {
+) -> Result<SegmentOutcome, AuditError> {
     let start = if context.opening {
         0
     } else {
@@ -1165,7 +1160,7 @@ fn scan_inner(
         }
     };
     let outcome = runs::scan_segment(
-        Reaction::Stop,
+        reaction,
         ScanSegmentArgs {
             ctx: context,
             trail,
@@ -1180,12 +1175,11 @@ fn scan_inner(
     // `scan_segment` wraps `classifier.finish()?` into
     // `ScanSegmentOutcome { state: Some(finished.state), .. }`
     // (runs.rs `scan_segment`), and `Classifier::finish`'s own invariant
-    // rejects a `state = None` path with `Violation::MissingHead`.
-    let run = outcome
-        .state
-        .expect("scan_segment Ok under Reaction::Stop implies state=Some");
+    // rejects a `state = None` path with `Violation::MissingHead`. Under
+    // `Reaction::Collect` the state may be `None` if the collector
+    // recorded without folding a complete record (addendum 27.1).
     let bytes = bytes.into_inner();
-    Ok(State {
+    let state = outcome.state.map(|run| State {
         run,
         offset: bytes.last_offset(),
         length: bytes.offset_cursor(),
@@ -1193,7 +1187,8 @@ fn scan_inner(
         since_checkpoint: since_cp,
         newline: bytes.last_newline(),
         gap: outcome.gap,
-    })
+    });
+    Ok((state, outcome.violations))
 }
 fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<(), AuditError> {
     apply_checked(record, state, genesis, false, true)?;

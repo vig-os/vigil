@@ -1712,7 +1712,16 @@ fn resume_base_refuses_non_checkpoint_without_archived_predecessor() {
     let kept = entry(&creation);
     write_records(&d.0, &[&kept]);
     let file = File::open(d.0.join("audit.jsonl")).unwrap();
-    let result = history_segment(&file, TRAIL, None, true, None, &mut None, &mut false);
+    let result = history_segment(
+        crate::audit::runs::Reaction::Stop,
+        &file,
+        TRAIL,
+        None,
+        true,
+        None,
+        &mut None,
+        &mut false,
+    );
     assert!(matches!(result, Err(e) if e.kind() == AuditErrorKind::CorruptTrail));
 }
 
@@ -1723,7 +1732,18 @@ fn inherited_run_reaches_first_strict_scan_of_later_history() {
     append_bytes(&d.0.join("audit.jsonl"), b"xyz\n");
     let file = File::open(d.0.join("audit.jsonl")).unwrap();
     let mut run = false;
-    let state = history_segment(&file, TRAIL, None, true, None, &mut None, &mut run).unwrap();
+    let state = history_segment(
+        crate::audit::runs::Reaction::Stop,
+        &file,
+        TRAIL,
+        None,
+        true,
+        None,
+        &mut None,
+        &mut run,
+    )
+    .unwrap()
+    .0;
     assert!(run);
     // An otherwise strict-valid segment must close the inherited run with an
     // immediate resume; a normal entry cannot silently erase that obligation.
@@ -1731,7 +1751,16 @@ fn inherited_run_reaches_first_strict_scan_of_later_history() {
     write_records(&d.0, &[&opening, &entry(&opening)]);
     let file = File::open(d.0.join("audit.jsonl")).unwrap();
     bad(
-        history_segment(&file, TRAIL, state, true, None, &mut None, &mut run),
+        history_segment(
+            crate::audit::runs::Reaction::Stop,
+            &file,
+            TRAIL,
+            state,
+            true,
+            None,
+            &mut None,
+            &mut run,
+        ),
         AuditErrorKind::CorruptTrail,
     );
 }
@@ -1876,7 +1905,17 @@ mod details {
         run: bool,
     ) -> Result<Option<State>, AuditError> {
         let mut r = run;
-        history_segment(f, TRAIL, state, opening, None, &mut None, &mut r)
+        history_segment(
+            crate::audit::runs::Reaction::Stop,
+            f,
+            TRAIL,
+            state,
+            opening,
+            None,
+            &mut None,
+            &mut r,
+        )
+        .map(|(s, _)| s)
     }
     /// Addendum 22.1/22.2: history_segment with `expected` + a `found`
     /// out-parameter, so pins can observe both the returned state and
@@ -1890,11 +1929,31 @@ mod details {
     ) -> (Result<Option<State>, AuditError>, Option<Record>) {
         let mut r = run;
         let mut found = None;
-        let res = history_segment(f, TRAIL, state, opening, Some(expected), &mut found, &mut r);
+        let res = history_segment(
+            crate::audit::runs::Reaction::Stop,
+            f,
+            TRAIL,
+            state,
+            opening,
+            Some(expected),
+            &mut found,
+            &mut r,
+        )
+        .map(|(s, _)| s);
         (res, found)
     }
     fn scc(f: &File, state: Option<State>, opening: bool) -> Result<State, AuditError> {
-        scan(f, TRAIL, state, opening, None, &mut None, false)
+        scan(
+            crate::audit::runs::Reaction::Stop,
+            f,
+            TRAIL,
+            state,
+            opening,
+            None,
+            &mut None,
+            false,
+        )
+        .map(|(s, _)| s.unwrap())
     }
     fn state_from(bytes: &[u8]) -> (Temp, State) {
         let d = Temp::new();
@@ -3634,7 +3693,18 @@ mod details {
         // outer open succeeds.
         let seg0 = File::open(segment(&d.0, 0)).unwrap();
         let mut run = false;
-        let state = history_segment(&seg0, TRAIL, None, true, None, &mut None, &mut run).unwrap();
+        let state = history_segment(
+            crate::audit::runs::Reaction::Stop,
+            &seg0,
+            TRAIL,
+            None,
+            true,
+            None,
+            &mut None,
+            &mut run,
+        )
+        .unwrap()
+        .0;
         assert!(run, "fragment-only seg0 belongs to a run");
         assert!(state.is_none(), "no complete record in seg0 to carry state");
     }

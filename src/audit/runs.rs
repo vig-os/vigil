@@ -47,9 +47,9 @@
 //! segment damaged for the end-of-segment checks (ruling 197-d1 addendum
 //! 19.2), so no follow-on `InvalidUndamagedSegment` derives from it.
 use super::{
-    AuditError, Mmr, Record,
+    AuditError, AuditErrorKind, Mmr, Record,
     format::Kind,
-    storage::{Head, corrupt},
+    storage::{self, Head, SegmentRead, SegmentSource, State, corrupt},
 };
 
 /// Typed enumeration of every `CorruptTrail` detail string the pure
@@ -571,16 +571,10 @@ pub(crate) struct ScanSegmentOutcome {
     /// Gap hasher the storage shim threads forward into `State.gap`.
     pub(crate) gap: Option<blake3::Hasher>,
     /// Empty under [`Reaction::Stop`]; the collector's recorded
-    /// `(pos, Violation)` list under [`Reaction::Collect`]. Consumed by
-    /// #197 R2b S3b's `classify` iterator and V4a; until then only
-    /// `#[cfg(test)]` Strict×Collect rows read it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by #197 R2b S3b's `classify` iterator and V4a; between S3a′ and S3b only #[cfg(test)] Strict×Collect rows read it"
-        )
-    )]
+    /// `(pos, Violation)` list under [`Reaction::Collect`]. Consumed
+    /// in non-test builds by the `storage.rs` Collect-capable shims
+    /// (addendum 27.1) which pair each entry with classify's
+    /// `segment_index`.
     pub(crate) violations: Vec<(CollectorPos, Violation)>,
 }
 
@@ -748,6 +742,229 @@ where
         }
         Reaction::Collect => Ok(classifier.finish_collect_strict()),
     }
+}
+
+/// Ruling 197-d1 addendum 25.1/25.2: the ONE multi-segment orchestration
+/// (`storage.rs` contains no loop over segments and no per-path segment
+/// sequencing after this slice). `storage::SegmentSource` lists and
+/// opens segment files lazily, in base order; `classify` picks the
+/// per-segment walk from a typed [`ReaderPath`] description -- no
+/// walker trait, no `Box<dyn ...>` -- threads `state`, `found` and
+/// `run` across segments, and decides whether the trail-level
+/// `HeadMismatch` guard fires.
+///
+/// Under [`Reaction::Stop`] this is byte-identical to the composed
+/// `initial_record` / `refresh` segment loops at e1c45a3.
+///
+/// [`ReaderPath::LiveOpen`] is the single live-open path with its
+/// (possibly empty) rotated list; **open fallback is not a separate
+/// variant**, it is `LiveOpen` with a non-empty rotated listing in
+/// `source`.
+#[derive(Clone, Copy)]
+pub(crate) enum ReaderPath {
+    /// `storage::initial_record` at e1c45a3 l.628-668: list the rotated
+    /// names (writable=false) then the live file (writable=true); each
+    /// sealed uses `history_segment(opening=true)`, the live uses
+    /// `scan_closing` with `expected`. The trail-level HeadMismatch
+    /// guard fires when `expected.is_some() && found.is_none()`.
+    LiveOpen { expected: Option<Head> },
+    /// `storage::refresh` same-inode branch at e1c45a3 l.969-985:
+    /// exactly one Live segment, walked by `scan(opening=false,
+    /// genesis=false, run=false)`. No HeadMismatch guard.
+    RefreshAppend,
+    /// `storage::refresh` rotated branch at e1c45a3 l.989-1027:
+    /// prelude (the cached live file, `history_segment(opening=false)`),
+    /// then rotated names (`history_segment(opening=true)`), then live
+    /// (`scan_closing` with `expected=None`). No HeadMismatch guard.
+    RefreshRotate,
+}
+
+/// Inputs to `classify` common to every reader path.
+pub(crate) struct ClassifyArgs {
+    pub(crate) trail: [u8; 16],
+    pub(crate) reaction: Reaction,
+    /// Only [`ReaderPath::LiveOpen`] starts from `None`; the refresh
+    /// paths pass the cached `State` in.
+    pub(crate) prior_state: Option<State>,
+}
+
+/// Terminal outcome of `classify`. On a non-empty path classify always
+/// ends on a Live segment, so `final_state` and `live_file` are
+/// `Some(_)` on the Ok Stop path; Collect may surface a partial final
+/// state when a run is still open.
+pub(crate) struct ClassifyOutput {
+    pub(crate) final_state: State,
+    pub(crate) live_file: std::fs::File,
+    pub(crate) found: Option<Record>,
+    /// Addendum 25.3: Collect rows assert this list exactly; Stop
+    /// returns `Vec::new()`. Consumed by V4a in #197 R2b S3b2 and by
+    /// the `#[cfg(test)]` CC rows + first-equality sweep in this
+    /// slice; Stop callers (`initial_record`/`refresh`) ignore it
+    /// since it is always empty under Stop.
+    #[expect(
+        dead_code,
+        reason = "read by #[cfg(test)] CC rows and the first-equality sweep in this slice; consumed by V4a in #197 R2b S3b2"
+    )]
+    pub(crate) violations: Vec<(SegmentViolationPos, Violation)>,
+    /// `source.newest()` after the plan finished expanding; the caller
+    /// stores it in `Cache::sealed_before`.
+    pub(crate) sealed_before: Option<std::path::PathBuf>,
+    /// Addendum 27.1: trail-level `HeadMismatch` outcome. Only
+    /// [`ReaderPath::LiveOpen`] with `expected: Some(_)` can set it.
+    /// Under [`Reaction::Stop`] `classify` returns `Err(HeadMismatch)`
+    /// where the reader does today (this flag then never surfaces);
+    /// under [`Reaction::Collect`] the flag is set after the last
+    /// segment and every collected violation is kept. No `Violation`
+    /// variant is added — the syn gate stays at 49.
+    #[expect(
+        dead_code,
+        reason = "read by the Collect CC10/CC11 head-mismatch rows; consumed by V4a in #197 R2b S3b2"
+    )]
+    pub(crate) head_mismatch: bool,
+}
+
+/// Addendum 25.3: Collect tags a (segment, record-in-segment) position
+/// per recorded violation. `segment_index` is classify's own
+/// enumeration of yielded segments (0-based, in base order). The
+/// `scan_segment` / `history_segment` walkers hand back their inner
+/// per-record index; classify pairs it with the segment index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SegmentViolationPos {
+    pub(crate) segment_index: usize,
+    pub(crate) record_index_in_segment: usize,
+}
+
+/// Ruling 197-d1 addendum 25.1: the ONE multi-segment orchestration.
+///
+/// Under [`Reaction::Stop`], behaviour is byte-identical to the composed
+/// `initial_record` / `refresh` segment loops at e1c45a3: a segment-
+/// level `Err` propagates, and a `ReaderPath::LiveOpen { expected: Some
+/// }` whose walk ends with `found == None` returns
+/// `Err(HeadMismatch)` (addendum 27.1 moves the construction site from
+/// `storage.rs:653` into this one function, so the syn gate total
+/// stays at 49).
+///
+/// Under [`Reaction::Collect`], every per-segment shim records its
+/// typed violations into `out.violations` tagged with
+/// [`SegmentViolationPos`] (segment index enumerated here, record
+/// index per segment supplied by the inner walker), and the loop
+/// continues through end-of-segment checks (addendum 17.4). A
+/// `ReaderPath::LiveOpen { expected: Some }` whose walk ends with
+/// `found == None` sets `out.head_mismatch = true` after the last
+/// segment and preserves every collected violation; no `Violation`
+/// variant is added (addendum 27.1).
+pub(crate) fn classify(
+    args: ClassifyArgs,
+    path: ReaderPath,
+    source: &mut SegmentSource<'_>,
+) -> Result<ClassifyOutput, AuditError> {
+    let ClassifyArgs {
+        trail,
+        reaction,
+        prior_state,
+    } = args;
+    let mut state: Option<State> = prior_state;
+    let mut found: Option<Record> = None;
+    let mut run: bool = false;
+    let mut live_file: Option<std::fs::File> = None;
+    let mut violations: Vec<(SegmentViolationPos, Violation)> = Vec::new();
+    let mut segment_index: usize = 0;
+    while let Some(seg) = source.next_segment()? {
+        let in_state = state.take();
+        let (next_state, seg_violations) = match (path, seg) {
+            (ReaderPath::LiveOpen { expected }, SegmentRead::Sealed { file, .. }) => {
+                storage::history_segment(
+                    reaction, &file, trail, in_state, true, expected, &mut found, &mut run,
+                )?
+            }
+            (ReaderPath::LiveOpen { expected }, SegmentRead::Live(file)) => {
+                let (s, v) = storage::scan_closing(
+                    reaction, &file, trail, in_state, expected, &mut found, run,
+                )?;
+                live_file = Some(file);
+                (s, v)
+            }
+            (ReaderPath::RefreshAppend, SegmentRead::Live(file)) => {
+                let (s, v) = storage::scan(
+                    reaction, &file, trail, in_state, false, None, &mut found, false,
+                )?;
+                live_file = Some(file);
+                (s, v)
+            }
+            (ReaderPath::RefreshAppend, SegmentRead::Sealed { .. }) => {
+                unreachable!("RefreshAppend yields a single Live segment");
+            }
+            (
+                ReaderPath::RefreshRotate,
+                SegmentRead::Sealed {
+                    file,
+                    prelude: true,
+                },
+            ) => storage::history_segment(
+                reaction, &file, trail, in_state, false, None, &mut found, &mut run,
+            )?,
+            (
+                ReaderPath::RefreshRotate,
+                SegmentRead::Sealed {
+                    file,
+                    prelude: false,
+                },
+            ) => storage::history_segment(
+                reaction, &file, trail, in_state, true, None, &mut found, &mut run,
+            )?,
+            (ReaderPath::RefreshRotate, SegmentRead::Live(file)) => {
+                let (s, v) =
+                    storage::scan_closing(reaction, &file, trail, in_state, None, &mut found, run)?;
+                live_file = Some(file);
+                (s, v)
+            }
+        };
+        // Under Reaction::Stop, next_state is always Some (invariant of
+        // the per-segment walkers). Under Reaction::Collect, a segment
+        // whose violations prevented every record fold returns None; in
+        // that case we keep the prior state so the final_state is still
+        // populated for callers that inspect it between violations.
+        if next_state.is_some() {
+            state = next_state;
+        }
+        // Addendum 27.2 / 25.3: pair each inner CollectorPos.record_index_in_segment
+        // with classify's own segment_index (CollectorPos's own segment_index is 0
+        // inside a single scan_segment / history_segment call).
+        for (pos, v) in seg_violations {
+            violations.push((
+                SegmentViolationPos {
+                    segment_index,
+                    record_index_in_segment: pos.record_index_in_segment,
+                },
+                v,
+            ));
+        }
+        segment_index += 1;
+    }
+    // Addendum 27.1: trail-level HeadMismatch decision. Only
+    // LiveOpen { expected: Some(_) } can set it. Under Stop it becomes
+    // an `Err`; under Collect it is recorded in `head_mismatch`.
+    let head_mismatch =
+        matches!(path, ReaderPath::LiveOpen { expected: Some(_) }) && found.is_none();
+    if head_mismatch && matches!(reaction, Reaction::Stop) {
+        return Err(AuditError::new(
+            AuditErrorKind::HeadMismatch,
+            "expected head absent or different",
+        ));
+    }
+    let final_state =
+        state.expect("classify: every reader path ends with a Live segment that sets state");
+    let live_file = live_file
+        .expect("classify: every reader path ends with a Live segment that sets live_file");
+    let sealed_before = source.newest().map(std::path::Path::to_path_buf);
+    Ok(ClassifyOutput {
+        final_state,
+        live_file,
+        found,
+        violations,
+        sealed_before,
+        head_mismatch,
+    })
 }
 
 /// Ruling 197-d1 addendum 24.3: internal event handed back by
