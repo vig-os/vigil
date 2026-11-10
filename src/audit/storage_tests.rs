@@ -94,6 +94,7 @@ fn reject<T>(result: Result<T, AuditError>) {
 fn corrupt_open(path: &Path) {
     reject(TrailReader::open(path, TRAIL, None));
 }
+
 fn write_records(path: &Path, records: &[&Record]) {
     write(
         path,
@@ -3733,7 +3734,7 @@ mod details {
     }
 
     // ---- S3b1a: SegmentSource / SegmentBytes pins ----------------------
-    // Ruling 197-d1 addendum 25.2 + S3b1a brief: byte-source properties
+    // Ruling 197-d1 addendum 25.2 + ruling 197-d1 addendum 25.2: byte-source properties
     // that S3b1b will rely on. Each row must pass at base `320a7d9` and
     // at head (this PR changes no behaviour). Together they pin the
     // laziness of `SegmentSource::next_segment`, the cross-segment glue
@@ -4719,23 +4720,24 @@ mod details {
     /// runtime behaviour.
     #[test]
     fn coverage_gate_no_segment_loop_in_storage_rs() {
-        /// Last segment of every path identifying a per-segment walk.
-        /// If a loop body in `storage.rs` calls one of these, drift is
-        /// back and this gate fails (addendum 27.3a).
-        const WALKER_NAMES: &[&str] = &[
-            "history_segment",
-            "scan_segment",
-            "scan_closing",
-            "scan_staged",
-            "scan",
-        ];
+        /// Seed walker names: the two `runs::*` per-segment orchestrators
+        /// every storage shim ultimately dispatches into. Ruling 197-d1
+        /// addendum 27 continuation: the full walker set is DERIVED from
+        /// these seeds — any non-test fn in `storage.rs` whose body calls
+        /// one of the seeds (directly or transitively through another
+        /// such fn) joins the set. A loop in `storage.rs` whose body calls
+        /// ANY member of that set fails the gate; this catches a base-
+        /// style refresh-rotate loop that drives the walk through a thin
+        /// wrapper (e.g. a hand-rolled `history_segment_stop`) without
+        /// the gate having to list every wrapper by name.
+        const SEED_WALKER_NAMES: &[&str] = &["history_segment", "scan_segment"];
 
         /// Allowed one-shot walker call sites in non-test `storage.rs`,
-        /// measured at head (addendum 27.3c). Keyed by the enclosing
-        /// fn and the walker name (the last path segment of the
-        /// callee), with the count of unlooped call sites inside that
-        /// fn. These are the storage shims composing into their inner
-        /// `runs::*` counterparts.
+        /// measured at head (ruling 197-d1 addendum 27.3c). Keyed by
+        /// the enclosing fn and the walker name (the last path segment
+        /// of the callee), with the count of unlooped call sites
+        /// inside that fn. These are the storage shims composing into
+        /// their inner `runs::*` counterparts.
         const ALLOWED: &[(&str, &str, usize, &str)] = &[
             (
                 "history_segment",
@@ -4748,24 +4750,6 @@ mod details {
                 "scan_segment",
                 1,
                 "scan_inner composes into runs::scan_segment once; the per-reader-path strict walk",
-            ),
-            (
-                "scan_closing_stop",
-                "scan_closing",
-                1,
-                "addendum 27.1 Stop-wrapper: runs::classify_stop's live-close call; wraps `scan_closing(Reaction::Stop,...)` to hand the caller a typed `State`",
-            ),
-            (
-                "scan_stop",
-                "scan",
-                1,
-                "addendum 27.1 Stop-wrapper: runs::classify_stop's refresh-append call; wraps `scan(Reaction::Stop,...)` to hand the caller a typed `State`",
-            ),
-            (
-                "history_segment_stop",
-                "history_segment",
-                1,
-                "addendum 27.1 Stop-wrapper: runs::classify_stop's sealed-segment call; wraps `history_segment(Reaction::Stop,...)` to hand the caller a typed `State`",
             ),
         ];
 
@@ -4783,26 +4767,88 @@ mod details {
             })
         }
 
-        /// Collects a hit whenever an `ExprCall` targets a path whose
-        /// last segment is a walker name. `inside_loop` says whether
-        /// the containing walk is inside a for/while/loop body (so the
-        /// gate fires), and also which enclosing fn we are in for the
-        /// allowlist bookkeeping.
+        /// First pass: for every non-test fn in `storage.rs`, record
+        /// its callee set (last-path-segment identifiers of each
+        /// `ExprCall` and `ExprMethodCall` inside its body). Used to
+        /// derive the walker set from `SEED_WALKER_NAMES` by
+        /// closing over "this fn calls one of the walkers transitively".
+        struct FnCallsVisitor {
+            in_test_depth: usize,
+            fn_stack: Vec<String>,
+            /// fn_name -> set of callee last-idents (outside `#[cfg(test)]`).
+            calls: std::collections::HashMap<String, std::collections::HashSet<String>>,
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for FnCallsVisitor {
+            fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+                let bump = is_cfg_test(&m.attrs);
+                if bump {
+                    self.in_test_depth += 1;
+                }
+                syn::visit::visit_item_mod(self, m);
+                if bump {
+                    self.in_test_depth -= 1;
+                }
+            }
+            fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+                let bump = is_cfg_test(&f.attrs);
+                if bump {
+                    self.in_test_depth += 1;
+                }
+                self.fn_stack.push(f.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, f);
+                self.fn_stack.pop();
+                if bump {
+                    self.in_test_depth -= 1;
+                }
+            }
+            fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+                let bump = is_cfg_test(&f.attrs);
+                if bump {
+                    self.in_test_depth += 1;
+                }
+                self.fn_stack.push(f.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, f);
+                self.fn_stack.pop();
+                if bump {
+                    self.in_test_depth -= 1;
+                }
+            }
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                if self.in_test_depth == 0
+                    && let syn::Expr::Path(path_expr) = &*call.func
+                    && let Some(last) = path_last_ident(&path_expr.path)
+                    && let Some(fn_name) = self.fn_stack.last().cloned()
+                {
+                    self.calls.entry(fn_name).or_default().insert(last);
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+            fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+                if self.in_test_depth == 0
+                    && let Some(fn_name) = self.fn_stack.last().cloned()
+                {
+                    self.calls
+                        .entry(fn_name)
+                        .or_default()
+                        .insert(m.method.to_string());
+                }
+                syn::visit::visit_expr_method_call(self, m);
+            }
+        }
+
+        /// Second pass: with the derived walker set in hand, record
+        /// every call site in each non-test fn: whether it is inside a
+        /// `for` / `while` / `loop` body (fails the gate), and the
+        /// per-fn one-shot counts (checked against the allowlist).
         struct WalkerVisitor<'a> {
             inside_loop_depth: usize,
             in_test_depth: usize,
             fn_stack: Vec<String>,
-            /// (fn_name, walker, count) for every one-shot (non-loop)
-            /// walker call outside `#[cfg(test)]`.
             allow_counts: std::collections::HashMap<(String, String), usize>,
-            /// (fn_name, walker) for every call inside a for/while/loop
-            /// body outside `#[cfg(test)]`. One hit here fails the gate.
             looped: Vec<(String, String)>,
-            /// Set of fn names (outside `#[cfg(test)]`) that call
-            /// `classify`. Used for (27.3b): `initial_record` /
-            /// `refresh` must each call `classify`.
             classify_callers: std::collections::HashSet<String>,
-            walker_names: &'a [&'a str],
+            walker_names: &'a std::collections::HashSet<String>,
         }
 
         impl<'a, 'ast> syn::visit::Visit<'ast> for WalkerVisitor<'a> {
@@ -4861,10 +4907,10 @@ mod details {
                     && self.in_test_depth == 0
                 {
                     let fn_name = self.fn_stack.last().cloned().unwrap_or_default();
-                    if last == "classify_stop" || last == "classify_collect" {
+                    if last == "classify" {
                         self.classify_callers.insert(fn_name.clone());
                     }
-                    if self.walker_names.contains(&last.as_str()) {
+                    if self.walker_names.contains(&last) {
                         if self.inside_loop_depth > 0 {
                             self.looped.push((fn_name, last));
                         } else {
@@ -4875,13 +4921,9 @@ mod details {
                 syn::visit::visit_expr_call(self, call);
             }
             fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
-                // Method calls like `foo.scan()` cannot be a walker
-                // (walkers are free fns) but a `self.scan(...)` inside
-                // an impl would read with the same identifier; be
-                // defensive and still flag loop occurrences.
                 let last = m.method.to_string();
                 if self.in_test_depth == 0
-                    && self.walker_names.contains(&last.as_str())
+                    && self.walker_names.contains(&last)
                     && self.inside_loop_depth > 0
                 {
                     let fn_name = self.fn_stack.last().cloned().unwrap_or_default();
@@ -4893,6 +4935,37 @@ mod details {
 
         let storage: syn::File = syn::parse_file(STORAGE_SRC)
             .expect("structural gate: storage.rs is not valid Rust (parse_file failed)");
+
+        // Pass 1: build the per-fn callee map and derive the walker
+        // set from `SEED_WALKER_NAMES` by closing over "this fn
+        // transitively calls one of the seeds" (ruling 197-d1
+        // addendum 27 continuation).
+        let mut calls_visitor = FnCallsVisitor {
+            in_test_depth: 0,
+            fn_stack: Vec::new(),
+            calls: std::collections::HashMap::new(),
+        };
+        syn::visit::Visit::visit_file(&mut calls_visitor, &storage);
+        let mut walker_set: std::collections::HashSet<String> =
+            SEED_WALKER_NAMES.iter().map(|s| (*s).to_string()).collect();
+        loop {
+            let mut grew = false;
+            for (fn_name, callees) in &calls_visitor.calls {
+                if walker_set.contains(fn_name) {
+                    continue;
+                }
+                if callees.iter().any(|c| walker_set.contains(c)) {
+                    walker_set.insert(fn_name.clone());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+
+        // Pass 2: record loop violations, one-shot call counts, and
+        // the set of fns calling `classify`.
         let mut v = WalkerVisitor {
             inside_loop_depth: 0,
             in_test_depth: 0,
@@ -4900,49 +4973,49 @@ mod details {
             allow_counts: std::collections::HashMap::new(),
             looped: Vec::new(),
             classify_callers: std::collections::HashSet::new(),
-            walker_names: WALKER_NAMES,
+            walker_names: &walker_set,
         };
         syn::visit::Visit::visit_file(&mut v, &storage);
 
-        // 27.3a: no walker call inside any for/while/loop body.
+        // Ruling 197-d1 addendum 27.3a: no walker call inside any
+        // for / while / loop body.
         assert!(
             v.looped.is_empty(),
-            "storage.rs must not contain a `for`/`while`/`loop` whose body calls \
-             `history_segment` / `scan_segment` / `scan_closing` / `scan_staged` / `scan`; \
+            "storage.rs must not contain a `for`/`while`/`loop` whose body calls a derived \
+             walker fn (seeds: {SEED_WALKER_NAMES:?}, derived set: {:?}); \
              offenders: {:?}",
+            walker_set,
             v.looped
         );
 
-        // 27.3b: `initial_record` and `refresh` each call `classify_stop`
-        // (addendum 27.1 split: Stop callers go through classify_stop,
-        // Collect through classify_collect; both are counted here as the
-        // orchestrator entry points).
+        // Ruling 197-d1 addendum 27.3b: `initial_record` and `refresh`
+        // each call `classify`.
         for caller in ["initial_record", "refresh"] {
             assert!(
                 v.classify_callers.contains(caller),
-                "storage.rs: fn `{caller}` must call `classify_stop` / `classify_collect` (addendum 27.3b)"
+                "storage.rs: fn `{caller}` must call `classify` (ruling 197-d1 addendum 27.3b)"
             );
         }
 
-        // 27.3b: `initial_record` and `refresh` must call no walker
-        // directly outside a loop either.
+        // Ruling 197-d1 addendum 27.3b: `initial_record` and `refresh`
+        // must call no walker directly outside a loop either.
         for caller in ["initial_record", "refresh"] {
-            for walker in WALKER_NAMES {
+            for walker in &walker_set {
                 let count = v
                     .allow_counts
-                    .get(&(caller.to_string(), (*walker).to_string()))
+                    .get(&(caller.to_string(), walker.clone()))
                     .copied()
                     .unwrap_or(0);
                 assert_eq!(
                     count, 0,
                     "storage.rs: fn `{caller}` must not call walker `{walker}` directly \
-                     (addendum 27.3b); every segment walk goes through `classify`"
+                     (ruling 197-d1 addendum 27.3b); every segment walk goes through `classify`"
                 );
             }
         }
 
-        // 27.3c: every remaining walker call site in non-test
-        // storage.rs matches the allowlist exactly.
+        // Ruling 197-d1 addendum 27.3c: every remaining walker call
+        // site in non-test `storage.rs` matches the allowlist exactly.
         let allowed_set: std::collections::HashMap<(String, String), usize> = ALLOWED
             .iter()
             .map(|(outer, walker, count, _)| {
@@ -4954,9 +5027,9 @@ mod details {
             assert_eq!(
                 expected,
                 Some(*count),
-                "storage.rs: unexpected walker call site (fn → walker → count): \
+                "storage.rs: unexpected walker call site (fn -> walker -> count): \
                  ({:?}, {}); update the allowlist with a documented reason \
-                 (addendum 27.3c)",
+                 (ruling 197-d1 addendum 27.3c)",
                 key,
                 count
             );
@@ -4973,8 +5046,7 @@ mod details {
 }
 
 /// Named reader pins for the multi-segment `runs::classify`
-/// orchestration (ruling 197-d1 addendum 25.3, brief R2b S3b1b round 1
-/// continuation). Each row builds a layout and asserts the literal
+/// orchestration (ruling 197-d1 addendum 25.3). Each row builds a layout and asserts the literal
 /// reader outcome (exact `Err` kind, `Ok` head, or `State` shape).
 ///
 /// Addendum 27.4: every expected kind / detail string is measured by
@@ -5181,7 +5253,7 @@ mod classify_reader_pins {
 
     /// RP8-refresh-append-err-live-shrank: cached live at length L,
     /// same inode but file shrank. `fn refresh` still catches this
-    /// before entering `classify` (brief: "this one does not enter
+    /// before entering `classify` (ruling 197-d1 addendum 27 continuation: "this one does not enter
     /// `classify`; it keeps the same `storage::refresh`-level check").
     #[test]
     fn rp8_refresh_append_err_live_shrank() {

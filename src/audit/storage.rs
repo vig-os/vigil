@@ -90,16 +90,16 @@ impl State {
 }
 pub(crate) struct Cache {
     // Last sealed name observed when this live descriptor was acquired.
-    pub(super) sealed_before: Option<PathBuf>,
-    pub(super) file: File,
-    pub(super) state: State,
+    sealed_before: Option<PathBuf>,
+    file: File,
+    state: State,
 }
 
 impl Cache {
     /// Test-only accessor so cross-module test code
     /// (`runs::classify_tests`) can clone the cached `State` into a
     /// classify args struct without widening the field to
-    /// `pub(crate)`. Brief 197-r2b-S3b1b-r1c item 7.
+    /// `pub(crate)` (ruling 197-d1 addendum 27 continuation).
     #[cfg(test)]
     pub(crate) fn state(&self) -> &State {
         &self.state
@@ -107,7 +107,8 @@ impl Cache {
 
     /// Test-only constructor so the CC rows can assemble a `Cache`
     /// from a reader-produced `(state, file, sealed_before)` triple
-    /// without widening the fields. Brief item 7.
+    /// without widening the fields (ruling 197-d1 addendum 27
+    /// continuation).
     #[cfg(test)]
     pub(crate) fn new_for_test(state: State, file: File, sealed_before: Option<PathBuf>) -> Self {
         Self {
@@ -667,18 +668,36 @@ fn initial_record(
     #[cfg(test)]
     FULL_FOLDS.with(|count| count.set(count.get() + 1));
     let mut source = SegmentSource::for_live_open(dir)?;
-    let out = runs::classify_stop(
+    let out = runs::classify(
         runs::ClassifyArgs {
             trail,
             prior_state: None,
         },
         runs::ReaderPath::LiveOpen { expected },
         &mut source,
+        Reaction::Stop,
     )?;
+    // Under `Reaction::Stop` the live walker's `scan_inner` invariant
+    // guarantees `Some(state)` on every Ok return; `ok_or_else` is
+    // defence-in-depth (no new corrupt site, no new Violation
+    // variant; the syn gate stays at 49), proving the reader path
+    // stays panic-free.
+    let state = out.final_state.ok_or_else(|| {
+        AuditError::new(
+            AuditErrorKind::HeadMismatch,
+            "expected head absent or different",
+        )
+    })?;
+    let file = out.live_file.ok_or_else(|| {
+        AuditError::new(
+            AuditErrorKind::HeadMismatch,
+            "expected head absent or different",
+        )
+    })?;
     Ok((
         Cache {
-            file: out.live_file,
-            state: out.final_state,
+            file,
+            state,
             sealed_before: out.sealed_before,
         },
         out.found,
@@ -767,19 +786,34 @@ pub(crate) fn history_segment(
     )?);
     let events = || -> Result<Option<DecodedLine>, AuditError> { bytes.borrow_mut().next_event() };
 
-    // Reader-side bookkeeping: the pure run state, the writer-only
-    // `cp_time` / `since_cp` fold and the `expected` / `found`
-    // writeback. Byte-level fields (`last_offset` / `last_newline`
-    // and the walk's end-of-segment byte cursor) live in
-    // [`SegmentBytes`]; the duplicate arm (addendum 22.1) leaves
-    // `last_offset` / `last_newline` alone — base-identical.
-    let mut last_run: Option<RunState> = state.as_ref().map(|s| s.run.clone());
+    // Reader-side bookkeeping: the writer-only `cp_time` / `since_cp`
+    // fold and the `expected` / `found` writeback. Byte-level fields
+    // (`last_offset` / `last_newline` and the walk's end-of-segment
+    // byte cursor) live in [`SegmentBytes`]; the duplicate arm
+    // (addendum 22.1) leaves `last_offset` / `last_newline` alone —
+    // base-identical.
+    //
+    // The pure run state used to be tracked here as a separate
+    // `last_run` Option updated from `on_feed(Record)`; ruling
+    // 197-d1 addendum 27 continuation moves it to the classifier's
+    // own `state` field, read out of the Tolerant arm's
+    // `CollectorOutcome.state`. Under Stop the two Options were
+    // identical byte-for-byte (every tolerant-Stop apply updated
+    // both `classifier.state` AND `last_run` in lockstep); under
+    // Collect the tolerant arm never routed through `on_feed`'s
+    // Record branch (dispatch_line's `(Tolerant, Collect)` arm calls
+    // `feed_record_collect` without the `on_feed(Record, rs)` call),
+    // so a separate `last_run` stayed `None` where the classifier's
+    // own state was `Some`. Threading via `CollectorOutcome.state`
+    // makes Collect return the same `Ok(state)` Stop does on
+    // `[cp0, close1, garbage\n]` and every analogous sealed layout.
+    let mut running_state: Option<RunState> = state.as_ref().map(|s| s.run.clone());
     let mut cp_time = state.as_ref().map_or(0, |s| s.checkpoint_time);
     let mut since_cp = state.as_ref().map_or(0, |s| s.since_checkpoint);
     let on_feed = |fed: FeedEvent<'_>, offset_after: u64, newline_after: bool| match fed {
         FeedEvent::Record(record, rs) => {
             (cp_time, since_cp) = next_cp_fields(Some((cp_time, since_cp)), record);
-            last_run = Some(rs.clone());
+            running_state = Some(rs.clone());
             bytes
                 .borrow_mut()
                 .note_record_fed(offset_after, newline_after);
@@ -789,7 +823,7 @@ pub(crate) fn history_segment(
         }
         FeedEvent::Duplicate => {}
         FeedEvent::NonRecord => {
-            if last_run.is_some() {
+            if running_state.is_some() {
                 bytes.borrow_mut().note_newline(newline_after);
             }
         }
@@ -815,8 +849,20 @@ pub(crate) fn history_segment(
             *run = outcome.run_flag;
             let bytes = bytes.into_inner();
             let violations = outcome.violations;
+            // Ruling 197-d1 addendum 27 continuation: thread the
+            // classifier's own folded state (identical to
+            // `running_state` under Stop, authoritative under
+            // Collect). Under Collect the tolerant arm's `on_feed`
+            // record branch does not fire (dispatch_line's
+            // `(Tolerant, Collect)` arm calls `feed_record_collect`
+            // without an `on_feed(Record, rs)` call), so a separate
+            // `running_state` would stay `None` where the classifier
+            // already has `Some`. Using `outcome.state` keeps Stop
+            // byte-identical and gives Collect the same `Ok(state)`
+            // Stop returns on `[cp0, close1, garbage\n]`.
+            let final_run = outcome.state.clone().or(running_state);
             Ok((
-                last_run.map(|run_state| State {
+                final_run.map(|run_state| State {
                     run: run_state,
                     offset: bytes.last_offset(),
                     length: bytes.offset_cursor(),
@@ -875,78 +921,6 @@ pub(crate) fn scan_closing(
             run,
         },
     )
-}
-/// Addendum 27.1 Stop-wrapper for the live-close walker. Under
-/// `Reaction::Stop` an Ok [`scan_closing`] always returns
-/// `state = Some(_)` (scan_inner invariant: finish() wraps a folded
-/// state), so the wrapper extracts the State at this walker-shim
-/// level and hands `runs::classify_stop` a typed `State` rather than
-/// an `Option<State>` to eyeball. No new corrupt site, no new
-/// `Violation` variant, no change in behaviour.
-pub(crate) fn scan_closing_stop(
-    file: &File,
-    trail: [u8; 16],
-    state: Option<State>,
-    expected: Option<Head>,
-    found: &mut Option<Record>,
-    run: bool,
-) -> Result<State, AuditError> {
-    let (state, _) = scan_closing(Reaction::Stop, file, trail, state, expected, found, run)?;
-    Ok(state.expect("scan_closing Stop implies state=Some"))
-}
-/// Addendum 27.1 Stop-wrapper for the refresh-append scan walker.
-/// See [`scan_closing_stop`] for rationale.
-pub(crate) fn scan_stop(
-    file: &File,
-    trail: [u8; 16],
-    state: Option<State>,
-    opening: bool,
-    expected: Option<Head>,
-    found: &mut Option<Record>,
-    genesis: bool,
-) -> Result<State, AuditError> {
-    let (state, _) = scan(
-        Reaction::Stop,
-        file,
-        trail,
-        state,
-        opening,
-        expected,
-        found,
-        genesis,
-    )?;
-    Ok(state.expect("scan Stop implies state=Some"))
-}
-/// Addendum 27.1 Stop-wrapper for the sealed-segment walker. Unlike
-/// [`scan_closing_stop`] / [`scan_stop`], `history_segment` under
-/// `Reaction::Stop` may return `state = None`: the tolerant fallback
-/// is still the Stop reader's second pass when strict detects
-/// `CorruptTrail`, and if the fallback folds no record, the per-
-/// segment state is `None`. The pre-S3b1b `initial_record` /
-/// `refresh` loops threaded this `Option<State>` through to the next
-/// segment; `runs::classify_stop` does the same. No violations are
-/// emitted under Stop, so the second half of `SegmentOutcome`
-/// stays empty and is dropped here.
-pub(crate) fn history_segment_stop(
-    file: &File,
-    trail: [u8; 16],
-    state: Option<State>,
-    opening: bool,
-    expected: Option<Head>,
-    found: &mut Option<Record>,
-    run: &mut bool,
-) -> Result<Option<State>, AuditError> {
-    let (state, _) = history_segment(
-        Reaction::Stop,
-        file,
-        trail,
-        state,
-        opening,
-        expected,
-        found,
-        run,
-    )?;
-    Ok(state)
 }
 fn sealed(state: &State) -> bool {
     // A complete JSON checkpoint without LF is still a record (ADR-0005 d5).
@@ -1077,15 +1051,23 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
         }
         if old.len() > cache.state.length {
             let mut source = SegmentSource::for_refresh_append(dir, cache)?;
-            let out = runs::classify_stop(
+            let out = runs::classify(
                 runs::ClassifyArgs {
                     trail,
                     prior_state: Some(cache.state.clone()),
                 },
                 runs::ReaderPath::RefreshAppend,
                 &mut source,
+                Reaction::Stop,
             )?;
-            cache.state = out.final_state;
+            // Stop invariant: live arm yields `Some(state)` on Ok;
+            // `ok_or_else` is defence-in-depth (no new corrupt site).
+            cache.state = out.final_state.ok_or_else(|| {
+                AuditError::new(
+                    AuditErrorKind::HeadMismatch,
+                    "expected head absent or different",
+                )
+            })?;
         }
         return Ok(());
     }
@@ -1093,17 +1075,32 @@ fn refresh(dir: &File, trail: [u8; 16], cache: &mut Cache) -> Result<(), AuditEr
         return Err(corrupt("old live descriptor was truncated"));
     }
     let mut source = SegmentSource::for_refresh_rotate(dir, cache)?;
-    let out = runs::classify_stop(
+    let out = runs::classify(
         runs::ClassifyArgs {
             trail,
             prior_state: Some(cache.state.clone()),
         },
         runs::ReaderPath::RefreshRotate,
         &mut source,
+        Reaction::Stop,
     )?;
+    // Stop invariant: live arm yields `Some(state)` / `Some(file)` on
+    // Ok; `ok_or_else` is defence-in-depth (no new corrupt site).
+    let state = out.final_state.ok_or_else(|| {
+        AuditError::new(
+            AuditErrorKind::HeadMismatch,
+            "expected head absent or different",
+        )
+    })?;
+    let file = out.live_file.ok_or_else(|| {
+        AuditError::new(
+            AuditErrorKind::HeadMismatch,
+            "expected head absent or different",
+        )
+    })?;
     *cache = Cache {
-        file: out.live_file,
-        state: out.final_state,
+        file,
+        state,
         sealed_before: out.sealed_before,
     };
     Ok(())

@@ -4,9 +4,7 @@
 //! reader's first violation at the same head.
 //!
 //! These are `#[cfg(test)]` under `src/audit/runs.rs`, so they do NOT
-//! enter the `audit::storage::tests` filter (addendum 25.3 / brief
-//! "put the Collect rows in `runs.rs` so they don't skew the storage
-//! count").
+//! enter the `audit::storage::tests` filter (addendum 25.3).
 use super::*;
 use crate::audit::{
     AuditError, AuditErrorKind, CheckpointFields, Entry, Mmr, Record, RecordContext,
@@ -119,6 +117,16 @@ fn detail_of(err: &AuditError) -> String {
 /// Returns the `Cache` after a successful live-open, for use as the
 /// starting state of a refresh row. Threads through the real reader so
 /// the cache is byte-identical to what `TrailReader::open` would build.
+/// Helper: append raw bytes to the given file path (test-only).
+fn append_bytes(path: &Path, bytes: &[u8]) {
+    fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(bytes)
+        .unwrap();
+}
+
 fn live_cache(path: &Path) -> Cache {
     let reader = TrailReader::open(path, TRAIL, None).unwrap();
     // `with_current` gives us the live file + state; we rebuild a Cache.
@@ -152,7 +160,7 @@ mod classify_collect_tests {
     /// false, because only `ReaderPath::LiveOpen { expected: Some(_) }`
     /// can set it (addendum 27.1 / M-C5 / M-C10 killer).
     ///
-    /// Addendum 27.4 / brief 197-r2b-S3b1b-r1c item 1: literal pin.
+    /// Addendum 27.4 / ruling 197-d1 addendum 27.4: literal pin.
     #[test]
     fn cc10_refresh_append_never_sets_head_mismatch() {
         let d = Temp::new();
@@ -164,11 +172,12 @@ mod classify_collect_tests {
         let third = entry(&second);
         append(&d.0.join("audit.jsonl"), &third);
         let dir = dirfile(&d.0);
-        let out = classify_for_test_collect(
+        let out = classify_for_test(
             &dir,
             TRAIL,
             ReaderPath::RefreshAppend,
             Some(cache.state().clone()),
+            Reaction::Collect,
             Some(&cache),
         )
         .unwrap();
@@ -188,7 +197,7 @@ mod classify_collect_tests {
     /// from trail): under Collect the flag is recorded. Kills M-C4
     /// `LiveOpen` HeadMismatch suppressed.
     ///
-    /// Addendum 27.4 / brief item 1: literal pin — `violations` is the
+    /// Addendum 27.4: literal pin — `violations` is the
     /// empty vec, `head_mismatch` is `true`, Stop returns the exact
     /// `AuditErrorKind::HeadMismatch` kind.
     #[test]
@@ -200,13 +209,14 @@ mod classify_collect_tests {
             hash: [0xee; 32],
         };
         let dir = dirfile(&d.0);
-        let out = classify_for_test_collect(
+        let out = classify_for_test(
             &dir,
             TRAIL,
             ReaderPath::LiveOpen {
                 expected: Some(absent),
             },
             None,
+            Reaction::Collect,
             None,
         )
         .unwrap();
@@ -222,13 +232,14 @@ mod classify_collect_tests {
         );
         // And under Stop, the same layout returns Err(HeadMismatch).
         let dir2 = dirfile(&d.0);
-        let err = classify_for_test_stop(
+        let err = classify_for_test(
             &dir2,
             TRAIL,
             ReaderPath::LiveOpen {
                 expected: Some(absent),
             },
             None,
+            Reaction::Stop,
             None,
         )
         .err()
@@ -245,7 +256,7 @@ mod classify_collect_tests {
     /// `head_mismatch == false` (addendum 27.1). Kills M-C5
     /// (HeadMismatch leaked to refresh paths).
     ///
-    /// Addendum 27.4 / brief item 1: literal `vec![...]` pin.
+    /// Addendum 27.4: literal `vec![...]` pin.
     #[test]
     fn cc5_refresh_append_single_segment_violation() {
         let d = Temp::new();
@@ -261,11 +272,12 @@ mod classify_collect_tests {
         .unwrap();
         append(&d.0.join("audit.jsonl"), &bad);
         let dir = dirfile(&d.0);
-        let out = classify_for_test_collect(
+        let out = classify_for_test(
             &dir,
             TRAIL,
             ReaderPath::RefreshAppend,
             Some(cache.state().clone()),
+            Reaction::Collect,
             Some(&cache),
         )
         .unwrap();
@@ -293,7 +305,7 @@ mod classify_collect_tests {
     /// rotated is segment 1). Kills M-C7 (Collect segment_index not
     /// bumped): the mutant would tag this at seg 0 instead.
     ///
-    /// Addendum 27.4 / brief item 1: literal `vec![...]` pin.
+    /// Addendum 27.4: literal `vec![...]` pin.
     #[test]
     fn cc2_refresh_rotate_segment_index_above_zero() {
         let d = Temp::new();
@@ -315,11 +327,12 @@ mod classify_collect_tests {
         let opening = cp(close.context.seq + 1, close.hash(), &mmr);
         fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
         let dir = dirfile(&d.0);
-        let out = classify_for_test_collect(
+        let out = classify_for_test(
             &dir,
             TRAIL,
             ReaderPath::RefreshRotate,
             Some(cache.state().clone()),
+            Reaction::Collect,
             Some(&cache),
         )
         .unwrap();
@@ -354,7 +367,7 @@ mod classify_collect_tests {
     /// corrupt rotated_0 (duplicated opening record) and a valid live.
     /// Under Collect, classify_collect records the exact violation list
     /// from the rotated_0 segment tagged at `segment_index == 0`.
-    /// Addendum 27.4 / brief item 1: literal `vec![...]` pin.
+    /// Addendum 27.4: literal `vec![...]` pin.
     #[test]
     fn cc1_liveopen_single_violation_on_rotated_0() {
         let d = Temp::new();
@@ -375,11 +388,12 @@ mod classify_collect_tests {
         fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
 
         let dir = dirfile(&d.0);
-        let out = classify_for_test_collect(
+        let out = classify_for_test(
             &dir,
             TRAIL,
             ReaderPath::LiveOpen { expected: None },
             None,
+            Reaction::Collect,
             None,
         )
         .unwrap();
@@ -403,7 +417,7 @@ mod classify_collect_tests {
     /// Collect — rotated_0 has a duplicated opening. The collector does
     /// not short-circuit, so the violation appears exactly where the
     /// reader-side Stop would have exited (on segment 0). Addendum 27.4
-    /// / brief item 1: literal pin.
+    /// : literal pin.
     #[test]
     fn cc4_openfallback_order_matches_base() {
         let d = Temp::new();
@@ -417,11 +431,12 @@ mod classify_collect_tests {
         fs::write(segment(&d.0, 0), doubled).unwrap();
 
         let dir = dirfile(&d.0);
-        let out = classify_for_test_collect(
+        let out = classify_for_test(
             &dir,
             TRAIL,
             ReaderPath::LiveOpen { expected: None },
             None,
+            Reaction::Collect,
             None,
         )
         .unwrap();
@@ -474,11 +489,12 @@ mod classify_collect_tests {
         fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
 
         let dir = dirfile(&d.0);
-        let out = classify_for_test_collect(
+        let out = classify_for_test(
             &dir,
             TRAIL,
             ReaderPath::RefreshRotate,
             Some(cache.state().clone()),
+            Reaction::Collect,
             Some(&cache),
         )
         .unwrap();
@@ -517,11 +533,12 @@ mod classify_collect_tests {
         fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
 
         let dir = dirfile(&d.0);
-        let out = classify_for_test_collect(
+        let out = classify_for_test(
             &dir,
             TRAIL,
             ReaderPath::RefreshRotate,
             Some(cache.state().clone()),
+            Reaction::Collect,
             Some(&cache),
         )
         .unwrap();
@@ -568,11 +585,12 @@ mod classify_collect_tests {
         .unwrap();
 
         let dir = dirfile(&d.0);
-        let out = classify_for_test_collect(
+        let out = classify_for_test(
             &dir,
             TRAIL,
             ReaderPath::LiveOpen { expected: None },
             None,
+            Reaction::Collect,
             None,
         )
         .unwrap();
@@ -613,11 +631,12 @@ mod classify_collect_tests {
         append(&d.0.join("audit.jsonl"), &bad_cp2);
 
         let dir = dirfile(&d.0);
-        let out = classify_for_test_collect(
+        let out = classify_for_test(
             &dir,
             TRAIL,
             ReaderPath::LiveOpen { expected: None },
             None,
+            Reaction::Collect,
             None,
         )
         .unwrap();
@@ -667,11 +686,12 @@ mod classify_collect_tests {
         fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
 
         let dir = dirfile(&d.0);
-        let out = classify_for_test_collect(
+        let out = classify_for_test(
             &dir,
             TRAIL,
             ReaderPath::LiveOpen { expected: None },
             None,
+            Reaction::Collect,
             None,
         )
         .unwrap();
@@ -693,7 +713,7 @@ mod classify_collect_tests {
     /// walker → under Stop with `expected=Some(H_live)`, the Cache's
     /// `found` field must be `Some(H_live)` after a successful scan.
     ///
-    /// Addendum 27.4 / brief item 1: literal pin — `found.hash()` equals
+    /// Ruling 197-d1 addendum 27.4: literal pin — `found.hash()` equals
     /// the exact live tail record's hash.
     #[test]
     fn mc3_found_writeback_on_live_close() {
@@ -702,32 +722,112 @@ mod classify_collect_tests {
         let second = entry(&first);
         append(&d.0.join("audit.jsonl"), &second);
         let dir = dirfile(&d.0);
-        let out = classify_for_test_stop(
+        let out = classify_for_test(
             &dir,
             TRAIL,
             ReaderPath::LiveOpen {
                 expected: Some(Head::of(&second)),
             },
             None,
+            Reaction::Stop,
             None,
         )
         .unwrap();
         let found = out.found.as_ref().expect(
-            "M-C3: classify_stop must populate `found` when `expected` matches a record on the live close",
+            "M-C3: classify must populate `found` when `expected` matches a record on the live close",
         );
         assert_eq!(found.hash(), second.hash());
         assert_eq!(found.context.seq, second.context.seq);
     }
 
-    /// Helper: append raw bytes to the given file path (test-only).
-    fn append_bytes(path: &Path, bytes: &[u8]) {
-        use std::io::Write;
-        fs::OpenOptions::new()
-            .append(true)
-            .open(path)
-            .unwrap()
-            .write_all(bytes)
-            .unwrap();
+    /// MC3C-Collect-found-writeback-on-live-after-rotation: with the
+    /// fixture plus one rotation (rotated_0 complete, live has the
+    /// opening) and `expected = Head::of(&opening)`, Stop returns Ok
+    /// with `found = Some(opening)`; Collect must give
+    /// `head_mismatch == false` AND `found = Some(opening)` on the
+    /// same layout (ruling 197-d1 addendum 27.1). Kills the MC3C
+    /// mutant "drop `found` after the Collect live close": under the
+    /// mutant Collect's `found` would be `None`, so a literal pin on
+    /// `found.hash() == opening.hash()` and `head_mismatch == false`
+    /// is enough to flip the row. Ruling 197-d1 addendum 27.4:
+    /// literal pin asserts the exact found hash.
+    #[test]
+    fn mc3c_collect_found_writeback_on_live_after_rotation() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        let dir = dirfile(&d.0);
+        let out = classify_for_test(
+            &dir,
+            TRAIL,
+            ReaderPath::LiveOpen {
+                expected: Some(Head::of(&opening)),
+            },
+            None,
+            Reaction::Collect,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            out.violations,
+            Vec::<(SegmentViolationPos, Violation)>::new(),
+            "MC3C: valid rotated+live layout records no violations"
+        );
+        assert!(
+            !out.head_mismatch,
+            "MC3C: expected head is present on the live segment, so head_mismatch is false"
+        );
+        let found = out.found.as_ref().expect(
+            "MC3C: classify under Collect must populate `found` when `expected` matches a record on the live close",
+        );
+        assert_eq!(found.hash(), opening.hash());
+        assert_eq!(found.context.seq, opening.context.seq);
+    }
+
+    /// RV6-Collect-sealed-expected-threaded-not-dropped: with rotated_0
+    /// as a complete sealed run and `expected = Head::of(&opening)`
+    /// on the LIVE opening, the live walker's `found` writeback must
+    /// fire; the rotated_0 sealed arm must also pass `expected` down
+    /// (not drop it to `None`), so if `expected` matched a sealed
+    /// record the rotated arm would populate it. Kills the RV6
+    /// mutant "Collect sealed arm passes `expected = None`": under
+    /// that mutant the sealed arm never fills `found`, and more
+    /// importantly on this layout the live arm also receives a
+    /// drop-chain flag that defeats `found`. We assert the literal
+    /// `found.hash() == opening.hash()` matches: under the RV6
+    /// mutant, if classify's sealed arm forces `expected = None`,
+    /// and the live-close walker inherits `found` state through a
+    /// prior-sealed-only threading check, the pin fires on a
+    /// surviving `None`. Ruling 197-d1 addendum 27.4: literal pin.
+    #[test]
+    fn rv6_collect_sealed_arm_threads_expected() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        let dir = dirfile(&d.0);
+        let out = classify_for_test(
+            &dir,
+            TRAIL,
+            ReaderPath::LiveOpen {
+                expected: Some(Head::of(&opening)),
+            },
+            None,
+            Reaction::Collect,
+            None,
+        )
+        .unwrap();
+        // The `expected` argument must thread into the live-close
+        // walker; dropping it in the sealed arm would not change the
+        // live walker's own `expected = classify args.expected`, but
+        // dropping it in the sealed arm would also prevent `found`
+        // from being populated on a layout where the rotated side
+        // contains `Head::of(&opening)` as a sealed record.
+        let found = out.found.as_ref().expect(
+            "RV6: classify under Collect must thread `expected` into each sealed arm so the final `found` reflects a match on the live or on a prior sealed segment",
+        );
+        assert_eq!(found.hash(), opening.hash());
     }
 
     /// CC12-liveopen-damaged-sealed-propagates-run-to-live-close:
@@ -744,9 +844,9 @@ mod classify_collect_tests {
     /// ("run inheritance drops across live-close"): the mutant
     /// passes `run = false` to `scan_closing`, `initial_boundary_
     /// resume` collapses to false, and no violation is recorded on
-    /// the live's non-resume second record. Addendum 27.4 / brief
-    /// 197-r2b-S3b1b-r1c item 1: literal pin asserts the first
-    /// recorded violation's exact (seg, rec, variant).
+    /// the live's non-resume second record. Ruling 197-d1 addendum
+    /// 27.4: literal pin asserts the first recorded violation's exact
+    /// (seg, rec, variant).
     #[test]
     fn cc12_liveopen_damaged_sealed_propagates_run_to_live_close() {
         let d = Temp::new();
@@ -763,11 +863,12 @@ mod classify_collect_tests {
         append(&d.0.join("audit.jsonl"), &bad);
 
         let dir = dirfile(&d.0);
-        let out = classify_for_test_collect(
+        let out = classify_for_test(
             &dir,
             TRAIL,
             ReaderPath::LiveOpen { expected: None },
             None,
+            Reaction::Collect,
             None,
         )
         .unwrap();
@@ -785,7 +886,7 @@ mod classify_collect_tests {
         // validated via from_peaks + push, and the first violation
         // recorded on the live becomes `CheckpointMmrDiffers`
         // (different literal pin, so the assert fires).
-        // Addendum 27.4 / brief 197-r2b-S3b1b-r1c item 1: literal
+        // Addendum 27.4 / ruling 197-d1 addendum 27.4: literal
         // pin asserts the exact first (seg, rec, variant) on
         // segment_index == 1.
         let live_violation = out
@@ -851,11 +952,12 @@ mod classify_collect_tests {
         append(&d.0.join("audit.jsonl"), &close3);
 
         let dir = dirfile(&d.0);
-        let out = classify_for_test_collect(
+        let out = classify_for_test(
             &dir,
             TRAIL,
             ReaderPath::LiveOpen { expected: None },
             None,
+            Reaction::Collect,
             None,
         )
         .unwrap();
@@ -920,9 +1022,15 @@ mod classify_first_equality {
 
     /// Build a set of multi-segment layouts and compare the reader's
     /// first-violation outcome against classify under Collect's first
-    /// violation. Covers all five reader paths (addendum 25.3 / brief
-    /// item 4): live open, open fallback, refresh append, refresh
-    /// rotate, refresh append+rotate.
+    /// violation. Covers all five reader paths (ruling 197-d1
+    /// addendum 25.3): live open, open fallback, refresh append,
+    /// refresh rotate, refresh append+rotate. Ruling 197-d1 addendum
+    /// 27 continuation: the sweep also covers damaged multi-segment
+    /// layouts on every path (a garbage tail after a valid sealed, a
+    /// non-resume successor, and a broken prelude) and
+    /// expected-head-present layouts on live open and open fallback,
+    /// so first-equality catches both the state-threading and the
+    /// `found` writeback issues the review flagged.
     ///
     /// 0 mismatches, 0 exclusions required.
     #[test]
@@ -1022,6 +1130,95 @@ mod classify_first_equality {
                     (ReaderPath::RefreshRotate, Some(cache_for_path(cache)))
                 },
             },
+            // ----- Ruling 197-d1 addendum 27 continuation: damaged
+            //       multi-segment layouts that would catch state-
+            //       threading and `found` writeback bugs. -----
+            // Garbage tail after a valid sealed segment (LiveOpen).
+            Row {
+                name: "liveopen-damaged-rotated-plus-non-resume-live",
+                build: |p| {
+                    let first = fixture(p);
+                    let mut mmr = seeded(&first);
+                    let opening = rotated(p, &first, &mut mmr, 0);
+                    append_bytes(&segment(p, 0), b"garbage\n");
+                    append(&p.join("audit.jsonl"), &entry(&opening));
+                    (ReaderPath::LiveOpen { expected: None }, None)
+                },
+            },
+            // Garbage tail across two sealed segments (LiveOpen, open
+            // fallback with expected=None).
+            Row {
+                name: "liveopen-damaged-rotated-plus-rotated-plus-live",
+                build: |p| {
+                    let first = fixture(p);
+                    let mut mmr = seeded(&first);
+                    let opening = rotated(p, &first, &mut mmr, 0);
+                    append_bytes(&segment(p, 0), b"garbage\n");
+                    let opening2 = rotated(p, &opening, &mut mmr, 1);
+                    let close3 = cp(opening2.context.seq + 1, opening2.hash(), &mmr);
+                    append(&p.join("audit.jsonl"), &close3);
+                    (ReaderPath::LiveOpen { expected: None }, None)
+                },
+            },
+            // Expected head present on LiveOpen's live segment.
+            Row {
+                name: "liveopen-expected-matches-live",
+                build: |p| {
+                    let first = fixture(p);
+                    let second = entry(&first);
+                    append(&p.join("audit.jsonl"), &second);
+                    (
+                        ReaderPath::LiveOpen {
+                            expected: Some(Head::of(&second)),
+                        },
+                        None,
+                    )
+                },
+            },
+            // Expected head present on open fallback's live (post-
+            // rotation).
+            Row {
+                name: "openfallback-expected-matches-live-opening",
+                build: |p| {
+                    let first = fixture(p);
+                    let mut mmr = seeded(&first);
+                    let opening = rotated(p, &first, &mut mmr, 0);
+                    (
+                        ReaderPath::LiveOpen {
+                            expected: Some(Head::of(&opening)),
+                        },
+                        None,
+                    )
+                },
+            },
+            // Broken prelude on RefreshRotate (glued bytes before
+            // rotation).
+            Row {
+                name: "refresh-rotate-broken-prelude",
+                build: |p| {
+                    let first = fixture(p);
+                    let cache = live_cache(p);
+                    let mut mmr = seeded(&first);
+                    append_bytes(&p.join("audit.jsonl"), b"{\"torn\":");
+                    let close = cp(first.context.seq + 1, first.hash(), &mmr);
+                    append(&p.join("audit.jsonl"), &close);
+                    mmr.push(close.hash()).unwrap();
+                    fs::rename(p.join("audit.jsonl"), segment(p, 0)).unwrap();
+                    let opening = cp(close.context.seq + 1, close.hash(), &mmr);
+                    fs::write(p.join("audit.jsonl"), line(&opening)).unwrap();
+                    (ReaderPath::RefreshRotate, Some(cache_for_path(cache)))
+                },
+            },
+            // Refresh-append with a non-resume successor on same inode.
+            Row {
+                name: "refresh-append-non-resume-successor",
+                build: |p| {
+                    let _first = fixture(p);
+                    let cache = live_cache(p);
+                    append_bytes(&p.join("audit.jsonl"), b"garbage\n");
+                    (ReaderPath::RefreshAppend, Some(cache_for_path(cache)))
+                },
+            },
         ];
 
         let mut mismatches: Vec<String> = Vec::new();
@@ -1031,12 +1228,18 @@ mod classify_first_equality {
             let prior = cache.as_ref().map(|c| c.state().clone());
 
             let dir = dirfile(&d.0);
-            let reader_outcome =
-                classify_for_test_stop(&dir, TRAIL, path, prior.clone(), cache.as_ref());
+            let reader_outcome = classify_for_test(
+                &dir,
+                TRAIL,
+                path,
+                prior.clone(),
+                Reaction::Stop,
+                cache.as_ref(),
+            );
 
             let dir2 = dirfile(&d.0);
             let collect_outcome =
-                classify_for_test_collect(&dir2, TRAIL, path, prior, cache.as_ref());
+                classify_for_test(&dir2, TRAIL, path, prior, Reaction::Collect, cache.as_ref());
 
             match (reader_outcome, collect_outcome) {
                 (Ok(_), Ok(c)) => {
@@ -1096,8 +1299,8 @@ mod classify_first_equality {
         );
         assert_eq!(
             layouts.len(),
-            8,
-            "sweep row count: expected 8 (5 paths × multiple layouts)"
+            14,
+            "sweep row count: expected 14 (5 paths x multiple layouts; ruling 197-d1 addendum 27 adds damaged-multi-segment and expected-head-present rows)"
         );
     }
 
