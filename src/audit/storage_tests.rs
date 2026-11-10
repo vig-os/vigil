@@ -4743,13 +4743,37 @@ mod details {
                 "history_segment",
                 "history_segment",
                 1,
-                "storage::history_segment composes into runs::history_segment once; the strict-pass closure stays one call",
+                "storage::history_segment composes into runs::history_segment once (ruling 197-d1 addendum 27.3c)",
+            ),
+            (
+                "history_segment",
+                "scan_inner",
+                1,
+                "storage::history_segment's strict-pass closure composes into scan_inner once (ruling 197-d1 addendum 27.3c)",
             ),
             (
                 "scan_inner",
                 "scan_segment",
                 1,
-                "scan_inner composes into runs::scan_segment once; the per-reader-path strict walk",
+                "scan_inner composes into runs::scan_segment once; the per-reader-path strict walk (ruling 197-d1 addendum 27.3c)",
+            ),
+            (
+                "scan",
+                "scan_inner",
+                1,
+                "storage::scan is a thin shim over scan_inner (ruling 197-d1 addendum 27.3c)",
+            ),
+            (
+                "scan_closing",
+                "scan_inner",
+                1,
+                "storage::scan_closing is a thin shim over scan_inner (ruling 197-d1 addendum 27.3c)",
+            ),
+            (
+                "scan_staged",
+                "scan_inner",
+                1,
+                "storage::scan_staged is a thin shim over scan_inner (ruling 197-d1 addendum 27.3c)",
             ),
         ];
 

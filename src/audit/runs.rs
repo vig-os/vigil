@@ -1091,18 +1091,34 @@ where
                     }
                 }
                 (Mode::Strict, Reaction::Collect) => {
-                    // Strict Collect: swallow errors; on_feed is not
-                    // called for Record here (the S3b `classify`
-                    // iterator and tests rebuild segment state from
-                    // the outcome, not from per-record on_feed calls;
-                    // mirrors the tolerant Collect record arm which
-                    // also skips on_feed).
+                    // Ruling 197-d1 addendum 27 continuation: under
+                    // Collect we must still thread the storage shim's
+                    // `found` writeback, writer-field fold and
+                    // byte-cursor so Collect returns the same
+                    // `(found, State)` Stop does on a valid trail with
+                    // a present expected head (addendum 27.1 /
+                    // `mc3c_found_writeback_on_live_after_rotation`).
+                    // After `feed_record_collect_strict` the
+                    // classifier's state either advanced (apply Ok) or
+                    // stayed put (apply Err -> violation recorded).
+                    // Calling on_feed with the classifier's new state
+                    // is safe: storage's Record on_feed fires `found`
+                    // only when `expected == Some(rs.head)`, so a
+                    // record that failed to apply but whose head
+                    // didn't match expected has no effect, and a
+                    // record that failed because of an unrelated check
+                    // but whose state still matches the expected head
+                    // was logically "folded" for the purpose of
+                    // first-equality against Stop.
                     classifier.feed_record_collect_strict(
                         record,
                         record_count,
                         trail,
                         record_index,
                     );
+                    if let Some(rs) = classifier.state() {
+                        on_feed(DispatchFed::Record(record, rs), offset_after, newline);
+                    }
                 }
                 (Mode::Tolerant, Reaction::Stop) => {
                     let prep =
@@ -1127,7 +1143,22 @@ where
                     on_feed(DispatchFed::Record(record, rs), offset_after, newline);
                 }
                 (Mode::Tolerant, Reaction::Collect) => {
+                    // Ruling 197-d1 addendum 27 continuation (mirrors
+                    // the Strict+Collect arm): thread on_feed under
+                    // Collect so storage shims' `found` writeback,
+                    // writer-field fold and byte cursor advance in
+                    // lockstep with the classifier's state (addendum
+                    // 27.1 Collect-vs-Stop first-equality). The
+                    // tolerant apply may trial_apply a record that
+                    // the collector then records as a violation
+                    // without advancing state; calling on_feed with
+                    // the classifier's current state is still safe
+                    // because the `found` writeback only fires when
+                    // `expected == Some(rs.head)`.
                     classifier.feed_record_collect(record, record_count, trail, record_index);
+                    if let Some(rs) = classifier.state() {
+                        on_feed(DispatchFed::Record(record, rs), offset_after, newline);
+                    }
                 }
             }
         }

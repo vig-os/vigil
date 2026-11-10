@@ -338,24 +338,17 @@ mod classify_collect_tests {
         .unwrap();
         assert_eq!(
             out.violations,
-            vec![
-                (
-                    SegmentViolationPos {
-                        segment_index: 0,
-                        record_index_in_segment: 1,
-                    },
-                    Violation::SequenceDidNotIncrease,
-                ),
-                (
-                    SegmentViolationPos {
-                        segment_index: 1,
-                        record_index_in_segment: 0,
-                    },
-                    Violation::RecordRolledBack,
-                ),
-            ],
-            "CC2: refresh-rotate exact literal list — prelude (seg 0) hits SequenceDidNotIncrease \
-             on the glued duplicate; rotated_0 (seg 1) hits RecordRolledBack on the opening scan"
+            vec![(
+                SegmentViolationPos {
+                    segment_index: 0,
+                    record_index_in_segment: 1,
+                },
+                Violation::SequenceDidNotIncrease,
+            )],
+            "CC2: refresh-rotate prelude hits SequenceDidNotIncrease at the duplicated record; \
+             state threading (ruling 197-d1 addendum 27 continuation) lets rotated_0's opening cp \
+             re-use the prelude's folded state, so the rotated segment's strict pass does not \
+             re-record a second violation"
         );
         assert!(
             !out.head_mismatch,
@@ -542,12 +535,22 @@ mod classify_collect_tests {
             Some(&cache),
         )
         .unwrap();
-        // Find a violation on segment_index == 1.
-        let any_seg1 = out.violations.iter().any(|(p, _)| p.segment_index == 1);
-        assert!(
-            any_seg1,
-            "CC7: refresh-rotate rotated-side violation must sit on seg 1; got {:?}",
-            out.violations
+        // Ruling 197-d1 addendum 27.4: literal assert_eq on the full
+        // vec. After state threading (addendum 27 continuation) the
+        // prelude's folded state is handed to rotated_0, so the strict
+        // first-violation surfaces on the prelude's glued duplicate at
+        // (seg=0, rec=1).
+        assert_eq!(
+            out.violations,
+            vec![(
+                SegmentViolationPos {
+                    segment_index: 0,
+                    record_index_in_segment: 1,
+                },
+                Violation::SequenceDidNotIncrease,
+            )],
+            "CC7: refresh-rotate exact literal list — prelude (seg 0) hits SequenceDidNotIncrease \
+             on the duplicate; rotated_0 (seg 1) re-uses the threaded state and does not re-record"
         );
     }
 
@@ -872,41 +875,32 @@ mod classify_collect_tests {
             None,
         )
         .unwrap();
-        // The live segment (segment_index == 1) records
-        // `InitialCheckpointDoesNotLinkGenesis` on its first record
-        // (opening cp). Under Collect, the sealed walk's tolerant
-        // arm does not thread State across the segment boundary
-        // (the per-segment State is rebuilt on each call), so the
-        // live-close walker sees `state = None` and
-        // `genesis = ctx.run || state.is_none()` evaluates true
-        // only because `*run` reached it carrying the prior run's
-        // damaged-latch signal. Kills M-C9 ("run inheritance
-        // drops across live-close"): under the mutant `run=false`
-        // leaves `genesis = false`, the opening cp is instead
-        // validated via from_peaks + push, and the first violation
-        // recorded on the live becomes `CheckpointMmrDiffers`
-        // (different literal pin, so the assert fires).
-        // Addendum 27.4 / ruling 197-d1 addendum 27.4: literal
-        // pin asserts the exact first (seg, rec, variant) on
-        // segment_index == 1.
-        let live_violation = out
-            .violations
-            .iter()
-            .find(|(p, _)| p.segment_index == 1)
-            .cloned();
+        // Ruling 197-d1 addendum 27 continuation / addendum 27.4:
+        // literal `vec![...]` assert_eq. With state threading, the
+        // sealed rotated_0's folded `State` reaches the live-close
+        // walker; the strict live-close pass sees `run=true` through
+        // the `*run` arg, `initial_boundary_resume = opening &&
+        // (ctx.run || !sealed(prior)) = true && (true || false) =
+        // true`, so the live's non-resume second record trips
+        // `boundary_resume && !first && !is_resume` and records
+        // `UnclosedSegmentLacksResume` at (seg=1, rec=1). This is
+        // byte-equal to the reader's RP12 `Err` detail
+        // ("unclosed segment lacks matching immediate resume").
+        // Kills M-C9 ("run inheritance drops across live-close"):
+        // under the mutant `run=false` collapses
+        // `initial_boundary_resume`, strict walks cleanly, and the
+        // violation never fires.
         assert_eq!(
-            live_violation,
-            Some((
+            out.violations,
+            vec![(
                 SegmentViolationPos {
                     segment_index: 1,
-                    record_index_in_segment: 0,
+                    record_index_in_segment: 1,
                 },
-                Violation::InitialCheckpointDoesNotLinkGenesis,
-            )),
-            "CC12: run=true propagation into scan_closing records \
-             InitialCheckpointDoesNotLinkGenesis on the live's opening cp (kills M-C9); \
-             got: {:?}",
-            out.violations,
+                Violation::UnclosedSegmentLacksResume,
+            )],
+            "CC12: exact literal list — run=true propagation into scan_closing records \
+             UnclosedSegmentLacksResume on the live's non-resume second record (kills M-C9)"
         );
         assert!(
             !out.head_mismatch,
@@ -961,42 +955,40 @@ mod classify_collect_tests {
             None,
         )
         .unwrap();
-        // The second segment (rotated_1, segment_index == 1)
-        // records `FirstSuccessorDoesNotCloseRun` on its opening cp
-        // (record 0): under Collect the sealed walk does not thread
-        // State across the boundary, strict Collect fails on
-        // boundary_resume and falls back to tolerant Collect with
-        // `inherited = run_in || unsealed_boundary = true || false
-        // = true`, and the opening cp with trial_apply(None, ..) =
-        // false trips `inherited && is_cp && !broken && !closing`.
-        // Kills M-C2 ("classify threads `run = false` across
-        // sealed->sealed"): under the mutant `run_in = false`
-        // (and state = None still because Collect does not thread
-        // state), `inherited = false || false = false`, no
-        // `FirstSuccessorDoesNotCloseRun` check fires, strict's
-        // `boundary_resume` also collapses, and the first
-        // violation recorded on rotated_1 becomes
-        // `CheckpointMmrDiffers` via the new-mmr-from-peaks path.
-        // Addendum 27.4: literal pin asserts the exact first
-        // (seg, rec, variant) on segment_index == 1.
-        let seg1_violation = out
-            .violations
-            .iter()
-            .find(|(p, _)| p.segment_index == 1)
-            .cloned();
+        // Ruling 197-d1 addendum 27 continuation / addendum 27.4:
+        // literal `vec![...]` assert_eq. With state threading, the
+        // sealed rotated_0's folded state reaches rotated_1's
+        // history_segment; strict detects the closing cp at `count ==
+        // 1` as `FirstSuccessorLacksImmediateResume` via
+        // `boundary_resume && !is_resume`, and the following live
+        // records `RecordRolledBack` because the state advance is
+        // halted by `recovery_pending`. Byte-equal to the reader's
+        // RP13 `Err` detail ("first successor lacks immediate
+        // resume"). Kills M-C2 ("classify threads `run = false`
+        // across sealed->sealed"): under the mutant `run_in=false`
+        // leaves `boundary_resume=false`, strict walks cleanly, and
+        // the resume violation never fires.
         assert_eq!(
-            seg1_violation,
-            Some((
-                SegmentViolationPos {
-                    segment_index: 1,
-                    record_index_in_segment: 0,
-                },
-                Violation::FirstSuccessorDoesNotCloseRun,
-            )),
-            "CC13: run=true propagation across sealed->sealed records \
-             FirstSuccessorDoesNotCloseRun on rotated_1's opening cp (kills M-C2); \
-             got: {:?}",
             out.violations,
+            vec![
+                (
+                    SegmentViolationPos {
+                        segment_index: 1,
+                        record_index_in_segment: 1,
+                    },
+                    Violation::FirstSuccessorLacksImmediateResume,
+                ),
+                (
+                    SegmentViolationPos {
+                        segment_index: 2,
+                        record_index_in_segment: 0,
+                    },
+                    Violation::RecordRolledBack,
+                ),
+            ],
+            "CC13: exact literal list — run=true propagation across sealed->sealed records \
+             FirstSuccessorLacksImmediateResume on rotated_1's closing cp (kills M-C2), \
+             followed by a RecordRolledBack on the live from the halted state advance"
         );
         assert!(
             !out.head_mismatch,
