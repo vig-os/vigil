@@ -1091,33 +1091,35 @@ where
                     }
                 }
                 (Mode::Strict, Reaction::Collect) => {
-                    // Ruling 197-d1 addendum 27 continuation: under
-                    // Collect we must still thread the storage shim's
-                    // `found` writeback, writer-field fold and
-                    // byte-cursor so Collect returns the same
-                    // `(found, State)` Stop does on a valid trail with
-                    // a present expected head (addendum 27.1 /
-                    // `mc3c_found_writeback_on_live_after_rotation`).
-                    // After `feed_record_collect_strict` the
-                    // classifier's state either advanced (apply Ok) or
-                    // stayed put (apply Err -> violation recorded).
-                    // Calling on_feed with the classifier's new state
-                    // is safe: storage's Record on_feed fires `found`
-                    // only when `expected == Some(rs.head)`, so a
-                    // record that failed to apply but whose head
-                    // didn't match expected has no effect, and a
-                    // record that failed because of an unrelated check
-                    // but whose state still matches the expected head
-                    // was logically "folded" for the purpose of
-                    // first-equality against Stop.
-                    classifier.feed_record_collect_strict(
+                    // #197 ruling addendum 27.1 Collect-vs-Stop Ok-path
+                    // equality: dispatch the Collect feed the same way
+                    // Stop does, keyed on the classifier's own
+                    // `Advance`. On `Advance::Record` the writer-field
+                    // fold runs once and `found` is written if the
+                    // record's head matches `expected`; on
+                    // `Advance::Duplicate` the writer fields stay put
+                    // but the duplicate's head still writes `found`
+                    // (base-identical); on `Err` (`None`) the
+                    // violation is already recorded through
+                    // `on_violation` and no `on_feed` call fires, so a
+                    // rejected record never advances `since_checkpoint`
+                    // nor spuriously writes `found`.
+                    match classifier.feed_record_collect_strict(
                         record,
                         record_count,
                         trail,
                         record_index,
-                    );
-                    if let Some(rs) = classifier.state() {
-                        on_feed(DispatchFed::Record(record, rs), offset_after, newline);
+                    ) {
+                        Some(Advance::Record) => {
+                            let rs = classifier
+                                .state()
+                                .expect("strict feed_record Ok(Record) implies state=Some");
+                            on_feed(DispatchFed::Record(record, rs), offset_after, newline);
+                        }
+                        Some(Advance::Duplicate) => {
+                            on_feed(DispatchFed::Duplicate(record), offset_after, newline);
+                        }
+                        None => {}
                     }
                 }
                 (Mode::Tolerant, Reaction::Stop) => {
@@ -1143,21 +1145,42 @@ where
                     on_feed(DispatchFed::Record(record, rs), offset_after, newline);
                 }
                 (Mode::Tolerant, Reaction::Collect) => {
-                    // Ruling 197-d1 addendum 27 continuation (mirrors
-                    // the Strict+Collect arm): thread on_feed under
-                    // Collect so storage shims' `found` writeback,
-                    // writer-field fold and byte cursor advance in
-                    // lockstep with the classifier's state (addendum
-                    // 27.1 Collect-vs-Stop first-equality). The
-                    // tolerant apply may trial_apply a record that
-                    // the collector then records as a violation
-                    // without advancing state; calling on_feed with
-                    // the classifier's current state is still safe
-                    // because the `found` writeback only fires when
-                    // `expected == Some(rs.head)`.
-                    classifier.feed_record_collect(record, record_count, trail, record_index);
-                    if let Some(rs) = classifier.state() {
-                        on_feed(DispatchFed::Record(record, rs), offset_after, newline);
+                    // #197 ruling addendum 27.1 Collect-vs-Stop Ok-path
+                    // equality: mirror the (Tolerant, Stop) arm.
+                    // `feed_record_collect` returns `Advance::Record`
+                    // after an apply Ok, `Advance::Duplicate` after
+                    // the shared `feed_record_tolerant_entry`
+                    // short-circuits on a duplicate (byte cursor
+                    // advances, writer fields stay put), and `None`
+                    // when `recovery_pending` is set, the entry
+                    // recorded a violation, or `feed_record_apply_
+                    // tolerant` rejected the record. A rejected
+                    // record must not reach `on_feed`: feeding
+                    // `Record` would fold `since_checkpoint` /
+                    // `checkpoint_time` and write `found` as if the
+                    // apply had succeeded.
+                    match classifier.feed_record_collect(record, record_count, trail, record_index)
+                    {
+                        Some(Advance::Record) => {
+                            // Invariant: `feed_record_collect`'s
+                            // `Some(Advance::Record)` only returns on
+                            // `feed_record_apply_tolerant` Ok, which
+                            // sets `self.state = Some(_)` (see
+                            // `apply_checked`'s Ok path threading the
+                            // new `RunState` into the classifier).
+                            // No new `Violation::MissingHead`
+                            // construction site here: the Stop arm's
+                            // defence-in-depth (`occ 0`) already
+                            // covers the shared invariant.
+                            let rs = classifier
+                                .state()
+                                .expect("feed_record_collect Ok(Record) implies state=Some");
+                            on_feed(DispatchFed::Record(record, rs), offset_after, newline);
+                        }
+                        Some(Advance::Duplicate) => {
+                            on_feed(DispatchFed::Duplicate(record), offset_after, newline);
+                        }
+                        None => {}
                     }
                 }
             }
@@ -2106,23 +2129,34 @@ impl Classifier {
         record_count: usize,
         trail: [u8; 16],
         record_index: usize,
-    ) {
+    ) -> Option<Advance> {
         debug_assert!(matches!(self.reaction, Reaction::Collect));
         self.current_pos.record_index_in_segment = record_index;
         if self.recovery_pending {
-            return;
+            return None;
         }
         let prep = match self.feed_record_tolerant_entry(record, record_count, trail) {
             Ok(p) => p,
-            Err(_) => return, // on_violation recorded it; recovery_pending set
+            Err(_) => return None, // on_violation recorded it; recovery_pending set
         };
         if matches!(prep, TolerantPrep::Duplicate) {
             // Addendum 17.2 / 19.1: the duplicate-line handling is in the
             // shared `feed_record_tolerant_entry` path above; here we only
-            // skip the apply, like the reader's `continue`.
-            return;
+            // skip the apply, like the reader's `continue`. The caller
+            // mirrors the Stop arm by feeding `DispatchFed::Duplicate`
+            // for this record — the writer-field fold stays put and the
+            // byte cursor advances through the shared `note_record_fed`.
+            return Some(Advance::Duplicate);
         }
-        let _ = self.feed_record_apply_tolerant(record);
+        // General branch: on apply Ok, the classifier advanced state and
+        // the caller can feed the record like Stop does. On apply Err the
+        // violation is already recorded; no `on_feed` call must fire
+        // (a `DispatchFed::Record` on a rejected record would advance
+        // `since_checkpoint` and/or write `found` as if the apply had
+        // succeeded, diverging from Stop on an identical layout).
+        self.feed_record_apply_tolerant(record)
+            .ok()
+            .map(|()| Advance::Record)
     }
 
     /// Ruling 197-d1 addendum 19.1 (and 17.2): the duplicate-line arm is
@@ -2207,15 +2241,24 @@ impl Classifier {
         record_count: usize,
         trail: [u8; 16],
         record_index: usize,
-    ) {
+    ) -> Option<Advance> {
         debug_assert!(matches!(self.reaction, Reaction::Collect));
         debug_assert!(matches!(self.mode, Mode::Strict));
         self.current_pos.record_index_in_segment = record_index;
         if self.recovery_pending {
-            return;
+            return None;
         }
         let gap = self.take_gap();
-        let _ = self.feed_record(record, record_count, trail, gap);
+        // Return the strict `Advance` so the caller can route Collect's
+        // `on_feed` the same way Stop does: `Advance::Record` folds the
+        // record into the writer-field bookkeeping and `found`,
+        // `Advance::Duplicate` leaves the writer fields untouched but
+        // still writes `found` when the duplicate's head matches
+        // `expected`, and an `Err` (already recorded through
+        // `on_violation`) feeds nothing so a rejected record never
+        // advances state (#197 ruling addendum 27.1 Collect-vs-Stop
+        // Ok-path equality).
+        self.feed_record(record, record_count, trail, gap).ok()
     }
 
     /// Ruling 197-d1 addendum 17.1 (S3a′): strict-mode Collect entry for
