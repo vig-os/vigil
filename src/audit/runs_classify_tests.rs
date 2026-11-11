@@ -393,9 +393,9 @@ mod classify_collect_tests {
                 Violation::SequenceDidNotIncrease,
             )],
             "CC2: refresh-rotate prelude hits SequenceDidNotIncrease at the duplicated record; \
-             state threading (ruling 197-d1 addendum 27 continuation) lets rotated_0's opening cp \
-             re-use the prelude's folded state, so the rotated segment's strict pass does not \
-             re-record a second violation"
+             state threading (#197 ruling addendum 27.1) lets rotated_0's opening cp re-use the \
+             prelude's folded state, so the rotated segment's strict pass does not re-record a \
+             second violation"
         );
         assert!(
             !out.head_mismatch,
@@ -592,9 +592,9 @@ mod classify_collect_tests {
             Some(&cache),
         )
         .unwrap();
-        // Ruling 197-d1 addendum 27.4: literal assert_eq on the full
-        // vec. After state threading (addendum 27 continuation) the
-        // prelude's folded state is handed to rotated_0, so the strict
+        // #197 ruling addendum 27.4: literal assert_eq on the full
+        // vec. Under state threading (addendum 27.1) the prelude's
+        // folded state is handed to rotated_0, so the strict
         // first-violation surfaces on the prelude's glued duplicate at
         // (seg=0, rec=1).
         assert_eq!(
@@ -956,14 +956,14 @@ mod classify_collect_tests {
             None,
         )
         .unwrap();
-        // Ruling 197-d1 addendum 27 continuation / addendum 27.4:
-        // literal `vec![...]` assert_eq. With state threading, the
-        // sealed rotated_0's folded `State` reaches the live-close
-        // walker; the strict live-close pass sees `run=true` through
-        // the `*run` arg, `initial_boundary_resume = opening &&
-        // (ctx.run || !sealed(prior)) = true && (true || false) =
-        // true`, so the live's non-resume second record trips
-        // `boundary_resume && !first && !is_resume` and records
+        // #197 ruling addendum 27.4: literal `vec![...]` assert_eq.
+        // With state threading, the sealed rotated_0's folded `State`
+        // reaches the live-close walker; the strict live-close pass
+        // sees `run=true` through the `*run` arg,
+        // `initial_boundary_resume = opening && (ctx.run ||
+        // !sealed(prior)) = true && (true || false) = true`, so the
+        // live's non-resume second record trips `boundary_resume &&
+        // !first && !is_resume` and records
         // `UnclosedSegmentLacksResume` at (seg=1, rec=1). This is
         // byte-equal to the reader's RP12 `Err` detail
         // ("unclosed segment lacks matching immediate resume").
@@ -1036,19 +1036,19 @@ mod classify_collect_tests {
             None,
         )
         .unwrap();
-        // Ruling 197-d1 addendum 27 continuation / addendum 27.4:
-        // literal `vec![...]` assert_eq. With state threading, the
-        // sealed rotated_0's folded state reaches rotated_1's
-        // history_segment; strict detects the closing cp at `count ==
-        // 1` as `FirstSuccessorLacksImmediateResume` via
-        // `boundary_resume && !is_resume`, and the following live
-        // records `RecordRolledBack` because the state advance is
-        // halted by `recovery_pending`. Byte-equal to the reader's
-        // RP13 `Err` detail ("first successor lacks immediate
-        // resume"). Kills M-C2 ("classify threads `run = false`
-        // across sealed->sealed"): under the mutant `run_in=false`
-        // leaves `boundary_resume=false`, strict walks cleanly, and
-        // the resume violation never fires.
+        // #197 ruling addendum 27.4: literal `vec![...]` assert_eq.
+        // With state threading, the sealed rotated_0's folded state
+        // reaches rotated_1's history_segment; strict detects the
+        // closing cp at `count == 1` as
+        // `FirstSuccessorLacksImmediateResume` via `boundary_resume &&
+        // !is_resume`, and the following live records
+        // `RecordRolledBack` because the state advance is halted by
+        // `recovery_pending`. Byte-equal to the reader's RP13 `Err`
+        // detail ("first successor lacks immediate resume"). Kills
+        // M-C2 ("classify threads `run = false` across
+        // sealed->sealed"): under the mutant `run_in=false` leaves
+        // `boundary_resume=false`, strict walks cleanly, and the
+        // resume violation never fires.
         assert_eq!(
             out.violations,
             vec![
@@ -1076,6 +1076,68 @@ mod classify_collect_tests {
             "CC13: LiveOpen with expected=None never sets head_mismatch"
         );
     }
+
+    /// CC14-liveopen-ok-expected-on-sealed-record: Collect counterpart
+    /// of RP14. Layout sealed `[cp0, e1, cp2]`, live `[cp3]`, with
+    /// `expected = Head(cp2)`. Under Collect, `out.violations` is
+    /// empty (every record folds cleanly), `out.head_mismatch` is
+    /// false (expected matches cp2 on the sealed segment), and
+    /// `out.found` is `Some(cp2)`.
+    ///
+    /// Kills the "Collect sealed arm passes `expected = None`" and
+    /// the "Collect clears `found` after each sealed segment"
+    /// mutants: under either plant the sealed walker never writes
+    /// `found`, the live walker never matches on cp3, `head_mismatch`
+    /// flips to true, and the row's `assert_eq!(out.found, Some(..))`
+    /// exits 101.
+    #[test]
+    fn cc14_liveopen_ok_expected_on_sealed_record() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let second = entry(&first);
+        append(&d.0.join("audit.jsonl"), &second);
+        let mut mmr = seeded(&first);
+        mmr.push(second.hash()).unwrap();
+        let cp2 = cp(second.context.seq + 1, second.hash(), &mmr);
+        append(&d.0.join("audit.jsonl"), &cp2);
+        mmr.push(cp2.hash()).unwrap();
+        fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+        let cp3 = cp(cp2.context.seq + 1, cp2.hash(), &mmr);
+        fs::write(d.0.join("audit.jsonl"), line(&cp3)).unwrap();
+
+        let dir = dirfile(&d.0);
+        let out = classify_for_test(
+            &dir,
+            TRAIL,
+            ReaderPath::LiveOpen {
+                expected: Some(Head::of(&cp2)),
+            },
+            None,
+            Reaction::Collect,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            out.violations,
+            vec![],
+            "CC14: a valid rotated+live trail with expected on the sealed cp records no \
+             violations",
+        );
+        assert!(
+            !out.head_mismatch,
+            "CC14: expected matches cp2 on the sealed segment, so head_mismatch is false",
+        );
+        let found = out
+            .found
+            .as_ref()
+            .expect("CC14: the sealed walker must write `found` when `expected` matches cp2");
+        assert_eq!(
+            (found.hash(), found.context.seq),
+            (cp2.hash(), cp2.context.seq),
+            "CC14: `found` is cp2 (the sealed segment's second checkpoint); no later \
+             record overwrites it",
+        );
+    }
 }
 
 // ============================================================
@@ -1097,13 +1159,13 @@ mod classify_first_equality {
     /// first-violation outcome against classify under Collect's first
     /// violation. Covers all five reader paths (ruling 197-d1
     /// addendum 25.3): live open, open fallback, refresh append,
-    /// refresh rotate, refresh append+rotate. Ruling 197-d1 addendum
-    /// 27 continuation: the sweep also covers damaged multi-segment
-    /// layouts on every path (a garbage tail after a valid sealed, a
-    /// non-resume successor, and a broken prelude) and
-    /// expected-head-present layouts on live open and open fallback,
-    /// so first-equality catches both the state-threading and the
-    /// `found` writeback issues the review flagged.
+    /// refresh rotate, refresh append+rotate. #197 ruling addendum
+    /// 27.1: the sweep also covers damaged multi-segment layouts on
+    /// every path (a garbage tail after a valid sealed, a non-resume
+    /// successor, and a broken prelude), expected-head-present
+    /// layouts on live open and open fallback, and duplicate-line
+    /// layouts, so Ok-path full equality pins the state-threading
+    /// and `found` writeback behaviour.
     ///
     /// 0 mismatches, 0 exclusions required.
     #[test]
@@ -1203,9 +1265,10 @@ mod classify_first_equality {
                     (ReaderPath::RefreshRotate, Some(cache_for_path(cache)))
                 },
             },
-            // ----- Ruling 197-d1 addendum 27 continuation: damaged
-            //       multi-segment layouts that would catch state-
-            //       threading and `found` writeback bugs. -----
+            // ----- Damaged multi-segment layouts that exercise
+            //       state threading and the `found` writeback across
+            //       the sealed->live boundary (#197 ruling addendum
+            //       27.1 Collect-vs-Stop Ok-path equality). -----
             // Garbage tail after a valid sealed segment (LiveOpen).
             Row {
                 name: "liveopen-damaged-rotated-plus-non-resume-live",

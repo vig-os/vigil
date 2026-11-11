@@ -119,7 +119,7 @@ impl Cache {
     /// Test-only accessor so cross-module test code
     /// (`runs::classify_tests`) can clone the cached `State` into a
     /// classify args struct without widening the field to
-    /// `pub(crate)` (ruling 197-d1 addendum 27 continuation).
+    /// `pub(crate)` (#197 ruling addendum 27.1 / 27.4 Collect rows).
     #[cfg(test)]
     pub(crate) fn state(&self) -> &State {
         &self.state
@@ -127,8 +127,8 @@ impl Cache {
 
     /// Test-only constructor so the CC rows can assemble a `Cache`
     /// from a reader-produced `(state, file, sealed_before)` triple
-    /// without widening the fields (ruling 197-d1 addendum 27
-    /// continuation).
+    /// without widening the fields (#197 ruling addendum 27.1 / 27.4
+    /// Collect rows).
     #[cfg(test)]
     pub(crate) fn new_for_test(state: State, file: File, sealed_before: Option<PathBuf>) -> Self {
         Self {
@@ -833,20 +833,19 @@ pub(crate) fn history_segment(
     // (addendum 22.1) leaves `last_offset` / `last_newline` alone —
     // base-identical.
     //
-    // The pure run state used to be tracked here as a separate
-    // `last_run` Option updated from `on_feed(Record)`; ruling
-    // 197-d1 addendum 27 continuation moves it to the classifier's
-    // own `state` field, read out of the Tolerant arm's
-    // `CollectorOutcome.state`. Under Stop the two Options were
-    // identical byte-for-byte (every tolerant-Stop apply updated
-    // both `classifier.state` AND `last_run` in lockstep); under
-    // Collect the tolerant arm never routed through `on_feed`'s
-    // Record branch (dispatch_line's `(Tolerant, Collect)` arm calls
-    // `feed_record_collect` without the `on_feed(Record, rs)` call),
-    // so a separate `last_run` stayed `None` where the classifier's
-    // own state was `Some`. Threading via `CollectorOutcome.state`
-    // makes Collect return the same `Ok(state)` Stop does on
-    // `[cp0, close1, garbage\n]` and every analogous sealed layout.
+    // The pure run state is read out of the Tolerant arm's
+    // `CollectorOutcome.state` rather than tracked here as a
+    // separate `last_run` Option. Under Stop the two were identical
+    // byte-for-byte (every tolerant-Stop apply updated both the
+    // classifier's `state` and `last_run` in lockstep); under
+    // Collect, `dispatch_line`'s `(Tolerant, Collect)` arm does not
+    // call `on_feed(Record, rs)` on a rejected record, so a
+    // separate `last_run` would stay `None` where the classifier's
+    // own state is `Some`. Reading `outcome.state` keeps Stop
+    // byte-identical AND gives Collect the same `Ok(state)` Stop
+    // returns on `[cp0, close1, garbage\n]` and every analogous
+    // sealed layout (#197 ruling addendum 27.1 Collect-vs-Stop
+    // Ok-path equality).
     let mut running_state: Option<RunState> = state.as_ref().map(|s| s.run.clone());
     let mut cp_time = state.as_ref().map_or(0, |s| s.checkpoint_time);
     let mut since_cp = state.as_ref().map_or(0, |s| s.since_checkpoint);
@@ -889,17 +888,15 @@ pub(crate) fn history_segment(
             *run = outcome.run_flag;
             let bytes = bytes.into_inner();
             let violations = outcome.violations;
-            // Ruling 197-d1 addendum 27 continuation: thread the
-            // classifier's own folded state (identical to
-            // `running_state` under Stop, authoritative under
-            // Collect). Under Collect the tolerant arm's `on_feed`
-            // record branch does not fire (dispatch_line's
-            // `(Tolerant, Collect)` arm calls `feed_record_collect`
-            // without an `on_feed(Record, rs)` call), so a separate
+            // Thread the classifier's own folded state (identical to
+            // `running_state` under Stop, authoritative under Collect).
+            // Under Collect the tolerant arm's `on_feed` Record branch
+            // does not fire on a rejected record, so a separate
             // `running_state` would stay `None` where the classifier
             // already has `Some`. Using `outcome.state` keeps Stop
             // byte-identical and gives Collect the same `Ok(state)`
-            // Stop returns on `[cp0, close1, garbage\n]`.
+            // Stop returns on `[cp0, close1, garbage\n]` (#197
+            // ruling addendum 27.1 Collect-vs-Stop Ok-path equality).
             let final_run = outcome.state.clone().or(running_state);
             Ok((
                 final_run.map(|run_state| State {

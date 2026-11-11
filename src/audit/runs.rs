@@ -253,12 +253,12 @@ pub(crate) struct CollectorPos {
 /// typed violations in feed order, and `gap` is the gap hasher the
 /// caller threads forward.
 pub(crate) struct CollectorOutcome {
-    /// Ruling 197-d1 addendum 27 continuation:
     /// `storage::history_segment`'s Tolerant arm threads this field
     /// (the classifier's own folded state) back into the caller's
     /// `State` so Collect yields the same `Ok(state)` Stop returns on
     /// damaged sealed layouts (e.g. `[cp0, close1, garbage\n]`); Stop
-    /// consumes it through the same path, preserving byte-identity.
+    /// consumes it through the same path, preserving byte-identity
+    /// (#197 ruling addendum 27.1 Collect-vs-Stop Ok-path equality).
     pub(crate) state: Option<RunState>,
     pub(crate) run_flag: bool,
     pub(crate) violations: Vec<(CollectorPos, Violation)>,
@@ -956,11 +956,12 @@ pub(crate) fn classify(
             // `initial_record` / `refresh` loops' threading
             // byte-for-byte. Under Collect the per-segment outcome
             // reproduces Stop's `Ok(state)` on sealed segments (see
-            // `storage::history_segment`'s Tolerant arm, which now
-            // builds its final `State` from the classifier's own
-            // `state` field so Collect threads the same State as Stop
-            // on `[cp0, close1, garbage\n]` and every analogous
-            // sealed layout — ruling 197-d1 addendum 27 continuation).
+            // `storage::history_segment`'s Tolerant arm, which builds
+            // its final `State` from the classifier's own `state`
+            // field so Collect threads the same State as Stop on
+            // `[cp0, close1, garbage\n]` and every analogous sealed
+            // layout; #197 ruling addendum 27.1 Collect-vs-Stop
+            // Ok-path equality).
             state = next_state;
         }
         for (pos, v) in seg_violations {

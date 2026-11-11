@@ -4749,15 +4749,16 @@ mod details {
     #[test]
     fn coverage_gate_no_segment_loop_in_storage_rs() {
         /// Seed walker names: the two `runs::*` per-segment orchestrators
-        /// every storage shim ultimately dispatches into. Ruling 197-d1
-        /// addendum 27 continuation: the full walker set is DERIVED from
-        /// these seeds — any non-test fn in `storage.rs` whose body calls
-        /// one of the seeds (directly or transitively through another
-        /// such fn) joins the set. A loop in `storage.rs` whose body calls
-        /// ANY member of that set fails the gate; this catches a base-
-        /// style refresh-rotate loop that drives the walk through a thin
-        /// wrapper (e.g. a hand-rolled `history_segment_stop`) without
-        /// the gate having to list every wrapper by name.
+        /// every storage shim ultimately dispatches into. The full
+        /// walker set is DERIVED from these seeds — any non-test fn in
+        /// `storage.rs` whose body calls one of the seeds (directly or
+        /// transitively through another such fn) joins the set. A loop
+        /// in `storage.rs` whose body calls ANY member of that set
+        /// fails the gate; this catches a base-style refresh-rotate
+        /// loop that drives the walk through a thin wrapper (e.g. a
+        /// hand-rolled `history_segment_stop`) without the gate having
+        /// to list every wrapper by name (#197 ruling addendum 27.3
+        /// structural check derived from the enum).
         const SEED_WALKER_NAMES: &[&str] = &["history_segment", "scan_segment"];
 
         /// Allowed one-shot walker call sites in non-test `storage.rs`,
@@ -4990,8 +4991,8 @@ mod details {
 
         // Pass 1: build the per-fn callee map and derive the walker
         // set from `SEED_WALKER_NAMES` by closing over "this fn
-        // transitively calls one of the seeds" (ruling 197-d1
-        // addendum 27 continuation).
+        // transitively calls one of the seeds" (#197 ruling addendum
+        // 27.3 structural check derived from the enum).
         let mut calls_visitor = FnCallsVisitor {
             in_test_depth: 0,
             fn_stack: Vec::new(),
@@ -5490,9 +5491,10 @@ mod classify_reader_pins {
     }
 
     /// RP8-refresh-append-err-live-shrank: cached live at length L,
-    /// same inode but file shrank. `fn refresh` still catches this
-    /// before entering `classify` (ruling 197-d1 addendum 27 continuation: "this one does not enter
-    /// `classify`; it keeps the same `storage::refresh`-level check").
+    /// same inode but file shrank. `fn refresh` catches this before
+    /// entering `classify`; the `missing live file` / `live file
+    /// shrank` checks stay on the refresh shim where the reader
+    /// expects them.
     #[test]
     fn rp8_refresh_append_err_live_shrank() {
         let d = Temp::new();
@@ -5595,5 +5597,60 @@ mod classify_reader_pins {
         let close3 = cp(opening2.context.seq + 1, opening2.hash(), &mmr);
         append(&d.0.join("audit.jsonl"), &close3);
         corrupt_open_detail(&d.0, "first successor lacks immediate resume");
+    }
+
+    /// RP14-liveopen-ok-expected-on-sealed-record: a layout where
+    /// `expected` names a record that sits on a sealed segment
+    /// (sealed `[cp0, e1, cp2]`, live `[cp3]`, `expected = Head(cp2)`).
+    /// The reader opens with `expected = Some(Head(cp2))`, the
+    /// open-fallback walks the sealed segment with `expected` threaded
+    /// into `history_segment`, and the on_feed Record callback fires
+    /// `found = Some(cp2)` when the fold reaches cp2.
+    ///
+    /// Kills the "classify Collect sealed arm passes `expected =
+    /// None`" and "classify Collect clears `found` after each sealed
+    /// segment" mutants: `found` stays empty, the Err(HeadMismatch)
+    /// branch takes over, and the row's `Ok` assertion exits 101.
+    /// The Stop reader's `found` writeback in `storage::scan_inner`
+    /// drives both kills because the sealed arm runs with
+    /// `expected = args.expected`.
+    #[test]
+    fn rp14_liveopen_ok_expected_on_sealed_record() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let second = entry(&first);
+        append(&d.0.join("audit.jsonl"), &second);
+        let mut mmr = seeded(&first);
+        mmr.push(second.hash()).unwrap();
+        let cp2 = cp(second.context.seq + 1, second.hash(), &mmr);
+        append(&d.0.join("audit.jsonl"), &cp2);
+        mmr.push(cp2.hash()).unwrap();
+        fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+        let cp3 = cp(cp2.context.seq + 1, cp2.hash(), &mmr);
+        fs::write(d.0.join("audit.jsonl"), line(&cp3)).unwrap();
+        mmr.push(cp3.hash()).unwrap();
+        let reader = TrailReader::open(&d.0, TRAIL, Some(Head::of(&cp2))).unwrap();
+        let want = ReaderPin {
+            head: Head::of(&cp3),
+            checkpoint: true,
+            pending_resume: false,
+            run_loss: false,
+            checkpoint_predecessor: Some(Head {
+                seq: cp3.context.seq - 1,
+                hash: cp3.context.previous,
+            }),
+            checkpoint_previous: cp3.context.previous,
+            mmr_size: mmr.size(),
+            mmr_peaks: mmr.peaks().to_vec(),
+            offset: line(&cp3).len() as u64,
+            length: line(&cp3).len() as u64,
+            checkpoint_time: cp3.context.time,
+            since_checkpoint: 0,
+            tail_newline: true,
+            gap_hash: None,
+            sealed_before: Some(segment_name(0)),
+            found: Some(Head::of(&cp2)),
+        };
+        assert_eq!(pin_of(&reader, Some(Head::of(&cp2))), want);
     }
 }
