@@ -1721,8 +1721,8 @@ mod classify_first_equality {
             19,
             "sweep row count: expected 19 (every reader path with Ok and Err shapes, \
              damaged multi-segment layouts, expected-head-present on each LiveOpen \
-             shape, duplicate-line layouts on live-open and open-fallback, and \
-             expected on a sealed-prelude record for refresh rotate; #197 ruling \
+             shape, duplicate-line layouts on live-open and open-fallback, and a \
+             RefreshRotate chain with cached prelude + close + opening; #197 ruling \
              addendum 27.1 Ok-path full equality)",
         );
     }
