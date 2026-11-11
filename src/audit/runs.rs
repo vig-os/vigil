@@ -787,17 +787,15 @@ pub(crate) struct ClassifyArgs {
 }
 
 /// Terminal outcome of [`classify`]. One struct serves both reactions
-/// (ruling 197-d1 addendum 27 — one loop for both reactions).
-/// `final_state` / `live_file` are `Option` because under
-/// `Reaction::Collect` a broken live-only layout can finish with no
-/// folded record; under `Reaction::Stop` the live walker's invariant
-/// yields `Some` on every Ok return, and `initial_record` / `refresh`
-/// extract via [`Option::ok_or_else`] without any `expect` on the
-/// reader path. The Collect-only fields (`violations`,
-/// `head_mismatch`) are marked dead outside `#[cfg(test)]` until V4a
-/// in #197 R2b S3b2 lands the non-test consumer (ruling 197-d1
-/// addendum 25.5 precedent, matching the S3a `CollectorOutcome.gap`
-/// and `CollectorOutcome.violations` gating).
+/// (#197 ruling addendum 27.1). `final_state` / `live_file` are
+/// `Option` because under `Reaction::Collect` a broken live-only
+/// layout can finish with no folded record; under `Reaction::Stop`
+/// the live walker's invariant yields `Some` on every Ok return, and
+/// `initial_record` / `refresh` extract via [`Option::ok_or_else`]
+/// without any `expect` on the reader path. The Collect-only fields
+/// (`violations`, `head_mismatch`) are marked dead outside
+/// `#[cfg(test)]`: they are read only by this crate's Collect proof
+/// at this head.
 pub(crate) struct ClassifyOutput {
     /// `None` only under `Reaction::Collect` when the live segment's
     /// walker folded no complete record (strict Collect may latch
@@ -844,7 +842,7 @@ pub(crate) struct SegmentViolationPos {
     pub(crate) record_index_in_segment: usize,
 }
 
-/// Ruling 197-d1 addendum 25.1 and addendum 27: THE ONE multi-segment
+/// Ruling 197-d1 addendum 25.1 and addendum 27.1: THE ONE multi-segment
 /// orchestration for both reactions. Walks the segments in base order
 /// from a typed [`ReaderPath`] description, calls the per-segment
 /// [`storage::history_segment`] / [`storage::scan_closing`] /
@@ -952,8 +950,8 @@ pub(crate) fn classify(
             final_state = next_state.clone();
         } else if next_state.is_some() {
             // Thread the per-segment state into the next sealed
-            // segment. Under Stop this matches the pre-S3b1b
-            // `initial_record` / `refresh` loops' threading
+            // segment. Under Stop this matches the composed
+            // `initial_record` / `refresh` segment loops at base
             // byte-for-byte. Under Collect the per-segment outcome
             // reproduces Stop's `Ok(state)` on sealed segments (see
             // `storage::history_segment`'s Tolerant arm, which builds

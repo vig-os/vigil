@@ -5178,9 +5178,7 @@ mod classify_reader_pins {
 
     /// RP1-liveopen-ok-single-segment: single checkpoint + live close;
     /// reader returns Ok with the head set to the live's last record.
-    /// Kills M-C3 (dropping `found` writeback on the live-close walker)
-    /// and M-C10 (dropping the final-segment violations under Collect,
-    /// which shares the Stop-side `found` threading).
+    /// Kills M-C3 (dropping `found` writeback on the live-close walker).
     #[test]
     fn rp1_liveopen_ok_single_segment() {
         let d = Temp::new();
@@ -5243,9 +5241,9 @@ mod classify_reader_pins {
     /// RP4-liveopen-ok-rotated-plus-live: rotated_0 complete sealed
     /// segment + live with an opening. Reader returns Ok and the state
     /// reflects the live's latest record. Kills M-C1 (classify segment
-    /// loop skips the first sealed segment) and M-C9 (run inheritance
-    /// drops across live-close): both would break the Ok state after
-    /// rotation.
+    /// loop skips the first sealed segment): skipping the sealed arm
+    /// leaves `sealed_before` as `None` instead of the rotated name,
+    /// so the pin's `sealed_before: Some(segment_name(0))` flips.
     #[test]
     fn rp4_liveopen_ok_rotated_plus_live() {
         let d = Temp::new();
@@ -5317,10 +5315,11 @@ mod classify_reader_pins {
 
     /// RP9-refresh-rotate-ok-prelude-plus-live: an open reader sees an
     /// in-flight rotation and refreshes through the rotated branch.
-    /// Reader returns Ok with the head on the new live. Kills M-C2
-    /// (classify threads `run=false` across sealed→sealed) and M-C6
-    /// (`SealedPrelude` treated as `SealedOpening`): both would break
-    /// the prelude/next-run threading.
+    /// Reader returns Ok with the head on the new live. Kills M-C6
+    /// (`SealedPrelude` treated as `SealedOpening`): under the mutant
+    /// the prelude's history_segment is called with `opening=true`
+    /// instead of `false`, which rejects the cached prelude on this
+    /// layout.
     #[test]
     fn rp9_refresh_rotate_ok_prelude_plus_live() {
         let d = Temp::new();
@@ -5358,9 +5357,11 @@ mod classify_reader_pins {
     }
 
     /// RP11-refresh-append+rotate-ok: cache a live, append, then
-    /// rotate. Reader refreshes twice and reaches the new live. Kills
-    /// M-C2 (`run=false` across sealed→sealed) by requiring that run
-    /// state threads through the appended-then-rotated transition.
+    /// rotate. Reader refreshes twice and reaches the new live. Pins
+    /// the appended-then-rotated transition: the second refresh goes
+    /// through `RefreshRotate` after the first appended through
+    /// `RefreshAppend`, and the cached state's `length` must grow
+    /// past the appended bytes before the rotation is observed.
     #[test]
     fn rp11_refresh_append_then_rotate_ok() {
         let d = Temp::new();
@@ -5400,10 +5401,11 @@ mod classify_reader_pins {
 
     /// RP5-openfallback-err-rotated-nonincreasing-seq: rotated_0 has a
     /// corrupt run with a non-increasing sequence. The reader rejects
-    /// with CorruptTrail from the rotated segment. Candidate killer for
-    /// M-C7 (Collect `segment_index` not bumped) via the propagated
-    /// detail shape — see runs_classify_tests for the primary Collect
-    /// killer.
+    /// with CorruptTrail from the rotated segment. Pins the `classify`
+    /// Stop path's error propagation on the first sealed segment: the
+    /// detail string is byte-identical to the strict walker's inline
+    /// violation, so a mutant that suppresses sealed-arm errors flips
+    /// the outcome to `Ok`.
     #[test]
     fn rp5_openfallback_err_rotated_nonincreasing_seq() {
         let d = Temp::new();
@@ -5607,13 +5609,14 @@ mod classify_reader_pins {
     /// into `history_segment`, and the on_feed Record callback fires
     /// `found = Some(cp2)` when the fold reaches cp2.
     ///
-    /// Kills the "classify Collect sealed arm passes `expected =
-    /// None`" and "classify Collect clears `found` after each sealed
-    /// segment" mutants: `found` stays empty, the Err(HeadMismatch)
-    /// branch takes over, and the row's `Ok` assertion exits 101.
-    /// The Stop reader's `found` writeback in `storage::scan_inner`
-    /// drives both kills because the sealed arm runs with
-    /// `expected = args.expected`.
+    /// Pins the Stop-side `found` writeback in `storage::scan_inner`:
+    /// the sealed arm runs with `expected = args.expected`, so the
+    /// reader's `TrailReader::open` returns `Ok` with `found` set to
+    /// the sealed cp. A mutant that drops `expected` from the sealed
+    /// arm on BOTH reactions (not Collect-gated) leaves `found`
+    /// empty, the `head_mismatch_condition` branch returns
+    /// `Err(HeadMismatch)` under Stop, and the row's `assert_eq!`
+    /// exits 101.
     #[test]
     fn rp14_liveopen_ok_expected_on_sealed_record() {
         let d = Temp::new();
@@ -5652,5 +5655,90 @@ mod classify_reader_pins {
             found: Some(Head::of(&cp2)),
         };
         assert_eq!(pin_of(&reader, Some(Head::of(&cp2))), want);
+    }
+
+    /// RP15-liveopen-ok-duplicate-entry-in-live: a layout `[cp0, e1, e1]`
+    /// in a single live file. The strict walker folds `cp0` as
+    /// `Advance::Record`, `e1` as `Advance::Record` (state advances,
+    /// `since_checkpoint` bumps to 1), and the second `e1` as
+    /// `Advance::Duplicate` (state unchanged, `since_checkpoint`
+    /// stays at 1 because the duplicate branch does not call
+    /// `next_cp_fields`; `offset`/`length` still advance via
+    /// `note_record_fed`). Ruling 197-d1 addendum 27.4: pin every
+    /// `State` field reachable through the `cfg(test)` accessors so
+    /// a Collect-arm mutant that re-routes a duplicate as a Record
+    /// would flip the reader pin's observable outcome or the
+    /// Collect-vs-Stop equality one row below in
+    /// `runs_classify_tests` reads them against this baseline.
+    #[test]
+    fn rp15_liveopen_ok_duplicate_entry_in_live() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let second = entry(&first);
+        append(&d.0.join("audit.jsonl"), &second);
+        append(&d.0.join("audit.jsonl"), &second);
+        let reader = open(&d.0);
+        let mut mmr = seeded(&first);
+        mmr.push(second.hash()).unwrap();
+        let bytes = (line(&first).len() + 2 * line(&second).len()) as u64;
+        let want = ReaderPin {
+            head: Head::of(&second),
+            checkpoint: false,
+            pending_resume: false,
+            run_loss: false,
+            checkpoint_predecessor: Some(Head::of(&first)),
+            checkpoint_previous: second.context.previous,
+            mmr_size: mmr.size(),
+            mmr_peaks: mmr.peaks().to_vec(),
+            offset: bytes,
+            length: bytes,
+            checkpoint_time: first.context.time,
+            since_checkpoint: 1,
+            tail_newline: true,
+            gap_hash: None,
+            sealed_before: None,
+            found: None,
+        };
+        assert_eq!(pin_of(&reader, None), want);
+    }
+
+    /// RP16-refresh-rotate-damaged-prelude-requires-resume-on-live:
+    /// a RefreshRotate layout where the cached prelude carries a
+    /// complete `Line::Unparsable` tail (`[cp0, close1, garbage\n]`
+    /// after rotation). The tolerant fallback latches `damaged=true`
+    /// and `run_flag=true` while leaving the returned `State` sealed
+    /// (`gap=None`, `run.checkpoint=true`), so `classify`'s `run`
+    /// out-parameter carries `true` across the sealed boundary. The
+    /// live arm is `scan_closing(... found, run)`; with `run=true`
+    /// its `initial_boundary_resume = opening && (ctx.run ||
+    /// !sealed(prior)) = true && (true || false) = true`, and
+    /// strict's `boundary_resume && !first && !is_resume` check
+    /// trips on the live's non-resume second record, returning
+    /// `UnclosedSegmentLacksResume`. A mutant that drops the `run`
+    /// arg to `false` on the RefreshRotate live arm collapses
+    /// `initial_boundary_resume` to `(false || false) = false`,
+    /// strict walks cleanly, and the refresh returns `Ok`; the
+    /// reader pin's `reject_detail` then exits 101 on the
+    /// unexpected `Ok`.
+    #[test]
+    fn rp16_refresh_rotate_damaged_prelude_requires_resume_on_live() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        // Damage the rotated segment (same inode as the cache's
+        // live) with a complete Unparsable line: the tolerant
+        // epilogue latches `damaged=true` and `run_flag=true` and
+        // keeps `gap=None`; `*run` is the only signal carried
+        // across the sealed->live boundary.
+        append_bytes(&segment(&d.0, 0), b"garbage\n");
+        // Non-resume second record on the live so `run=true` trips
+        // `UnclosedSegmentLacksResume`.
+        append(&d.0.join("audit.jsonl"), &entry(&opening));
+        reject_detail(
+            reader.with_current(|_| Ok(()), |_, _, _| Ok(())),
+            "unclosed segment lacks matching immediate resume",
+        );
     }
 }

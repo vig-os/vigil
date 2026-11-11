@@ -205,7 +205,7 @@ mod classify_collect_tests {
     /// CC10-emit-head-mismatch-flag-false (refresh path, absent expected):
     /// Collect on RefreshAppend with no violation keeps `head_mismatch`
     /// false, because only `ReaderPath::LiveOpen { expected: Some(_) }`
-    /// can set it (addendum 27.1 / M-C5 / M-C10 killer).
+    /// can set it (addendum 27.1 / M-C5 killer).
     ///
     /// Addendum 27.4 / ruling 197-d1 addendum 27.4: literal pin.
     #[test]
@@ -347,10 +347,11 @@ mod classify_collect_tests {
 
     /// CC2-refresh-rotate-violation-in-rotated: a RefreshRotate layout
     /// with a valid prelude, a corrupt rotated_0 following it, and a
-    /// valid new live. Under Collect, classify tags the recorded
-    /// violation with `segment_index == 1` (prelude is segment 0,
-    /// rotated is segment 1). Kills M-C7 (Collect segment_index not
-    /// bumped): the mutant would tag this at seg 0 instead.
+    /// valid new live. Under Collect, state threading (#197 ruling
+    /// addendum 27.1) hands rotated_0's opening cp the prelude's
+    /// folded state, so the strict first-violation surfaces on the
+    /// prelude's duplicated record at `segment_index == 0`,
+    /// `record_index_in_segment == 1`.
     ///
     /// Addendum 27.4: literal `vec![...]` pin.
     #[test]
@@ -499,9 +500,11 @@ mod classify_collect_tests {
     /// non-identical rollback after the cache offset: an `Entry` with
     /// `seq == first.seq` (the rollback the strict scan rejects before
     /// dedup logic can swallow it as an identical duplicate). Under
-    /// Collect, classify_collect records at least one violation on
-    /// `segment_index == 0`. Kills M-C6 (`SealedPrelude` treated as
-    /// `SealedOpening`) via the shape of the first violation.
+    /// Collect, classify_collect records a prelude-side
+    /// `SequenceDidNotIncrease` at `segment_index == 0`
+    /// (`record_index_in_segment == 0`) and continues into rotated_0
+    /// where the broken hash link surfaces as a `RecordRolledBack`
+    /// at `segment_index == 1`.
     #[test]
     fn cc6_refresh_rotate_prelude_violation() {
         let d = Temp::new();
@@ -869,51 +872,6 @@ mod classify_collect_tests {
         assert_eq!(found.context.seq, opening.context.seq);
     }
 
-    /// RV6-Collect-sealed-expected-threaded-not-dropped: with rotated_0
-    /// as a complete sealed run and `expected = Head::of(&opening)`
-    /// on the LIVE opening, the live walker's `found` writeback must
-    /// fire; the rotated_0 sealed arm must also pass `expected` down
-    /// (not drop it to `None`), so if `expected` matched a sealed
-    /// record the rotated arm would populate it. Kills the RV6
-    /// mutant "Collect sealed arm passes `expected = None`": under
-    /// that mutant the sealed arm never fills `found`, and more
-    /// importantly on this layout the live arm also receives a
-    /// drop-chain flag that defeats `found`. We assert the literal
-    /// `found.hash() == opening.hash()` matches: under the RV6
-    /// mutant, if classify's sealed arm forces `expected = None`,
-    /// and the live-close walker inherits `found` state through a
-    /// prior-sealed-only threading check, the pin fires on a
-    /// surviving `None`. Ruling 197-d1 addendum 27.4: literal pin.
-    #[test]
-    fn rv6_collect_sealed_arm_threads_expected() {
-        let d = Temp::new();
-        let first = fixture(&d.0);
-        let mut mmr = seeded(&first);
-        let opening = rotated(&d.0, &first, &mut mmr, 0);
-        let dir = dirfile(&d.0);
-        let out = classify_for_test(
-            &dir,
-            TRAIL,
-            ReaderPath::LiveOpen {
-                expected: Some(Head::of(&opening)),
-            },
-            None,
-            Reaction::Collect,
-            None,
-        )
-        .unwrap();
-        // The `expected` argument must thread into the live-close
-        // walker; dropping it in the sealed arm would not change the
-        // live walker's own `expected = classify args.expected`, but
-        // dropping it in the sealed arm would also prevent `found`
-        // from being populated on a layout where the rotated side
-        // contains `Head::of(&opening)` as a sealed record.
-        let found = out.found.as_ref().expect(
-            "RV6: classify under Collect must thread `expected` into each sealed arm so the final `found` reflects a match on the live or on a prior sealed segment",
-        );
-        assert_eq!(found.hash(), opening.hash());
-    }
-
     /// CC12-liveopen-damaged-sealed-propagates-run-to-live-close:
     /// Under `Reaction::Collect`, the same layout as RP12 records an
     /// `UnclosedSegmentLacksResume` violation tagged at
@@ -1138,6 +1096,208 @@ mod classify_collect_tests {
              record overwrites it",
         );
     }
+
+    /// CC15-liveopen-ok-duplicate-entry-in-live: a layout `[cp0, e1, e1]`
+    /// in a single live file. Under `Reaction::Stop` the strict walker
+    /// takes `Advance::Duplicate` on the second `e1` (state unchanged,
+    /// `since_checkpoint` stays at 1). Under `Reaction::Collect` the
+    /// (Strict, Collect) dispatch arm receives `Some(Advance::Duplicate)`
+    /// from `feed_record_collect_strict` and emits
+    /// `DispatchFed::Duplicate` through `on_feed`, so Collect's
+    /// `final_state` matches Stop's bit-for-bit, with `violations == []`
+    /// and `head_mismatch == false` (ruling 197-d1 addendum 27.1
+    /// Collect-vs-Stop Ok-path equality).
+    ///
+    /// A mutant on the (Strict, Collect) arm that re-routes a duplicate
+    /// as `DispatchFed::Record` re-enters `on_feed`'s Record branch and
+    /// bumps `since_checkpoint` to 2 on the second `e1`, so Collect's
+    /// `final_state.since_checkpoint` diverges from Stop's; this row's
+    /// `assert_eq!` on the full `ok_outcome()` then exits 101.
+    #[test]
+    fn cc15_liveopen_ok_duplicate_entry_in_live() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let second = entry(&first);
+        append(&d.0.join("audit.jsonl"), &second);
+        append(&d.0.join("audit.jsonl"), &second);
+        let dir1 = dirfile(&d.0);
+        let stop = classify_for_test(
+            &dir1,
+            TRAIL,
+            ReaderPath::LiveOpen { expected: None },
+            None,
+            Reaction::Stop,
+            None,
+        )
+        .expect("CC15/Stop: `[cp0, e1, e1]` is a valid live-only layout");
+        let dir2 = dirfile(&d.0);
+        let collect = classify_for_test(
+            &dir2,
+            TRAIL,
+            ReaderPath::LiveOpen { expected: None },
+            None,
+            Reaction::Collect,
+            None,
+        )
+        .expect("CC15/Collect: `[cp0, e1, e1]` is a valid live-only layout");
+        assert_eq!(
+            collect.violations,
+            Vec::<(SegmentViolationPos, Violation)>::new(),
+            "CC15: a duplicate line on a live-only layout records no violations under Collect",
+        );
+        assert!(
+            !collect.head_mismatch,
+            "CC15: LiveOpen with `expected=None` never sets `head_mismatch`",
+        );
+        assert_eq!(
+            ok_outcome(&collect),
+            ok_outcome(&stop),
+            "CC15: Collect's `final_state` / `found` must equal Stop's bit-for-bit on \
+             `[cp0, e1, e1]` (every State field, including `since_checkpoint == 1`)",
+        );
+        let finish = collect
+            .final_state
+            .as_ref()
+            .expect("CC15: live arm yields a folded state");
+        assert_eq!(
+            finish.since_checkpoint, 1,
+            "CC15: the duplicate branch must NOT call `next_cp_fields`, so \
+             `since_checkpoint` stays at 1 (the count from the first `e1`)",
+        );
+    }
+
+    /// CC16-liveopen-err-record-rolled-back-expected-on-prior-live:
+    /// a layout `[cp0, e1, H]` where `H` is a distinct record with the
+    /// same `context.seq` as `e1` (and the same `context.previous =
+    /// cp0.hash`), so `apply_checked` returns
+    /// `Violation::RecordRolledBack`. The `expected` head is `e1`, so
+    /// when the Collect walker folds `e1` the on_feed Record branch
+    /// writes `found = Some(e1)`. The Strict-Collect arm then rejects
+    /// `H` through `feed_record_collect_strict` (returns `None`),
+    /// `on_violation` records `(pos{0,2}, RecordRolledBack)` and
+    /// latches `recovery_pending`, and the `None` dispatch branch runs
+    /// nothing: `found` keeps its `Some(e1)` value.
+    ///
+    /// A mutant on the (Strict, Collect) arm that runs `on_feed` on
+    /// the `None` branch feeds `DispatchFed::Record(H, rs=e1)`, so
+    /// `expected == Some(rs.head)` matches and the `on_feed` Record
+    /// branch overwrites `found` to `Some(H)`. This row's
+    /// `assert_eq!` on `found` then exits 101.
+    #[test]
+    fn cc16_liveopen_err_record_rolled_back_expected_on_prior_live() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let second = entry(&first);
+        append(&d.0.join("audit.jsonl"), &second);
+        // `H`: same seq as `second`, distinct payload (different
+        // actor), same previous (points to cp0). `apply_checked`
+        // returns `Violation::RecordRolledBack` because
+        // `head.seq <= s.head.seq` (equal) and the hashes differ.
+        let h = Record::new(
+            RecordContext::new(
+                TRAIL,
+                second.context.seq,
+                100 + second.context.seq,
+                "other",
+                first.hash(),
+            ),
+            Entry::new("other", "change", "object"),
+        )
+        .unwrap();
+        append(&d.0.join("audit.jsonl"), &h);
+
+        let dir = dirfile(&d.0);
+        let out = classify_for_test(
+            &dir,
+            TRAIL,
+            ReaderPath::LiveOpen {
+                expected: Some(Head::of(&second)),
+            },
+            None,
+            Reaction::Collect,
+            None,
+        )
+        .expect("CC16: Collect finishes Ok with a rolled-back record recorded");
+        assert_eq!(
+            out.violations,
+            vec![(
+                SegmentViolationPos {
+                    segment_index: 0,
+                    record_index_in_segment: 2,
+                },
+                Violation::RecordRolledBack,
+            )],
+            "CC16: exact literal list — `H` rolls the stream back at (seg=0, rec=2), \
+             nothing else records",
+        );
+        let found = out
+            .found
+            .as_ref()
+            .expect("CC16: the Record-branch writeback must fire when `e1` folds");
+        assert_eq!(
+            (found.hash(), found.context.seq),
+            (second.hash(), second.context.seq),
+            "CC16: `found` is `e1` (the record whose head equals `expected`); the \
+             rejected `H` must NOT overwrite `found` through the `None` dispatch branch",
+        );
+        assert!(
+            !out.head_mismatch,
+            "CC16: `expected` was found on the live segment before `H` rejected, so \
+             `head_mismatch` stays false",
+        );
+    }
+
+    /// CC17-refresh-rotate-damaged-prelude-requires-resume-on-live:
+    /// Collect counterpart of `RP16`. Same RefreshRotate layout
+    /// (cached prelude ends with a complete `Line::Unparsable`
+    /// payload after rotation); under `Reaction::Collect` the live
+    /// arm's Strict-Collect walker records `UnclosedSegmentLacksResume`
+    /// at `segment_index == 1` (the live), tagged at
+    /// `record_index_in_segment == 1`. The threaded `run=true` from
+    /// the damaged sealed prelude is the sole signal driving
+    /// `initial_boundary_resume`; a mutant that drops the live arm's
+    /// `run` arg to `false` collapses it, strict walks the live
+    /// cleanly, and the violation disappears — the row's
+    /// `assert_eq!` on the exact `violations` list then exits 101.
+    #[test]
+    fn cc17_refresh_rotate_damaged_prelude_requires_resume_on_live() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let cache = live_cache(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        append_bytes(&segment(&d.0, 0), b"garbage\n");
+        append(&d.0.join("audit.jsonl"), &entry(&opening));
+
+        let dir = dirfile(&d.0);
+        let out = classify_for_test(
+            &dir,
+            TRAIL,
+            ReaderPath::RefreshRotate,
+            Some(cache.state().clone()),
+            Reaction::Collect,
+            Some(&cache),
+        )
+        .expect("CC17: Collect finishes Ok with the live-side violation recorded");
+        assert_eq!(
+            out.violations,
+            vec![(
+                SegmentViolationPos {
+                    segment_index: 1,
+                    record_index_in_segment: 1,
+                },
+                Violation::UnclosedSegmentLacksResume,
+            )],
+            "CC17: exact literal list — the threaded `run=true` from the damaged \
+             prelude makes the live's non-resume second record trip \
+             `UnclosedSegmentLacksResume` at (seg=1, rec=1)",
+        );
+        assert!(
+            !out.head_mismatch,
+            "CC17: `RefreshRotate` never passes an `expected` head, so `head_mismatch` \
+             stays false",
+        );
+    }
 }
 
 // ============================================================
@@ -1356,11 +1516,11 @@ mod classify_first_equality {
                 },
             },
             // #197 ruling addendum 27.1 Ok-path full-equality: layouts
-            // that would catch the Collect `on_feed` divergence item 1
-            // of this fix round fixed. A duplicate line on a live-only
-            // layout: Stop takes `Advance::Duplicate`, which keeps
-            // `since_checkpoint` at 1; broken Collect would fold the
-            // duplicate as `Advance::Record` and raise it to 2.
+            // that pin Collect's Advance routing on duplicates and
+            // on expected-head threading. A duplicate line on a
+            // live-only layout: Stop takes `Advance::Duplicate`,
+            // which keeps `since_checkpoint` at 1; feeding the
+            // duplicate as `Advance::Record` would raise it to 2.
             Row {
                 name: "liveopen-ok-duplicate-entry",
                 build: |p| {
@@ -1425,16 +1585,15 @@ mod classify_first_equality {
                     )
                 },
             },
-            // Expected head on a sealed-prelude record (refresh rotate
-            // shape). Same kill class as the open-fallback row above,
-            // but routed through `history_segment(opening = false)`.
-            // Note: `RefreshRotate` never raises HeadMismatch, so this
-            // row exercises the sealed walker's `expected` plumbing
-            // only through the Ok-path full-equality: if the sealed
-            // arm dropped `expected` to `None`, Collect's `found`
-            // would stay empty.
+            // RefreshRotate with the cached live rotated under the
+            // reader: the cached prelude holds `[cp0, e1]`, rotated_0
+            // closes it with `[cp0, e1, close]`, and the new live
+            // carries the opening. Exercises the sealed walker's
+            // state threading across the RefreshRotate prelude →
+            // rotated → live chain (`RefreshRotate` never passes an
+            // `expected` head, so the row does not drive `found`).
             Row {
-                name: "refresh-rotate-ok-expected-on-prelude-record",
+                name: "refresh-rotate-ok-cached-prelude-plus-close-plus-opening",
                 build: |p| {
                     let first = fixture(p);
                     let second = entry(&first);
