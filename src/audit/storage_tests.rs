@@ -94,6 +94,31 @@ fn reject<T>(result: Result<T, AuditError>) {
 fn corrupt_open(path: &Path) {
     reject(TrailReader::open(path, TRAIL, None));
 }
+/// Extracts the detail string from an [`AuditError`] via its `Display`
+/// impl (`"{kind:?}: {detail}"`). Ruling 197-d1 addendum 27.4: the RP
+/// literal outcomes pin both the `kind` and the exact detail.
+fn detail_of(err: &AuditError) -> String {
+    let display = format!("{err}");
+    display
+        .split_once(": ")
+        .map_or(display.clone(), |(_, d)| d.to_string())
+}
+/// Pin an `Err` outcome by both `kind` and the exact detail string
+/// (ruling 197-d1 addendum 27.4). Extended from `bad(kind)` to keep the
+/// RP Err helpers DRY.
+fn bad_detail<T>(result: Result<T, AuditError>, kind: AuditErrorKind, detail: &str) {
+    let err = result.err().expect("expected Err");
+    assert_eq!(err.kind(), kind, "kind mismatch");
+    assert_eq!(detail_of(&err), detail, "detail mismatch");
+}
+/// Pin a `CorruptTrail` outcome by its exact detail string.
+fn reject_detail<T>(result: Result<T, AuditError>, detail: &str) {
+    bad_detail(result, AuditErrorKind::CorruptTrail, detail);
+}
+/// Pin a `TrailReader::open` `CorruptTrail` outcome by its exact detail.
+fn corrupt_open_detail(path: &Path, detail: &str) {
+    reject_detail(TrailReader::open(path, TRAIL, None), detail);
+}
 
 fn write_records(path: &Path, records: &[&Record]) {
     write(
@@ -105,7 +130,10 @@ fn write(path: &Path, bytes: impl AsRef<[u8]>) {
     fs::write(path.join("audit.jsonl"), bytes).unwrap();
 }
 fn segment(path: &Path, id: usize) -> PathBuf {
-    path.join(format!("audit-20260101T000000.000000000Z_{id:06}.jsonl"))
+    path.join(segment_name(id))
+}
+fn segment_name(id: usize) -> PathBuf {
+    PathBuf::from(format!("audit-20260101T000000.000000000Z_{id:06}.jsonl"))
 }
 fn rotated(path: &Path, last: &Record, mmr: &mut Mmr, id: usize) -> Record {
     let close = cp(last.context.seq + 1, last.hash(), mmr);
@@ -5084,6 +5112,69 @@ mod details {
 mod classify_reader_pins {
     use super::*;
 
+    /// Full reader-observed outcome for an `Ok` RP pin (ruling 197-d1
+    /// addendum 27.4). Captures every field of `storage::State` the
+    /// test can reach through the `cfg(test)` accessors, plus
+    /// `Cache::sealed_before` and the `Option<Head>` of the record
+    /// matched against the opener's `expected` head (`None` when
+    /// `expected = None`).
+    #[derive(Debug, PartialEq, Clone)]
+    struct ReaderPin {
+        head: Head,
+        checkpoint: bool,
+        pending_resume: bool,
+        run_loss: bool,
+        checkpoint_predecessor: Option<Head>,
+        checkpoint_previous: [u8; 32],
+        mmr_size: u64,
+        mmr_peaks: Vec<[u8; 32]>,
+        offset: u64,
+        length: u64,
+        checkpoint_time: u64,
+        since_checkpoint: u64,
+        tail_newline: bool,
+        gap_hash: Option<[u8; 32]>,
+        sealed_before: Option<PathBuf>,
+        found: Option<Head>,
+    }
+
+    /// Measures the full `ReaderPin` from an opened [`TrailReader`]:
+    /// the cached `State` + `sealed_before` from the reader's own
+    /// `Cache`, and `found` from a re-run of the initial scan under
+    /// the directory lock (ruling 197-d1 addendum 27.4). For an
+    /// `Ok(_)` `TrailReader::open`, this captures exactly what the
+    /// reader threaded through `classify` under `Reaction::Stop`.
+    fn pin_of(reader: &TrailReader, expected: Option<Head>) -> ReaderPin {
+        let found = reader
+            .with_initial(
+                expected,
+                |_| Ok(()),
+                |_, _, _s, record| Ok(record.map(|r| Head::of(&r))),
+            )
+            .unwrap();
+        reader.inspect_cache(|cache| {
+            let s = cache.state();
+            ReaderPin {
+                head: s.run.head,
+                checkpoint: s.run.checkpoint,
+                pending_resume: s.run.pending_resume,
+                run_loss: s.run.run_loss,
+                checkpoint_predecessor: s.run.checkpoint_predecessor,
+                checkpoint_previous: s.run.checkpoint_previous,
+                mmr_size: s.run.mmr.size(),
+                mmr_peaks: s.run.mmr.peaks().to_vec(),
+                offset: s.offset(),
+                length: s.length,
+                checkpoint_time: s.checkpoint_time,
+                since_checkpoint: s.since_checkpoint,
+                tail_newline: s.tail_newline(),
+                gap_hash: s.gap_digest_raw(),
+                sealed_before: cache.sealed_before().map(Path::to_path_buf),
+                found,
+            }
+        })
+    }
+
     /// RP1-liveopen-ok-single-segment: single checkpoint + live close;
     /// reader returns Ok with the head set to the live's last record.
     /// Kills M-C3 (dropping `found` writeback on the live-close walker)
@@ -5094,12 +5185,38 @@ mod classify_reader_pins {
         let d = Temp::new();
         let first = fixture(&d.0);
         let reader = open(&d.0);
-        assert_eq!(head(&reader), Head::of(&first));
-        // An explicit expected head that matches must also round-trip:
-        // the `found` writeback on `scan_closing` is what makes
-        // TrailReader::open return Ok instead of HeadMismatch. M-C3
-        // would turn this into Err(HeadMismatch).
-        assert!(TrailReader::open(&d.0, TRAIL, Some(Head::of(&first))).is_ok());
+        let want_mmr = seeded(&first);
+        let want = ReaderPin {
+            head: Head::of(&first),
+            checkpoint: true,
+            pending_resume: false,
+            run_loss: false,
+            checkpoint_predecessor: None,
+            checkpoint_previous: Record::genesis(&TRAIL),
+            mmr_size: want_mmr.size(),
+            mmr_peaks: want_mmr.peaks().to_vec(),
+            offset: line(&first).len() as u64,
+            length: line(&first).len() as u64,
+            checkpoint_time: first.context.time,
+            since_checkpoint: 0,
+            tail_newline: true,
+            gap_hash: None,
+            sealed_before: None,
+            found: None,
+        };
+        assert_eq!(pin_of(&reader, None), want.clone());
+        // Round-trip with the matching expected head: the `found`
+        // writeback on `scan_closing` is what makes `TrailReader::open`
+        // return Ok instead of HeadMismatch (M-C3 would flip this to
+        // Err(HeadMismatch)).
+        let matched = TrailReader::open(&d.0, TRAIL, Some(Head::of(&first))).unwrap();
+        assert_eq!(
+            pin_of(&matched, Some(Head::of(&first))),
+            ReaderPin {
+                found: Some(Head::of(&first)),
+                ..want
+            }
+        );
     }
 
     /// RP3-liveopen-err-headmismatch: valid trail but `expected=Some(_)`
@@ -5115,9 +5232,10 @@ mod classify_reader_pins {
             seq: 42,
             hash: [0xee; 32],
         };
-        bad(
+        bad_detail(
             TrailReader::open(&d.0, TRAIL, Some(absent)),
             AuditErrorKind::HeadMismatch,
+            "expected head absent or different",
         );
     }
 
@@ -5133,7 +5251,29 @@ mod classify_reader_pins {
         let first = fixture(&d.0);
         let mut mmr = seeded(&first);
         let opening = rotated(&d.0, &first, &mut mmr, 0);
-        assert_eq!(head(&open(&d.0)), Head::of(&opening));
+        let reader = open(&d.0);
+        let want = ReaderPin {
+            head: Head::of(&opening),
+            checkpoint: true,
+            pending_resume: false,
+            run_loss: false,
+            checkpoint_predecessor: Some(Head {
+                seq: opening.context.seq - 1,
+                hash: opening.context.previous,
+            }),
+            checkpoint_previous: opening.context.previous,
+            mmr_size: mmr.size(),
+            mmr_peaks: mmr.peaks().to_vec(),
+            offset: line(&opening).len() as u64,
+            length: line(&opening).len() as u64,
+            checkpoint_time: opening.context.time,
+            since_checkpoint: 0,
+            tail_newline: true,
+            gap_hash: None,
+            sealed_before: Some(segment_name(0)),
+            found: None,
+        };
+        assert_eq!(pin_of(&reader, None), want);
     }
 
     /// RP7-refresh-append-ok: cache a live file, then append; refresh
@@ -5147,11 +5287,31 @@ mod classify_reader_pins {
         let reader = open(&d.0);
         let second = entry(&first);
         append(&d.0.join("audit.jsonl"), &second);
-        assert_eq!(head(&reader), Head::of(&second));
         // Refresh must succeed with no spurious HeadMismatch.
         reader
             .with_current(|_| Ok(()), |_, _, _| Ok(()))
             .expect("RP7: refresh-append must be Ok");
+        let mut mmr = seeded(&first);
+        mmr.push(second.hash()).unwrap();
+        let want = ReaderPin {
+            head: Head::of(&second),
+            checkpoint: false,
+            pending_resume: false,
+            run_loss: false,
+            checkpoint_predecessor: Some(Head::of(&first)),
+            checkpoint_previous: second.context.previous,
+            mmr_size: mmr.size(),
+            mmr_peaks: mmr.peaks().to_vec(),
+            offset: (line(&first).len() + line(&second).len()) as u64,
+            length: (line(&first).len() + line(&second).len()) as u64,
+            checkpoint_time: first.context.time,
+            since_checkpoint: 1,
+            tail_newline: true,
+            gap_hash: None,
+            sealed_before: None,
+            found: None,
+        };
+        assert_eq!(pin_of(&reader, None), want);
     }
 
     /// RP9-refresh-rotate-ok-prelude-plus-live: an open reader sees an
@@ -5169,7 +5329,31 @@ mod classify_reader_pins {
         let opening = rotated(&d.0, &first, &mut mmr, 0);
         // The lagging reader must now see the rotated segment + the new
         // live via the RefreshRotate `classify` path.
-        assert_eq!(head(&reader), Head::of(&opening));
+        reader
+            .with_current(|_| Ok(()), |_, _, _| Ok(()))
+            .expect("RP9: refresh-rotate must be Ok");
+        let want = ReaderPin {
+            head: Head::of(&opening),
+            checkpoint: true,
+            pending_resume: false,
+            run_loss: false,
+            checkpoint_predecessor: Some(Head {
+                seq: opening.context.seq - 1,
+                hash: opening.context.previous,
+            }),
+            checkpoint_previous: opening.context.previous,
+            mmr_size: mmr.size(),
+            mmr_peaks: mmr.peaks().to_vec(),
+            offset: line(&opening).len() as u64,
+            length: line(&opening).len() as u64,
+            checkpoint_time: opening.context.time,
+            since_checkpoint: 0,
+            tail_newline: true,
+            gap_hash: None,
+            sealed_before: Some(segment_name(0)),
+            found: None,
+        };
+        assert_eq!(pin_of(&reader, None), want);
     }
 
     /// RP11-refresh-append+rotate-ok: cache a live, append, then
@@ -5186,7 +5370,31 @@ mod classify_reader_pins {
         let mut mmr = seeded(&first);
         mmr.push(second.hash()).unwrap();
         let opening = rotated(&d.0, &second, &mut mmr, 0);
-        assert_eq!(head(&reader), Head::of(&opening));
+        reader
+            .with_current(|_| Ok(()), |_, _, _| Ok(()))
+            .expect("RP11: append+rotate refresh must be Ok");
+        let want = ReaderPin {
+            head: Head::of(&opening),
+            checkpoint: true,
+            pending_resume: false,
+            run_loss: false,
+            checkpoint_predecessor: Some(Head {
+                seq: opening.context.seq - 1,
+                hash: opening.context.previous,
+            }),
+            checkpoint_previous: opening.context.previous,
+            mmr_size: mmr.size(),
+            mmr_peaks: mmr.peaks().to_vec(),
+            offset: line(&opening).len() as u64,
+            length: line(&opening).len() as u64,
+            checkpoint_time: opening.context.time,
+            since_checkpoint: 0,
+            tail_newline: true,
+            gap_hash: None,
+            sealed_before: Some(segment_name(0)),
+            found: None,
+        };
+        assert_eq!(pin_of(&reader, None), want);
     }
 
     /// RP5-openfallback-err-rotated-nonincreasing-seq: rotated_0 has a
@@ -5206,7 +5414,10 @@ mod classify_reader_pins {
         let bytes = fs::read(segment(&d.0, 0)).unwrap();
         let doubled = [bytes, line(&first)].concat();
         fs::write(segment(&d.0, 0), doubled).unwrap();
-        reject(TrailReader::open(&d.0, TRAIL, None));
+        reject_detail(
+            TrailReader::open(&d.0, TRAIL, None),
+            "record sequence did not increase inside sealed run",
+        );
     }
 
     /// RP2-liveopen-err-missing-initial-checkpoint: live-only, first
@@ -5221,7 +5432,7 @@ mod classify_reader_pins {
         let first = cp(0, Record::genesis(&TRAIL), &Mmr::new());
         let bad_first = entry(&first);
         write_records(&d.0, &[&bad_first]);
-        corrupt_open(&d.0);
+        corrupt_open_detail(&d.0, "missing opening checkpoint");
     }
 
     /// RP6-openfallback-err-live-after-valid-rotated: rotated_0 is a
@@ -5249,7 +5460,7 @@ mod classify_reader_pins {
             .set_len(length - 1)
             .unwrap();
         append_bytes(&path, b"garbage\n");
-        corrupt_open(&d.0);
+        corrupt_open_detail(&d.0, "invalid audit line or opening checkpoint");
     }
 
     /// RP10-refresh-rotate-err-prelude-glued-bytes: refresh after a
@@ -5272,7 +5483,10 @@ mod classify_reader_pins {
         fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
         let opening = cp(close.context.seq + 1, close.hash(), &mmr);
         fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
-        reject(reader.with_current(|_| Ok(()), |_, _, _| Ok(())));
+        reject_detail(
+            reader.with_current(|_| Ok(()), |_, _, _| Ok(())),
+            "record rolled back, changed or broke its hash link",
+        );
     }
 
     /// RP8-refresh-append-err-live-shrank: cached live at length L,
@@ -5298,7 +5512,10 @@ mod classify_reader_pins {
             .unwrap()
             .set_len(length - 10)
             .unwrap();
-        reject(reader.with_current(|_| Ok(()), |_, _, _| Ok(())));
+        reject_detail(
+            reader.with_current(|_| Ok(()), |_, _, _| Ok(())),
+            "live file shrank below cached length",
+        );
     }
 
     /// RP12-liveopen-damaged-sealed-propagates-run-across-live-close:
@@ -5336,7 +5553,7 @@ mod classify_reader_pins {
         // `UnclosedSegmentLacksResume` via strict's
         // `boundary_resume && !first && !is_resume` check.
         append(&d.0.join("audit.jsonl"), &entry(&opening));
-        corrupt_open(&d.0);
+        corrupt_open_detail(&d.0, "unclosed segment lacks matching immediate resume");
     }
 
     /// RP13-liveopen-damaged-sealed-propagates-run-across-sealed:
@@ -5377,6 +5594,6 @@ mod classify_reader_pins {
         // observable as Ok vs. Err rather than two different Errs.
         let close3 = cp(opening2.context.seq + 1, opening2.hash(), &mmr);
         append(&d.0.join("audit.jsonl"), &close3);
-        corrupt_open(&d.0);
+        corrupt_open_detail(&d.0, "first successor lacks immediate resume");
     }
 }

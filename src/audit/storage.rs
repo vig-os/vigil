@@ -87,6 +87,26 @@ impl State {
     pub(crate) fn needs_newline(&self) -> bool {
         !self.newline
     }
+    /// Test-only accessor: the cursor the reader holds for the live
+    /// file's next read (ruling 197-d1 addendum 27.4). Used by the RP
+    /// literal outcomes to pin the full cached `State`.
+    #[cfg(test)]
+    pub(crate) fn offset(&self) -> u64 {
+        self.offset
+    }
+    /// Test-only accessor: the raw gap-hasher's digest without the B2b
+    /// repair LF (ruling 197-d1 addendum 27.4). `repair_digest`
+    /// includes that LF; the RP rows pin the raw gap state.
+    #[cfg(test)]
+    pub(crate) fn gap_digest_raw(&self) -> Option<[u8; 32]> {
+        self.gap.as_ref().map(|g| *g.clone().finalize().as_bytes())
+    }
+    /// Test-only accessor: whether the last complete record ended in LF
+    /// (ruling 197-d1 addendum 27.4). The negation of `needs_newline`.
+    #[cfg(test)]
+    pub(crate) fn tail_newline(&self) -> bool {
+        self.newline
+    }
 }
 pub(crate) struct Cache {
     // Last sealed name observed when this live descriptor was acquired.
@@ -116,6 +136,13 @@ impl Cache {
             file,
             sealed_before,
         }
+    }
+    /// Test-only accessor: the newest sealed segment name observed at
+    /// open time, as the reader stored it (ruling 197-d1 addendum
+    /// 27.4). Used by the RP literal outcomes.
+    #[cfg(test)]
+    pub(crate) fn sealed_before(&self) -> Option<&Path> {
+        self.sealed_before.as_deref()
     }
 }
 
@@ -235,6 +262,19 @@ impl TrailReader {
         f: impl FnOnce(&File, &mut File, &mut State) -> Result<T, AuditError>,
     ) -> Result<T, AuditError> {
         self.with_current_checked(settle, Some(decide), f)
+    }
+
+    /// Test-only accessor: borrows the cached `State` and the stored
+    /// `sealed_before` sealed-segment-name bound (ruling 197-d1
+    /// addendum 27.4). Used by the RP literal outcomes to pin the full
+    /// reader-observed state after `open` / `with_current`.
+    #[cfg(test)]
+    pub(crate) fn inspect_cache<T>(&self, f: impl FnOnce(&Cache) -> T) -> T {
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&cache)
     }
 
     fn with_current_checked<T>(
