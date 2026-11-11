@@ -114,6 +114,53 @@ fn detail_of(err: &AuditError) -> String {
     s.split_once(": ").map_or(s.clone(), |(_, d)| d.to_string())
 }
 
+/// Serialises every reachable field of [`ClassifyOutput::final_state`] +
+/// [`ClassifyOutput::found`] into a string. The first-equality sweep uses
+/// this to compare the Stop and Collect Ok outcomes bit-for-bit
+/// (#197 ruling addendum 27.1 Collect-vs-Stop Ok-path equality). Comparing
+/// strings keeps the diagnostic readable when a mismatch fires.
+fn ok_outcome(output: &ClassifyOutput) -> String {
+    let state = output.final_state.as_ref().map(|s| {
+        let run = &s.run;
+        let predecessor = run.checkpoint_predecessor.map(|h| (h.seq, h.hash));
+        format!(
+            "head=({},{:x?}) checkpoint={} pending_resume={} run_loss={} predecessor={:?} \
+             prev={:x?} mmr_size={} mmr_peaks={:x?} offset={} length={} cp_time={} \
+             since_cp={} newline={} gap_digest={:x?}",
+            run.head.seq,
+            run.head.hash,
+            run.checkpoint,
+            run.pending_resume,
+            run.run_loss,
+            predecessor,
+            run.checkpoint_previous,
+            run.mmr.size(),
+            run.mmr.peaks(),
+            s.offset(),
+            s.length,
+            s.checkpoint_time,
+            s.since_checkpoint,
+            s.tail_newline(),
+            s.gap_digest_raw(),
+        )
+    });
+    let found = output.found.as_ref().map(|r| {
+        format!(
+            "head=({},{:x?}) seq={}",
+            r.context.seq,
+            r.hash(),
+            r.context.seq
+        )
+    });
+    format!(
+        "state={:?} found={:?} sealed_before={:?} live_file_present={}",
+        state,
+        found,
+        output.sealed_before,
+        output.live_file.is_some(),
+    )
+}
+
 /// Returns the `Cache` after a successful live-open, for use as the
 /// starting state of a refresh row. Threads through the real reader so
 /// the cache is byte-identical to what `TrailReader::open` would build.
@@ -433,21 +480,17 @@ mod classify_collect_tests {
             None,
         )
         .unwrap();
-        // The first recorded violation is on the rotated_0 segment
-        // (segment_index == 0). Pin the first entry's (pos, violation)
-        // and that no violation precedes it.
-        let first_v = out.violations.first().cloned();
         assert_eq!(
-            first_v,
-            Some((
+            out.violations,
+            vec![(
                 SegmentViolationPos {
                     segment_index: 0,
                     record_index_in_segment: 2,
                 },
                 Violation::SequenceDidNotIncrease,
-            )),
-            "CC4: open-fallback first violation sits on rotated_0 (seg=0, rec=2) \
-             with SequenceDidNotIncrease (base-identical)"
+            )],
+            "CC4: open-fallback collect records exactly the rotated_0 duplicated-opening \
+             violation (seg 0 rec 2 / SequenceDidNotIncrease), same first-violation as Stop",
         );
     }
 
@@ -491,14 +534,28 @@ mod classify_collect_tests {
             Some(&cache),
         )
         .unwrap();
-        // The first recorded violation sits on segment_index == 0 (the
-        // prelude segment, read as `history_segment(opening = false)`).
-        let first_seg = out.violations.first().map(|(p, _)| p.segment_index);
         assert_eq!(
-            first_seg,
-            Some(0),
-            "CC6: refresh-rotate prelude's first violation sits on seg 0; got {:?}",
-            out.violations
+            out.violations,
+            vec![
+                (
+                    SegmentViolationPos {
+                        segment_index: 0,
+                        record_index_in_segment: 0,
+                    },
+                    Violation::SequenceDidNotIncrease,
+                ),
+                (
+                    SegmentViolationPos {
+                        segment_index: 1,
+                        record_index_in_segment: 0,
+                    },
+                    Violation::RecordRolledBack,
+                ),
+            ],
+            "CC6: refresh-rotate collect records the prelude's SequenceDidNotIncrease at \
+             the mid-segment append offset (seg 0 rec 0) and continues into the \
+             rotated_0 segment where the opening checkpoint's hash link is now broken \
+             (seg 1 rec 0 / RecordRolledBack)",
         );
         assert!(!out.head_mismatch);
     }
@@ -597,14 +654,27 @@ mod classify_collect_tests {
             None,
         )
         .unwrap();
-        // Cross-segment: at least one violation on seg 0 (rotated_0)
-        // AND at least one on seg 1 (live).
-        let has_seg0 = out.violations.iter().any(|(p, _)| p.segment_index == 0);
-        let has_seg1 = out.violations.iter().any(|(p, _)| p.segment_index == 1);
-        assert!(
-            has_seg0 && has_seg1,
-            "CC3: cross-segment violations require one on each segment; got {:?}",
-            out.violations
+        assert_eq!(
+            out.violations,
+            vec![
+                (
+                    SegmentViolationPos {
+                        segment_index: 0,
+                        record_index_in_segment: 2,
+                    },
+                    Violation::SequenceDidNotIncrease,
+                ),
+                (
+                    SegmentViolationPos {
+                        segment_index: 1,
+                        record_index_in_segment: 1,
+                    },
+                    Violation::RecordRolledBack,
+                ),
+            ],
+            "CC3: cross-segment collect records the rotated_0 duplicated opening \
+             (seg 0 rec 2 / SequenceDidNotIncrease) followed by the live rollback \
+             (seg 1 rec 1 / RecordRolledBack)",
         );
     }
 
@@ -643,17 +713,18 @@ mod classify_collect_tests {
             None,
         )
         .unwrap();
-        // Under Collect, the checkpoint-MMR mismatch is recorded as a
-        // typed Violation::CheckpointMmrDiffers on the single segment
-        // (segment_index 0).
-        let has_mmr_differs = out
-            .violations
-            .iter()
-            .any(|(p, v)| *v == Violation::CheckpointMmrDiffers && p.segment_index == 0);
-        assert!(
-            has_mmr_differs,
-            "CC8: expected CheckpointMmrDiffers recorded on seg 0; got {:?}",
-            out.violations
+        assert_eq!(
+            out.violations,
+            vec![(
+                SegmentViolationPos {
+                    segment_index: 0,
+                    record_index_in_segment: 2,
+                },
+                Violation::CheckpointMmrDiffers,
+            )],
+            "CC8: fold-iii salvage records exactly one CheckpointMmrDiffers at the \
+             bad checkpoint's position (seg 0 rec 2); the segment is then marked \
+             damaged so no derived InvalidUndamagedSegment follows (addendum 19.2)",
         );
     }
 
@@ -698,17 +769,27 @@ mod classify_collect_tests {
             None,
         )
         .unwrap();
-        // The violation's record_index_in_segment must be > 0 (M-C8
-        // would set it to 0).
-        let non_zero_record_index = out
-            .violations
-            .iter()
-            .any(|(p, _)| p.record_index_in_segment > 0);
-        assert!(
-            non_zero_record_index,
-            "CC9: a violation with record_index_in_segment > 0 proves classify_collect bumps \
-             the per-segment record index (kills M-C8); got {:?}",
-            out.violations
+        assert_eq!(
+            out.violations,
+            vec![
+                (
+                    SegmentViolationPos {
+                        segment_index: 0,
+                        record_index_in_segment: 5,
+                    },
+                    Violation::SequenceGapInSealedRun,
+                ),
+                (
+                    SegmentViolationPos {
+                        segment_index: 1,
+                        record_index_in_segment: 0,
+                    },
+                    Violation::RecordRolledBack,
+                ),
+            ],
+            "CC9: rotated_0 records the rollback at record index 5 (kills M-C8 which \
+             would tag it 0), then the live opening checkpoint inherits the damaged \
+             run and the walk records a RecordRolledBack at seg 1 rec 0",
         );
     }
 
@@ -1211,6 +1292,119 @@ mod classify_first_equality {
                     (ReaderPath::RefreshAppend, Some(cache_for_path(cache)))
                 },
             },
+            // #197 ruling addendum 27.1 Ok-path full-equality: layouts
+            // that would catch the Collect `on_feed` divergence item 1
+            // of this fix round fixed. A duplicate line on a live-only
+            // layout: Stop takes `Advance::Duplicate`, which keeps
+            // `since_checkpoint` at 1; broken Collect would fold the
+            // duplicate as `Advance::Record` and raise it to 2.
+            Row {
+                name: "liveopen-ok-duplicate-entry",
+                build: |p| {
+                    let first = fixture(p);
+                    let second = entry(&first);
+                    append(&p.join("audit.jsonl"), &second);
+                    append(&p.join("audit.jsonl"), &second);
+                    (ReaderPath::LiveOpen { expected: None }, None)
+                },
+            },
+            // Same duplicate layout driving open fallback: the sealed
+            // segment carries the duplicated entry, so the strict pass
+            // runs through the Collect-Strict arm of `dispatch_line`.
+            // The strict walker treats the second `e1` as
+            // `Advance::Duplicate` (state unchanged), so the closing
+            // checkpoint rolls the MMR with the entry pushed exactly
+            // once -- matching how the writer would seal this run.
+            Row {
+                name: "openfallback-ok-duplicate-entry-in-sealed",
+                build: |p| {
+                    let first = fixture(p);
+                    let second = entry(&first);
+                    append(&p.join("audit.jsonl"), &second);
+                    append(&p.join("audit.jsonl"), &second);
+                    let mut mmr = seeded(&first);
+                    mmr.push(second.hash()).unwrap();
+                    let close = cp(second.context.seq + 1, second.hash(), &mmr);
+                    append(&p.join("audit.jsonl"), &close);
+                    mmr.push(close.hash()).unwrap();
+                    fs::rename(p.join("audit.jsonl"), segment(p, 0)).unwrap();
+                    let opening = cp(close.context.seq + 1, close.hash(), &mmr);
+                    fs::write(p.join("audit.jsonl"), line(&opening)).unwrap();
+                    (ReaderPath::LiveOpen { expected: None }, None)
+                },
+            },
+            // Expected head on a SEALED segment's record (open fallback
+            // shape). Kills the RV6 mutant "Collect sealed arm passes
+            // `expected = None`" and the OWN8 mutant "Collect clears
+            // `found` after each sealed segment" through the Ok-path
+            // full-equality branch: under either mutant Collect's final
+            // `found` is `None` while the reader's is `Some(cp2)`, and
+            // Collect's `head_mismatch` flips to true.
+            Row {
+                name: "openfallback-ok-expected-on-sealed-record",
+                build: |p| {
+                    let first = fixture(p);
+                    let second = entry(&first);
+                    append(&p.join("audit.jsonl"), &second);
+                    let mut mmr = seeded(&first);
+                    mmr.push(second.hash()).unwrap();
+                    let cp2 = cp(second.context.seq + 1, second.hash(), &mmr);
+                    append(&p.join("audit.jsonl"), &cp2);
+                    mmr.push(cp2.hash()).unwrap();
+                    fs::rename(p.join("audit.jsonl"), segment(p, 0)).unwrap();
+                    let cp3 = cp(cp2.context.seq + 1, cp2.hash(), &mmr);
+                    fs::write(p.join("audit.jsonl"), line(&cp3)).unwrap();
+                    (
+                        ReaderPath::LiveOpen {
+                            expected: Some(Head::of(&cp2)),
+                        },
+                        None,
+                    )
+                },
+            },
+            // Expected head on a sealed-prelude record (refresh rotate
+            // shape). Same kill class as the open-fallback row above,
+            // but routed through `history_segment(opening = false)`.
+            // Note: `RefreshRotate` never raises HeadMismatch, so this
+            // row exercises the sealed walker's `expected` plumbing
+            // only through the Ok-path full-equality: if the sealed
+            // arm dropped `expected` to `None`, Collect's `found`
+            // would stay empty.
+            Row {
+                name: "refresh-rotate-ok-expected-on-prelude-record",
+                build: |p| {
+                    let first = fixture(p);
+                    let second = entry(&first);
+                    append(&p.join("audit.jsonl"), &second);
+                    let cache = live_cache(p);
+                    let mut mmr = seeded(&first);
+                    mmr.push(second.hash()).unwrap();
+                    let close = cp(second.context.seq + 1, second.hash(), &mmr);
+                    append(&p.join("audit.jsonl"), &close);
+                    mmr.push(close.hash()).unwrap();
+                    fs::rename(p.join("audit.jsonl"), segment(p, 0)).unwrap();
+                    let opening = cp(close.context.seq + 1, close.hash(), &mmr);
+                    fs::write(p.join("audit.jsonl"), line(&opening)).unwrap();
+                    (ReaderPath::RefreshRotate, Some(cache_for_path(cache)))
+                },
+            },
+            // Expected head matches the single live record (live-open
+            // single segment, expected present). Pairs with the other
+            // expected-present rows so every reader path has one.
+            Row {
+                name: "liveopen-ok-expected-on-live-single",
+                build: |p| {
+                    let first = fixture(p);
+                    let second = entry(&first);
+                    append(&p.join("audit.jsonl"), &second);
+                    (
+                        ReaderPath::LiveOpen {
+                            expected: Some(Head::of(&second)),
+                        },
+                        None,
+                    )
+                },
+            },
         ];
 
         let mut mismatches: Vec<String> = Vec::new();
@@ -1234,11 +1428,22 @@ mod classify_first_equality {
                 classify_for_test(&dir2, TRAIL, path, prior, Reaction::Collect, cache.as_ref());
 
             match (reader_outcome, collect_outcome) {
-                (Ok(_), Ok(c)) => {
+                (Ok(r), Ok(c)) => {
+                    // #197 ruling addendum 27.1: Ok-path full equality.
+                    // Where the reader returns Ok, Collect's `final_state`
+                    // (every field) and `found` must equal the reader's,
+                    // with empty `violations` and `head_mismatch == false`.
                     if !c.violations.is_empty() || c.head_mismatch {
                         mismatches.push(format!(
                             "{}: reader Ok, Collect has violations {:?} or head_mismatch {}",
                             row.name, c.violations, c.head_mismatch
+                        ));
+                    }
+                    let (want, got) = (ok_outcome(&r), ok_outcome(&c));
+                    if want != got {
+                        mismatches.push(format!(
+                            "{}: reader Ok outcome differs from Collect Ok outcome\n  reader: {}\n  collect: {}",
+                            row.name, want, got
                         ));
                     }
                 }
@@ -1291,8 +1496,12 @@ mod classify_first_equality {
         );
         assert_eq!(
             layouts.len(),
-            14,
-            "sweep row count: expected 14 (5 paths x multiple layouts; ruling 197-d1 addendum 27 adds damaged-multi-segment and expected-head-present rows)"
+            19,
+            "sweep row count: expected 19 (every reader path with Ok and Err shapes, \
+             damaged multi-segment layouts, expected-head-present on each LiveOpen \
+             shape, duplicate-line layouts on live-open and open-fallback, and \
+             expected on a sealed-prelude record for refresh rotate; #197 ruling \
+             addendum 27.1 Ok-path full equality)",
         );
     }
 

@@ -811,29 +811,23 @@ pub(crate) struct ClassifyOutput {
     /// `source.newest()` after the plan finished expanding; the caller
     /// stores it in `Cache::sealed_before`.
     pub(crate) sealed_before: Option<std::path::PathBuf>,
-    /// Ruling 197-d1 addendum 25.3: Collect rows assert this list
+    /// #197 ruling addendum 25.3: Collect rows assert this list
     /// exactly; empty under `Reaction::Stop`.
     #[cfg_attr(
         not(test),
-        allow(
-            dead_code,
-            reason = "read by the Collect proof in this crate's tests; V4a in #197 R2b S3b2 lands the non-test consumer"
-        )
+        expect(dead_code, reason = "read by the Collect proof in this crate's tests")
     )]
     pub(crate) violations: Vec<(SegmentViolationPos, Violation)>,
-    /// Ruling 197-d1 addendum 27.1: trail-level `HeadMismatch`
+    /// #197 ruling addendum 27.1: trail-level `HeadMismatch`
     /// outcome. Only `ReaderPath::LiveOpen { expected: Some(_) }` can
     /// set it. Under `Reaction::Stop` the same condition returns
     /// `Err(HeadMismatch)` instead (the only HeadMismatch
-    /// construction site in `classify` so the syn gate stays at 49);
+    /// construction site in `classify`, so the syn gate stays at 49);
     /// under `Reaction::Collect` the flag records the decision and
     /// the collected violations are preserved.
     #[cfg_attr(
         not(test),
-        allow(
-            dead_code,
-            reason = "read by the Collect proof in this crate's tests; V4a in #197 R2b S3b2 lands the non-test consumer"
-        )
+        expect(dead_code, reason = "read by the Collect proof in this crate's tests")
     )]
     pub(crate) head_mismatch: bool,
 }
@@ -846,21 +840,7 @@ pub(crate) struct ClassifyOutput {
 /// index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SegmentViolationPos {
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "read by the Collect proof in this crate's tests; V4a in #197 R2b S3b2 lands the non-test consumer"
-        )
-    )]
     pub(crate) segment_index: usize,
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "read by the Collect proof in this crate's tests; V4a in #197 R2b S3b2 lands the non-test consumer"
-        )
-    )]
     pub(crate) record_index_in_segment: usize,
 }
 
