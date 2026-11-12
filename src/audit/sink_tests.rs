@@ -2937,9 +2937,19 @@ fn resume_discovery_requires_full_validation_before_writing() {
     let dir = File::open(&t.0).unwrap();
     let names = rotate::rotated_names_at(&dir, "audit").unwrap();
     let file = existing(&dir, &names[0], false).unwrap();
-    let mut state = history_segment(&file, writer.trail, None, true, None, &mut None, &mut false)
-        .unwrap()
-        .unwrap();
+    let mut state = history_segment(
+        crate::audit::runs::Reaction::Stop,
+        &file,
+        writer.trail,
+        None,
+        true,
+        None,
+        &mut None,
+        &mut false,
+    )
+    .unwrap()
+    .0
+    .unwrap();
     // The header declares an acceptable bound, but its MMR omits the retained
     // application record. Discovery must never turn that into write authority.
     let mut wrong = Mmr::new();
