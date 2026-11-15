@@ -774,6 +774,7 @@ pub(crate) fn history_segment(
     expected: Option<Head>,
     found: &mut Option<Record>,
     run: &mut bool,
+    closer_fired: &mut bool,
 ) -> Result<SegmentOutcome, AuditError> {
     // Decision 8 still applies when a malformed suffix makes the successor
     // enter the run fallback: a linking opening cannot defer its declaration.
@@ -808,7 +809,7 @@ pub(crate) fn history_segment(
     // violation and then the tolerant fallback records. Only the
     // tolerant fallback below sees the outer reaction.
     #[rustfmt::skip]
-    let strict = move || scan_inner(Reaction::Stop, file, trail, strict_state, expected, &mut fc.borrow_mut(), ctx)
+    let strict = move || scan_inner(Reaction::Stop, file, trail, strict_state, expected, &mut fc.borrow_mut(), ctx, None)
         .map(|(s, _)| s.expect("scan_inner Stop implies state=Some"));
     // Lazy tolerant byte source. The seek, the glued-byte / LF check,
     // `read_line`, `decode_line_kind` AND the tolerant-side byte
@@ -880,12 +881,20 @@ pub(crate) fn history_segment(
     *found = found_cell.into_inner();
     match walk? {
         HistorySegmentWalk::Strict(next) => {
+            // Strict completed with no violations. If the walker entered
+            // with inherited run (ctx.run==true), the strict pass just
+            // accepted a (i)+(ii) closer; otherwise strict's closer
+            // evidence stays false. Ruling 197-d1 addendum 28 fix round:
+            // classify consumes this walker-level signal to derive
+            // `SegmentClass::Closer` without heuristics.
+            *closer_fired = ctx.run;
             *run = false;
             Ok((Some(next), Vec::new()))
         }
         HistorySegmentWalk::Tolerant(outcome) => {
             let outcome = *outcome;
             *run = outcome.run_flag;
+            *closer_fired = outcome.closer_fired;
             let bytes = bytes.into_inner();
             let violations = outcome.violations;
             // Thread the classifier's own folded state (identical to
@@ -933,9 +942,14 @@ pub(crate) fn scan_staged(
             genesis: true,
             run,
         },
+        None,
     )?;
     Ok(state.expect("scan_staged Stop implies state=Some"))
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "addendum 28 fix round threads closer_fired alongside the existing found/run out-params"
+)]
 pub(crate) fn scan_closing(
     reaction: Reaction,
     file: &File,
@@ -944,6 +958,7 @@ pub(crate) fn scan_closing(
     expected: Option<Head>,
     found: &mut Option<Record>,
     run: bool,
+    closer_fired: &mut bool,
 ) -> Result<SegmentOutcome, AuditError> {
     scan_inner(
         reaction,
@@ -957,6 +972,7 @@ pub(crate) fn scan_closing(
             genesis: false,
             run,
         },
+        Some(closer_fired),
     )
 }
 pub(crate) fn sealed(state: &State) -> bool {
@@ -1202,6 +1218,7 @@ pub(crate) fn scan(
             genesis,
             run: false,
         },
+        None,
     )
 }
 
@@ -1217,6 +1234,10 @@ pub(crate) fn scan(
 /// composes through this shim, so a single strict walk serves every
 /// reader path (`scan` ×3, `scan_staged` ×2, `scan_closing` ×2,
 /// `history_segment`'s strict pass).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "addendum 28 fix round adds a Classifier-level closer_fired out-param surfaced here"
+)]
 fn scan_inner(
     reaction: Reaction,
     file: &File,
@@ -1225,6 +1246,7 @@ fn scan_inner(
     expected: Option<Head>,
     found: &mut Option<Record>,
     context: SegmentContext,
+    closer_fired: Option<&mut bool>,
 ) -> Result<SegmentOutcome, AuditError> {
     let start = if context.opening {
         0
@@ -1305,6 +1327,9 @@ fn scan_inner(
     // `Reaction::Collect` the state may be `None` if the collector
     // recorded without folding a complete record (addendum 27.1).
     let bytes = bytes.into_inner();
+    if let Some(flag) = closer_fired {
+        *flag = outcome.closer_fired;
+    }
     let state = outcome.state.map(|run| State {
         run,
         offset: bytes.last_offset(),

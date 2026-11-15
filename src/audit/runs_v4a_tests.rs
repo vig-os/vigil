@@ -840,46 +840,91 @@ fn cv7_a9_span_seg_renumbered_run_local() {
 }
 
 // ============================================================
-// CV2 (subset): a couple of p-row equality checks. The full table
-// of p01..p13 is left to a follow-up slice because the agreement
-// construction requires the `storage_tests::runs` helpers which
-// are not visible here without additional seams.
+// CV2 (subset): the `cv2_sample_*` row covers A8 / p09 equivalence.
+// The full `cv2_p01..cv2_p13` table lives below, constructed via
+// the widened `storage::tests::runs` helpers (addendum 27.4).
 // ============================================================
 
-/// CV0 (addendum 25.5): every field the slice adds is read at this
-/// head. This row exercises `SegmentReport.boundary_resume` /
-/// `SegmentReport.final_state` and `RunReport.first_segment` /
-/// `RunReport.last_segment` so the compile-time read requirement is
-/// satisfied in both `lib` and `lib test` builds.
+/// CV0 (addendum 25.5, fix round B2): every field the slice adds is
+/// READ and ASSERTED at this head. Replaces the earlier `let _ =`
+/// touches, which the review flagged as "no pin" — a drop/rewrite of
+/// a field could leave the row green because nothing was compared.
 #[test]
 fn cv0_every_field_is_read_here() {
     let a = build_a1();
     let out = classify_collect(&a.dir_path);
-    assert_eq!(out.runs.len(), 1);
+    assert_eq!(out.runs.len(), 1, "CV0: A1 has one closed run");
     let rr = &out.runs[0];
-    // RunReport fields:
-    let _ = rr.first_segment;
-    let _ = rr.last_segment;
-    let _ = rr.closing_opening;
-    let _ = &rr.loss_points;
-    let _ = &rr.spans;
+    // RunReport fields: assert concrete values for A1.
+    assert_eq!(rr.first_segment, 1, "CV0: A1 run first_segment == 1");
+    assert_eq!(rr.last_segment, 2, "CV0: A1 run last_segment == 2");
+    assert_eq!(
+        rr.closing_opening,
+        Some(a.cp6_head),
+        "CV0: A1 closing_opening == Head::of(&cp6)",
+    );
+    assert_eq!(
+        rr.loss_points,
+        vec![super::LossPoint {
+            loss_seq: 4,
+            first: 3,
+            count: 1,
+        }],
+        "CV0: A1 loss_points literal",
+    );
+    assert!(rr.spans.is_empty(), "CV0: A1 spans empty");
     assert!(
         !out.segments.is_empty(),
-        "A1 segments populated under Collect"
+        "CV0: A1 segments populated under Collect",
     );
-    // SegmentReport fields:
-    for seg in &out.segments {
-        let _ = seg.class;
-        let _ = seg.run_membership;
-        let _ = seg.damage;
-        let _ = seg.boundary_resume;
-        let _ = &seg.final_state;
-    }
-    // LossPoint fields:
+    // SegmentReport fields: assert concrete expectations for A1.
+    // A1 layout: S0=Base, S1=InRun, live=Closer.
+    assert_eq!(out.segments.len(), 3, "CV0: A1 three segments");
+    assert_eq!(
+        out.segments[0].class,
+        super::SegmentClass::Base,
+        "CV0: A1 S0 class == Base",
+    );
+    assert_eq!(out.segments[0].run_membership, None);
+    assert!(!out.segments[0].damage);
+    assert!(!out.segments[0].boundary_resume);
+    assert!(out.segments[0].final_state.is_some());
+    assert_eq!(
+        out.segments[1].class,
+        super::SegmentClass::InRun,
+        "CV0: A1 S1 class == InRun",
+    );
+    assert_eq!(out.segments[1].run_membership, Some(0));
+    assert!(!out.segments[1].damage);
+    assert_eq!(
+        out.segments[2].class,
+        super::SegmentClass::Closer,
+        "CV0: A1 live class == Closer",
+    );
+    assert_eq!(out.segments[2].run_membership, Some(0));
+    assert!(!out.segments[2].damage);
+    // Count `boundary_resume=true` across A1's segments. Exactly ONE
+    // segment latches it: the walker's own `boundary_resume` derived
+    // from `role_opening && !storage::sealed(prior)`. A1 has:
+    //   S0: prior=None  -> sealed-equivalent -> false
+    //   S1: prior=cp0   -> sealed            -> false
+    //   S2: prior=S1    -> unsealed (headless r4 forced pending_resume
+    //                       on the tolerant walk's state)
+    // -> count = 1. O2 kill rows (inverted sealed check) flip this.
+    let br_true = out.segments.iter().filter(|s| s.boundary_resume).count();
+    assert_eq!(
+        br_true, 1,
+        "CV0: A1 exactly one segment latches boundary_resume"
+    );
+    // Pin all three values are read (not just the sum) by binding
+    // each field.
+    let br_values: Vec<bool> = out.segments.iter().map(|s| s.boundary_resume).collect();
+    assert_eq!(br_values.len(), 3, "CV0: A1 three boundary_resume reads");
+    // LossPoint fields: destructure (assert loses would already fail above).
     for lp in &rr.loss_points {
-        let _ = lp.loss_seq;
-        let _ = lp.first;
-        let _ = lp.count;
+        assert_eq!(lp.loss_seq, 4);
+        assert_eq!(lp.first, 3);
+        assert_eq!(lp.count, 1);
     }
 }
 
@@ -921,6 +966,15 @@ fn run_bounds(out: &super::ClassifyOutput) -> Vec<(usize, usize)> {
 /// sealed `S0=[cp0]`, sealed `S1=[kept]` (headless), sealed
 /// `S2=[close1, resume1, "broken\n"]`, live=`[close2, resume2]`.
 /// Reader: `Ok`.
+///
+/// Ruling 197-d1 addendum 28 fix round (B1): grouping uses the
+/// walker's own closer signal, so S2 is both the Closer of run 0
+/// (its `close1+resume1` pair closes the run opened by S1) AND
+/// the first segment of run 1 (its trailing `"broken\n"` fragment
+/// reopens a run that the live closer in S3 closes). Run 0's
+/// `closing_opening` = the closer's opening checkpoint (seq 7, the
+/// `close1` written by `close_run(kept)`, which uses `last.seq + 4
+/// = 3 + 4 = 7`).
 #[test]
 fn cv2_p01_closing_segment_can_start_second_run() {
     let d = st::Temp::new();
@@ -937,18 +991,117 @@ fn cv2_p01_closing_segment_can_start_second_run() {
     TrailReader::open(&d.0, TRAIL, None).expect("p01: reader Ok");
     let out = classify_collect(&d.0);
     assert!(out.violations.is_empty(), "p01: no violations");
-    // One run spans S1 through the live closer: classify groups
-    // `[InRun|Damaged]*` closed by one `Closer`. Both the live
-    // segment (3) and the intermediate S2 are part of that run.
+    // Two closed runs: S1..=S2 (closes kept's headless run) and
+    // S2..=live (closes the run reopened by the "broken" tail).
     assert_eq!(
         run_bounds(&out),
-        vec![(1, 3)],
-        "p01: one closed run [1..=3]"
+        vec![(1, 2), (2, 3)],
+        "p01: two closed runs ([1..=2] closed by S2, [2..=3] closed by live)",
+    );
+    // `closing_opening` of run 0 is the opening checkpoint of its
+    // closer segment: S2's first record is `checkpoint` (seq 7).
+    assert_eq!(
+        out.runs[0].closing_opening.map(|h| h.seq),
+        Some(7),
+        "p01 run 0: closing_opening seq == 7 (close1 in S2)",
+    );
+}
+
+/// R-honest-mid (brief #197 R2b S3b2 r2 B1 pin): an honest segment
+/// between the base and the run's start is NOT a run member.
+/// Layout: `S0=[cp0]`, sealed `S1=[signed(1, cp0.hash)]`
+/// (honest checkpoint-only middle), sealed `S2=[headless(cp1, 6)]`
+/// (opens a run), live=`[close2, resume2]` (closes the run). The
+/// walker leaves `*run==false` through S0 and S1 (no run activity),
+/// then latches `run==true` in S2 (headless -> run opens), then
+/// clears it in live (closer). Grouping places S1 OUTSIDE the run.
+#[test]
+fn cv2_r_honest_mid_honest_middle_is_not_a_run_member() {
+    let d = st::Temp::new();
+    let cp0 = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&cp0], &[]);
+    let mmr0 = st::seeded(&cp0);
+    // S1: a honest checkpoint-only segment (no run activity).
+    let cp1 = st_runs::signed(1, cp0.hash(), &mmr0);
+    st_runs::put(&d, 1, &[&cp1], &[]);
+    let mmr1 = st::seeded_pair(&cp0, &cp1);
+    // S2: a headless run segment linking from cp1 (opens run 0).
+    let kept = st_runs::headless(&cp1, cp1.context.seq + 5);
+    st_runs::put(&d, 2, &[&kept], &[]);
+    let mut fold = mmr1;
+    fold.push(kept.hash()).unwrap();
+    // live: close the run.
+    let _ = st_runs::close_run(&d, &kept, &fold);
+    TrailReader::open(&d.0, TRAIL, None).expect("R-honest-mid: reader Ok");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "R-honest-mid: no violations");
+    assert_eq!(
+        run_bounds(&out),
+        vec![(2, 3)],
+        "R-honest-mid: run starts at S2 (headless), closes at live S3",
     );
     assert_eq!(
         membership(&out),
-        vec![None, Some(0), Some(0), Some(0)],
-        "p01: segments 1..=3 in run 0; S0 (base) not in a run",
+        vec![None, None, Some(0), Some(0)],
+        "R-honest-mid: S1 (honest middle) is NOT a run member",
+    );
+}
+
+/// R-honest-between (brief #197 R2b S3b2 r2 B1 pin): two runs on the
+/// same trail. The layout chains run 0 (closed by S2's close1+resume1)
+/// directly into run 1's opening via a second headless in S3 (the
+/// `second_loss_keeps_first_run_acceptable` storage-tests pattern):
+///
+///   S0=[cp0], S1=[kept1] (headless, run 0 opens),
+///   S2=[close1, resume1] (closes run 0),
+///   S3=[kept2] (headless off resume1, run 1 opens),
+///   live=[close2, resume2] (closes run 1).
+///
+/// S0 is Base (not in any run); S3 is the first segment of run 1 so
+/// S3 IS a run member. The "honest between" behaviour the brief
+/// targets -- that classify's grouping does not extend run 0 past
+/// its closer S2 -- is the real pin: S2 is in run 0 only, S3
+/// belongs to run 1 only.
+#[test]
+fn cv2_r_honest_between_two_runs_on_same_trail() {
+    let d = st::Temp::new();
+    let cp0 = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&cp0], &[]);
+    // S1: headless (run 0 opens).
+    let kept1 = st_runs::headless(&cp0, 3);
+    st_runs::put(&d, 1, &[&kept1], &[]);
+    let mut fold = st::seeded_pair(&cp0, &kept1);
+    // S2: closer for run 0.
+    let close1_seq = kept1.context.seq + 4;
+    let close1 = st_runs::signed(close1_seq, kept1.hash(), &fold);
+    let resume1 = st::declaration(
+        &close1,
+        kept1.context.seq,
+        kept1.hash(),
+        close1.context.seq - 1,
+        None,
+    );
+    st_runs::put(&d, 2, &[&close1, &resume1], &[]);
+    fold.push(close1.hash()).unwrap();
+    fold.push(resume1.hash()).unwrap();
+    // S3: second headless, opens run 1 off resume1.
+    let kept2 = st_runs::headless(&resume1, resume1.context.seq + 3);
+    st_runs::put(&d, 3, &[&kept2], &[]);
+    fold.push(kept2.hash()).unwrap();
+    // live: close run 1.
+    let _ = st_runs::close_run(&d, &kept2, &fold);
+    TrailReader::open(&d.0, TRAIL, None).expect("R-honest-between: reader Ok");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "R-honest-between: no violations");
+    assert_eq!(
+        run_bounds(&out),
+        vec![(1, 2), (3, 4)],
+        "R-honest-between: two runs, S2 closes run 0 and does NOT bleed into run 1",
+    );
+    assert_eq!(
+        membership(&out),
+        vec![None, Some(0), Some(0), Some(1), Some(1)],
+        "R-honest-between: S0 base; S1+S2 in run 0; S3+live in run 1",
     );
 }
 

@@ -240,6 +240,15 @@ pub(crate) struct CollectorOutcome {
     pub(crate) run_flag: bool,
     pub(crate) violations: Vec<(CollectorPos, Violation)>,
     pub(crate) gap: Option<blake3::Hasher>,
+    /// True iff the walker detected a (i)+(ii) closer in this segment:
+    /// tolerant mode sets it when `count==1 && closing` fires and the
+    /// resume completes (`run_flag = false`); strict mode sets it when
+    /// the first-successor-is-resume path accepts a resume after an
+    /// inherited-run or unsealed boundary. Consumed by `classify` to
+    /// derive `SegmentClass::Closer` without heuristics (ruling
+    /// 197-d1 addendum 28, fix round: use the walker's own signal,
+    /// not an approximation from `(run_in, run_out, damage)` alone).
+    pub(crate) closer_fired: bool,
 }
 
 impl std::fmt::Debug for CollectorOutcome {
@@ -552,6 +561,11 @@ pub(crate) struct ScanSegmentOutcome {
     /// (addendum 27.1) which pair each entry with classify's
     /// `segment_index`.
     pub(crate) violations: Vec<(CollectorPos, Violation)>,
+    /// Strict-walk closer evidence: true iff the walker accepted an
+    /// immediate resume after a `boundary_resume` boundary (an
+    /// unsealed or inherited-run prior). Used by `classify` to derive
+    /// `SegmentClass::Closer` from walker signals.
+    pub(crate) closer_fired: bool,
 }
 
 /// Addendum 22.4 / 20.1: segment-shape inputs to the shared
@@ -641,6 +655,7 @@ where
                 run_flag: fin.run_flag,
                 violations: Vec::new(),
                 gap: fin.gap,
+                closer_fired: fin.closer_fired,
             }
         }
         Reaction::Collect => classifier.finish_collect(),
@@ -714,6 +729,7 @@ where
                 state: Some(finished.state),
                 gap: finished.gap,
                 violations: Vec::new(),
+                closer_fired: finished.closer_fired,
             })
         }
         Reaction::Collect => Ok(classifier.finish_collect_strict()),
@@ -807,9 +823,9 @@ pub(crate) struct ClassifyOutput {
     pub(crate) head_mismatch: bool,
     /// #197 ruling addendum 25.5: one [`SegmentReport`] per segment
     /// classify yielded, in base order. Read by the V4a walk at this
-    /// head (see `#[cfg(test)] mod classify_v4a_walk`); V4a's
-    /// `verify::fold::check_runs` consumes the same shape through
-    /// `Collection` without going through `classify`.
+    /// head (see `#[cfg(test)] mod classify_v4a_walk`). V4a's fold
+    /// verifier (ruling 13-V4-d1 et seq.) consumes the same shape in
+    /// a follow-up slice.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "read by the V4a walk in this crate's tests")
@@ -838,30 +854,38 @@ pub(crate) struct SegmentViolationPos {
     pub(crate) record_index_in_segment: usize,
 }
 
-/// #197 ruling addendum 25.5: segment classification the V4a walk
-/// consumes. Computed in [`classify`] from the segment's position in
-/// the plan, the state threaded across the boundary, and whether the
-/// segment recorded any violations.
+/// #197 ruling addendum 25.5 (and addendum 28 fix round): segment
+/// classification the V4a walk consumes. Computed in [`classify`]
+/// purely from the walker's own signals — `damage`, `run_in`,
+/// `run_out`, and the Classifier's `closer_fired` latch — with no
+/// heuristic fallback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SegmentClass {
-    /// Segment 0 with `run_in == false` whose walker returned `Some`
-    /// state and recorded no violations (ADR-0005 "Base" / ruling
-    /// 107-d1; archived prefix allowed).
+    /// No run activity in this segment: `!damage && !run_in &&
+    /// !run_out && !closer_fired`. Covers both segment 0 with a
+    /// plain base checkpoint (ADR-0005 "Base" / ruling 107-d1) and
+    /// honest intermediate segments between runs (e.g. a signed
+    /// checkpoint in the middle of a trail). Breaks run membership.
     Base,
-    /// Segment that entered with `run_in == true` (prior run active)
-    /// and whose walker did not close the run.
+    /// Run-member segment that neither ends a run nor is damaged:
+    /// `!damage && !closer_fired && (run_in || run_out)`. Covers
+    /// headless middles, fragment-only run segments, and the first
+    /// segment of a newly-opened run.
     InRun,
-    /// Segment that entered with `run_in == true` and closed the run
-    /// (ADR amendment 6 (i)+(ii)): `run_out == false` with no recorded
-    /// violation. May also be run-triggering in its own tail and start
-    /// run 2 (`run_out == true`); classify emits a separate
-    /// [`SegmentReport`] for that case iff the walker re-latches
-    /// `run` in the same segment.
+    /// Segment where the walker's own (i)+(ii) closer fired:
+    /// `!damage && closer_fired`. Ends the run it closed. If the
+    /// walker also left `*run == true` (e.g. p01's trailing
+    /// unparsable tail), a second run begins AT this same segment
+    /// (its grouping keeps `run_membership` set to the run this
+    /// segment closed; the next iteration may group it into the
+    /// reopened run).
     Closer,
-    /// Segment that recorded at least one violation (any kind), or
-    /// entered `run_in == false` and left `run_out == true` without a
-    /// closing (i)+(ii). Addendum 19.2: a fold-(iii) mismatch marks
-    /// its segment damaged for the end-of-segment checks.
+    /// Segment that recorded at least one violation (any kind).
+    /// Addendum 19.2: a fold-(iii) mismatch marks its segment
+    /// damaged for the end-of-segment checks; the run-grouping loop
+    /// treats a damaged segment as a run member iff a surrounding
+    /// run is still open, so the overall `runs` list stays empty
+    /// whenever `violations` is non-empty (addendum 28 point 2).
     Damaged,
 }
 
@@ -1035,16 +1059,20 @@ fn collect_segment_spans_and_records(
 /// the arm is unreachable by construction, and the body stays empty
 /// instead of panicking (no `unreachable!` on the reader path).
 ///
-/// # Collect-side memory (addendum 25.5)
+/// # Collect-side memory (addendum 25.5, 28 fix round D2)
 ///
-/// Under [`Reaction::Collect`] this function retains, for the full
-/// trail before grouping runs, both `seg_spans: Vec<Vec<Span>>` and
-/// `seg_records: Vec<Vec<RecordHeadInfo>>` (one entry per segment,
-/// one record head per complete record on this trail). The spans
-/// are the product fed into each [`RunReport`]; the per-record
-/// heads are an input to the loss-point hash-link chain. The
-/// `Stop` reaction holds nothing extra and matches the reader's
-/// memory profile byte-for-byte.
+/// Under [`Reaction::Collect`] this function retains only what the
+/// grouping loop needs: `seg_spans: Vec<Vec<Span>>` (one list per
+/// segment — the product fed into each [`RunReport`]) and
+/// `seg_records: Vec<Vec<RecordHeadInfo>>` (one record head per
+/// complete record, consumed by the loss-point hash-link chain to
+/// compute `(prev, this)` at each run's first segment). The per-
+/// segment `run_out` flag is kept in a `Vec<bool>` the same length
+/// as `seg_spans`. Nothing else is retained; `seg_records` entries
+/// for segments that end up as `Base` (not run members) are still
+/// kept, since the grouping needs the last record of the segment
+/// immediately preceding a run to compute its first loss point.
+/// The `Stop` reaction holds none of these Collect-only vectors.
 pub(crate) fn classify(
     args: ClassifyArgs,
     path: ReaderPath,
@@ -1068,6 +1096,12 @@ pub(crate) fn classify(
     let build_reports = matches!(reaction, Reaction::Collect);
     let mut seg_spans: Vec<Vec<super::verify::lines::Span>> = Vec::new();
     let mut seg_records: Vec<Vec<RecordHeadInfo>> = Vec::new();
+    // Per-segment `run_out` (the `*run` flag after the walker fired).
+    // Grouping uses this to detect a closer that reopens (`closer_fired
+    // == true && run_out == true`), which starts a new run at the same
+    // segment index (ruling 197-d1 addendum 28 fix round: use walker
+    // signals, not a heuristic).
+    let mut seg_run_out: Vec<bool> = Vec::new();
     let mut segment_index: usize = 0;
     while let Some(seg) = source.next_segment()? {
         let in_state = state.take();
@@ -1099,16 +1133,32 @@ pub(crate) fn classify(
         } else {
             None
         };
+        let mut closer_fired: bool = false;
         let (next_state, seg_violations, live) = match (path, seg) {
             (ReaderPath::LiveOpen { expected }, SegmentRead::Sealed { file, .. }) => {
                 let (s, v) = storage::history_segment(
-                    reaction, &file, trail, in_state, true, expected, &mut found, &mut run,
+                    reaction,
+                    &file,
+                    trail,
+                    in_state,
+                    true,
+                    expected,
+                    &mut found,
+                    &mut run,
+                    &mut closer_fired,
                 )?;
                 (s, v, None)
             }
             (ReaderPath::LiveOpen { expected }, SegmentRead::Live(file)) => {
                 let (s, v) = storage::scan_closing(
-                    reaction, &file, trail, in_state, expected, &mut found, run,
+                    reaction,
+                    &file,
+                    trail,
+                    in_state,
+                    expected,
+                    &mut found,
+                    run,
+                    &mut closer_fired,
                 )?;
                 (s, v, Some(file))
             }
@@ -1133,7 +1183,15 @@ pub(crate) fn classify(
                 },
             ) => {
                 let (s, v) = storage::history_segment(
-                    reaction, &file, trail, in_state, false, None, &mut found, &mut run,
+                    reaction,
+                    &file,
+                    trail,
+                    in_state,
+                    false,
+                    None,
+                    &mut found,
+                    &mut run,
+                    &mut closer_fired,
                 )?;
                 (s, v, None)
             }
@@ -1145,13 +1203,29 @@ pub(crate) fn classify(
                 },
             ) => {
                 let (s, v) = storage::history_segment(
-                    reaction, &file, trail, in_state, true, None, &mut found, &mut run,
+                    reaction,
+                    &file,
+                    trail,
+                    in_state,
+                    true,
+                    None,
+                    &mut found,
+                    &mut run,
+                    &mut closer_fired,
                 )?;
                 (s, v, None)
             }
             (ReaderPath::RefreshRotate, SegmentRead::Live(file)) => {
-                let (s, v) =
-                    storage::scan_closing(reaction, &file, trail, in_state, None, &mut found, run)?;
+                let (s, v) = storage::scan_closing(
+                    reaction,
+                    &file,
+                    trail,
+                    in_state,
+                    None,
+                    &mut found,
+                    run,
+                    &mut closer_fired,
+                )?;
                 (s, v, Some(file))
             }
         };
@@ -1202,39 +1276,35 @@ pub(crate) fn classify(
                 v,
             ));
         }
-        // Addendum 25.5: derive the segment class from the run
-        // transition and the damage flag. `Closer` is the segment
-        // that ends a prior run without recording a violation;
-        // `InRun` is a run-inheriting segment whose walker left the
-        // run still open; `Base` is segment 0 entering with no prior
-        // run and no damage; everything else is `Damaged`.
-        //
-        // The live segment is terminal: it does not thread the
-        // `*run` out-parameter back to classify (storage's
-        // `scan_closing` takes `run: bool` by value, not `&mut`),
-        // so a live segment with `run_in_before && !damage` is
-        // treated as a Closer by inspection of its role (i)+(ii)
-        // completed by the walker without violation.
+        // Ruling 197-d1 addendum 28 fix round: derive `SegmentClass`
+        // purely from the walker's own signals. No heuristic fallback.
+        //   - `damage`: the walker recorded at least one violation;
+        //   - `run_in_before`: the `*run` flag before the walker fired;
+        //   - `run_out`: the `*run` flag after the walker fired;
+        //   - `closer_fired`: the walker's own (i)+(ii) closer evidence
+        //     (strict: boundary_resume accepted an immediate resume;
+        //     tolerant: `count==1 && closing` cleared `run_flag`).
+        // `Base` means "segment with no run activity" (the walker left
+        // `*run` false in and out and recorded no damage). It is no
+        // longer restricted to `segment_index == 0`; an honest
+        // intermediate segment is `Base` too, and breaks run
+        // membership. The `_` wildcard binds the one impossible
+        // combination (walker closed a run without `run_in_before`) to
+        // `Damaged`: a closer with no prior run is evidence of
+        // damage, not a valid closer.
         let run_out = run;
-        let class = if damage {
-            SegmentClass::Damaged
-        } else if run_in_before && (is_live || !run_out) {
-            SegmentClass::Closer
-        } else if run_in_before {
-            SegmentClass::InRun
-        } else if run_out {
-            // `run_in == false && run_out == true`: walker latched a
-            // new run inside this segment with no (i)+(ii) closing
-            // before the segment boundary. 13-V4-d2 point 1: an
-            // unclosed run emits no run finding. This covers the
-            // `[cp0, "not json\n"]` (p04) case where segment 0 is
-            // both the base and run-triggering through its trailing
-            // unparsable line.
-            SegmentClass::Damaged
-        } else if segment_index == 0 && next_state_is_some {
-            SegmentClass::Base
-        } else {
-            SegmentClass::InRun
+        let class = match (damage, run_in_before, run_out, closer_fired) {
+            (true, _, _, _) => SegmentClass::Damaged,
+            (false, true, _, true) => SegmentClass::Closer,
+            (false, true, _, false) => SegmentClass::InRun,
+            (false, false, true, false) => SegmentClass::InRun,
+            (false, false, false, false) => SegmentClass::Base,
+            // The walker signalled a closer without `run_in_before`
+            // being true: the strict path would have errored, so this
+            // case is unreachable in practice. Classify as Damaged so
+            // `SegmentClass::Closer` stays iff the walker ended a
+            // prior run.
+            (false, false, _, true) => SegmentClass::Damaged,
         };
         if build_reports {
             segments.push(SegmentReport {
@@ -1244,43 +1314,67 @@ pub(crate) fn classify(
                 boundary_resume,
                 final_state: next_state_run,
             });
+            seg_run_out.push(run_out);
         }
+        // `is_live`, `next_state_is_some`: no longer needed for class
+        // derivation; silence warnings in test builds.
+        let _ = is_live;
+        let _ = next_state_is_some;
         segment_index += 1;
     }
-    // Addendum 25.5 + 28 point 2: group consecutive segments into
-    // closed runs. A closed run spans from the first non-Base,
-    // non-Closer run-triggering segment up through the first Closer.
-    // Unclosed candidate runs (ending in Damaged with no later Closer)
-    // emit no RunReport (13-V4-d2 point 1). `Base` segments break run
-    // membership. Addendum 28 point 2: `runs` stays empty whenever
-    // `violations` is non-empty or `head_mismatch` is set; `segments`
-    // is still filled with its damage flags.
+    // Ruling 197-d1 addendum 28 fix round: group segments into closed
+    // runs using the walker's own `Closer` signal.
+    //   - A new run starts at the first run-active segment following
+    //     either segment 0, a `Base` segment, or a prior `Closer` that
+    //     reopened (`run_out == true`).
+    //   - A run ends at a `Closer`. If that same `Closer` reopened
+    //     (`final_state` carries an unsealed run so the walker left
+    //     `*run == true`), the next run begins AT that same segment.
+    //   - `Base` breaks run membership. Unclosed candidate runs emit
+    //     no `RunReport` (ruling 13-V4-d2 point 1).
+    //   - Addendum 28 point 2: `runs` stays empty whenever
+    //     `violations` is non-empty or `head_mismatch` is set;
+    //     `segments` is still filled with its damage flags.
     let head_mismatch_condition =
         matches!(path, ReaderPath::LiveOpen { expected: Some(_) }) && found.is_none();
     let mut runs_out: Vec<RunReport> = Vec::new();
     let suppress_runs = !violations.is_empty() || head_mismatch_condition;
     if build_reports && !suppress_runs {
+        // Precompute per-segment `run_out` for the grouping. The
+        // `final_state` field on `SegmentReport` is the walker's post-
+        // segment run state (`Some` iff a complete record was folded);
+        // `run_out` here is "the walker left `*run == true`", which
+        // under Collect equals `final_state.is_some() && final_state's
+        // sealed status is still mid-run`. We cannot read `*run` after
+        // the loop; instead we track transitions directly. The current
+        // in-progress run is tracked by `open_run_start`.
+        let mut open_run_start: Option<usize> = None;
         let mut i = 0;
         while i < segments.len() {
-            if matches!(
-                segments[i].class,
-                SegmentClass::InRun | SegmentClass::Damaged
-            ) {
-                let first_segment = i;
-                let mut j = i;
-                let mut closed_at: Option<usize> = None;
-                while j < segments.len() {
-                    match segments[j].class {
-                        SegmentClass::Closer => {
-                            closed_at = Some(j);
-                            break;
-                        }
-                        SegmentClass::Base => break,
-                        SegmentClass::InRun | SegmentClass::Damaged => {}
-                    }
-                    j += 1;
+            let class_i = segments[i].class;
+            match class_i {
+                SegmentClass::Base => {
+                    // Base breaks membership; drop any in-progress
+                    // candidate (unclosed; no RunReport).
+                    open_run_start = None;
+                    i += 1;
+                    continue;
                 }
-                if let Some(last_segment) = closed_at {
+                SegmentClass::InRun | SegmentClass::Damaged => {
+                    if open_run_start.is_none() {
+                        open_run_start = Some(i);
+                    }
+                    i += 1;
+                    continue;
+                }
+                SegmentClass::Closer => {
+                    // A closer ends any open run. Its `first_segment`
+                    // is either the in-progress start (an earlier
+                    // run-active segment) OR -- if no prior run was
+                    // open -- the closer itself (a single-segment
+                    // run covering just this closer; used by p09/A8).
+                    let first_segment = open_run_start.unwrap_or(i);
+                    let last_segment = i;
                     let run_idx = runs_out.len();
                     // Addendum 25.5: compute spans by concatenating
                     // the per-segment spans (each with `after =
@@ -1369,15 +1463,25 @@ pub(crate) fn classify(
                             .take(last_segment + 1)
                             .skip(first_segment)
                         {
+                            // A closer that reopens keeps its primary
+                            // membership on the run it closed (this
+                            // iteration); the next iteration may
+                            // overwrite the closer segment's
+                            // membership to the new run if that run
+                            // closes too.
                             seg.run_membership = Some(run_idx);
                         }
                     }
+                    // Closer+reopen: if the walker left `*run == true`,
+                    // a new run begins AT this same segment. Otherwise
+                    // move past it.
+                    if seg_run_out.get(last_segment).copied().unwrap_or(false) {
+                        open_run_start = Some(last_segment);
+                    } else {
+                        open_run_start = None;
+                    }
                     i = last_segment + 1;
-                } else {
-                    i = j;
                 }
-            } else {
-                i += 1;
             }
         }
     }
@@ -1750,12 +1854,25 @@ pub(crate) struct Classifier {
     /// (ruling 197-d1 point 4 "ends the run under consideration").
     /// Fold (iii) is the one asymmetric site and does NOT set this.
     recovery_pending: bool,
+    /// Walker's closer-fired evidence: latched when a (i)+(ii)
+    /// closer completed in this segment. Tolerant mode sets it at
+    /// `count == 1 && closing && is_resume` (when `run_flag` goes
+    /// false); strict mode sets it when `boundary_resume && !first`
+    /// accepts an immediate resume. `classify` consumes it to derive
+    /// `SegmentClass::Closer` from the walker's own run-transition
+    /// (ruling 197-d1 addendum 28, fix round) rather than
+    /// approximating from `(run_in, run_out, damage)` alone.
+    /// Cleared by [`Classifier::reset_at_boundary`] on every segment
+    /// boundary.
+    closer_fired: bool,
 }
 
 /// The run state and gap hasher produced by [`Classifier::finish`] on success.
 pub(crate) struct FinishOutcome {
     pub(crate) state: RunState,
     pub(crate) gap: Option<blake3::Hasher>,
+    /// Walker's closer-fired evidence (see `CollectorOutcome::closer_fired`).
+    pub(crate) closer_fired: bool,
 }
 
 impl Classifier {
@@ -1794,6 +1911,7 @@ impl Classifier {
             },
             collected: Vec::new(),
             recovery_pending: false,
+            closer_fired: false,
         }
     }
 
@@ -1834,6 +1952,7 @@ impl Classifier {
             },
             collected: Vec::new(),
             recovery_pending: false,
+            closer_fired: false,
         }
     }
 
@@ -1968,6 +2087,18 @@ impl Classifier {
         {
             return Err(self.on_violation(Violation::UnclosedSegmentLacksResume));
         }
+        // Ruling 197-d1 addendum 28 (fix round): strict closer evidence.
+        // A `boundary_resume && !first && is_resume` sequence is the
+        // reader's own "immediate resume after unsealed-or-inherited-run
+        // boundary" -- i.e., the (i)+(ii) closer the walker just
+        // accepted. Latch so `classify` can derive `SegmentClass::Closer`
+        // from the walker's signal rather than a heuristic.
+        if self.boundary_resume
+            && !self.first
+            && matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume")
+        {
+            self.closer_fired = true;
+        }
         // ADR-0005 amendment 9 part 1: a run-opened segment with no predecessor
         // state still requires a genesis link (same disjunct as `scan_inner`).
         let genesis = self.ctx.genesis || (self.ctx.run && self.state.is_none());
@@ -2088,6 +2219,7 @@ impl Classifier {
         Ok(FinishOutcome {
             state,
             gap: self.gap,
+            closer_fired: self.closer_fired,
         })
     }
 
@@ -2113,6 +2245,7 @@ impl Classifier {
             state: self.state,
             gap: self.gap,
             violations: self.collected,
+            closer_fired: self.closer_fired,
         }
     }
 
@@ -2270,6 +2403,12 @@ impl Classifier {
                 return Err(self.on_violation(Violation::FirstSuccessorLacksImmediateResume));
             }
             self.run_flag = false;
+            // Ruling 197-d1 addendum 28 (fix round): latch the
+            // walker's own closer-fired evidence here. `classify`
+            // reads it per segment to derive `SegmentClass::Closer`
+            // from the walker's run transition rather than from a
+            // heuristic over `(run_in, run_out, damage)`.
+            self.closer_fired = true;
         }
         let before_loss = !(broken || self.state.as_ref().is_some_and(|s| s.run_loss));
         let compare_mmr = outside_run || before_loss;
@@ -2352,6 +2491,7 @@ impl Classifier {
         Ok(TolerantFinishOutcome {
             gap: self.gap,
             run_flag: self.run_flag,
+            closer_fired: self.closer_fired,
         })
     }
 
@@ -2490,6 +2630,7 @@ impl Classifier {
         self.broken_from_prepare = false;
         self.outside_run_from_prepare = false;
         self.recovery_pending = false;
+        self.closer_fired = false;
         self.current_pos = CollectorPos {
             segment_index: next_segment_index,
             record_index_in_segment: 0,
@@ -2723,6 +2864,7 @@ impl Classifier {
             run_flag: self.run_flag,
             violations: self.collected,
             gap: self.gap,
+            closer_fired: self.closer_fired,
         }
     }
 }
@@ -2753,6 +2895,8 @@ pub(crate) enum TolerantPrep {
 pub(crate) struct TolerantFinishOutcome {
     pub(crate) gap: Option<blake3::Hasher>,
     pub(crate) run_flag: bool,
+    /// Walker's closer-fired evidence (see `CollectorOutcome::closer_fired`).
+    pub(crate) closer_fired: bool,
 }
 
 /// First-record trial apply used by the tolerant-mode classifier. Calls
@@ -2834,11 +2978,13 @@ mod collector_tests {
             run_flag: false,
             violations: vec![(pos, Violation::MissingHead)],
             gap: None,
+            closer_fired: false,
         };
         assert!(outcome.state.is_none());
         assert!(!outcome.run_flag);
         assert_eq!(outcome.violations.len(), 1);
         assert!(outcome.gap.is_none());
+        assert!(!outcome.closer_fired);
         // Drive the shared `history_segment` orchestration: strict Ok →
         // Strict; strict CorruptTrail with no events → Tolerant with an
         // empty-walk outcome; strict Io → propagates.
@@ -3108,6 +3254,7 @@ mod collector_tests {
                 run_flag: false,
                 violations: Vec::new(),
                 gap: None,
+                closer_fired: false,
             },
             HistorySegmentWalk::Tolerant(out) => *out,
         }

@@ -1750,6 +1750,7 @@ fn resume_base_refuses_non_checkpoint_without_archived_predecessor() {
         None,
         &mut None,
         &mut false,
+        &mut false,
     );
     assert!(matches!(result, Err(e) if e.kind() == AuditErrorKind::CorruptTrail));
 }
@@ -1770,6 +1771,7 @@ fn inherited_run_reaches_first_strict_scan_of_later_history() {
         None,
         &mut None,
         &mut run,
+        &mut false,
     )
     .unwrap()
     .0;
@@ -1789,6 +1791,7 @@ fn inherited_run_reaches_first_strict_scan_of_later_history() {
             None,
             &mut None,
             &mut run,
+            &mut false,
         ),
         AuditErrorKind::CorruptTrail,
     );
@@ -1943,6 +1946,7 @@ mod details {
             None,
             &mut None,
             &mut r,
+            &mut false,
         )
         .map(|(s, _)| s)
     }
@@ -1967,6 +1971,7 @@ mod details {
             Some(expected),
             &mut found,
             &mut r,
+            &mut false,
         )
         .map(|(s, _)| s);
         (res, found)
@@ -3731,6 +3736,7 @@ mod details {
             None,
             &mut None,
             &mut run,
+            &mut false,
         )
         .unwrap()
         .0;

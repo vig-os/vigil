@@ -2946,6 +2946,7 @@ fn resume_discovery_requires_full_validation_before_writing() {
         None,
         &mut None,
         &mut false,
+        &mut false,
     )
     .unwrap()
     .0
