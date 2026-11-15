@@ -845,10 +845,9 @@ fn cv7_a9_span_seg_renumbered_run_local() {
 // the widened `storage::tests::runs` helpers (addendum 27.4).
 // ============================================================
 
-/// CV0 (addendum 25.5, fix round B2): every field the slice adds is
-/// READ and ASSERTED at this head. Replaces the earlier `let _ =`
-/// touches, which the review flagged as "no pin" — a drop/rewrite of
-/// a field could leave the row green because nothing was compared.
+/// CV0 (addendum 25.5): every field the slice adds is READ and
+/// ASSERTED at this head, so a drop or rewrite of a field cannot
+/// leave this row green with nothing compared.
 #[test]
 fn cv0_every_field_is_read_here() {
     let a = build_a1();
@@ -944,8 +943,8 @@ fn cv2_sample_p09_empty_segment_closed_run_equals_a8() {
 // (widened to `pub(crate)` for this slice), then (i) records
 // `TrailReader::open`'s outcome, (ii) runs `classify` under
 // `Reaction::Collect`, (iii) asserts the literal `out.runs` /
-// `run_membership` expected per the brief. C2: a rejected trail
-// gives `out.runs` empty.
+// `run_membership` for the layout. Addendum 28 point 2: a rejected
+// trail gives `out.runs` empty.
 // ============================================================
 
 use crate::audit::storage::tests::{self as st, runs as st_runs};
@@ -967,7 +966,7 @@ fn run_bounds(out: &super::ClassifyOutput) -> Vec<(usize, usize)> {
 /// `S2=[close1, resume1, "broken\n"]`, live=`[close2, resume2]`.
 /// Reader: `Ok`.
 ///
-/// Ruling 197-d1 addendum 28 fix round (B1): grouping uses the
+/// Ruling 197-d1 addendum 28 (B1): grouping uses the
 /// walker's own closer signal, so S2 is both the Closer of run 0
 /// (its `close1+resume1` pair closes the run opened by S1) AND
 /// the first segment of run 1 (its trailing `"broken\n"` fragment
@@ -1007,7 +1006,7 @@ fn cv2_p01_closing_segment_can_start_second_run() {
     );
 }
 
-/// R-honest-mid (brief #197 R2b S3b2 r2 B1 pin): an honest segment
+/// R-honest-mid (ruling 197-d1 addendum 28): an honest segment
 /// between the base and the run's start is NOT a run member.
 /// Layout: `S0=[cp0]`, sealed `S1=[signed(1, cp0.hash)]`
 /// (honest checkpoint-only middle), sealed `S2=[headless(cp1, 6)]`
@@ -1047,7 +1046,7 @@ fn cv2_r_honest_mid_honest_middle_is_not_a_run_member() {
     );
 }
 
-/// R-honest-between (brief #197 R2b S3b2 r2 B1 pin): two runs on the
+/// R-honest-between (ruling 197-d1 addendum 28): two runs on the
 /// same trail. The layout chains run 0 (closed by S2's close1+resume1)
 /// directly into run 1's opening via a second headless in S3 (the
 /// `second_loss_keeps_first_run_acceptable` storage-tests pattern):
@@ -1058,10 +1057,10 @@ fn cv2_r_honest_mid_honest_middle_is_not_a_run_member() {
 ///   live=[close2, resume2] (closes run 1).
 ///
 /// S0 is Base (not in any run); S3 is the first segment of run 1 so
-/// S3 IS a run member. The "honest between" behaviour the brief
-/// targets -- that classify's grouping does not extend run 0 past
-/// its closer S2 -- is the real pin: S2 is in run 0 only, S3
-/// belongs to run 1 only.
+/// S3 IS a run member. The "honest between" behaviour pinned here --
+/// that classify's grouping does not extend run 0 past its closer
+/// S2 -- is the real invariant: S2 is in run 0 only, S3 belongs to
+/// run 1 only.
 #[test]
 fn cv2_r_honest_between_two_runs_on_same_trail() {
     let d = st::Temp::new();

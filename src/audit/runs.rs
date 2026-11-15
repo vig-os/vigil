@@ -246,7 +246,7 @@ pub(crate) struct CollectorOutcome {
     /// the first-successor-is-resume path accepts a resume after an
     /// inherited-run or unsealed boundary. Consumed by `classify` to
     /// derive `SegmentClass::Closer` without heuristics (ruling
-    /// 197-d1 addendum 28, fix round: use the walker's own signal,
+    /// 197-d1 addendum 28: use the walker's own signal,
     /// not an approximation from `(run_in, run_out, damage)` alone).
     pub(crate) closer_fired: bool,
 }
@@ -854,7 +854,7 @@ pub(crate) struct SegmentViolationPos {
     pub(crate) record_index_in_segment: usize,
 }
 
-/// #197 ruling addendum 25.5 (and addendum 28 fix round): segment
+/// #197 ruling addendum 25.5 (and addendum 28): segment
 /// classification the V4a walk consumes. Computed in [`classify`]
 /// purely from the walker's own signals — `damage`, `run_in`,
 /// `run_out`, and the Classifier's `closer_fired` latch — with no
@@ -992,38 +992,52 @@ struct RecordHeadInfo {
 
 /// Addendum 25.5 (spans/records): one pass of `verify::lines::stream`
 /// over a segment file to collect spans (with per-segment `after =
-/// u64::MAX` sentinel) AND the `(seq, hash, previous)` of every
-/// complete record on this trail. Classify re-runs it under Collect
-/// only, once per segment, so no loss-point arithmetic lives on the
-/// Stop path. The file handle is sought to byte 0 by the walker.
+/// u64::MAX` sentinel) AND the (first, last) record head on this
+/// trail. Ruling 197-d1 addendum 28 point 2 (D2): retention is the
+/// per-segment first and last record head only -- a single pair is
+/// sufficient to compute the gap-point (hash-link break) at each run-
+/// segment boundary (the pair (last-of-prior-segment, first-of-this-
+/// segment)) and to pin the closer's opening-checkpoint head; no
+/// within-segment record list is kept. Classify re-runs this pass
+/// once per segment under Collect, so no loss-point arithmetic lives
+/// on the Stop path. The file handle is sought to byte 0 by the walker.
 fn collect_segment_spans_and_records(
     file: &mut std::fs::File,
     trail: [u8; 16],
     segment_index: usize,
-) -> (Vec<super::verify::lines::Span>, Vec<RecordHeadInfo>) {
+) -> (
+    Vec<super::verify::lines::Span>,
+    Option<(RecordHeadInfo, RecordHeadInfo)>,
+) {
     use std::io::{BufReader, Seek, SeekFrom};
     if file.seek(SeekFrom::Start(0)).is_err() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), None);
     }
     let reader = BufReader::new(file);
-    let mut records: Vec<RecordHeadInfo> = Vec::new();
+    let mut first: Option<RecordHeadInfo> = None;
+    let mut last: Option<RecordHeadInfo> = None;
     let seg_u32: u32 = u32::try_from(segment_index).unwrap_or(u32::MAX);
     let spans = super::verify::lines::stream(reader, seg_u32, |item| {
         if let super::verify::lines::Content::Records(recs) = &item.content {
             for r in recs {
                 if r.context.trail == trail {
-                    records.push(RecordHeadInfo {
+                    let info = RecordHeadInfo {
                         seq: r.context.seq,
                         hash: Head::of(r).hash,
                         previous: r.context.previous,
-                    });
+                    };
+                    if first.is_none() {
+                        first = Some(info);
+                    }
+                    last = Some(info);
                 }
             }
         }
     });
+    let heads = first.zip(last);
     match spans {
-        Ok(v) => (v, records),
-        Err(_) => (Vec::new(), records),
+        Ok(v) => (v, heads),
+        Err(_) => (Vec::new(), heads),
     }
 }
 
@@ -1059,20 +1073,22 @@ fn collect_segment_spans_and_records(
 /// the arm is unreachable by construction, and the body stays empty
 /// instead of panicking (no `unreachable!` on the reader path).
 ///
-/// # Collect-side memory (addendum 25.5, 28 fix round D2)
+/// # Collect-side memory (addendum 25.5, 28 D2)
 ///
 /// Under [`Reaction::Collect`] this function retains only what the
 /// grouping loop needs: `seg_spans: Vec<Vec<Span>>` (one list per
 /// segment — the product fed into each [`RunReport`]) and
-/// `seg_records: Vec<Vec<RecordHeadInfo>>` (one record head per
-/// complete record, consumed by the loss-point hash-link chain to
-/// compute `(prev, this)` at each run's first segment). The per-
-/// segment `run_out` flag is kept in a `Vec<bool>` the same length
-/// as `seg_spans`. Nothing else is retained; `seg_records` entries
-/// for segments that end up as `Base` (not run members) are still
-/// kept, since the grouping needs the last record of the segment
-/// immediately preceding a run to compute its first loss point.
-/// The `Stop` reaction holds none of these Collect-only vectors.
+/// `seg_records: Vec<Option<(RecordHeadInfo, RecordHeadInfo)>>` (per
+/// segment, only the first and last record head on this trail; D2:
+/// the gap pair at each run-segment boundary is `(last-of-prior-
+/// segment, first-of-this-segment)`, both already retained, and the
+/// closer's opening-checkpoint head is the segment's first). No
+/// within-segment record list is kept. The per-segment `run_out`
+/// flag is kept in a `Vec<bool>` the same length as `seg_spans`.
+/// `seg_records` entries for `Base` segments are still kept, since
+/// the grouping needs the last record of the segment immediately
+/// preceding a run to compute its gap point. `Stop` holds none of
+/// these Collect-only vectors.
 pub(crate) fn classify(
     args: ClassifyArgs,
     path: ReaderPath,
@@ -1095,30 +1111,36 @@ pub(crate) fn classify(
     // through `verify::lines::stream` after the walker call.
     let build_reports = matches!(reaction, Reaction::Collect);
     let mut seg_spans: Vec<Vec<super::verify::lines::Span>> = Vec::new();
-    let mut seg_records: Vec<Vec<RecordHeadInfo>> = Vec::new();
+    let mut seg_records: Vec<Option<(RecordHeadInfo, RecordHeadInfo)>> = Vec::new();
     // Per-segment `run_out` (the `*run` flag after the walker fired).
     // Grouping uses this to detect a closer that reopens (`closer_fired
     // == true && run_out == true`), which starts a new run at the same
-    // segment index (ruling 197-d1 addendum 28 fix round: use walker
+    // segment index (ruling 197-d1 addendum 28: use walker
     // signals, not a heuristic).
     let mut seg_run_out: Vec<bool> = Vec::new();
     let mut segment_index: usize = 0;
     while let Some(seg) = source.next_segment()? {
         let in_state = state.take();
-        // Addendum 25.5: capture entry-side signals the per-segment
-        // report needs. `opening` is derived from the ReaderPath+role
-        // pair; `boundary_resume` is `opening && prior mid-run`
-        // (inlined `storage::sealed` so classify stays I/O-free).
-        let (role_opening, _role_prelude) = match (path, &seg) {
-            (ReaderPath::LiveOpen { .. }, SegmentRead::Sealed { .. })
-            | (ReaderPath::LiveOpen { .. }, SegmentRead::Live(_))
-            | (ReaderPath::RefreshRotate, SegmentRead::Sealed { prelude: false, .. })
-            | (ReaderPath::RefreshRotate, SegmentRead::Live(_)) => (true, false),
-            (ReaderPath::RefreshRotate, SegmentRead::Sealed { prelude: true, .. }) => (false, true),
-            (ReaderPath::RefreshAppend, _) => (false, false),
+        // Addendum 28 point 1 (D1): per-segment report bookkeeping
+        // (`role_opening`, `boundary_resume`, `storage::sealed`) runs
+        // ONLY under Collect. Under Stop the reader path keeps its
+        // base shape: no role dispatch, no sealed check, no per-segment
+        // report fields built. `run_in_before` stays outside the gate
+        // because the walker arms need it to decide run class after
+        // the call.
+        let boundary_resume = if build_reports {
+            let role_opening = match (path, &seg) {
+                (ReaderPath::LiveOpen { .. }, SegmentRead::Sealed { .. })
+                | (ReaderPath::LiveOpen { .. }, SegmentRead::Live(_))
+                | (ReaderPath::RefreshRotate, SegmentRead::Sealed { prelude: false, .. })
+                | (ReaderPath::RefreshRotate, SegmentRead::Live(_)) => true,
+                (ReaderPath::RefreshRotate, SegmentRead::Sealed { prelude: true, .. })
+                | (ReaderPath::RefreshAppend, _) => false,
+            };
+            role_opening && in_state.as_ref().is_some_and(|s| !storage::sealed(s))
+        } else {
+            false
         };
-        let boundary_resume =
-            role_opening && in_state.as_ref().is_some_and(|s| !storage::sealed(s));
         let run_in_before = run;
         // Addendum 25.5 (spans/records): under Collect, clone the
         // segment's file handle BEFORE the walker consumes it so a
@@ -1133,47 +1155,31 @@ pub(crate) fn classify(
         } else {
             None
         };
-        let mut closer_fired: bool = false;
-        let (next_state, seg_violations, live) = match (path, seg) {
+        let (next_state, seg_violations, closer_fired, live) = match (path, seg) {
             (ReaderPath::LiveOpen { expected }, SegmentRead::Sealed { file, .. }) => {
-                let (s, v) = storage::history_segment(
-                    reaction,
-                    &file,
-                    trail,
-                    in_state,
-                    true,
-                    expected,
-                    &mut found,
-                    &mut run,
-                    &mut closer_fired,
+                let out = storage::history_segment(
+                    reaction, &file, trail, in_state, true, expected, &mut found, &mut run,
                 )?;
-                (s, v, None)
+                (out.state, out.violations, out.closer_fired, None)
             }
             (ReaderPath::LiveOpen { expected }, SegmentRead::Live(file)) => {
-                let (s, v) = storage::scan_closing(
-                    reaction,
-                    &file,
-                    trail,
-                    in_state,
-                    expected,
-                    &mut found,
-                    run,
-                    &mut closer_fired,
+                let out = storage::scan_closing(
+                    reaction, &file, trail, in_state, expected, &mut found, run,
                 )?;
-                (s, v, Some(file))
+                (out.state, out.violations, out.closer_fired, Some(file))
             }
             (ReaderPath::RefreshAppend, SegmentRead::Live(file)) => {
-                let (s, v) = storage::scan(
+                let out = storage::scan(
                     reaction, &file, trail, in_state, false, None, &mut found, false,
                 )?;
-                (s, v, Some(file))
+                (out.state, out.violations, out.closer_fired, Some(file))
             }
             (ReaderPath::RefreshAppend, SegmentRead::Sealed { .. }) => {
                 // `SegmentSource::for_refresh_append` yields only a
                 // single Live segment; this arm is unreachable by
                 // construction. Keep it as a no-op so the reader path
                 // has no `unreachable!`.
-                (in_state, Vec::new(), None)
+                (in_state, Vec::new(), false, None)
             }
             (
                 ReaderPath::RefreshRotate,
@@ -1182,18 +1188,10 @@ pub(crate) fn classify(
                     prelude: true,
                 },
             ) => {
-                let (s, v) = storage::history_segment(
-                    reaction,
-                    &file,
-                    trail,
-                    in_state,
-                    false,
-                    None,
-                    &mut found,
-                    &mut run,
-                    &mut closer_fired,
+                let out = storage::history_segment(
+                    reaction, &file, trail, in_state, false, None, &mut found, &mut run,
                 )?;
-                (s, v, None)
+                (out.state, out.violations, out.closer_fired, None)
             }
             (
                 ReaderPath::RefreshRotate,
@@ -1202,54 +1200,63 @@ pub(crate) fn classify(
                     prelude: false,
                 },
             ) => {
-                let (s, v) = storage::history_segment(
-                    reaction,
-                    &file,
-                    trail,
-                    in_state,
-                    true,
-                    None,
-                    &mut found,
-                    &mut run,
-                    &mut closer_fired,
+                let out = storage::history_segment(
+                    reaction, &file, trail, in_state, true, None, &mut found, &mut run,
                 )?;
-                (s, v, None)
+                (out.state, out.violations, out.closer_fired, None)
             }
             (ReaderPath::RefreshRotate, SegmentRead::Live(file)) => {
-                let (s, v) = storage::scan_closing(
-                    reaction,
-                    &file,
-                    trail,
-                    in_state,
-                    None,
-                    &mut found,
-                    run,
-                    &mut closer_fired,
-                )?;
-                (s, v, Some(file))
+                let out =
+                    storage::scan_closing(reaction, &file, trail, in_state, None, &mut found, run)?;
+                (out.state, out.violations, out.closer_fired, Some(file))
             }
         };
-        // Addendum 25.5: capture per-segment report inputs before
-        // the Stop-identical `state`/`live_file`/`final_state`
-        // bookkeeping consumes `next_state`.
-        let next_state_run = next_state.as_ref().map(|s| s.run.clone());
-        let next_state_is_some = next_state.is_some();
-        let damage = !seg_violations.is_empty();
-        let is_live = live.is_some();
-        // Addendum 25.5: run the span/record-head pass for this
-        // segment under Collect. We rewind the dup handle to byte 0
-        // (base-identical: `verify::lines::stream` sets `after =
-        // u64::MAX` on the first span of each segment per 13-V4-d2
-        // point 2). On I/O failure under Collect we silently drop
-        // this segment's span data (spans are a report input, not a
-        // reader-side invariant).
+        // Addendum 28 point 1 (D1): per-segment report work runs ONLY
+        // under Collect. The whole build block captures span/record
+        // heads, derives `SegmentClass` from the walker's own signals
+        // (no heuristic fallback), and pushes one `SegmentReport`:
+        //   - `damage`: the walker recorded at least one violation;
+        //   - `run_in_before`: the `*run` flag before the walker fired;
+        //   - `run_out`: the `*run` flag after the walker fired (`run`);
+        //   - `closer_fired`: the walker's own (i)+(ii) closer evidence
+        //     (strict: Classifier latched on `boundary_resume && !first
+        //     && is_resume`; tolerant: `count==1 && closing` cleared
+        //     `run_flag`).
+        // `Base` means "segment with no run activity". The last match
+        // arm binds the impossible combination (walker closed a run
+        // without `run_in_before`) to `Damaged` -- a closer with no
+        // prior run is evidence of damage, not a valid closer.
         if build_reports {
-            let (spans, records) = span_handle
+            let damage = !seg_violations.is_empty();
+            let next_state_run = next_state.as_ref().map(|s| s.run.clone());
+            // Addendum 25.5: rewind the dup handle to byte 0 so
+            // `verify::lines::stream` sets `after = u64::MAX` on each
+            // segment's first span (13-V4-d2 point 2). On I/O failure
+            // we silently drop this segment's spans and records --
+            // they are a report input, not a reader invariant.
+            let (spans, heads) = span_handle
                 .map(|mut f| collect_segment_spans_and_records(&mut f, trail, segment_index))
-                .unwrap_or_else(|| (Vec::new(), Vec::new()));
+                .unwrap_or((Vec::new(), None));
             seg_spans.push(spans);
-            seg_records.push(records);
+            seg_records.push(heads);
+            let class = match (damage, run_in_before, run, closer_fired) {
+                (true, _, _, _) => SegmentClass::Damaged,
+                (false, true, _, true) => SegmentClass::Closer,
+                (false, true, _, false) => SegmentClass::InRun,
+                (false, false, true, false) => SegmentClass::InRun,
+                (false, false, false, false) => SegmentClass::Base,
+                (false, false, _, true) => SegmentClass::Damaged,
+            };
+            segments.push(SegmentReport {
+                class,
+                run_membership: None, // backfilled after the loop
+                damage,
+                boundary_resume,
+                final_state: next_state_run,
+            });
+            seg_run_out.push(run);
         }
+        // Base reader bookkeeping, unchanged under Stop.
         if let Some(file) = live {
             live_file = Some(file);
             final_state = next_state.clone();
@@ -1263,7 +1270,7 @@ pub(crate) fn classify(
             // its final `State` from the classifier's own `state`
             // field so Collect threads the same State as Stop on
             // `[cp0, close1, garbage\n]` and every analogous sealed
-            // layout; #197 ruling addendum 27.1 Collect-vs-Stop
+            // layout; ruling 197-d1 addendum 27.1 Collect-vs-Stop
             // Ok-path equality).
             state = next_state;
         }
@@ -1276,53 +1283,9 @@ pub(crate) fn classify(
                 v,
             ));
         }
-        // Ruling 197-d1 addendum 28 fix round: derive `SegmentClass`
-        // purely from the walker's own signals. No heuristic fallback.
-        //   - `damage`: the walker recorded at least one violation;
-        //   - `run_in_before`: the `*run` flag before the walker fired;
-        //   - `run_out`: the `*run` flag after the walker fired;
-        //   - `closer_fired`: the walker's own (i)+(ii) closer evidence
-        //     (strict: boundary_resume accepted an immediate resume;
-        //     tolerant: `count==1 && closing` cleared `run_flag`).
-        // `Base` means "segment with no run activity" (the walker left
-        // `*run` false in and out and recorded no damage). It is no
-        // longer restricted to `segment_index == 0`; an honest
-        // intermediate segment is `Base` too, and breaks run
-        // membership. The `_` wildcard binds the one impossible
-        // combination (walker closed a run without `run_in_before`) to
-        // `Damaged`: a closer with no prior run is evidence of
-        // damage, not a valid closer.
-        let run_out = run;
-        let class = match (damage, run_in_before, run_out, closer_fired) {
-            (true, _, _, _) => SegmentClass::Damaged,
-            (false, true, _, true) => SegmentClass::Closer,
-            (false, true, _, false) => SegmentClass::InRun,
-            (false, false, true, false) => SegmentClass::InRun,
-            (false, false, false, false) => SegmentClass::Base,
-            // The walker signalled a closer without `run_in_before`
-            // being true: the strict path would have errored, so this
-            // case is unreachable in practice. Classify as Damaged so
-            // `SegmentClass::Closer` stays iff the walker ended a
-            // prior run.
-            (false, false, _, true) => SegmentClass::Damaged,
-        };
-        if build_reports {
-            segments.push(SegmentReport {
-                class,
-                run_membership: None, // backfilled after the loop
-                damage,
-                boundary_resume,
-                final_state: next_state_run,
-            });
-            seg_run_out.push(run_out);
-        }
-        // `is_live`, `next_state_is_some`: no longer needed for class
-        // derivation; silence warnings in test builds.
-        let _ = is_live;
-        let _ = next_state_is_some;
         segment_index += 1;
     }
-    // Ruling 197-d1 addendum 28 fix round: group segments into closed
+    // Ruling 197-d1 addendum 28: group segments into closed
     // runs using the walker's own `Closer` signal.
     //   - A new run starts at the first run-active segment following
     //     either segment 0, a `Base` segment, or a prior `Closer` that
@@ -1396,59 +1359,55 @@ pub(crate) fn classify(
                             spans.push(sp2);
                         }
                     }
-                    // Addendum 25.5 + B3d1-d4: compute loss_points by
-                    // walking the run's record heads in order. The
-                    // "preceding complete record" for the run's first
-                    // record is the last record on the prior segment
-                    // (if any) -- but under Collect, segments[k-1]
-                    // may have been Base or part of another run. We
-                    // use the last record from seg_records[k-1] if
-                    // it exists, else None (ruling 13-V4-d2 point 3:
+                    // Addendum 25.5 + B3d1-d4 (D2 retention): compute
+                    // loss_points from the (first, last) pair of each
+                    // run segment. The "preceding complete record" for
+                    // the run's first record is the last record on the
+                    // prior segment (if any). Ruling 13-V4-d2 point 3:
                     // a run segment adds a loss point only when a
-                    // complete record precedes it on the trail).
+                    // complete record precedes it on the trail.
                     let mut loss_points: Vec<LossPoint> = Vec::new();
-                    let mut prev_complete: Option<&RecordHeadInfo> = None;
-                    if first_segment > 0 {
-                        prev_complete = seg_records[first_segment - 1].last();
-                    }
+                    let mut prev_complete: Option<RecordHeadInfo> = if first_segment > 0 {
+                        seg_records[first_segment - 1].map(|(_f, l)| l)
+                    } else {
+                        None
+                    };
                     let mut skip_run = false;
-                    'outer: for seg_records_k in seg_records
+                    'outer: for (first_rec, last_rec) in seg_records
                         .iter()
                         .take(last_segment + 1)
                         .skip(first_segment)
+                        .flatten()
                     {
-                        for (ri, r) in seg_records_k.iter().enumerate() {
-                            if ri == 0
-                                && let Some(p) = prev_complete
-                                && r.previous != p.hash
-                            {
-                                // Loss point at the hash-link break;
-                                // checked arithmetic (13-V4-d3 point 2
-                                // last bullet): overflow or non-
-                                // increasing seq drops only THIS run.
-                                let Some(first) = p.seq.checked_add(1) else {
-                                    skip_run = true;
-                                    break 'outer;
-                                };
-                                let Some(count) = r.seq.checked_sub(first) else {
-                                    skip_run = true;
-                                    break 'outer;
-                                };
-                                loss_points.push(LossPoint {
-                                    loss_seq: r.seq,
-                                    first,
-                                    count,
-                                });
-                            }
-                            prev_complete = Some(r);
+                        if let Some(p) = &prev_complete
+                            && first_rec.previous != p.hash
+                        {
+                            // Loss point at the hash-link break;
+                            // checked arithmetic (13-V4-d3 point 2
+                            // last bullet): overflow or non-
+                            // increasing seq drops only THIS run.
+                            let Some(first) = p.seq.checked_add(1) else {
+                                skip_run = true;
+                                break 'outer;
+                            };
+                            let Some(count) = first_rec.seq.checked_sub(first) else {
+                                skip_run = true;
+                                break 'outer;
+                            };
+                            loss_points.push(LossPoint {
+                                loss_seq: first_rec.seq,
+                                first,
+                                count,
+                            });
                         }
+                        prev_complete = Some(*last_rec);
                     }
                     // Addendum 25.5: capture the closer's opening
                     // checkpoint Head (ADR (i)). That is the first
                     // record on the Closer segment.
-                    let closing_opening = seg_records[last_segment].first().map(|r| Head {
-                        seq: r.seq,
-                        hash: r.hash,
+                    let closing_opening = seg_records[last_segment].map(|(f, _l)| Head {
+                        seq: f.seq,
+                        hash: f.hash,
                     });
                     if !skip_run {
                         runs_out.push(RunReport {
@@ -1860,7 +1819,7 @@ pub(crate) struct Classifier {
     /// false); strict mode sets it when `boundary_resume && !first`
     /// accepts an immediate resume. `classify` consumes it to derive
     /// `SegmentClass::Closer` from the walker's own run-transition
-    /// (ruling 197-d1 addendum 28, fix round) rather than
+    /// (ruling 197-d1 addendum 28) rather than
     /// approximating from `(run_in, run_out, damage)` alone.
     /// Cleared by [`Classifier::reset_at_boundary`] on every segment
     /// boundary.
@@ -2087,7 +2046,7 @@ impl Classifier {
         {
             return Err(self.on_violation(Violation::UnclosedSegmentLacksResume));
         }
-        // Ruling 197-d1 addendum 28 (fix round): strict closer evidence.
+        // Ruling 197-d1 addendum 28  strict closer evidence.
         // A `boundary_resume && !first && is_resume` sequence is the
         // reader's own "immediate resume after unsealed-or-inherited-run
         // boundary" -- i.e., the (i)+(ii) closer the walker just
@@ -2403,7 +2362,7 @@ impl Classifier {
                 return Err(self.on_violation(Violation::FirstSuccessorLacksImmediateResume));
             }
             self.run_flag = false;
-            // Ruling 197-d1 addendum 28 (fix round): latch the
+            // Ruling 197-d1 addendum 28  latch the
             // walker's own closer-fired evidence here. `classify`
             // reads it per segment to derive `SegmentClass::Closer`
             // from the walker's run transition rather than from a

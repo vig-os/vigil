@@ -1750,7 +1750,6 @@ fn resume_base_refuses_non_checkpoint_without_archived_predecessor() {
         None,
         &mut None,
         &mut false,
-        &mut false,
     );
     assert!(matches!(result, Err(e) if e.kind() == AuditErrorKind::CorruptTrail));
 }
@@ -1771,10 +1770,9 @@ fn inherited_run_reaches_first_strict_scan_of_later_history() {
         None,
         &mut None,
         &mut run,
-        &mut false,
     )
     .unwrap()
-    .0;
+    .state;
     assert!(run);
     // An otherwise strict-valid segment must close the inherited run with an
     // immediate resume; a normal entry cannot silently erase that obligation.
@@ -1791,7 +1789,6 @@ fn inherited_run_reaches_first_strict_scan_of_later_history() {
             None,
             &mut None,
             &mut run,
-            &mut false,
         ),
         AuditErrorKind::CorruptTrail,
     );
@@ -1946,9 +1943,8 @@ mod details {
             None,
             &mut None,
             &mut r,
-            &mut false,
         )
-        .map(|(s, _)| s)
+        .map(|o| o.state)
     }
     /// Addendum 22.1/22.2: history_segment with `expected` + a `found`
     /// out-parameter, so pins can observe both the returned state and
@@ -1971,9 +1967,8 @@ mod details {
             Some(expected),
             &mut found,
             &mut r,
-            &mut false,
         )
-        .map(|(s, _)| s);
+        .map(|o| o.state);
         (res, found)
     }
     fn scc(f: &File, state: Option<State>, opening: bool) -> Result<State, AuditError> {
@@ -1987,7 +1982,7 @@ mod details {
             &mut None,
             false,
         )
-        .map(|(s, _)| s.unwrap())
+        .map(|o| o.state.unwrap())
     }
     fn state_from(bytes: &[u8]) -> (Temp, State) {
         let d = Temp::new();
@@ -3736,10 +3731,9 @@ mod details {
             None,
             &mut None,
             &mut run,
-            &mut false,
         )
         .unwrap()
-        .0;
+        .state;
         assert!(run, "fragment-only seg0 belongs to a run");
         assert!(state.is_none(), "no complete record in seg0 to carry state");
     }
