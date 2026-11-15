@@ -1891,22 +1891,34 @@ fn b3_n1a_closer_fired_stuck_false_kill() {
 
 /// M-N1b kill — `closer_fired = ctx.run` (inherited-run inference).
 /// Needs a layout where `ctx.run` is true on a non-closing strict
-/// pass: A1's `S1` is in a run (`run_in_before=true`) and does NOT
-/// close it. Pinning `segments[1].class == InRun` kills the
-/// inferred mutant (which would latch `Closer` on S1).
+/// pass: p02 S2 inherits the run opened by S1 and does NOT close
+/// it (the live closer is a separate segment). Pinning `segments[2]
+/// .class == InRun` kills the inferred mutant (which would latch
+/// `Closer` on S2 because `run_in_before==true`), and would then
+/// split `cv2_p02`'s single run `[(1,3)]` into `[(1,2),(2,3)]`.
 #[test]
 fn b3_n1b_closer_fired_from_ctx_run_kill() {
-    let a = build_a1();
-    TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
-    let out = classify_collect(&a.dir_path);
+    let d = st::Temp::new();
+    let first = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&first], &[]);
+    let mut fold = st::seeded(&first);
+    let r_a = st_runs::headless(&first, first.context.seq + 5);
+    st_runs::put(&d, 1, &[&r_a], &[]);
+    fold.push(r_a.hash()).unwrap();
+    let r_b = st_runs::headless(&r_a, r_a.context.seq + 5);
+    st_runs::put(&d, 2, &[&r_b], &[]);
+    fold.push(r_b.hash()).unwrap();
+    let _ = st_runs::close_run(&d, &r_b, &fold);
+    TrailReader::open(&d.0, TRAIL, None).expect("M-N1b: reader Ok on p02 layout");
+    let out = classify_collect(&d.0);
     assert_eq!(
-        out.segments[1].class,
+        out.segments[2].class,
         super::SegmentClass::InRun,
-        "M-N1b kill: A1 S1 stays InRun (mutant with closer_fired=ctx.run would flip it to Closer)",
+        "M-N1b kill: p02 S2 stays InRun (mutant closer_fired=run_in_before would latch Closer here)",
     );
     assert_eq!(
-        out.segments[1].run_membership,
+        out.segments[2].run_membership,
         Some(0),
-        "M-N1b kill: A1 S1 belongs to run 0",
+        "M-N1b kill: p02 S2 belongs to run 0",
     );
 }
