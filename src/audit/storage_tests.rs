@@ -94,6 +94,32 @@ fn reject<T>(result: Result<T, AuditError>) {
 fn corrupt_open(path: &Path) {
     reject(TrailReader::open(path, TRAIL, None));
 }
+/// Extracts the detail string from an [`AuditError`] via its `Display`
+/// impl (`"{kind:?}: {detail}"`). Ruling 197-d1 addendum 27.4: the RP
+/// literal outcomes pin both the `kind` and the exact detail.
+fn detail_of(err: &AuditError) -> String {
+    let display = format!("{err}");
+    display
+        .split_once(": ")
+        .map_or(display.clone(), |(_, d)| d.to_string())
+}
+/// Pin an `Err` outcome by both `kind` and the exact detail string
+/// (ruling 197-d1 addendum 27.4). Extended from `bad(kind)` to keep the
+/// RP Err helpers DRY.
+fn bad_detail<T>(result: Result<T, AuditError>, kind: AuditErrorKind, detail: &str) {
+    let err = result.err().expect("expected Err");
+    assert_eq!(err.kind(), kind, "kind mismatch");
+    assert_eq!(detail_of(&err), detail, "detail mismatch");
+}
+/// Pin a `CorruptTrail` outcome by its exact detail string.
+fn reject_detail<T>(result: Result<T, AuditError>, detail: &str) {
+    bad_detail(result, AuditErrorKind::CorruptTrail, detail);
+}
+/// Pin a `TrailReader::open` `CorruptTrail` outcome by its exact detail.
+fn corrupt_open_detail(path: &Path, detail: &str) {
+    reject_detail(TrailReader::open(path, TRAIL, None), detail);
+}
+
 fn write_records(path: &Path, records: &[&Record]) {
     write(
         path,
@@ -104,7 +130,10 @@ fn write(path: &Path, bytes: impl AsRef<[u8]>) {
     fs::write(path.join("audit.jsonl"), bytes).unwrap();
 }
 fn segment(path: &Path, id: usize) -> PathBuf {
-    path.join(format!("audit-20260101T000000.000000000Z_{id:06}.jsonl"))
+    path.join(segment_name(id))
+}
+fn segment_name(id: usize) -> PathBuf {
+    PathBuf::from(format!("audit-20260101T000000.000000000Z_{id:06}.jsonl"))
 }
 fn rotated(path: &Path, last: &Record, mmr: &mut Mmr, id: usize) -> Record {
     let close = cp(last.context.seq + 1, last.hash(), mmr);
@@ -1712,7 +1741,16 @@ fn resume_base_refuses_non_checkpoint_without_archived_predecessor() {
     let kept = entry(&creation);
     write_records(&d.0, &[&kept]);
     let file = File::open(d.0.join("audit.jsonl")).unwrap();
-    let result = history_segment(&file, TRAIL, None, true, None, &mut None, &mut false);
+    let result = history_segment(
+        crate::audit::runs::Reaction::Stop,
+        &file,
+        TRAIL,
+        None,
+        true,
+        None,
+        &mut None,
+        &mut false,
+    );
     assert!(matches!(result, Err(e) if e.kind() == AuditErrorKind::CorruptTrail));
 }
 
@@ -1723,7 +1761,18 @@ fn inherited_run_reaches_first_strict_scan_of_later_history() {
     append_bytes(&d.0.join("audit.jsonl"), b"xyz\n");
     let file = File::open(d.0.join("audit.jsonl")).unwrap();
     let mut run = false;
-    let state = history_segment(&file, TRAIL, None, true, None, &mut None, &mut run).unwrap();
+    let state = history_segment(
+        crate::audit::runs::Reaction::Stop,
+        &file,
+        TRAIL,
+        None,
+        true,
+        None,
+        &mut None,
+        &mut run,
+    )
+    .unwrap()
+    .0;
     assert!(run);
     // An otherwise strict-valid segment must close the inherited run with an
     // immediate resume; a normal entry cannot silently erase that obligation.
@@ -1731,7 +1780,16 @@ fn inherited_run_reaches_first_strict_scan_of_later_history() {
     write_records(&d.0, &[&opening, &entry(&opening)]);
     let file = File::open(d.0.join("audit.jsonl")).unwrap();
     bad(
-        history_segment(&file, TRAIL, state, true, None, &mut None, &mut run),
+        history_segment(
+            crate::audit::runs::Reaction::Stop,
+            &file,
+            TRAIL,
+            state,
+            true,
+            None,
+            &mut None,
+            &mut run,
+        ),
         AuditErrorKind::CorruptTrail,
     );
 }
@@ -1748,27 +1806,50 @@ mod details {
     use std::collections::{HashMap, HashSet};
 
     // The gate parses `storage.rs` and `runs.rs` separately with
-    // `syn::parse_file` and collects the `corrupt` call sites across
-    // both in a fixed file order (storage.rs first, then runs.rs), so
-    // the `(detail, occurrence)` keys stay stable.
+    // `syn::parse_file` and collects sites across both in a fixed file
+    // order (storage.rs first, then runs.rs), so the
+    // `(detail, occurrence)` keys stay stable. From R2b S3a onward the
+    // gate is re-keyed per ruling 197-d1 addendum 16 point 4: it
+    // counts every `corrupt("literal")` in `storage.rs` and every
+    // `Violation::<Variant>` construction expression in `runs.rs`,
+    // mapping each variant to its `detail()` string.
     //
-    // The pure classifier (`runs::Classifier`) owns 39 of the 48 sites:
+    // The pure classifier (`runs::Classifier`) owns 42 of the 49 sites:
     // every `apply_checked` detail (ruling 197-d1 point 2, R1), the
     // strict-mode per-segment checks driven by `feed_record` / `finish`
-    // / `invalid_opening_line`, and the tolerant-mode checks driven by
+    // / `invalid_opening_line`, the tolerant-mode checks driven by
     // `feed_record_prepare_tolerant` / `feed_record_apply_tolerant` /
-    // `finish_tolerant` / `feed_record_err_tolerant`. The reader shim
-    // in `storage.rs` keeps the remaining 9 sites: the byte-level and
-    // file-open checks, plus a defence-in-depth `missing head` after
-    // `feed_record_apply_tolerant` (UNREACHABLE: a successful apply
-    // leaves `classifier.state()=Some`, matched by the UNREACHABLE
-    // table row below). `check_attestation` is the single site for
+    // `finish_tolerant` / `feed_record_err_tolerant`, the finish-time
+    // records inside `finish_collect` (addendum 16 point 5), and the
+    // shared-walk `missing head` invariant that moved out of
+    // `storage.rs` with the addendum-20.1 orchestration (UNREACHABLE
+    // for `apply_checked`'s Ok case leaves `classifier.state()=Some`,
+    // matched by the UNREACHABLE table row below). The reader shim in
+    // `storage.rs` keeps the remaining 7 sites: the byte-level and
+    // file-open checks. `check_attestation` is the single site for
     // `missing or mismatched repair attestation` (ruling 197-d1
     // addendum 7); the reader orders it per path at the position
-    // ruling 197-d1 addendum 12 fixes. The `missing head` site that
-    // used to sit after `apply_checked` in the reader is now a
-    // classifier invariant with no inline call, so the total sits at
-    // 48 = 9 in `storage.rs` + 39 in `runs.rs`.
+    // ruling 197-d1 addendum 12 fixes. The total sits at
+    // 49 = 7 in `storage.rs` + 42 in `runs.rs`. The one net extra
+    // site over the 39+9=48 base is the balance of three S3a-era
+    // adds against one S3b1a-round-2 merge: the fold (iii) salvage
+    // push adds one `Violation::CheckpointMmrDiffers` construction
+    // site inside `feed_record_apply_tolerant` (UNREACHABLE for the
+    // reader-side pin gate: exercised by `collector_tests`, no
+    // `assert_corrupt`); `apply_checked`'s fresh-Mmr genesis fold
+    // carries an explicit `.map_err(|_| Violation::MmrOverflow)?`
+    // (UNREACHABLE: `Mmr::new()` + push of one leaf cannot overflow);
+    // and the glue-byte LF check — strict `SegmentBytes::
+    // check_glue_byte_strict` and tolerant `SegmentBytes::next_event`
+    // — behaves identically on the Err path, so the two copies of
+    // `corrupt("bytes glued to complete unterminated record")` merge
+    // into one shared helper `consume_glue_byte` (50 → 49). The
+    // `missing head` occurrence 0 is the shared-walk invariant
+    // described above; occurrence 1 is `Classifier::finish`'s own
+    // construction, pinned by `pin_sc_missing_head_opening_false_*`.
+    // A renamed variant whose `detail()` is not updated, or a new
+    // `Violation::<X>` variant without a pin, fails the gate
+    // (addendum 16 point 4).
     const STORAGE_SRC: &str = include_str!("storage.rs");
     const RUNS_SRC: &str = include_str!("runs.rs");
     const STORAGE_TESTS_SRC: &str = include_str!("storage_tests.rs");
@@ -1853,10 +1934,55 @@ mod details {
         run: bool,
     ) -> Result<Option<State>, AuditError> {
         let mut r = run;
-        history_segment(f, TRAIL, state, opening, None, &mut None, &mut r)
+        history_segment(
+            crate::audit::runs::Reaction::Stop,
+            f,
+            TRAIL,
+            state,
+            opening,
+            None,
+            &mut None,
+            &mut r,
+        )
+        .map(|(s, _)| s)
+    }
+    /// Addendum 22.1/22.2: history_segment with `expected` + a `found`
+    /// out-parameter, so pins can observe both the returned state and
+    /// the strict-pass partial writes that must survive on the Err path.
+    fn hsc_found(
+        f: &File,
+        state: Option<State>,
+        opening: bool,
+        run: bool,
+        expected: Head,
+    ) -> (Result<Option<State>, AuditError>, Option<Record>) {
+        let mut r = run;
+        let mut found = None;
+        let res = history_segment(
+            crate::audit::runs::Reaction::Stop,
+            f,
+            TRAIL,
+            state,
+            opening,
+            Some(expected),
+            &mut found,
+            &mut r,
+        )
+        .map(|(s, _)| s);
+        (res, found)
     }
     fn scc(f: &File, state: Option<State>, opening: bool) -> Result<State, AuditError> {
-        scan(f, TRAIL, state, opening, None, &mut None, false)
+        scan(
+            crate::audit::runs::Reaction::Stop,
+            f,
+            TRAIL,
+            state,
+            opening,
+            None,
+            &mut None,
+            false,
+        )
+        .map(|(s, _)| s.unwrap())
     }
     fn state_from(bytes: &[u8]) -> (Temp, State) {
         let d = Temp::new();
@@ -1984,6 +2110,194 @@ mod details {
             hsc(&o(&d), None, true, false),
             "missing or mismatched repair attestation",
             0,
+        );
+    }
+    #[test]
+    fn pin_hs_fallback_duplicate_advances_length_through_feed_callback() {
+        // Addendum 22.1: a trailing duplicate flows through the shared
+        // `on_feed` callback as `FeedEvent::Duplicate`, which advances
+        // the `SegmentBytes` offset cursor (so `s.length` is base-
+        // identical) while leaving `state.offset` and `state.newline`
+        // untouched. Repro: predecessor `scan([cp0, e1, cp2])`,
+        // segment file `[e3, e3]`,
+        // `history_segment(opening=true, run=false)`. Strict fails
+        // with `MissingOpeningCheckpoint` (e3 is an entry on an
+        // opening segment), so the tolerant fallback walks both
+        // copies. A mutant that skips `on_feed` on the duplicate arm
+        // leaves the `SegmentBytes` offset cursor at the first copy,
+        // so `s.length` equals the single-record byte count (base
+        // gives 2×, head's bug gave 1×).
+        let cp0_rec = cp0();
+        let e1 = entry(&cp0_rec);
+        let mut mmr = seeded(&cp0_rec);
+        mmr.push(e1.hash()).unwrap();
+        let cp2 = cp(2, e1.hash(), &mmr);
+        let pre = Temp::new();
+        w(&pre, &[line(&cp0_rec), line(&e1), line(&cp2)].concat());
+        let pre_state = scc(&o(&pre), None, true).unwrap();
+        assert_eq!(pre_state.run.head.seq, 2);
+        let e3 = Record::new(context(3, cp2.hash()), Entry::new("a", "c", "o")).unwrap();
+        let seg = Temp::new();
+        let seg_bytes = [line(&e3), line(&e3)].concat();
+        let expected_length = seg_bytes.len() as u64;
+        w(&seg, &seg_bytes);
+        let state = hsc(&o(&seg), Some(pre_state), true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.length, expected_length,
+            "duplicate arm must advance the walk cursor past both copies via on_feed",
+        );
+    }
+    #[test]
+    fn pin_hs_found_persists_on_strict_write_before_tolerant_duplicate() {
+        // Addendum 22.2: on the Ok path through the tolerant fallback,
+        // strict's partial `*found` write survives because the two
+        // passes share one buffer (base-identical: a single `&mut found`
+        // was threaded through both passes). Layout: predecessor at e1
+        // (continuation, opening=false); the live file holds
+        // `[cp0, e1, e1_duplicate, unparsable]`. Strict scans from
+        // pred.offset: the duplicate e1 is `Advance::Duplicate`, so
+        // `*found` is set to the duplicate; the trailing unparsable
+        // trips `invalid audit line or opening checkpoint`, so strict
+        // fails with CorruptTrail. The tolerant fallback walks the
+        // same two records: e1 takes the duplicate arm (saved_prior's
+        // head already matches), so `on_feed` is `FeedEvent::Duplicate`
+        // and `found` is NOT re-written; the trailing unparsable
+        // latches `damaged` and the segment finishes Ok. With the
+        // previous two-buffer design, strict's write lived only in a
+        // local that was dropped on `CorruptTrail`, and `found`
+        // returned to the caller as `None` (base gave Some).
+        let cp0_rec = cp0();
+        let e1 = entry(&cp0_rec);
+        let d = Temp::new();
+        w(&d, &[line(&cp0_rec), line(&e1)].concat());
+        let pre_state = scc(&o(&d), None, true).unwrap();
+        append_bytes(&d.0.join("audit.jsonl"), &line(&e1));
+        append_bytes(&d.0.join("audit.jsonl"), b"not json\n");
+        let expected = Head::of(&e1);
+        let (res, found) = hsc_found(&o(&d), Some(pre_state), false, false, expected);
+        assert!(
+            res.is_ok(),
+            "tolerant must finish Ok on fragment-only continuation past e1",
+        );
+        assert_eq!(
+            found.map(|r| r.context.seq),
+            Some(e1.context.seq),
+            "strict's `*found` write must persist across CorruptTrail into tolerant Ok",
+        );
+    }
+    #[test]
+    fn pin_hs_found_persists_on_err_after_strict_partial_write() {
+        // Addendum 22.2: on the Err path, strict's partial `*found`
+        // writes survive. Layout: no predecessor (`opening=true`), the
+        // file holds `[cp0, e1, broken_e2]` where broken_e2 has a
+        // wrong `previous`. Strict folds cp0 (not a match), then e1
+        // (matches; `*found = Some(e1)`), then broken_e2 trips the
+        // hash-link check and strict returns CorruptTrail. The
+        // tolerant fallback walks from the start, hits the same broken
+        // link, and the method returns Err. With the previous
+        // two-buffer design, strict's `*found = Some(e1)` lived only
+        // in the local inside the strict closure and was dropped; now
+        // the shared buffer writes back before the `?` propagates.
+        let cp0_rec = cp0();
+        let e1 = entry(&cp0_rec);
+        let broken = Record::new(context(2, [42; 32]), Entry::new("a", "c", "o")).unwrap();
+        let d = Temp::new();
+        w(&d, &[line(&cp0_rec), line(&e1), line(&broken)].concat());
+        let expected = Head::of(&e1);
+        let (res, found) = hsc_found(&o(&d), None, true, false, expected);
+        assert_eq!(
+            res.err().expect("broken link must propagate").kind(),
+            AuditErrorKind::CorruptTrail,
+        );
+        assert_eq!(
+            found.map(|r| r.context.seq),
+            Some(e1.context.seq),
+            "strict's partial `*found` write must survive on the Err path",
+        );
+    }
+    #[test]
+    fn pin_hs_on_feed_writes_found_on_opening_tolerant_walk_at_seq_max() {
+        // Addendum 22.2 (round-7): on `history_segment(opening=true, *)`
+        // the tolerant fallback's `on_feed(FeedEvent::Record, …)` must
+        // write the matching head back into the shared `found` buffer
+        // when `expected == Some(head)`, including the saturated
+        // `head.seq` end of addendum 15's range. Repro: no predecessor
+        // state, the live file holds a leading JSON fragment
+        // (incomplete object -> `Line::Fragment`) and then an
+        // archived-prefix checkpoint with `context.seq` pinned to the
+        // record builder's ceiling (`i64::MAX as u64`; `Record::build`
+        // rejects anything above that as "sequence exceeds OTLP int64",
+        // so this is the largest `head.seq` the on-disk wire format
+        // admits in the sense of addendum 15's saturated-seq branch)
+        // and `context.previous == genesis` (root-link + pending). The
+        // strict pass fails at the opening fragment with
+        // `invalid audit line or opening checkpoint`, so `scan_inner`
+        // never reaches any record and writes nothing into `found`.
+        // The tolerant fallback restarts at offset 0, folds the
+        // fragment as `FeedEvent::NonRecord` (no `found` write), then
+        // folds the checkpoint; `on_feed` fires as
+        // `FeedEvent::Record(cp_max, rs)` and the storage closure runs
+        // the writeback `*fc.borrow_mut() = Some(record.clone())`.
+        // The segment still finishes with `invalid undamaged segment`
+        // (no damage latched, count=1) so the method returns Err; the
+        // writeback must land before the `?` propagates (addendum 22.2
+        // moves the `found_cell.into_inner()` back to the caller
+        // ahead of `match walk?`). A mutant deleting the writeback,
+        // or negating the `expected == Some(head)` guard, leaves the
+        // shared buffer empty and `found` returns to the caller as
+        // `None`; base's `history_segment` fallback wrote `found`
+        // directly in the same loop, so it stayed `Some(cp_max)`.
+        //
+        // Build the archived-prefix checkpoint directly: the shared
+        // `cp` helper derives `time = 100 + seq`, which overflows at
+        // the saturated-seq ceiling; the storage flow depends on
+        // `context.seq`, not `context.time`.
+        let max_seq = i64::MAX as u64;
+        let fold = genesis_fold();
+        let fields = CheckpointFields::new(
+            fold.size(),
+            fold.root(),
+            fold.peaks().to_vec(),
+            [1; 32],
+            [0; 64],
+        )
+        .unwrap();
+        let cp_max = Record::checkpoint(
+            RecordContext::new(TRAIL, max_seq, 0, "test", Record::genesis(&TRAIL)),
+            fields,
+        )
+        .unwrap();
+        let d = Temp::new();
+        let mut bytes: Vec<u8> = Vec::new();
+        // Line::Fragment: an incomplete JSON object is an EOF parse
+        // error, which `super::lines::classify` reports as `Fragment`.
+        bytes.extend_from_slice(b"{\"torn\":\n");
+        bytes.extend_from_slice(&line(&cp_max));
+        w(&d, &bytes);
+        let expected = Head::of(&cp_max);
+        let (res, found) = hsc_found(&o(&d), None, true, false, expected);
+        assert_eq!(
+            res.err()
+                .expect("opening fragment + undamaged singleton must still propagate")
+                .kind(),
+            AuditErrorKind::CorruptTrail,
+        );
+        assert_eq!(
+            cp_max.context.seq, max_seq,
+            "sanity: the expected head is the saturated-seq branch",
+        );
+        assert_eq!(
+            found.as_ref().map(|r| r.context.seq),
+            Some(max_seq),
+            "`on_feed` must write `found` for `expected == head` at the saturated \
+             seq ceiling on an opening-only tolerant walk (no strict partial write)",
+        );
+        assert_eq!(
+            found.map(|r| Head::of(&r)),
+            Some(expected),
+            "writeback must carry the exact record, not just its seq",
         );
     }
     #[test]
@@ -2397,7 +2711,7 @@ mod details {
         assert_corrupt(
             scc(&o(&d), Some(s), false),
             "bytes glued to complete unterminated record",
-            1,
+            0,
         );
     }
     #[test]
@@ -3408,14 +3722,418 @@ mod details {
         // outer open succeeds.
         let seg0 = File::open(segment(&d.0, 0)).unwrap();
         let mut run = false;
-        let state = history_segment(&seg0, TRAIL, None, true, None, &mut None, &mut run).unwrap();
+        let state = history_segment(
+            crate::audit::runs::Reaction::Stop,
+            &seg0,
+            TRAIL,
+            None,
+            true,
+            None,
+            &mut None,
+            &mut run,
+        )
+        .unwrap()
+        .0;
         assert!(run, "fragment-only seg0 belongs to a run");
         assert!(state.is_none(), "no complete record in seg0 to carry state");
+    }
+
+    /// S3a′ S2 (ruling 197-d1 addendum 17.1): strict Stop
+    /// `Line::Record(Err(_))` preserves today's detail
+    /// (`invalid audit line or opening checkpoint`), which is the
+    /// same detail `feed_unparsable` emits via `invalid_opening_line()`.
+    /// The refactor routes `Record(Err)` into
+    /// `Classifier::feed_record_err_strict`, which reuses that helper;
+    /// no new construction site is added.
+    #[test]
+    fn pin_sc_record_err_strict_reuses_invalid_opening_line_detail() {
+        let d = Temp::new();
+        let f = cp0();
+        // Append a record-err: a line that parses as JSON but is not a
+        // valid vigil record. `super::lines::classify` on such a
+        // payload returns `Line::Record(Err(_))`.
+        let bad = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{}]}]}]}"#;
+        w(&d, &[line(&f), bad.to_vec(), b"\n".to_vec()].concat());
+        assert_corrupt(
+            scc(&o(&d), None, true),
+            "invalid audit line or opening checkpoint",
+            0,
+        );
+    }
+
+    // ---- S3b1a: SegmentSource / SegmentBytes pins ----------------------
+    // Ruling 197-d1 addendum 25.2 + ruling 197-d1 addendum 25.2: byte-source properties
+    // that S3b1b will rely on. Each row must pass at base `320a7d9` and
+    // at head (this PR changes no behaviour). Together they pin the
+    // laziness of `SegmentSource::next_segment`, the cross-segment glue
+    // byte check, the `on_feed` offset bookkeeping across refresh-append,
+    // and `decode_line_kind`'s Fragment-vs-Unparsable mapping.
+
+    fn fifo_segment(d: &Temp, id: usize) {
+        assert!(
+            Command::new("mkfifo")
+                .arg(segment(&d.0, id))
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// SB1 live-open order: a corrupt rotated_0 (seg_only concat) plus a
+    /// non-regular rotated_1 (FIFO) sits in the directory. `TrailReader
+    /// ::open` must surface **seg_0's** `invalid audit record in sealed
+    /// run`, not a `nonregular trail file` from eagerly probing seg_1.
+    /// Kills MA1 (eager open-up-front) because eager would error on
+    /// seg_1's open before seg_0's tolerant walk runs.
+    #[test]
+    fn sb1_liveopen_base_order_short_circuits_on_segment_0_error() {
+        let d = seg_only(concat(&[&cp0()], b"{}\n"));
+        fifo_segment(&d, 1);
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "invalid audit record in sealed run",
+            0,
+        );
+    }
+
+    /// SB1 refresh-rotate order: the prelude walk surfaces its own
+    /// `invalid audit record in sealed run` BEFORE `segments_after`
+    /// runs its directory listing. Proves addendum 25.2: on
+    /// `refresh-rotate`, the base order is "walk prelude first, then
+    /// list newer segments". Kills MA5 (prelude skipped: refresh would
+    /// reach the valid live and return Ok instead of the pinned Err)
+    /// AND the B1 regression where `for_refresh_rotate` listed
+    /// `segments_after` eagerly at construction time — because with
+    /// `chmod 0300` the directory can't be listed, so eager listing
+    /// would surface `Io Permission denied` before the prelude walk
+    /// ever started.
+    #[test]
+    fn sb1_refresh_rotate_prelude_walks_before_segments_after() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        // Append corrupt bytes to the cached inode BEFORE rotating, so
+        // the renamed file (soon-to-be prelude) carries them. The
+        // reader's descriptor keeps pointing to the same inode.
+        append_bytes(&d.0.join("audit.jsonl"), b"{}\n");
+        fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+        // Fresh live with a cp1-based opening keeps refresh in the
+        // rotate branch (different inode). Then `chmod 0300` on the
+        // directory makes any later `rotated_names_at` / `statat` fail
+        // with EACCES, so the two orderings surface distinct errors:
+        // prelude-first → the corrupt-prelude's `CorruptTrail`;
+        // segments_after-first → `Io Permission denied`.
+        let opening = cp(1, first.hash(), &seeded(&first));
+        fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
+        fs::set_permissions(&d.0, fs::Permissions::from_mode(0o300)).unwrap();
+        let r = reader.with_current(|_| Ok(()), |_, _, _| Ok(()));
+        fs::set_permissions(&d.0, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_corrupt(r, "invalid audit record in sealed run", 0);
+    }
+
+    /// SB2 glue across segments, live open: an unterminated-last
+    /// rotated segment followed by a terminated live file whose
+    /// opening is a fresh checkpoint linking to rotated_0's head.
+    /// Base-identical: `history_segment(opening=true)` and
+    /// `scan_closing(opening=true)` both run with
+    /// `needs_glue_check=false` at the segment boundary (opening=true
+    /// forces a fresh offset), so live-open returns Ok with the
+    /// cache's final `State` fully pinned. A SegmentBytes bookkeeping
+    /// drift (MA3-style) that produced the wrong `offset` or
+    /// `length` across the transition would move the pinned tuple.
+    #[test]
+    fn sb2_glue_across_segments_live_open_ok() {
+        let d = Temp::new();
+        let f = cp0();
+        // rotated_0 ends without LF on cp0.
+        let mut seg0 = line(&f);
+        assert!(seg0.pop() == Some(b'\n'));
+        fs::write(segment(&d.0, 0), &seg0).unwrap();
+        // Live file: fresh opening checkpoint cp1 linked to cp0's
+        // hash, so the opening check succeeds across the segment
+        // transition.
+        let opening = cp(1, f.hash(), &seeded(&f));
+        fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
+        let reader = TrailReader::open(&d.0, TRAIL, None).unwrap();
+        let live_len = line(&opening).len() as u64;
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, s| {
+                    assert_eq!(s.offset, live_len);
+                    assert_eq!(s.length, live_len);
+                    assert!(s.newline);
+                    assert!(s.gap.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    /// SB2 glue across segments, refresh rotate: the cached live
+    /// ends without LF on cp0, and is rotated into seg_0 as-is. The
+    /// fresh live carries a cp1 opening that links to cp0. On
+    /// refresh, the rotate branch walks the prelude first (seg_0's
+    /// unterminated cp0 bytes), which the shared `SegmentSource`
+    /// yields before listing newer segments; the trailing live is
+    /// then scanned as its own opening segment. Pins the FINAL
+    /// `(offset, length, newline, gap)` tuple from the live scan,
+    /// which must land exactly at the end of cp1 with a trailing LF.
+    /// Kills the byte-bookkeeping mutants on the live-segment scan:
+    /// `MA3` (`note_record_fed` offset off-by-one) and `MA3b`
+    /// (`offset_cursor` off-by-one) move `offset` and `length` away
+    /// from the pinned cp1 line length; `NRF2` (drops the
+    /// `last_offset` write) leaves `offset = 1471` (the prelude
+    /// cursor) instead of the cp1 record boundary.
+    #[test]
+    fn sb2_glue_across_segments_refresh_rotate_ok() {
+        let d = Temp::new();
+        // Seed cached state with an unterminated cp0.
+        let f = cp0();
+        let mut cached_bytes = line(&f);
+        assert!(cached_bytes.pop() == Some(b'\n'));
+        fs::write(d.0.join("audit.jsonl"), &cached_bytes).unwrap();
+        let reader = TrailReader::open(&d.0, TRAIL, None).unwrap();
+        // Rotate the unterminated cached file as-is; the prelude
+        // intentionally ends without LF so the refresh-rotate walk
+        // enters its glue-check branch on the prelude segment.
+        fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+        let opening = cp(1, f.hash(), &seeded(&f));
+        fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
+        let live_len = line(&opening).len() as u64;
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, s| {
+                    assert_eq!(s.offset, live_len);
+                    assert_eq!(s.length, live_len);
+                    assert!(s.newline);
+                    assert!(s.gap.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    /// SB3 refresh-append bookkeeping: after each refresh-append, pin
+    /// the exact [`State`] field tuple (`offset`, `length`, `newline`,
+    /// `gap`). An off-by-one in `SegmentBytes::note_record_fed` moves
+    /// `offset` away from the record boundary; a wrong `offset_cursor`
+    /// bump breaks `length`. Kills MA3.
+    #[test]
+    fn sb3_refresh_append_bookkeeping_pins_state() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let first_len = line(&first).len() as u64;
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, s| {
+                    assert_eq!(s.offset, first_len);
+                    assert_eq!(s.length, first_len);
+                    assert!(s.newline);
+                    assert!(s.gap.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let e1 = entry(&first);
+        let e1_len = line(&e1).len() as u64;
+        append(&d.0.join("audit.jsonl"), &e1);
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, s| {
+                    assert_eq!(s.offset, first_len + e1_len);
+                    assert_eq!(s.length, first_len + e1_len);
+                    assert!(s.newline);
+                    assert!(s.gap.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let e2 = entry(&e1);
+        let e2_len = line(&e2).len() as u64;
+        append(&d.0.join("audit.jsonl"), &e2);
+        reader
+            .with_current(
+                |_| Ok(()),
+                |_, _, s| {
+                    assert_eq!(s.offset, first_len + e1_len + e2_len);
+                    assert_eq!(s.length, first_len + e1_len + e2_len);
+                    assert!(s.newline);
+                    assert!(s.gap.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    /// SB4 fragment at a segment END, exercised through a real
+    /// multi-segment path: `seg_0 = [cp0, "{\"torn\":"]` (fragment
+    /// without LF at the end of the sealed segment) plus a cp1 live.
+    /// `TrailReader::open` walks seg_0 first through
+    /// `history_segment`, which lands a repair gap with `newline=
+    /// false`; the trailing live then enters its own scan with a
+    /// pending resume from the unterminated boundary and no resume
+    /// declaration follows. Pins the multi-segment open outcome.
+    #[test]
+    fn sb4_fragment_at_segment_end_multi_segment() {
+        let f = cp0();
+        let fragment = b"{\"torn\":";
+        let d = Temp::new();
+        fs::write(segment(&d.0, 0), [line(&f), fragment.to_vec()].concat()).unwrap();
+        let cp1_rec = cp(1, f.hash(), &seeded(&f));
+        fs::write(d.0.join("audit.jsonl"), line(&cp1_rec)).unwrap();
+        assert_corrupt(
+            TrailReader::open(&d.0, TRAIL, None),
+            "resume checkpoint lacks its declaration",
+            0,
+        );
+    }
+
+    /// SB4 fragment at a segment START, exercised through the
+    /// multi-segment `history_segment` tolerant fallback over a
+    /// predecessor sealed-state: a fragment is the FIRST tolerant-
+    /// decoded line of the second call. Layout: the first `hsc` on
+    /// `[cp0]` yields a sealed state; the second `hsc` on
+    /// `[fragment, cp0]` reads `{"torn":\n` as its first line,
+    /// which must decode as Fragment and start a repair gap, so
+    /// when the tolerant walk then folds a duplicate cp0 (seq=0)
+    /// the sealed-run seq check fires and the pinned detail is
+    /// `"record sequence did not increase inside sealed run"`
+    /// (occurrence 0). Under MA4 the first line would decode as
+    /// Unparsable and this layout's error would flip to
+    /// `"unparsable line before complete record"`.
+    #[test]
+    fn sb4_fragment_at_segment_start_multi_segment() {
+        let f = cp0();
+        let d_a = Temp::new();
+        w(&d_a, &line(&f));
+        let state_a = hsc(&o(&d_a), None, true, false)
+            .expect("seg a Ok")
+            .expect("state=Some");
+        let fragment = b"{\"torn\":\n";
+        let d_b = Temp::new();
+        w(&d_b, &[fragment.to_vec(), line(&f)].concat());
+        assert_corrupt(
+            hsc(&o(&d_b), Some(state_a), true, false),
+            "record sequence did not increase inside sealed run",
+            0,
+        );
+    }
+
+    /// MX2 / MX3 killer: on a strict path, the glue byte must set
+    /// BOTH `last_offset` and `last_newline` to `(offset_cursor,
+    /// true)`. Pins `(offset, length, newline) = (1472, 1472, true)`
+    /// (the head value for `state_unterminated` → append `"\n"` →
+    /// `scan(opening=false)`), then appends an attested entry and
+    /// confirms the next `scan` returns Ok. Mutants that drop the
+    /// `last_newline = true` write (MX2) or the `last_offset =
+    /// offset_cursor` write (MX3) would move the pinned tuple away
+    /// from `(X+1, X+1, true)`.
+    #[test]
+    fn mx2_mx3_strict_glue_sets_last_offset_and_last_newline() {
+        let (d, s, f) = state_unterminated();
+        let unterm_len = s.offset;
+        append_bytes(&d.0.join("audit.jsonl"), b"\n");
+        let after = scc(&o(&d), Some(s.clone()), false).unwrap();
+        assert_eq!(after.offset, unterm_len + 1);
+        assert_eq!(after.length, unterm_len + 1);
+        assert!(after.newline);
+        let e1 = entry(&f);
+        append_bytes(&d.0.join("audit.jsonl"), &line(&e1));
+        let again = scc(&o(&d), Some(after), false).expect("scan continues Ok");
+        assert_eq!(again.length, unterm_len + 1 + line(&e1).len() as u64);
+    }
+
+    /// MX4 killer: on a tolerant path, the lazy glue-byte branch of
+    /// `SegmentBytes::next_event` must bump `offset_cursor` after a
+    /// successful `\n`. Layout: an unterminated cp0, then append
+    /// `"\nnot json\n"`, then `history_segment(opening=false, run=true)`.
+    /// The glue byte `\n` consumes one byte, the unparsable
+    /// `"not json\n"` consumes the rest. Pins
+    /// `length = unterm_len + 10` (9 bytes of `not json\n` plus the
+    /// glue byte). A mutant that drops the `offset_cursor += 1`
+    /// after the tolerant glue-byte check (MX4) would record
+    /// `length = unterm_len + 9`.
+    #[test]
+    fn mx4_tolerant_glue_bumps_offset_cursor() {
+        let (d, s, _f) = state_unterminated();
+        let unterm_len = s.offset;
+        append_bytes(&d.0.join("audit.jsonl"), b"\nnot json\n");
+        let res = hsc(&o(&d), Some(s), false, true).expect("history_segment Ok");
+        let state = res.expect("Some(state) when the initial state was Some");
+        assert_eq!(state.length, unterm_len + 10);
+    }
+
+    /// MH5 killer: on a strict refresh over an unterminated state
+    /// with no new bytes, `consume_glue_byte` must return `Ok(false)`
+    /// (count=0 at EOF), NOT `Ok(true)`. The merged helper's EOF
+    /// branch feeds `check_glue_byte_strict`, so returning `true` on
+    /// EOF would promote `last_newline` to `true` through the
+    /// strict-side glue promotion while leaving `offset_cursor`
+    /// unchanged; the state would appear terminated and a later
+    /// refresh would stop checking for glue bytes. Pins
+    /// `(offset, length, newline)` first with no new bytes, so the
+    /// mutant's spurious `last_newline = true` flips the pinned
+    /// `false`. Then appends an `x` byte and refreshes again: the
+    /// base reader errors with `bytes glued to complete unterminated
+    /// record` because the glue byte must be LF.
+    #[test]
+    fn mh5_strict_glue_eof_returns_false() {
+        let (d, s, _f) = state_unterminated();
+        let unterm_len = s.offset;
+        let after = scc(&o(&d), Some(s.clone()), false).expect("scan Ok at EOF");
+        assert_eq!(after.offset, unterm_len);
+        assert_eq!(after.length, unterm_len);
+        assert!(!after.newline);
+        append_bytes(&d.0.join("audit.jsonl"), b"x");
+        assert_corrupt(
+            scc(&o(&d), Some(after), false),
+            "bytes glued to complete unterminated record",
+            0,
+        );
+    }
+
+    /// SCN1 killer: on a strict path, `scan_inner` builds
+    /// `State { length: bytes.offset_cursor() }`, not
+    /// `bytes.last_offset()`. The two diverge when a Fragment is
+    /// decoded on an opening segment: strict's `feed_fragment`
+    /// extends the gap hasher and returns Ok (the fragment is NOT
+    /// an opening-line violation here, because a complete record
+    /// is in scope), so the walk finishes with `last_offset` at
+    /// the record boundary but `offset_cursor` past the fragment
+    /// bytes. Layout:
+    /// `[cp0, "{\"torn\":"]` (fragment at end, no LF). Pins
+    /// `offset = len(cp0)` (last_offset at the record boundary)
+    /// and `length = len(cp0) + 8` (cursor past the fragment).
+    /// Under SCN1 (`length: last_offset()`), length would collapse
+    /// to `len(cp0)` and this test would fail.
+    #[test]
+    fn scn1_strict_fragment_length_is_offset_cursor() {
+        let f = cp0();
+        let fragment = b"{\"torn\":";
+        let d = Temp::new();
+        w(&d, &[line(&f), fragment.to_vec()].concat());
+        let s = scc(&o(&d), None, true).expect("strict Ok with gap after fragment");
+        let cp0_len = line(&f).len() as u64;
+        assert_eq!(s.offset, cp0_len);
+        assert_eq!(s.length, cp0_len + fragment.len() as u64);
+        assert!(!s.newline);
+        assert!(s.gap.is_some());
     }
 
     // ---- Coverage gate --------------------------------------------------
 
     const UNREACHABLE: &[(&str, usize, &str)] = &[
+        (
+            "checkpoint MMR differs from preceding records",
+            1,
+            "Addendum 16 point 2 (17.3 / 19.2): fold (iii) salvage push in feed_record_apply_tolerant records the Violation into the collector's vector without returning an AuditError; exercised by collector_tests::collector_fold_iii_mismatch_on_history_segment_opening_true_run_false (and its three per-path siblings) and collector_tests::collector_salvage_mmr_includes_the_checkpoint_leaf (no reader-side assert_corrupt).",
+        ),
         (
             "missing written state",
             0,
@@ -3424,14 +4142,15 @@ mod details {
         (
             "missing head",
             0,
-            "history_segment shim: feed_record_apply_tolerant Ok leaves classifier.state()=Some",
+            "shared `runs::history_segment` walk: `feed_record_apply_tolerant` Ok leaves `classifier.state()=Some` so the defence-in-depth `Violation::MissingHead` construction after the apply is unreachable (addendum 20.1)",
         ),
         // `Classifier::feed_record` returns the new state from
         // `apply_checked` directly; its post-apply follow-up is a
         // classifier invariant with no inline `corrupt("missing head")`
-        // call. The remaining `missing head` sites are
-        // `history_segment`'s (occ 0, UNREACHABLE) and
-        // `runs::Classifier::finish`'s (occ 1, tested by
+        // call. The remaining `missing head` sites are both in
+        // `runs.rs`: occ 0 is the shared `history_segment` walk's
+        // UNREACHABLE defence-in-depth (above) and occ 1 is
+        // `Classifier::finish`'s own construction (tested by
         // `pin_sc_missing_head_opening_false_*`).
         (
             "invalid opening peaks",
@@ -3443,7 +4162,16 @@ mod details {
             0,
             "state=None + non-Checkpoint fires 'missing initial checkpoint' first",
         ),
-        ("MMR overflow", 0, "requires 2^64 leaves"),
+        (
+            "MMR overflow",
+            0,
+            "apply_checked's fresh-Mmr genesis fold: Mmr::new() + push of one leaf cannot overflow size or miss peaks",
+        ),
+        (
+            "MMR overflow",
+            1,
+            "apply_checked's main record fold: requires 2^64 leaves",
+        ),
     ];
 
     // 197-d1 addendum 9: the gate parses Rust with `syn::parse_file`
@@ -3488,18 +4216,68 @@ mod details {
         path.segments.last().map(|s| &s.ident)
     }
 
-    fn parse_sites(sources: &[&str]) -> Vec<(String, usize)> {
-        // Every `ExprCall` whose callee path ends in `corrupt` and
-        // whose first argument is a string literal is a corrupt-site
-        // in the reader. Each source is parsed on its own with
-        // `syn::parse_file` and sites are collected in the caller's
-        // fixed order, so the `(detail, occurrence)` key stays stable
-        // across both files -- the same key
-        // `assert_corrupt(result, "detail", site)` uses.
-        struct Collect {
+    fn parse_sites() -> Vec<(String, usize)> {
+        // Addendum 16 point 4: the gate scans `storage.rs` for every
+        // `corrupt("literal")` call (ExprCall whose callee ends in
+        // `corrupt`, first arg is a string literal) and scans `runs.rs`
+        // for every `Violation::<Variant>` construction expression
+        // (ExprPath whose first segment is `Violation`), mapping each
+        // variant to its `detail()` string via the single source of
+        // truth [`runs::Violation::detail`]. Sites are collected in a
+        // fixed file order (storage.rs first, then runs.rs) so the
+        // `(detail, occurrence)` key stays stable across both files
+        // -- the same key `assert_corrupt(result, "detail", site)` uses.
+        // The pattern binding `v @ Violation::CheckpointMmrDiffers` in
+        // `feed_record_apply_tolerant`'s salvage arm is NOT a
+        // construction expression (patterns are not expressions), so
+        // this scan does not double-count it.
+        use crate::audit::runs::Violation;
+
+        // Addendum 17.5: derive the variant set by syn-parsing
+        // `enum Violation` from `runs.rs` (not from `Violation::ALL`),
+        // and fail unless `ALL` equals it. A variant added to the enum
+        // but missing from `ALL`, with a live construction site and no
+        // pin, fails the gate: the site is counted and the pin is
+        // missing.
+        let parse_enum_variants = |file: &syn::File| -> HashSet<String> {
+            let mut names = HashSet::new();
+            for item in &file.items {
+                if let syn::Item::Enum(e) = item
+                    && e.ident == "Violation"
+                {
+                    for v in &e.variants {
+                        names.insert(v.ident.to_string());
+                    }
+                }
+            }
+            names
+        };
+        let runs_pre: syn::File = syn::parse_file(RUNS_SRC)
+            .expect("coverage gate: runs.rs is not valid Rust (parse_file failed)");
+        let enum_variants: HashSet<String> = parse_enum_variants(&runs_pre);
+        assert!(
+            !enum_variants.is_empty(),
+            "coverage gate: syn-parse of enum Violation yielded no variants",
+        );
+        let all_variants: HashSet<String> =
+            Violation::ALL.iter().map(|v| format!("{v:?}")).collect();
+        assert_eq!(
+            enum_variants, all_variants,
+            "coverage gate: enum Violation's variant set != Violation::ALL \
+             (addendum 17.5: the ALL list must mirror the enum definition)",
+        );
+
+        // Variant-name → detail string. With the ALL==enum cross-check
+        // above, every parsed enum variant also has a runtime detail().
+        let name_to_detail: HashMap<String, &'static str> = Violation::ALL
+            .iter()
+            .map(|v| (format!("{v:?}"), v.detail()))
+            .collect();
+
+        struct CollectStorage {
             raw: Vec<String>,
         }
-        impl<'ast> syn::visit::Visit<'ast> for Collect {
+        impl<'ast> syn::visit::Visit<'ast> for CollectStorage {
             fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
                 if let syn::Expr::Path(p) = &*call.func
                     && path_last_segment(&p.path).is_some_and(|i| i == "corrupt")
@@ -3511,15 +4289,132 @@ mod details {
                 syn::visit::visit_expr_call(self, call);
             }
         }
-        let mut c = Collect { raw: Vec::new() };
-        for source in sources {
-            let file: syn::File = syn::parse_file(source)
-                .expect("coverage gate: a reader source is not valid Rust (parse_file failed)");
-            syn::visit::Visit::visit_file(&mut c, &file);
+
+        // Addendum 17.5: exclude `#[cfg(test)]` code from site counting.
+        // A `Violation::X` construction inside a `#[cfg(test)]` module or
+        // item is a test, not a product site, and must not count.
+        fn attrs_have_cfg_test(attrs: &[syn::Attribute]) -> bool {
+            attrs.iter().any(|a| {
+                a.path().is_ident("cfg")
+                    && a.parse_args::<syn::Meta>().ok().is_some_and(|m| match m {
+                        syn::Meta::Path(p) => p.is_ident("test"),
+                        _ => false,
+                    })
+            })
         }
+
+        struct CollectRuns<'a> {
+            raw: Vec<String>,
+            name_to_detail: &'a HashMap<String, &'static str>,
+            in_pattern: usize,
+            in_cfg_test: usize,
+        }
+        impl<'ast, 'a> syn::visit::Visit<'ast> for CollectRuns<'a> {
+            fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
+                // Two-segment path `Violation::<Variant>`. `Self::X` paths
+                // inside `impl Violation` have `Self` as the first segment
+                // and are therefore skipped (the `const ALL` list and
+                // `fn detail` are the enum's own definition, not call
+                // sites). In syn 2.x `Pat::Path` wraps `ExprPath`, so a
+                // pattern-position `Violation::<Variant>` (as in the fold
+                // (iii) salvage arm `Err(Violation::CheckpointMmrDiffers)
+                // if ... =>`) also reaches this visitor; the `in_pattern`
+                // stack skips those — the salvage arm's pattern is NOT
+                // a construction site (patterns match values, they do
+                // not create them), the ONE construction for the salvage
+                // is the explicit `self.collected.push((.., Violation::X))`
+                // inside the arm body.
+                if self.in_pattern == 0 && self.in_cfg_test == 0 {
+                    let segs = &p.path.segments;
+                    if segs.len() == 2
+                        && segs[0].ident == "Violation"
+                        && let Some(detail) = self.name_to_detail.get(&segs[1].ident.to_string())
+                    {
+                        self.raw.push((*detail).to_string());
+                    }
+                }
+                syn::visit::visit_expr_path(self, p);
+            }
+            fn visit_pat(&mut self, p: &'ast syn::Pat) {
+                self.in_pattern += 1;
+                syn::visit::visit_pat(self, p);
+                self.in_pattern -= 1;
+            }
+            fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+                let bump = attrs_have_cfg_test(&m.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_item_mod(self, m);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+            fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+                let bump = attrs_have_cfg_test(&f.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_item_fn(self, f);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+            fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+                let bump = attrs_have_cfg_test(&i.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_item_impl(self, i);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+            fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+                // Addendum 19.6: a `#[cfg(test)]` fn inside an `impl`
+                // block is an `ImplItemFn`, not an `ItemFn`; without
+                // this visit the gate would count its `Violation::X`
+                // sites as product sites.
+                let bump = attrs_have_cfg_test(&f.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_impl_item_fn(self, f);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+            fn visit_item_const(&mut self, c: &'ast syn::ItemConst) {
+                let bump = attrs_have_cfg_test(&c.attrs);
+                if bump {
+                    self.in_cfg_test += 1;
+                }
+                syn::visit::visit_item_const(self, c);
+                if bump {
+                    self.in_cfg_test -= 1;
+                }
+            }
+        }
+
+        let mut raw: Vec<String> = Vec::new();
+        let storage: syn::File = syn::parse_file(STORAGE_SRC)
+            .expect("coverage gate: storage.rs is not valid Rust (parse_file failed)");
+        let mut cs = CollectStorage { raw: Vec::new() };
+        syn::visit::Visit::visit_file(&mut cs, &storage);
+        raw.extend(cs.raw);
+        let runs: syn::File = syn::parse_file(RUNS_SRC)
+            .expect("coverage gate: runs.rs is not valid Rust (parse_file failed)");
+        let mut cr = CollectRuns {
+            raw: Vec::new(),
+            name_to_detail: &name_to_detail,
+            in_pattern: 0,
+            in_cfg_test: 0,
+        };
+        syn::visit::Visit::visit_file(&mut cr, &runs);
+        raw.extend(cr.raw);
+
         let mut counts: HashMap<String, usize> = HashMap::new();
-        c.raw
-            .into_iter()
+        raw.into_iter()
             .map(|d| {
                 let n = *counts.get(&d).unwrap_or(&0);
                 counts.insert(d.clone(), n + 1);
@@ -3781,11 +4676,13 @@ mod details {
 
     #[test]
     fn coverage_gate_pins_every_corrupt_site() {
-        // Fixed file order: storage.rs first (9 sites), then runs.rs
-        // (39 sites). Each source is parsed on its own with
-        // `syn::parse_file`, so neither file needs to be syntactically
-        // concatenable with the other.
-        let sites = parse_sites(&[STORAGE_SRC, RUNS_SRC]);
+        // Fixed file order: storage.rs first (8 corrupt-literal sites),
+        // then runs.rs (42 `Violation::<X>` construction sites, re-keyed
+        // per addendum 16 point 4). Each source is parsed on its own
+        // with `syn::parse_file`, so neither file needs to be
+        // syntactically concatenable with the other.
+        use crate::audit::runs::Violation;
+        let sites = parse_sites();
         let site_set: HashSet<(String, usize)> = sites.iter().cloned().collect();
         let asserted: HashSet<(String, usize)> =
             parse_assertions(STORAGE_TESTS_SRC).into_iter().collect();
@@ -3800,6 +4697,27 @@ mod details {
             }
         }
         assert!(missing.is_empty(), "uncovered corrupt sites: {missing:?}");
+        // Addendum 20.2: per-variant coverage. Every `Violation`
+        // variant must have at least one construction site AND an
+        // asserting pin (or at least one UNREACHABLE entry); a variant
+        // added to `enum Violation`, `ALL` and `detail()` with no
+        // site and no pin fails the gate here (G3).
+        let site_details: HashSet<String> = site_set.iter().map(|(d, _)| d.clone()).collect();
+        let pinned_details: HashSet<String> = asserted.iter().map(|(d, _)| d.clone()).collect();
+        let unreach_details: HashSet<String> = unreach.iter().map(|(d, _)| d.clone()).collect();
+        let mut variant_missing: Vec<&'static str> = Vec::new();
+        for v in Violation::ALL.iter().copied() {
+            let d = v.detail();
+            let has_site = site_details.contains(d);
+            let covered = pinned_details.contains(d) || unreach_details.contains(d);
+            if !has_site || !covered {
+                variant_missing.push(d);
+            }
+        }
+        assert!(
+            variant_missing.is_empty(),
+            "per-variant coverage (addendum 20.2) failed: {variant_missing:?}"
+        );
         // Stale-label check: any (detail, occurrence) pair that an
         // assert_corrupt names must exist in storage.rs or runs.rs, so
         // a pin left behind after a reader change cannot silently hide.
@@ -3815,8 +4733,1012 @@ mod details {
         }
         assert_eq!(
             sites.len(),
-            48,
+            49,
             "corrupt-site count changed; update gate explicitly"
+        );
+    }
+
+    /// Addendum 27.3 structural gate: `storage.rs` must not contain any
+    /// `for` / `while` / `loop` whose body calls a segment walker, and
+    /// `initial_record` / `refresh` must each call `classify` and call
+    /// no walker directly. Every remaining walker call in non-test
+    /// `storage.rs` matches an explicit allowlist (fn → count) measured
+    /// at head, with the reason documented. The static gate cannot
+    /// prove dynamic reachability; the behavioural mutants prove
+    /// runtime behaviour.
+    #[test]
+    fn coverage_gate_no_segment_loop_in_storage_rs() {
+        /// Seed walker names: the two `runs::*` per-segment orchestrators
+        /// every storage shim ultimately dispatches into. The full
+        /// walker set is DERIVED from these seeds — any non-test fn in
+        /// `storage.rs` whose body calls one of the seeds (directly or
+        /// transitively through another such fn) joins the set. A loop
+        /// in `storage.rs` whose body calls ANY member of that set
+        /// fails the gate; this catches a base-style refresh-rotate
+        /// loop that drives the walk through a thin wrapper (e.g. a
+        /// hand-rolled `history_segment_stop`) without the gate having
+        /// to list every wrapper by name (#197 ruling addendum 27.3
+        /// structural check derived from the enum).
+        const SEED_WALKER_NAMES: &[&str] = &["history_segment", "scan_segment"];
+
+        /// Allowed one-shot walker call sites in non-test `storage.rs`,
+        /// measured at head (ruling 197-d1 addendum 27.3c). Keyed by
+        /// the enclosing fn and the walker name (the last path segment
+        /// of the callee), with the count of unlooped call sites
+        /// inside that fn. These are the storage shims composing into
+        /// their inner `runs::*` counterparts.
+        const ALLOWED: &[(&str, &str, usize, &str)] = &[
+            (
+                "history_segment",
+                "history_segment",
+                1,
+                "storage::history_segment composes into runs::history_segment once (ruling 197-d1 addendum 27.3c)",
+            ),
+            (
+                "history_segment",
+                "scan_inner",
+                1,
+                "storage::history_segment's strict-pass closure composes into scan_inner once (ruling 197-d1 addendum 27.3c)",
+            ),
+            (
+                "scan_inner",
+                "scan_segment",
+                1,
+                "scan_inner composes into runs::scan_segment once; the per-reader-path strict walk (ruling 197-d1 addendum 27.3c)",
+            ),
+            (
+                "scan",
+                "scan_inner",
+                1,
+                "storage::scan is a thin shim over scan_inner (ruling 197-d1 addendum 27.3c)",
+            ),
+            (
+                "scan_closing",
+                "scan_inner",
+                1,
+                "storage::scan_closing is a thin shim over scan_inner (ruling 197-d1 addendum 27.3c)",
+            ),
+            (
+                "scan_staged",
+                "scan_inner",
+                1,
+                "storage::scan_staged is a thin shim over scan_inner (ruling 197-d1 addendum 27.3c)",
+            ),
+        ];
+
+        fn path_last_ident(path: &syn::Path) -> Option<String> {
+            path.segments.last().map(|s| s.ident.to_string())
+        }
+
+        fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+            attrs.iter().any(|a| {
+                a.path().is_ident("cfg")
+                    && a.parse_args::<syn::Meta>().ok().is_some_and(|m| match m {
+                        syn::Meta::Path(p) => p.is_ident("test"),
+                        _ => false,
+                    })
+            })
+        }
+
+        /// First pass: for every non-test fn in `storage.rs`, record
+        /// its callee set (last-path-segment identifiers of each
+        /// `ExprCall` and `ExprMethodCall` inside its body). Used to
+        /// derive the walker set from `SEED_WALKER_NAMES` by
+        /// closing over "this fn calls one of the walkers transitively".
+        struct FnCallsVisitor {
+            in_test_depth: usize,
+            fn_stack: Vec<String>,
+            /// fn_name -> set of callee last-idents (outside `#[cfg(test)]`).
+            calls: std::collections::HashMap<String, std::collections::HashSet<String>>,
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for FnCallsVisitor {
+            fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+                let bump = is_cfg_test(&m.attrs);
+                if bump {
+                    self.in_test_depth += 1;
+                }
+                syn::visit::visit_item_mod(self, m);
+                if bump {
+                    self.in_test_depth -= 1;
+                }
+            }
+            fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+                let bump = is_cfg_test(&f.attrs);
+                if bump {
+                    self.in_test_depth += 1;
+                }
+                self.fn_stack.push(f.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, f);
+                self.fn_stack.pop();
+                if bump {
+                    self.in_test_depth -= 1;
+                }
+            }
+            fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+                let bump = is_cfg_test(&f.attrs);
+                if bump {
+                    self.in_test_depth += 1;
+                }
+                self.fn_stack.push(f.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, f);
+                self.fn_stack.pop();
+                if bump {
+                    self.in_test_depth -= 1;
+                }
+            }
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                if self.in_test_depth == 0
+                    && let syn::Expr::Path(path_expr) = &*call.func
+                    && let Some(last) = path_last_ident(&path_expr.path)
+                    && let Some(fn_name) = self.fn_stack.last().cloned()
+                {
+                    self.calls.entry(fn_name).or_default().insert(last);
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+            fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+                if self.in_test_depth == 0
+                    && let Some(fn_name) = self.fn_stack.last().cloned()
+                {
+                    self.calls
+                        .entry(fn_name)
+                        .or_default()
+                        .insert(m.method.to_string());
+                }
+                syn::visit::visit_expr_method_call(self, m);
+            }
+        }
+
+        /// Second pass: with the derived walker set in hand, record
+        /// every call site in each non-test fn: whether it is inside a
+        /// `for` / `while` / `loop` body (fails the gate), and the
+        /// per-fn one-shot counts (checked against the allowlist).
+        struct WalkerVisitor<'a> {
+            inside_loop_depth: usize,
+            in_test_depth: usize,
+            fn_stack: Vec<String>,
+            allow_counts: std::collections::HashMap<(String, String), usize>,
+            looped: Vec<(String, String)>,
+            classify_callers: std::collections::HashSet<String>,
+            walker_names: &'a std::collections::HashSet<String>,
+        }
+
+        impl<'a, 'ast> syn::visit::Visit<'ast> for WalkerVisitor<'a> {
+            fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+                let bump = is_cfg_test(&m.attrs);
+                if bump {
+                    self.in_test_depth += 1;
+                }
+                syn::visit::visit_item_mod(self, m);
+                if bump {
+                    self.in_test_depth -= 1;
+                }
+            }
+            fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+                let bump = is_cfg_test(&f.attrs);
+                if bump {
+                    self.in_test_depth += 1;
+                }
+                self.fn_stack.push(f.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, f);
+                self.fn_stack.pop();
+                if bump {
+                    self.in_test_depth -= 1;
+                }
+            }
+            fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+                let bump = is_cfg_test(&f.attrs);
+                if bump {
+                    self.in_test_depth += 1;
+                }
+                self.fn_stack.push(f.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, f);
+                self.fn_stack.pop();
+                if bump {
+                    self.in_test_depth -= 1;
+                }
+            }
+            fn visit_expr_for_loop(&mut self, f: &'ast syn::ExprForLoop) {
+                self.inside_loop_depth += 1;
+                syn::visit::visit_expr_for_loop(self, f);
+                self.inside_loop_depth -= 1;
+            }
+            fn visit_expr_while(&mut self, w: &'ast syn::ExprWhile) {
+                self.inside_loop_depth += 1;
+                syn::visit::visit_expr_while(self, w);
+                self.inside_loop_depth -= 1;
+            }
+            fn visit_expr_loop(&mut self, l: &'ast syn::ExprLoop) {
+                self.inside_loop_depth += 1;
+                syn::visit::visit_expr_loop(self, l);
+                self.inside_loop_depth -= 1;
+            }
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                if let syn::Expr::Path(path_expr) = &*call.func
+                    && let Some(last) = path_last_ident(&path_expr.path)
+                    && self.in_test_depth == 0
+                {
+                    let fn_name = self.fn_stack.last().cloned().unwrap_or_default();
+                    if last == "classify" {
+                        self.classify_callers.insert(fn_name.clone());
+                    }
+                    if self.walker_names.contains(&last) {
+                        if self.inside_loop_depth > 0 {
+                            self.looped.push((fn_name, last));
+                        } else {
+                            *self.allow_counts.entry((fn_name, last)).or_insert(0) += 1;
+                        }
+                    }
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+            fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+                let last = m.method.to_string();
+                if self.in_test_depth == 0
+                    && self.walker_names.contains(&last)
+                    && self.inside_loop_depth > 0
+                {
+                    let fn_name = self.fn_stack.last().cloned().unwrap_or_default();
+                    self.looped.push((fn_name, last));
+                }
+                syn::visit::visit_expr_method_call(self, m);
+            }
+        }
+
+        let storage: syn::File = syn::parse_file(STORAGE_SRC)
+            .expect("structural gate: storage.rs is not valid Rust (parse_file failed)");
+
+        // Pass 1: build the per-fn callee map and derive the walker
+        // set from `SEED_WALKER_NAMES` by closing over "this fn
+        // transitively calls one of the seeds" (#197 ruling addendum
+        // 27.3 structural check derived from the enum).
+        let mut calls_visitor = FnCallsVisitor {
+            in_test_depth: 0,
+            fn_stack: Vec::new(),
+            calls: std::collections::HashMap::new(),
+        };
+        syn::visit::Visit::visit_file(&mut calls_visitor, &storage);
+        let mut walker_set: std::collections::HashSet<String> =
+            SEED_WALKER_NAMES.iter().map(|s| (*s).to_string()).collect();
+        loop {
+            let mut grew = false;
+            for (fn_name, callees) in &calls_visitor.calls {
+                if walker_set.contains(fn_name) {
+                    continue;
+                }
+                if callees.iter().any(|c| walker_set.contains(c)) {
+                    walker_set.insert(fn_name.clone());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+
+        // Pass 2: record loop violations, one-shot call counts, and
+        // the set of fns calling `classify`.
+        let mut v = WalkerVisitor {
+            inside_loop_depth: 0,
+            in_test_depth: 0,
+            fn_stack: Vec::new(),
+            allow_counts: std::collections::HashMap::new(),
+            looped: Vec::new(),
+            classify_callers: std::collections::HashSet::new(),
+            walker_names: &walker_set,
+        };
+        syn::visit::Visit::visit_file(&mut v, &storage);
+
+        // Ruling 197-d1 addendum 27.3a: no walker call inside any
+        // for / while / loop body.
+        assert!(
+            v.looped.is_empty(),
+            "storage.rs must not contain a `for`/`while`/`loop` whose body calls a derived \
+             walker fn (seeds: {SEED_WALKER_NAMES:?}, derived set: {:?}); \
+             offenders: {:?}",
+            walker_set,
+            v.looped
+        );
+
+        // Ruling 197-d1 addendum 27.3b: `initial_record` and `refresh`
+        // each call `classify`.
+        for caller in ["initial_record", "refresh"] {
+            assert!(
+                v.classify_callers.contains(caller),
+                "storage.rs: fn `{caller}` must call `classify` (ruling 197-d1 addendum 27.3b)"
+            );
+        }
+
+        // Ruling 197-d1 addendum 27.3b: `initial_record` and `refresh`
+        // must call no walker directly outside a loop either.
+        for caller in ["initial_record", "refresh"] {
+            for walker in &walker_set {
+                let count = v
+                    .allow_counts
+                    .get(&(caller.to_string(), walker.clone()))
+                    .copied()
+                    .unwrap_or(0);
+                assert_eq!(
+                    count, 0,
+                    "storage.rs: fn `{caller}` must not call walker `{walker}` directly \
+                     (ruling 197-d1 addendum 27.3b); every segment walk goes through `classify`"
+                );
+            }
+        }
+
+        // Ruling 197-d1 addendum 27.3c: every remaining walker call
+        // site in non-test `storage.rs` matches the allowlist exactly.
+        let allowed_set: std::collections::HashMap<(String, String), usize> = ALLOWED
+            .iter()
+            .map(|(outer, walker, count, _)| {
+                (((*outer).to_string(), (*walker).to_string()), *count)
+            })
+            .collect();
+        for (key, count) in &v.allow_counts {
+            let expected = allowed_set.get(key).copied();
+            assert_eq!(
+                expected,
+                Some(*count),
+                "storage.rs: unexpected walker call site (fn -> walker -> count): \
+                 ({:?}, {}); update the allowlist with a documented reason \
+                 (ruling 197-d1 addendum 27.3c)",
+                key,
+                count
+            );
+        }
+        for (key, expected_count) in &allowed_set {
+            let found = v.allow_counts.get(key).copied().unwrap_or(0);
+            assert_eq!(
+                found, *expected_count,
+                "storage.rs: allowlisted walker site ({:?}) expected count {} but found {}",
+                key, expected_count, found
+            );
+        }
+    }
+}
+
+/// Named reader pins for the multi-segment `runs::classify`
+/// orchestration (ruling 197-d1 addendum 25.3). Each row builds a layout and asserts the literal
+/// reader outcome (exact `Err` kind, `Ok` head, or `State` shape).
+///
+/// Addendum 27.4: every expected kind / detail string is measured by
+/// running the row at base e1c45a3 **and** at head; these rows pass at
+/// both, so a mutant that changes `classify`'s behaviour makes the row
+/// fail with exit 101 (addendum 25.4). The reader goes through
+/// `classify` under `Reaction::Stop`; the structural gate
+/// `coverage_gate_no_segment_loop_in_storage_rs` guarantees this is the
+/// only multi-segment path, so these rows are reader-side
+/// classify-behaviour pins, not tautologies.
+mod classify_reader_pins {
+    use super::*;
+
+    /// Full reader-observed outcome for an `Ok` RP pin (ruling 197-d1
+    /// addendum 27.4). Captures every field of `storage::State` the
+    /// test can reach through the `cfg(test)` accessors, plus
+    /// `Cache::sealed_before` and the `Option<Head>` of the record
+    /// matched against the opener's `expected` head (`None` when
+    /// `expected = None`).
+    #[derive(Debug, PartialEq, Clone)]
+    struct ReaderPin {
+        head: Head,
+        checkpoint: bool,
+        pending_resume: bool,
+        run_loss: bool,
+        checkpoint_predecessor: Option<Head>,
+        checkpoint_previous: [u8; 32],
+        mmr_size: u64,
+        mmr_peaks: Vec<[u8; 32]>,
+        offset: u64,
+        length: u64,
+        checkpoint_time: u64,
+        since_checkpoint: u64,
+        tail_newline: bool,
+        gap_hash: Option<[u8; 32]>,
+        sealed_before: Option<PathBuf>,
+        found: Option<Head>,
+    }
+
+    /// Measures the full `ReaderPin` from an opened [`TrailReader`]:
+    /// the cached `State` + `sealed_before` from the reader's own
+    /// `Cache`, and `found` from a re-run of the initial scan under
+    /// the directory lock (ruling 197-d1 addendum 27.4). For an
+    /// `Ok(_)` `TrailReader::open`, this captures exactly what the
+    /// reader threaded through `classify` under `Reaction::Stop`.
+    fn pin_of(reader: &TrailReader, expected: Option<Head>) -> ReaderPin {
+        let found = reader
+            .with_initial(
+                expected,
+                |_| Ok(()),
+                |_, _, _s, record| Ok(record.map(|r| Head::of(&r))),
+            )
+            .unwrap();
+        reader.inspect_cache(|cache| {
+            let s = cache.state();
+            ReaderPin {
+                head: s.run.head,
+                checkpoint: s.run.checkpoint,
+                pending_resume: s.run.pending_resume,
+                run_loss: s.run.run_loss,
+                checkpoint_predecessor: s.run.checkpoint_predecessor,
+                checkpoint_previous: s.run.checkpoint_previous,
+                mmr_size: s.run.mmr.size(),
+                mmr_peaks: s.run.mmr.peaks().to_vec(),
+                offset: s.offset(),
+                length: s.length,
+                checkpoint_time: s.checkpoint_time,
+                since_checkpoint: s.since_checkpoint,
+                tail_newline: s.tail_newline(),
+                gap_hash: s.gap_digest_raw(),
+                sealed_before: cache.sealed_before().map(Path::to_path_buf),
+                found,
+            }
+        })
+    }
+
+    /// RP1-liveopen-ok-single-segment: single checkpoint + live close;
+    /// reader returns Ok with the head set to the live's last record.
+    /// Kills M-C3 (dropping `found` writeback on the live-close walker).
+    #[test]
+    fn rp1_liveopen_ok_single_segment() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let want_mmr = seeded(&first);
+        let want = ReaderPin {
+            head: Head::of(&first),
+            checkpoint: true,
+            pending_resume: false,
+            run_loss: false,
+            checkpoint_predecessor: None,
+            checkpoint_previous: Record::genesis(&TRAIL),
+            mmr_size: want_mmr.size(),
+            mmr_peaks: want_mmr.peaks().to_vec(),
+            offset: line(&first).len() as u64,
+            length: line(&first).len() as u64,
+            checkpoint_time: first.context.time,
+            since_checkpoint: 0,
+            tail_newline: true,
+            gap_hash: None,
+            sealed_before: None,
+            found: None,
+        };
+        assert_eq!(pin_of(&reader, None), want.clone());
+        // Round-trip with the matching expected head: the `found`
+        // writeback on `scan_closing` is what makes `TrailReader::open`
+        // return Ok instead of HeadMismatch (M-C3 would flip this to
+        // Err(HeadMismatch)).
+        let matched = TrailReader::open(&d.0, TRAIL, Some(Head::of(&first))).unwrap();
+        assert_eq!(
+            pin_of(&matched, Some(Head::of(&first))),
+            ReaderPin {
+                found: Some(Head::of(&first)),
+                ..want
+            }
+        );
+    }
+
+    /// RP3-liveopen-err-headmismatch: valid trail but `expected=Some(_)`
+    /// with a head not present anywhere. Reader returns
+    /// `Err(HeadMismatch)` (addendum 27.1 moves the construction site
+    /// from `storage.rs:653` into `classify`; the kind stays unchanged).
+    /// Kills M-C4 (`LiveOpen` HeadMismatch suppressed).
+    #[test]
+    fn rp3_liveopen_err_headmismatch() {
+        let d = Temp::new();
+        let _first = fixture(&d.0);
+        let absent = Head {
+            seq: 42,
+            hash: [0xee; 32],
+        };
+        bad_detail(
+            TrailReader::open(&d.0, TRAIL, Some(absent)),
+            AuditErrorKind::HeadMismatch,
+            "expected head absent or different",
+        );
+    }
+
+    /// RP4-liveopen-ok-rotated-plus-live: rotated_0 complete sealed
+    /// segment + live with an opening. Reader returns Ok and the state
+    /// reflects the live's latest record. Kills M-C1 (classify segment
+    /// loop skips the first sealed segment): skipping the sealed arm
+    /// leaves `sealed_before` as `None` instead of the rotated name,
+    /// so the pin's `sealed_before: Some(segment_name(0))` flips.
+    #[test]
+    fn rp4_liveopen_ok_rotated_plus_live() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        let reader = open(&d.0);
+        let want = ReaderPin {
+            head: Head::of(&opening),
+            checkpoint: true,
+            pending_resume: false,
+            run_loss: false,
+            checkpoint_predecessor: Some(Head {
+                seq: opening.context.seq - 1,
+                hash: opening.context.previous,
+            }),
+            checkpoint_previous: opening.context.previous,
+            mmr_size: mmr.size(),
+            mmr_peaks: mmr.peaks().to_vec(),
+            offset: line(&opening).len() as u64,
+            length: line(&opening).len() as u64,
+            checkpoint_time: opening.context.time,
+            since_checkpoint: 0,
+            tail_newline: true,
+            gap_hash: None,
+            sealed_before: Some(segment_name(0)),
+            found: None,
+        };
+        assert_eq!(pin_of(&reader, None), want);
+    }
+
+    /// RP7-refresh-append-ok: cache a live file, then append; refresh
+    /// reaches `classify(RefreshAppend)` and returns Ok. Kills M-C5
+    /// (HeadMismatch leaked to refresh paths): under that mutant the
+    /// refresh would spuriously `Err(HeadMismatch)`.
+    #[test]
+    fn rp7_refresh_append_ok() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let second = entry(&first);
+        append(&d.0.join("audit.jsonl"), &second);
+        // Refresh must succeed with no spurious HeadMismatch.
+        reader
+            .with_current(|_| Ok(()), |_, _, _| Ok(()))
+            .expect("RP7: refresh-append must be Ok");
+        let mut mmr = seeded(&first);
+        mmr.push(second.hash()).unwrap();
+        let want = ReaderPin {
+            head: Head::of(&second),
+            checkpoint: false,
+            pending_resume: false,
+            run_loss: false,
+            checkpoint_predecessor: Some(Head::of(&first)),
+            checkpoint_previous: second.context.previous,
+            mmr_size: mmr.size(),
+            mmr_peaks: mmr.peaks().to_vec(),
+            offset: (line(&first).len() + line(&second).len()) as u64,
+            length: (line(&first).len() + line(&second).len()) as u64,
+            checkpoint_time: first.context.time,
+            since_checkpoint: 1,
+            tail_newline: true,
+            gap_hash: None,
+            sealed_before: None,
+            found: None,
+        };
+        assert_eq!(pin_of(&reader, None), want);
+    }
+
+    /// RP9-refresh-rotate-ok-prelude-plus-live: an open reader sees an
+    /// in-flight rotation and refreshes through the rotated branch.
+    /// Reader returns Ok with the head on the new live. Kills M-C6
+    /// (`SealedPrelude` treated as `SealedOpening`): under the mutant
+    /// the prelude's history_segment is called with `opening=true`
+    /// instead of `false`, which rejects the cached prelude on this
+    /// layout.
+    #[test]
+    fn rp9_refresh_rotate_ok_prelude_plus_live() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        // The lagging reader must now see the rotated segment + the new
+        // live via the RefreshRotate `classify` path.
+        reader
+            .with_current(|_| Ok(()), |_, _, _| Ok(()))
+            .expect("RP9: refresh-rotate must be Ok");
+        let want = ReaderPin {
+            head: Head::of(&opening),
+            checkpoint: true,
+            pending_resume: false,
+            run_loss: false,
+            checkpoint_predecessor: Some(Head {
+                seq: opening.context.seq - 1,
+                hash: opening.context.previous,
+            }),
+            checkpoint_previous: opening.context.previous,
+            mmr_size: mmr.size(),
+            mmr_peaks: mmr.peaks().to_vec(),
+            offset: line(&opening).len() as u64,
+            length: line(&opening).len() as u64,
+            checkpoint_time: opening.context.time,
+            since_checkpoint: 0,
+            tail_newline: true,
+            gap_hash: None,
+            sealed_before: Some(segment_name(0)),
+            found: None,
+        };
+        assert_eq!(pin_of(&reader, None), want);
+    }
+
+    /// RP11-refresh-append+rotate-ok: cache a live, append, then
+    /// rotate. Reader refreshes twice and reaches the new live. Pins
+    /// the appended-then-rotated transition: the second refresh goes
+    /// through `RefreshRotate` after the first appended through
+    /// `RefreshAppend`, and the cached state's `length` must grow
+    /// past the appended bytes before the rotation is observed.
+    #[test]
+    fn rp11_refresh_append_then_rotate_ok() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let second = entry(&first);
+        append(&d.0.join("audit.jsonl"), &second);
+        let mut mmr = seeded(&first);
+        mmr.push(second.hash()).unwrap();
+        let opening = rotated(&d.0, &second, &mut mmr, 0);
+        reader
+            .with_current(|_| Ok(()), |_, _, _| Ok(()))
+            .expect("RP11: append+rotate refresh must be Ok");
+        let want = ReaderPin {
+            head: Head::of(&opening),
+            checkpoint: true,
+            pending_resume: false,
+            run_loss: false,
+            checkpoint_predecessor: Some(Head {
+                seq: opening.context.seq - 1,
+                hash: opening.context.previous,
+            }),
+            checkpoint_previous: opening.context.previous,
+            mmr_size: mmr.size(),
+            mmr_peaks: mmr.peaks().to_vec(),
+            offset: line(&opening).len() as u64,
+            length: line(&opening).len() as u64,
+            checkpoint_time: opening.context.time,
+            since_checkpoint: 0,
+            tail_newline: true,
+            gap_hash: None,
+            sealed_before: Some(segment_name(0)),
+            found: None,
+        };
+        assert_eq!(pin_of(&reader, None), want);
+    }
+
+    /// RP5-openfallback-err-rotated-nonincreasing-seq: rotated_0 has a
+    /// corrupt run with a non-increasing sequence. The reader rejects
+    /// with CorruptTrail from the rotated segment. Pins the `classify`
+    /// Stop path's error propagation on the first sealed segment: the
+    /// detail string is byte-identical to the strict walker's inline
+    /// violation, so a mutant that suppresses sealed-arm errors flips
+    /// the outcome to `Ok`.
+    #[test]
+    fn rp5_openfallback_err_rotated_nonincreasing_seq() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let mut mmr = seeded(&first);
+        let _ = rotated(&d.0, &first, &mut mmr, 0);
+        // Corrupt rotated_0: duplicate its opening record so sequence
+        // doesn't strictly increase inside the sealed run.
+        let bytes = fs::read(segment(&d.0, 0)).unwrap();
+        let doubled = [bytes, line(&first)].concat();
+        fs::write(segment(&d.0, 0), doubled).unwrap();
+        reject_detail(
+            TrailReader::open(&d.0, TRAIL, None),
+            "record sequence did not increase inside sealed run",
+        );
+    }
+
+    /// RP2-liveopen-err-missing-initial-checkpoint: live-only, first
+    /// record is a non-checkpoint entry. Reader rejects with
+    /// `CorruptTrail` (the detail is the reader's byte-identical
+    /// `missing initial checkpoint` / `missing opening checkpoint`;
+    /// here we assert the kind and that `open` fails, which is what the
+    /// mutant table consumes — a kind flip is the kill signal).
+    #[test]
+    fn rp2_liveopen_err_missing_initial_checkpoint() {
+        let d = Temp::new();
+        let first = cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        let bad_first = entry(&first);
+        write_records(&d.0, &[&bad_first]);
+        corrupt_open_detail(&d.0, "missing opening checkpoint");
+    }
+
+    /// RP6-openfallback-err-live-after-valid-rotated: rotated_0 is a
+    /// complete sealed run. The live file has bytes glued to an
+    /// unterminated record: cut the trailing LF off the opening and
+    /// append more bytes, so a later LF appears inside what looks like
+    /// a single line. The reader rejects with CorruptTrail. This pins
+    /// the glue-byte check that fires after the final live segment is
+    /// opened inside `classify`.
+    #[test]
+    fn rp6_openfallback_err_live_glued() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let mut mmr = seeded(&first);
+        let _ = rotated(&d.0, &first, &mut mmr, 0);
+        // Truncate the live file's trailing LF, then append garbage
+        // ending in a newline: on refresh/re-open the reader detects
+        // "bytes glued to complete unterminated record" (R0b pin).
+        let path = d.0.join("audit.jsonl");
+        let length = fs::metadata(&path).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(length - 1)
+            .unwrap();
+        append_bytes(&path, b"garbage\n");
+        corrupt_open_detail(&d.0, "invalid audit line or opening checkpoint");
+    }
+
+    /// RP10-refresh-rotate-err-prelude-glued-bytes: refresh after a
+    /// rotation finds the prelude (cached live re-read as sealed) with
+    /// glued bytes; reader rejects via the prelude's
+    /// `history_segment(opening=false)` walk inside `classify`.
+    #[test]
+    fn rp10_refresh_rotate_err_prelude_glued() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let mut mmr = seeded(&first);
+        // Corrupt the live with a glued fragment before rotation.
+        append_bytes(&d.0.join("audit.jsonl"), b"{\"torn\":");
+        // Now rotate manually: this produces an invalid prelude once
+        // the reader refreshes through the RefreshRotate path.
+        let close = cp(first.context.seq + 1, first.hash(), &mmr);
+        append(&d.0.join("audit.jsonl"), &close);
+        mmr.push(close.hash()).unwrap();
+        fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+        let opening = cp(close.context.seq + 1, close.hash(), &mmr);
+        fs::write(d.0.join("audit.jsonl"), line(&opening)).unwrap();
+        reject_detail(
+            reader.with_current(|_| Ok(()), |_, _, _| Ok(())),
+            "record rolled back, changed or broke its hash link",
+        );
+    }
+
+    /// RP8-refresh-append-err-live-shrank: cached live at length L,
+    /// same inode but file shrank. `fn refresh` catches this before
+    /// entering `classify`; the `missing live file` / `live file
+    /// shrank` checks stay on the refresh shim where the reader
+    /// expects them.
+    #[test]
+    fn rp8_refresh_append_err_live_shrank() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let second = entry(&first);
+        append(&d.0.join("audit.jsonl"), &second);
+        // Refresh once so the reader's cached state advances past
+        // `[first]`.
+        reader.with_current(|_| Ok(()), |_, _, _| Ok(())).unwrap();
+        // Now truncate the live file.
+        let path = d.0.join("audit.jsonl");
+        let length = fs::metadata(&path).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(length - 10)
+            .unwrap();
+        reject_detail(
+            reader.with_current(|_| Ok(()), |_, _, _| Ok(())),
+            "live file shrank below cached length",
+        );
+    }
+
+    /// RP12-liveopen-damaged-sealed-propagates-run-across-live-close:
+    /// A LiveOpen layout where rotated_0 is a complete sealed run
+    /// (`[cp0, close1]`) plus a trailing newline-terminated
+    /// `Line::Unparsable` payload. The Unparsable line latches
+    /// `damaged = true` WITHOUT updating `self.gap`, so the tolerant
+    /// epilogue promotes `run_flag = true` while the returned `State`
+    /// keeps `gap = None` AND `state.run.checkpoint = true`
+    /// (sealed(prior) is still true). `classify_stop` then threads
+    /// `run = true` into `scan_closing_stop` on the live, where
+    /// `initial_boundary_resume = opening && (ctx.run || !sealed)`
+    /// evaluates `true && (true || false) = true` -- the `run` arg
+    /// is the ONLY signal that makes it fire -- and strict's
+    /// `boundary_resume && !first && !is_resume` check on the live's
+    /// non-resume second record returns `UnclosedSegmentLacksResume`.
+    /// Kills M-C9 ("run inheritance drops across live-close"): the
+    /// mutant passes `run = false` to `scan_closing`, so
+    /// `initial_boundary_resume` collapses to `(false || false) =
+    /// false`, strict walks cleanly, and the reader returns `Ok`.
+    #[test]
+    fn rp12_liveopen_damaged_sealed_propagates_run_to_live_close() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        // Damage rotated_0 with a complete Unparsable line (not a
+        // JSON fragment): `[cp0, close1, "garbage\n"]`. The tolerant
+        // fallback latches `damaged = true` WITHOUT touching `gap`,
+        // so the returned state has `gap = None` (sealed(prior) =
+        // true) while `*run` is promoted to `true` -- the `run`
+        // thread is the sole signal into the live-close walker.
+        append_bytes(&segment(&d.0, 0), b"garbage\n");
+        // Non-resume second record on the live so `run=true` trips
+        // `UnclosedSegmentLacksResume` via strict's
+        // `boundary_resume && !first && !is_resume` check.
+        append(&d.0.join("audit.jsonl"), &entry(&opening));
+        corrupt_open_detail(&d.0, "unclosed segment lacks matching immediate resume");
+    }
+
+    /// RP13-liveopen-damaged-sealed-propagates-run-across-sealed:
+    /// A LiveOpen layout with TWO rotated segments. rotated_0 is
+    /// `[cp0, close1]` plus a trailing `Line::Unparsable` line, so
+    /// the tolerant fallback latches `damaged = true` and
+    /// `run_flag = true` while leaving `gap = None` AND the closing
+    /// `RunState` sealed. `classify_stop` then threads `run = true`
+    /// into rotated_1's `history_segment_stop`. Inside strict,
+    /// `initial_boundary_resume = true && (ctx.run || !sealed) =
+    /// true && (true || false) = true` -- again the `run` arg is
+    /// the ONLY signal -- and the closing cp at `count == 1` (not
+    /// a resume) trips `boundary_resume && !first && !is_resume`,
+    /// returning `UnclosedSegmentLacksResume`. Kills M-C2 ("classify
+    /// threads `run = false` across sealed->sealed"): the mutant
+    /// resets `run = false` between sealed segments, so
+    /// `initial_boundary_resume` collapses to `(false || false) =
+    /// false`, strict walks `[opening, close]` cleanly, and the
+    /// reader returns `Ok`.
+    #[test]
+    fn rp13_liveopen_damaged_sealed_propagates_run_across_sealed() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        // Damage rotated_0 with a complete Unparsable line: the
+        // tolerant epilogue latches `run_flag = true` AND leaves
+        // `gap = None` (sealed(prior) stays true). Only the
+        // threaded `*run` carries the "run was open" signal into
+        // rotated_1.
+        append_bytes(&segment(&d.0, 0), b"garbage\n");
+        // Second rotation builds rotated_1 = [opening, close] and
+        // leaves a new opening in live.
+        let opening2 = rotated(&d.0, &opening, &mut mmr, 1);
+        // Close the new live-side run so that under the mutant (where
+        // every segment is accepted) the reader still reaches a
+        // sealed state and returns Ok, making the mutant's effect
+        // observable as Ok vs. Err rather than two different Errs.
+        let close3 = cp(opening2.context.seq + 1, opening2.hash(), &mmr);
+        append(&d.0.join("audit.jsonl"), &close3);
+        corrupt_open_detail(&d.0, "first successor lacks immediate resume");
+    }
+
+    /// RP14-liveopen-ok-expected-on-sealed-record: a layout where
+    /// `expected` names a record that sits on a sealed segment
+    /// (sealed `[cp0, e1, cp2]`, live `[cp3]`, `expected = Head(cp2)`).
+    /// The reader opens with `expected = Some(Head(cp2))`, the
+    /// open-fallback walks the sealed segment with `expected` threaded
+    /// into `history_segment`, and the on_feed Record callback fires
+    /// `found = Some(cp2)` when the fold reaches cp2.
+    ///
+    /// Pins the Stop-side `found` writeback in `storage::scan_inner`:
+    /// the sealed arm runs with `expected = args.expected`, so the
+    /// reader's `TrailReader::open` returns `Ok` with `found` set to
+    /// the sealed cp. A mutant that drops `expected` from the sealed
+    /// arm on BOTH reactions (not Collect-gated) leaves `found`
+    /// empty, the `head_mismatch_condition` branch returns
+    /// `Err(HeadMismatch)` under Stop, and the row's `assert_eq!`
+    /// exits 101.
+    #[test]
+    fn rp14_liveopen_ok_expected_on_sealed_record() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let second = entry(&first);
+        append(&d.0.join("audit.jsonl"), &second);
+        let mut mmr = seeded(&first);
+        mmr.push(second.hash()).unwrap();
+        let cp2 = cp(second.context.seq + 1, second.hash(), &mmr);
+        append(&d.0.join("audit.jsonl"), &cp2);
+        mmr.push(cp2.hash()).unwrap();
+        fs::rename(d.0.join("audit.jsonl"), segment(&d.0, 0)).unwrap();
+        let cp3 = cp(cp2.context.seq + 1, cp2.hash(), &mmr);
+        fs::write(d.0.join("audit.jsonl"), line(&cp3)).unwrap();
+        mmr.push(cp3.hash()).unwrap();
+        let reader = TrailReader::open(&d.0, TRAIL, Some(Head::of(&cp2))).unwrap();
+        let want = ReaderPin {
+            head: Head::of(&cp3),
+            checkpoint: true,
+            pending_resume: false,
+            run_loss: false,
+            checkpoint_predecessor: Some(Head {
+                seq: cp3.context.seq - 1,
+                hash: cp3.context.previous,
+            }),
+            checkpoint_previous: cp3.context.previous,
+            mmr_size: mmr.size(),
+            mmr_peaks: mmr.peaks().to_vec(),
+            offset: line(&cp3).len() as u64,
+            length: line(&cp3).len() as u64,
+            checkpoint_time: cp3.context.time,
+            since_checkpoint: 0,
+            tail_newline: true,
+            gap_hash: None,
+            sealed_before: Some(segment_name(0)),
+            found: Some(Head::of(&cp2)),
+        };
+        assert_eq!(pin_of(&reader, Some(Head::of(&cp2))), want);
+    }
+
+    /// RP15-liveopen-ok-duplicate-entry-in-live: a layout `[cp0, e1, e1]`
+    /// in a single live file. The strict walker folds `cp0` as
+    /// `Advance::Record`, `e1` as `Advance::Record` (state advances,
+    /// `since_checkpoint` bumps to 1), and the second `e1` as
+    /// `Advance::Duplicate` (state unchanged, `since_checkpoint`
+    /// stays at 1 because the duplicate branch does not call
+    /// `next_cp_fields`; `offset`/`length` still advance via
+    /// `note_record_fed`). Ruling 197-d1 addendum 27.4: pin every
+    /// `State` field reachable through the `cfg(test)` accessors so
+    /// a Collect-arm mutant that re-routes a duplicate as a Record
+    /// would flip the reader pin's observable outcome or the
+    /// Collect-vs-Stop equality one row below in
+    /// `runs_classify_tests` reads them against this baseline.
+    #[test]
+    fn rp15_liveopen_ok_duplicate_entry_in_live() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let second = entry(&first);
+        append(&d.0.join("audit.jsonl"), &second);
+        append(&d.0.join("audit.jsonl"), &second);
+        let reader = open(&d.0);
+        let mut mmr = seeded(&first);
+        mmr.push(second.hash()).unwrap();
+        let bytes = (line(&first).len() + 2 * line(&second).len()) as u64;
+        let want = ReaderPin {
+            head: Head::of(&second),
+            checkpoint: false,
+            pending_resume: false,
+            run_loss: false,
+            checkpoint_predecessor: Some(Head::of(&first)),
+            checkpoint_previous: second.context.previous,
+            mmr_size: mmr.size(),
+            mmr_peaks: mmr.peaks().to_vec(),
+            offset: bytes,
+            length: bytes,
+            checkpoint_time: first.context.time,
+            since_checkpoint: 1,
+            tail_newline: true,
+            gap_hash: None,
+            sealed_before: None,
+            found: None,
+        };
+        assert_eq!(pin_of(&reader, None), want);
+    }
+
+    /// RP16-refresh-rotate-damaged-prelude-requires-resume-on-live:
+    /// a RefreshRotate layout where the cached prelude carries a
+    /// complete `Line::Unparsable` tail (`[cp0, close1, garbage\n]`
+    /// after rotation). The tolerant fallback latches `damaged=true`
+    /// and `run_flag=true` while leaving the returned `State` sealed
+    /// (`gap=None`, `run.checkpoint=true`), so `classify`'s `run`
+    /// out-parameter carries `true` across the sealed boundary. The
+    /// live arm is `scan_closing(... found, run)`; with `run=true`
+    /// its `initial_boundary_resume = opening && (ctx.run ||
+    /// !sealed(prior)) = true && (true || false) = true`, and
+    /// strict's `boundary_resume && !first && !is_resume` check
+    /// trips on the live's non-resume second record, returning
+    /// `UnclosedSegmentLacksResume`. A mutant that drops the `run`
+    /// arg to `false` on the RefreshRotate live arm collapses
+    /// `initial_boundary_resume` to `(false || false) = false`,
+    /// strict walks cleanly, and the refresh returns `Ok`; the
+    /// reader pin's `reject_detail` then exits 101 on the
+    /// unexpected `Ok`.
+    #[test]
+    fn rp16_refresh_rotate_damaged_prelude_requires_resume_on_live() {
+        let d = Temp::new();
+        let first = fixture(&d.0);
+        let reader = open(&d.0);
+        let mut mmr = seeded(&first);
+        let opening = rotated(&d.0, &first, &mut mmr, 0);
+        // Damage the rotated segment (same inode as the cache's
+        // live) with a complete Unparsable line: the tolerant
+        // epilogue latches `damaged=true` and `run_flag=true` and
+        // keeps `gap=None`; `*run` is the only signal carried
+        // across the sealed->live boundary.
+        append_bytes(&segment(&d.0, 0), b"garbage\n");
+        // Non-resume second record on the live so `run=true` trips
+        // `UnclosedSegmentLacksResume`.
+        append(&d.0.join("audit.jsonl"), &entry(&opening));
+        reject_detail(
+            reader.with_current(|_| Ok(()), |_, _, _| Ok(())),
+            "unclosed segment lacks matching immediate resume",
         );
     }
 }
