@@ -11,11 +11,11 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
-const TRAIL: [u8; 16] = [17; 16];
+pub(crate) const TRAIL: [u8; 16] = [17; 16];
 static NEXT: AtomicUsize = AtomicUsize::new(0);
-struct Temp(PathBuf);
+pub(crate) struct Temp(pub(crate) PathBuf);
 impl Temp {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
             "vigil-audit-reader-{}-{}",
             std::process::id(),
@@ -30,15 +30,15 @@ impl Drop for Temp {
         fs::remove_dir_all(&self.0).unwrap();
     }
 }
-fn context(seq: u64, previous: [u8; 32]) -> RecordContext {
+pub(crate) fn context(seq: u64, previous: [u8; 32]) -> RecordContext {
     RecordContext::new(TRAIL, seq, 100 + seq, "test", previous)
 }
-fn cp(seq: u64, previous: [u8; 32], mmr: &Mmr) -> Record {
+pub(crate) fn cp(seq: u64, previous: [u8; 32], mmr: &Mmr) -> Record {
     let peaks = mmr.peaks().to_vec();
     let fields = CheckpointFields::new(mmr.size(), mmr.root(), peaks, [1; 32], [0; 64]).unwrap();
     Record::checkpoint(context(seq, previous), fields).unwrap()
 }
-fn line(record: &Record) -> Vec<u8> {
+pub(crate) fn line(record: &Record) -> Vec<u8> {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
     let extra = AnyValue {
         value: Some(any_value::Value::StringValue("context".into())),
@@ -49,15 +49,15 @@ fn line(record: &Record) -> Vec<u8> {
     line.push(b'\n');
     line
 }
-fn seeded(first: &Record) -> Mmr {
+pub(crate) fn seeded(first: &Record) -> Mmr {
     let mut mmr = Mmr::new();
     mmr.push(first.hash()).unwrap();
     mmr
 }
-fn append(path: &Path, record: &Record) {
+pub(crate) fn append(path: &Path, record: &Record) {
     append_bytes(path, &line(record));
 }
-fn append_bytes(path: &Path, bytes: &[u8]) {
+pub(crate) fn append_bytes(path: &Path, bytes: &[u8]) {
     fs::OpenOptions::new()
         .append(true)
         .open(path)
@@ -78,7 +78,7 @@ fn head(reader: &TrailReader) -> Head {
         .with_current(|_| Ok(()), |_, _, s| Ok(s.run.head))
         .unwrap()
 }
-fn entry(previous: &Record) -> Record {
+pub(crate) fn entry(previous: &Record) -> Record {
     Record::new(
         context(previous.context.seq + 1, previous.hash()),
         Entry::new("actor", "change", "object"),
@@ -120,7 +120,7 @@ fn corrupt_open_detail(path: &Path, detail: &str) {
     reject_detail(TrailReader::open(path, TRAIL, None), detail);
 }
 
-fn write_records(path: &Path, records: &[&Record]) {
+pub(crate) fn write_records(path: &Path, records: &[&Record]) {
     write(
         path,
         records.iter().flat_map(|r| line(r)).collect::<Vec<_>>(),
@@ -129,7 +129,7 @@ fn write_records(path: &Path, records: &[&Record]) {
 fn write(path: &Path, bytes: impl AsRef<[u8]>) {
     fs::write(path.join("audit.jsonl"), bytes).unwrap();
 }
-fn segment(path: &Path, id: usize) -> PathBuf {
+pub(crate) fn segment(path: &Path, id: usize) -> PathBuf {
     path.join(segment_name(id))
 }
 fn segment_name(id: usize) -> PathBuf {
@@ -663,7 +663,7 @@ fn missing_closure_requires_matching_immediate_resume() {
     reject(reader.with_current(|_| Ok(()), |_, _, _| Ok(())));
     corrupt_open(&d.0);
 }
-fn seeded_pair(first: &Record, last: &Record) -> Mmr {
+pub(crate) fn seeded_pair(first: &Record, last: &Record) -> Mmr {
     let mut mmr = seeded(first);
     mmr.push(last.hash()).unwrap();
     mmr
@@ -708,7 +708,7 @@ fn intervening_segment_without_closure_or_resume_is_rejected() {
     corrupt_open(&d.0);
 }
 
-fn declaration(
+pub(crate) fn declaration(
     opening: &Record,
     seq: u64,
     hash: [u8; 32],
@@ -858,12 +858,12 @@ fn genesis_resume_requires_immediate_matching_declaration() {
     assert_eq!(head(&open(&d.0)), Head::of(&resume));
 }
 
-mod runs {
+pub(crate) mod runs {
     use super::*;
     use crate::audit::{KeyFileSigner, Signer};
 
     // All checkpoints here have real signatures from the test-only constructor.
-    fn signed(seq: u64, previous: [u8; 32], mmr: &Mmr) -> Record {
+    pub(crate) fn signed(seq: u64, previous: [u8; 32], mmr: &Mmr) -> Record {
         let key = KeyFileSigner::from_hex(&"27".repeat(32)).unwrap();
         let fields = |sig| {
             CheckpointFields::new(
@@ -886,17 +886,17 @@ mod runs {
         .unwrap();
         record
     }
-    fn base(d: &Temp) -> Record {
+    pub(crate) fn base(d: &Temp) -> Record {
         let first = signed(0, Record::genesis(&TRAIL), &Mmr::new());
         write_records(&d.0, &[&first]);
         first
     }
-    fn put(d: &Temp, id: usize, records: &[&Record], suffix: &[u8]) {
+    pub(crate) fn put(d: &Temp, id: usize, records: &[&Record], suffix: &[u8]) {
         let mut bytes: Vec<_> = records.iter().flat_map(|r| line(r)).collect();
         bytes.extend(suffix);
         fs::write(segment(&d.0, id), bytes).unwrap();
     }
-    fn close_run(d: &Temp, last: &Record, fold: &Mmr) -> (Record, Record) {
+    pub(crate) fn close_run(d: &Temp, last: &Record, fold: &Mmr) -> (Record, Record) {
         let checkpoint = signed(last.context.seq + 4, last.hash(), fold);
         let resume = declaration(
             &checkpoint,
@@ -908,7 +908,7 @@ mod runs {
         write_records(&d.0, &[&checkpoint, &resume]);
         (checkpoint, resume)
     }
-    fn headless(first: &Record, seq: u64) -> Record {
+    pub(crate) fn headless(first: &Record, seq: u64) -> Record {
         Record::new(
             context(seq, entry(first).hash()),
             Entry::new("actor", "change", "object"),

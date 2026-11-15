@@ -1034,6 +1034,17 @@ fn collect_segment_spans_and_records(
 /// `SegmentSource::for_refresh_append` plan only yields `Live`, so
 /// the arm is unreachable by construction, and the body stays empty
 /// instead of panicking (no `unreachable!` on the reader path).
+///
+/// # Collect-side memory (addendum 25.5)
+///
+/// Under [`Reaction::Collect`] this function retains, for the full
+/// trail before grouping runs, both `seg_spans: Vec<Vec<Span>>` and
+/// `seg_records: Vec<Vec<RecordHeadInfo>>` (one entry per segment,
+/// one record head per complete record on this trail). The spans
+/// are the product fed into each [`RunReport`]; the per-record
+/// heads are an input to the loss-point hash-link chain. The
+/// `Stop` reaction holds nothing extra and matches the reader's
+/// memory profile byte-for-byte.
 pub(crate) fn classify(
     args: ClassifyArgs,
     path: ReaderPath,
@@ -1211,14 +1222,17 @@ pub(crate) fn classify(
             SegmentClass::Closer
         } else if run_in_before {
             SegmentClass::InRun
-        } else if segment_index == 0 && next_state_is_some {
-            SegmentClass::Base
         } else if run_out {
             // `run_in == false && run_out == true`: walker latched a
             // new run inside this segment with no (i)+(ii) closing
             // before the segment boundary. 13-V4-d2 point 1: an
-            // unclosed run emits no run finding.
+            // unclosed run emits no run finding. This covers the
+            // `[cp0, "not json\n"]` (p04) case where segment 0 is
+            // both the base and run-triggering through its trailing
+            // unparsable line.
             SegmentClass::Damaged
+        } else if segment_index == 0 && next_state_is_some {
+            SegmentClass::Base
         } else {
             SegmentClass::InRun
         };

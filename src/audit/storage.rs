@@ -1377,7 +1377,7 @@ fn next_cp_fields(prior: Option<(u64, u64)>, record: &Record) -> (u64, u64) {
 
 #[cfg(test)]
 #[path = "storage_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 thread_local! { static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }

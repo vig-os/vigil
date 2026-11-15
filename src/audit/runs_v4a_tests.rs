@@ -542,6 +542,102 @@ fn cv4_fold_iii_mismatch_records_and_runs_empty() {
 }
 
 // ============================================================
+// CV4b (per C5 M-D4 second killer, also M-D9): a two-segment
+// fold-(iii) mismatch row with a (i)+(ii) closer in live. Pins
+// both the recorded CheckpointMmrDiffers and `runs.is_empty()`
+// under addendum 28.2.
+// ============================================================
+
+#[test]
+fn cv4b_fold_iii_mismatch_two_segment_layout() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let e1 = entry_rec(1, cp0.hash());
+    // bad_cp2 claims a wrong fold (empty MMR, not seeded with cp0+e1).
+    let wrong_fold = seeded(&cp0);
+    let bad_cp2 = signed_cp(2, e1.hash(), &wrong_fold);
+    let e3 = entry_rec(3, bad_cp2.hash());
+    put_segment(&d.0, 0, &[&cp0, &e1, &bad_cp2, &e3], &[]);
+    // Live is a (i)+(ii) closer opening a next run (opening_cp links
+    // e3.hash, immediate resume). Under addendum 28.2 the recorded
+    // CheckpointMmrDiffers suppresses the run; a mutant that keeps
+    // `runs` populated flips that pin.
+    let mut fold_through = seeded(&cp0);
+    fold_through.push(e1.hash()).unwrap();
+    fold_through.push(bad_cp2.hash()).unwrap();
+    fold_through.push(e3.hash()).unwrap();
+    let cp_opening = signed_cp(4, e3.hash(), &fold_through);
+    let resume = resume_decl(&cp_opening, e3.context.seq, e3.hash(), 3);
+    write_records(&d.0, &[&cp_opening, &resume]);
+    let dir = dirfile(&d.0);
+    let out = super::classify_for_test(
+        &dir,
+        TRAIL,
+        super::ReaderPath::LiveOpen { expected: None },
+        None,
+        super::Reaction::Collect,
+        None,
+    )
+    .unwrap();
+    let diffs = out
+        .violations
+        .iter()
+        .filter(|(_, v)| matches!(v, super::Violation::CheckpointMmrDiffers))
+        .count();
+    assert!(
+        diffs >= 1,
+        "CV4b: at least one CheckpointMmrDiffers across the layout (got {:?})",
+        out.violations,
+    );
+    assert!(out.runs.is_empty(), "CV4b: runs empty (addendum 28.2)");
+}
+
+// ============================================================
+// CV4c (per C5 M-D9 second killer): fold-(iii) mismatch in a sealed
+// segment with a live closer that would otherwise form a (i)+(ii)
+// run. Addendum 28.2: `violations` non-empty keeps `runs` empty
+// even though a `RunReport` would group the segments. A mutant that
+// drops the `suppress_runs` guard on violations flips the pin.
+// ============================================================
+
+#[test]
+fn cv4c_fold_iii_with_closer_suppress_runs() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let e1 = entry_rec(1, cp0.hash());
+    let wrong_fold = seeded(&cp0);
+    let bad_cp2 = signed_cp(2, e1.hash(), &wrong_fold);
+    put_segment(&d.0, 0, &[&cp0, &e1, &bad_cp2], &[]);
+    // Live: a (i)+(ii) closer after bad_cp2 (opening links bad_cp2's
+    // hash, immediate resume). Under suppress_runs=true this yields
+    // no run report; dropping the guard would emit a RunReport.
+    let mut fold_through = seeded(&cp0);
+    fold_through.push(e1.hash()).unwrap();
+    fold_through.push(bad_cp2.hash()).unwrap();
+    let cp_opening = signed_cp(3, bad_cp2.hash(), &fold_through);
+    let resume = resume_decl(&cp_opening, bad_cp2.context.seq, bad_cp2.hash(), 2);
+    write_records(&d.0, &[&cp_opening, &resume]);
+    let dir = dirfile(&d.0);
+    let out = super::classify_for_test(
+        &dir,
+        TRAIL,
+        super::ReaderPath::LiveOpen { expected: None },
+        None,
+        super::Reaction::Collect,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !out.violations.is_empty(),
+        "CV4c: fold-(iii) violation expected"
+    );
+    assert!(
+        out.runs.is_empty(),
+        "CV4c (addendum 28.2): runs empty when violations non-empty, even with a (i)+(ii) closer",
+    );
+}
+
+// ============================================================
 // CV8: non-increasing seq at a would-be loss point -- the reader
 // rejects with `record sequence did not increase`; classify records
 // the violation and runs is empty.
@@ -795,4 +891,537 @@ fn cv2_sample_p09_empty_segment_closed_run_equals_a8() {
     let out = classify_collect(&a.dir_path);
     assert!(out.violations.is_empty());
     assert_eq!(out.runs.len(), 1, "p09 == A8: one closed run");
+}
+
+// ============================================================
+// CV2: full p01..p13 agreement rows (ruling 13-V4-d3, 13-v4a.md §A6).
+// Each row builds its directory via `storage_tests::runs` helpers
+// (widened to `pub(crate)` for this slice), then (i) records
+// `TrailReader::open`'s outcome, (ii) runs `classify` under
+// `Reaction::Collect`, (iii) asserts the literal `out.runs` /
+// `run_membership` expected per the brief. C2: a rejected trail
+// gives `out.runs` empty.
+// ============================================================
+
+use crate::audit::storage::tests::{self as st, runs as st_runs};
+
+fn membership(out: &super::ClassifyOutput) -> Vec<Option<usize>> {
+    out.segments.iter().map(|s| s.run_membership).collect()
+}
+
+fn run_bounds(out: &super::ClassifyOutput) -> Vec<(usize, usize)> {
+    out.runs
+        .iter()
+        .map(|r| (r.first_segment, r.last_segment))
+        .collect()
+}
+
+/// p01 — closing segment starts second run.
+/// Builds the `closing_segment_can_start_second_run` layout:
+/// sealed `S0=[cp0]`, sealed `S1=[kept]` (headless), sealed
+/// `S2=[close1, resume1, "broken\n"]`, live=`[close2, resume2]`.
+/// Reader: `Ok`.
+#[test]
+fn cv2_p01_closing_segment_can_start_second_run() {
+    let d = st::Temp::new();
+    let first = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&first], &[]);
+    let kept = st_runs::headless(&first, 3);
+    st_runs::put(&d, 1, &[&kept], &[]);
+    let mut fold = st::seeded_pair(&first, &kept);
+    let (checkpoint, resume) = st_runs::close_run(&d, &kept, &fold);
+    st_runs::put(&d, 2, &[&checkpoint, &resume], b"broken\n");
+    fold.push(checkpoint.hash()).unwrap();
+    fold.push(resume.hash()).unwrap();
+    let _ = st_runs::close_run(&d, &resume, &fold);
+    TrailReader::open(&d.0, TRAIL, None).expect("p01: reader Ok");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "p01: no violations");
+    // One run spans S1 through the live closer: classify groups
+    // `[InRun|Damaged]*` closed by one `Closer`. Both the live
+    // segment (3) and the intermediate S2 are part of that run.
+    assert_eq!(
+        run_bounds(&out),
+        vec![(1, 3)],
+        "p01: one closed run [1..=3]"
+    );
+    assert_eq!(
+        membership(&out),
+        vec![None, Some(0), Some(0), Some(0)],
+        "p01: segments 1..=3 in run 0; S0 (base) not in a run",
+    );
+}
+
+/// p02 — honest two-segment run (storage_tests::runs::run_lengths_one_and_two).
+#[test]
+fn cv2_p02_two_segment_run() {
+    let d = st::Temp::new();
+    let first = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&first], &[]);
+    let mut fold = st::seeded(&first);
+    let r_a = st_runs::headless(&first, first.context.seq + 5);
+    st_runs::put(&d, 1, &[&r_a], &[]);
+    fold.push(r_a.hash()).unwrap();
+    let r_b = st_runs::headless(&r_a, r_a.context.seq + 5);
+    st_runs::put(&d, 2, &[&r_b], &[]);
+    fold.push(r_b.hash()).unwrap();
+    let _ = st_runs::close_run(&d, &r_b, &fold);
+    TrailReader::open(&d.0, TRAIL, None).expect("p02: reader Ok");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "p02: no violations");
+    assert_eq!(
+        run_bounds(&out),
+        vec![(1, 3)],
+        "p02: one run spans S1..=live (two headless segments + live closer)",
+    );
+    assert_eq!(
+        membership(&out),
+        vec![None, Some(0), Some(0), Some(0)],
+        "p02: S0 base; S1, S2, live all in run 0",
+    );
+}
+
+/// p03 — fragment-only segment belongs to run (storage_tests::runs::fragment_only_segment_belongs_to_run).
+#[test]
+fn cv2_p03_fragment_only_segment_belongs_to_run() {
+    let d = st::Temp::new();
+    let first = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&first], &[]);
+    st_runs::put(&d, 1, &[], b"{\"torn\":");
+    let _ = st_runs::close_run(&d, &first, &st::seeded(&first));
+    TrailReader::open(&d.0, TRAIL, None).expect("p03: reader Ok");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "p03: no violations");
+    assert_eq!(
+        run_bounds(&out),
+        vec![(1, 2)],
+        "p03: one run covers S1 (fragment-only) and live closer",
+    );
+    assert_eq!(
+        membership(&out),
+        vec![None, Some(0), Some(0)],
+        "p03: S0 base; S1 + live in run 0",
+    );
+}
+
+/// p04 — unparsable last line is sealed evidence (storage_tests::runs::unparsable_last_line_is_sealed_evidence).
+/// S0=[cp0, "not json\n"], live=[closer, resume]. The sealed segment
+/// is run-triggering via its trailing Unparsable line.
+#[test]
+fn cv2_p04_unparsable_last_line_is_sealed_evidence() {
+    let d = st::Temp::new();
+    let first = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&first], b"not json\n");
+    let _ = st_runs::close_run(&d, &first, &st::seeded(&first));
+    TrailReader::open(&d.0, TRAIL, None).expect("p04: reader Ok");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "p04: no violations");
+    assert_eq!(
+        run_bounds(&out),
+        vec![(0, 1)],
+        "p04: one run covers S0 (unparsable tail) and live closer",
+    );
+    assert_eq!(
+        membership(&out),
+        vec![Some(0), Some(0)],
+        "p04: S0 and live both in run 0",
+    );
+}
+
+/// p05 — archived base (prev != genesis) followed by honest resume.
+/// Reader `Ok`, no run (archived base alone is a valid base; not
+/// run-triggering; ruling 107-d1). Mirrors
+/// `storage_tests::classify_reader_pins::accepted_archived_base`.
+#[test]
+fn cv2_p05_archived_base_honest_resume_no_run() {
+    let d = st::Temp::new();
+    // Archived prefix: first checkpoint has `previous = [42; 32]`
+    // (an opaque archived predecessor hash) and the genesis-seeded
+    // fold the archived prefix implies.
+    let genesis_fold = {
+        let mut m = Mmr::new();
+        m.push(Record::genesis(&TRAIL)).unwrap();
+        m
+    };
+    let archived = st::cp(7, [42; 32], &genesis_fold);
+    let r = st::declaration(&archived, 0, [42; 32], 6, None);
+    st::write_records(&d.0, &[&archived, &r]);
+    TrailReader::open(&d.0, TRAIL, None).expect("p05: archived base Ok");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "p05: no violations");
+    assert!(
+        out.runs.is_empty(),
+        "p05: archived base alone is not run-triggering (0 runs)",
+    );
+}
+
+/// p06 — p12-shape with headless run before it. S0 sealed=[cp0],
+/// headless-run S0b=[kept], S1=[cp_linking(previous=kept.hash), e_next]
+/// without immediate resume. Reader `Err(CorruptTrail: first successor
+/// lacks immediate resume)`.
+#[test]
+fn cv2_p06_linking_after_headless_without_resume() {
+    let d = st::Temp::new();
+    let first = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&first], &[]);
+    let kept = st_runs::headless(&first, 3);
+    st_runs::put(&d, 1, &[&kept], &[]);
+    let mut fold = st::seeded_pair(&first, &kept);
+    let opening = st_runs::signed(4, kept.hash(), &fold);
+    let not_resume = st::entry(&opening);
+    fold.push(opening.hash()).unwrap();
+    fold.push(not_resume.hash()).unwrap();
+    let cp_live = st_runs::signed(not_resume.context.seq + 1, not_resume.hash(), &fold);
+    let resume = st::declaration(
+        &cp_live,
+        not_resume.context.seq,
+        not_resume.hash(),
+        cp_live.context.seq - 1,
+        None,
+    );
+    st_runs::put(&d, 2, &[&opening, &not_resume], &[]);
+    st::write_records(&d.0, &[&cp_live, &resume]);
+    // Reader: CorruptTrail; exact detail may be caller-specific. We
+    // only pin that it is an Err (C2: `out.runs` empty).
+    assert!(
+        TrailReader::open(&d.0, TRAIL, None).is_err(),
+        "p06: reader rejects linking opening after unsealed with no resume",
+    );
+    let out = classify_collect(&d.0);
+    assert!(
+        !out.violations.is_empty() || out.head_mismatch,
+        "p06: classify records at least one violation or head_mismatch",
+    );
+    assert!(
+        out.runs.is_empty(),
+        "p06 (C2): out.runs empty on rejected trail"
+    );
+}
+
+/// p07 — non-checkpoint first record at base. S0=[entry(seq=0,
+/// previous=genesis)] (not a checkpoint). Reader `Err(CorruptTrail:
+/// missing initial checkpoint)`.
+#[test]
+fn cv2_p07_non_checkpoint_first_record_at_base() {
+    let d = st::Temp::new();
+    // An entry with seq=0 pointing at genesis -- not a checkpoint.
+    let e0 = Record::new(
+        st::context(0, Record::genesis(&TRAIL)),
+        Entry::new("actor", "change", "object"),
+    )
+    .unwrap();
+    st_runs::put(&d, 0, &[&e0], &[]);
+    let fold = {
+        let mut m = Mmr::new();
+        m.push(e0.hash()).unwrap();
+        m
+    };
+    let close = st_runs::signed(1, e0.hash(), &fold);
+    let resume = st::declaration(&close, 0, e0.hash(), 0, None);
+    st::write_records(&d.0, &[&close, &resume]);
+    assert!(
+        TrailReader::open(&d.0, TRAIL, None).is_err(),
+        "p07: reader rejects non-checkpoint first record at base",
+    );
+    let out = classify_collect(&d.0);
+    assert!(
+        !out.violations.is_empty() || out.head_mismatch,
+        "p07: classify records a violation",
+    );
+    assert!(
+        out.runs.is_empty(),
+        "p07 (C2): out.runs empty on rejected trail"
+    );
+}
+
+/// p08 — archived base cp crashed, honest resume into live. The
+/// archived prefix lives in sealed S0; the live file holds the
+/// closer + resume. Reader `Ok`; classify emits no run (ruling
+/// 13-V4-d3: the archived base alone is not run-triggering).
+#[test]
+fn cv2_p08_archived_base_crashed_honest_resume_no_run() {
+    let d = st::Temp::new();
+    let genesis_fold = {
+        let mut m = Mmr::new();
+        m.push(Record::genesis(&TRAIL)).unwrap();
+        m
+    };
+    // Archived base cp at seq=5 with prev != genesis.
+    let archived = st::cp(5, [42; 32], &genesis_fold);
+    st_runs::put(&d, 0, &[&archived], &[]);
+    let mut fold = genesis_fold;
+    fold.push(archived.hash()).unwrap();
+    let close = st::cp(6, archived.hash(), &fold);
+    let resume = st::declaration(&close, 5, archived.hash(), 5, None);
+    st::write_records(&d.0, &[&close, &resume]);
+    TrailReader::open(&d.0, TRAIL, None).expect("p08: archived base Ok");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "p08: no violations");
+    assert!(
+        out.runs.is_empty(),
+        "p08: archived-prefix-only (no run-triggering segment); 0 runs",
+    );
+}
+
+/// p09 — closed run with no complete records (equal to A8).
+/// Sealed S0=[cp0], S1=empty, live=[opening, resume]. Reader `Ok`.
+#[test]
+fn cv2_p09_closed_run_zero_records_equals_a8() {
+    let a = build_a8();
+    TrailReader::open(&a.dir_path, TRAIL, None).expect("p09: reader Ok");
+    let out = classify_collect(&a.dir_path);
+    assert!(out.violations.is_empty(), "p09: no violations");
+    assert_eq!(
+        run_bounds(&out),
+        vec![(1, 2)],
+        "p09: one run covers S1 (empty) and live closer",
+    );
+    assert_eq!(
+        membership(&out),
+        vec![None, Some(0), Some(0)],
+        "p09: S0 base; S1 and live in run 0",
+    );
+}
+
+/// p10 — fragment-only segment with predecessor cp0. Sealed S0=[cp0],
+/// S1 fragment-only, live=[opening(prev=cp0), resume]. Reader `Ok`.
+#[test]
+fn cv2_p10_fragment_only_with_predecessor() {
+    let d = st::Temp::new();
+    let first = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&first], &[]);
+    st_runs::put(&d, 1, &[], b"{\"torn\":");
+    // Closer links cp0.hash (not the fragment-only segment's bytes).
+    let fold = st::seeded(&first);
+    let close = st_runs::signed(1, first.hash(), &fold);
+    let resume = st::declaration(&close, 0, first.hash(), 0, None);
+    st::write_records(&d.0, &[&close, &resume]);
+    TrailReader::open(&d.0, TRAIL, None).expect("p10: reader Ok");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "p10: no violations");
+    assert_eq!(
+        run_bounds(&out),
+        vec![(1, 2)],
+        "p10: one run spans S1 (fragment-only) and live closer",
+    );
+    assert_eq!(
+        membership(&out),
+        vec![None, Some(0), Some(0)],
+        "p10: S0 base; S1 and live in run 0",
+    );
+}
+
+/// p11 — two consecutive record-free segments then closer. Sealed
+/// S0=[cp0], S1 fragment-only, S2 Unparsable-only, live=[opening,
+/// resume]. Reader `Ok`.
+#[test]
+fn cv2_p11_two_record_free_segments_then_closer() {
+    let d = st::Temp::new();
+    let first = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&first], &[]);
+    st_runs::put(&d, 1, &[], b"{\"torn\":");
+    st_runs::put(&d, 2, &[], b"not json\n");
+    let fold = st::seeded(&first);
+    let close = st_runs::signed(1, first.hash(), &fold);
+    let resume = st::declaration(&close, 0, first.hash(), 0, None);
+    st::write_records(&d.0, &[&close, &resume]);
+    TrailReader::open(&d.0, TRAIL, None).expect("p11: reader Ok");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "p11: no violations");
+    assert_eq!(
+        run_bounds(&out),
+        vec![(1, 3)],
+        "p11: one run spans S1..=live (two record-free + closer)",
+    );
+    assert_eq!(
+        membership(&out),
+        vec![None, Some(0), Some(0), Some(0)],
+        "p11: S0 base; S1, S2, live in run 0",
+    );
+}
+
+/// p12 — linking opening after unsealed with no immediate resume.
+/// Reader `Err(CorruptTrail: first successor lacks immediate resume)`.
+#[test]
+fn cv2_p12_linking_opening_after_unsealed_no_resume() {
+    let d = st::Temp::new();
+    let first = st_runs::base(&d);
+    // S0 unsealed: [cp0, entry] with NO closing checkpoint nor LF
+    // (the storage walker treats a closed segment without LF as
+    // unclosed if it lacks an accompanying resume).
+    let e1 = st::entry(&first);
+    let bytes: Vec<u8> = [&first, &e1].iter().flat_map(|r| st::line(r)).collect();
+    // Strip trailing LF so the segment is "unsealed".
+    let bytes = if bytes.last() == Some(&b'\n') {
+        bytes[..bytes.len() - 1].to_vec()
+    } else {
+        bytes
+    };
+    std::fs::write(st::segment(&d.0, 0), bytes).unwrap();
+    let mut fold = st::seeded_pair(&first, &e1);
+    // S1: opening links e1.hash, second record is NOT a resume.
+    let opening = st_runs::signed(e1.context.seq + 1, e1.hash(), &fold);
+    let not_resume = st::entry(&opening);
+    st_runs::put(&d, 1, &[&opening, &not_resume], &[]);
+    fold.push(opening.hash()).unwrap();
+    fold.push(not_resume.hash()).unwrap();
+    let cp_live = st_runs::signed(not_resume.context.seq + 1, not_resume.hash(), &fold);
+    let resume = st::declaration(
+        &cp_live,
+        not_resume.context.seq,
+        not_resume.hash(),
+        cp_live.context.seq - 1,
+        None,
+    );
+    st::write_records(&d.0, &[&cp_live, &resume]);
+    assert!(
+        TrailReader::open(&d.0, TRAIL, None).is_err(),
+        "p12: reader rejects linking opening after unsealed with no resume",
+    );
+    let out = classify_collect(&d.0);
+    assert!(
+        !out.violations.is_empty() || out.head_mismatch,
+        "p12: classify records a violation",
+    );
+    assert!(
+        out.runs.is_empty(),
+        "p12 (C2): out.runs empty on rejected trail"
+    );
+}
+
+/// p13a — §19.2 S0 deleted. S1=[P5(prev != genesis), e6, C7],
+/// old_live has an opening without an immediate resume. Reader
+/// `Err(CorruptTrail)`; `out.runs` empty.
+#[test]
+fn cv2_p13a_section_19_2_s0_deleted() {
+    let d = st::Temp::new();
+    // P5: first present record, seq=5, previous != genesis.
+    let p5 = st_runs::signed(5, [99u8; 32], &{
+        let mut m = Mmr::new();
+        m.push([99u8; 32]).unwrap();
+        m
+    });
+    let e6 = st::entry(&p5);
+    let mut fold = st::seeded_pair(&p5, &e6);
+    let c7 = st_runs::signed(7, e6.hash(), &fold);
+    fold.push(c7.hash()).unwrap();
+    st_runs::put(&d, 0, &[&p5, &e6, &c7], &[]);
+    // old_live: opening O8 + e9 (not a resume).
+    let o8 = st_runs::signed(8, c7.hash(), &fold);
+    let e9 = st::entry(&o8);
+    fold.push(o8.hash()).unwrap();
+    fold.push(e9.hash()).unwrap();
+    let cp_live = st_runs::signed(e9.context.seq + 1, e9.hash(), &fold);
+    let resume = st::declaration(
+        &cp_live,
+        e9.context.seq,
+        e9.hash(),
+        cp_live.context.seq - 1,
+        None,
+    );
+    st_runs::put(&d, 1, &[&o8, &e9], &[]);
+    st::write_records(&d.0, &[&cp_live, &resume]);
+    assert!(
+        TrailReader::open(&d.0, TRAIL, None).is_err(),
+        "p13a: reader rejects P5 with prev != genesis as a lone base",
+    );
+    let out = classify_collect(&d.0);
+    assert!(
+        !out.violations.is_empty() || out.head_mismatch,
+        "p13a: classify records a violation",
+    );
+    assert!(
+        out.runs.is_empty(),
+        "p13a (C2): out.runs empty on rejected trail"
+    );
+}
+
+/// p13b — §19.2 S0 kept, S1 cut to P5, honest resume. Storage still
+/// rejects old_live because O8's successor e9 is not a resume.
+#[test]
+fn cv2_p13b_section_19_2_s0_kept() {
+    let d = st::Temp::new();
+    let first = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&first], &[]);
+    // S1=[P5(prev != cp0.hash), e6, C7]
+    let p5 = st_runs::signed(5, [99u8; 32], &{
+        let mut m = Mmr::new();
+        m.push([99u8; 32]).unwrap();
+        m
+    });
+    let e6 = st::entry(&p5);
+    let mut fold = st::seeded_pair(&p5, &e6);
+    let c7 = st_runs::signed(7, e6.hash(), &fold);
+    fold.push(c7.hash()).unwrap();
+    st_runs::put(&d, 1, &[&p5, &e6, &c7], &[]);
+    let o8 = st_runs::signed(8, c7.hash(), &fold);
+    let e9 = st::entry(&o8);
+    fold.push(o8.hash()).unwrap();
+    fold.push(e9.hash()).unwrap();
+    let cp_live = st_runs::signed(e9.context.seq + 1, e9.hash(), &fold);
+    let resume = st::declaration(
+        &cp_live,
+        e9.context.seq,
+        e9.hash(),
+        cp_live.context.seq - 1,
+        None,
+    );
+    st_runs::put(&d, 2, &[&o8, &e9], &[]);
+    st::write_records(&d.0, &[&cp_live, &resume]);
+    assert!(
+        TrailReader::open(&d.0, TRAIL, None).is_err(),
+        "p13b: reader rejects P5 that does not link cp0.hash",
+    );
+    let out = classify_collect(&d.0);
+    assert!(
+        !out.violations.is_empty() || out.head_mismatch,
+        "p13b: classify records a violation",
+    );
+    assert!(
+        out.runs.is_empty(),
+        "p13b (C2): out.runs empty on rejected trail"
+    );
+}
+
+// ============================================================
+// CV3: p09 + p10 fragment-only agreement (digest-only runs, with
+// and without spans). CV1-A8 already pins p09's digest; this row
+// pins that p10 produces a digest-only run with exactly one span.
+// ============================================================
+
+#[test]
+fn cv3_p09_and_p10_digest_only_with_and_without_spans() {
+    // p09 (== A8): digest-only run, zero spans.
+    let a = build_a8();
+    let out_p09 = classify_collect(&a.dir_path);
+    assert_eq!(out_p09.runs.len(), 1);
+    let rr_p09 = &out_p09.runs[0];
+    assert!(rr_p09.loss_points.is_empty(), "CV3 p09: no loss points");
+    assert!(rr_p09.spans.is_empty(), "CV3 p09: no spans");
+
+    // p10: digest-only run, exactly one span (S1 fragment-only).
+    let d = st::Temp::new();
+    let first = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&first], &[]);
+    st_runs::put(&d, 1, &[], b"{\"torn\":");
+    let fold = st::seeded(&first);
+    let close = st_runs::signed(1, first.hash(), &fold);
+    let resume = st::declaration(&close, 0, first.hash(), 0, None);
+    st::write_records(&d.0, &[&close, &resume]);
+    TrailReader::open(&d.0, TRAIL, None).expect("CV3 p10: reader Ok");
+    let out_p10 = classify_collect(&d.0);
+    assert_eq!(out_p10.runs.len(), 1, "CV3 p10: one run");
+    let rr_p10 = &out_p10.runs[0];
+    assert!(rr_p10.loss_points.is_empty(), "CV3 p10: no loss points");
+    assert_eq!(
+        rr_p10.spans.len(),
+        1,
+        "CV3 p10: one span (fragment-only S1)"
+    );
+    assert_eq!(rr_p10.spans[0].seg, 0, "CV3 p10: span seg run-local 0");
+    assert_eq!(
+        rr_p10.spans[0].after,
+        u64::MAX,
+        "CV3 p10: span starts at segment first byte (after == u64::MAX)",
+    );
 }
