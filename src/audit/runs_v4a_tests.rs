@@ -22,8 +22,8 @@
 
 use super::*;
 use crate::audit::{
-    CheckpointFields, Entry, KeyFileSigner, Mmr, Record, RecordContext, Signer,
-    storage::TrailReader,
+    AuditError, AuditErrorKind, CheckpointFields, Entry, KeyFileSigner, Mmr, Record, RecordContext,
+    Signer, storage::TrailReader,
 };
 use std::{
     fs,
@@ -329,6 +329,28 @@ fn classify_stop(path: &Path) -> super::ClassifyOutput {
 
 fn digest_hex(digest: &[u8; 32]) -> String {
     crate::audit::digest_string(digest)
+}
+
+/// Pin the reader's exact `CorruptTrail` detail for a rejected trail
+/// (ruling 197-d1 addendum 27.4: literal reader-detail pins at base
+/// `ba7ef3e` for p06, p07, p12, p13a, p13b).
+fn assert_reader_corrupt(dir: &Path, expected_detail: &str, label: &str) {
+    let err: AuditError = TrailReader::open(dir, TRAIL, None)
+        .err()
+        .unwrap_or_else(|| panic!("{label}: expected Err(CorruptTrail), got Ok"));
+    assert_eq!(
+        err.kind(),
+        AuditErrorKind::CorruptTrail,
+        "{label}: wrong kind: {err}",
+    );
+    let got = format!("{err}")
+        .strip_prefix("CorruptTrail: ")
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    assert_eq!(
+        got, expected_detail,
+        "{label}: reader detail mismatch at base ba7ef3e",
+    );
 }
 
 // Captured at head on this slice (re-computed on every build by the
@@ -1233,16 +1255,29 @@ fn cv2_p06_linking_after_headless_without_resume() {
     );
     st_runs::put(&d, 2, &[&opening, &not_resume], &[]);
     st::write_records(&d.0, &[&cp_live, &resume]);
-    // Reader: CorruptTrail; exact detail may be caller-specific. We
-    // only pin that it is an Err (C2: `out.runs` empty).
-    assert!(
-        TrailReader::open(&d.0, TRAIL, None).is_err(),
-        "p06: reader rejects linking opening after unsealed with no resume",
-    );
+    // Ruling 197-d1 addendum 27.4: literal reader-detail pin at base
+    // `ba7ef3e`, plus literal violation list.
+    assert_reader_corrupt(&d.0, "first successor lacks immediate resume", "p06");
     let out = classify_collect(&d.0);
-    assert!(
-        !out.violations.is_empty() || out.head_mismatch,
-        "p06: classify records at least one violation or head_mismatch",
+    assert_eq!(
+        out.violations,
+        vec![
+            (
+                super::SegmentViolationPos {
+                    segment_index: 2,
+                    record_index_in_segment: 1,
+                },
+                super::Violation::FirstSuccessorLacksImmediateResume,
+            ),
+            (
+                super::SegmentViolationPos {
+                    segment_index: 3,
+                    record_index_in_segment: 0,
+                },
+                super::Violation::RecordRolledBack,
+            ),
+        ],
+        "p06: literal violation list (addendum 27.4)",
     );
     assert!(
         out.runs.is_empty(),
@@ -1271,14 +1306,18 @@ fn cv2_p07_non_checkpoint_first_record_at_base() {
     let close = st_runs::signed(1, e0.hash(), &fold);
     let resume = st::declaration(&close, 0, e0.hash(), 0, None);
     st::write_records(&d.0, &[&close, &resume]);
-    assert!(
-        TrailReader::open(&d.0, TRAIL, None).is_err(),
-        "p07: reader rejects non-checkpoint first record at base",
-    );
+    assert_reader_corrupt(&d.0, "missing initial checkpoint", "p07");
     let out = classify_collect(&d.0);
-    assert!(
-        !out.violations.is_empty() || out.head_mismatch,
-        "p07: classify records a violation",
+    assert_eq!(
+        out.violations,
+        vec![(
+            super::SegmentViolationPos {
+                segment_index: 0,
+                record_index_in_segment: 0,
+            },
+            super::Violation::MissingInitialCheckpoint,
+        )],
+        "p07: literal violation list (addendum 27.4)",
     );
     assert!(
         out.runs.is_empty(),
@@ -1426,14 +1465,27 @@ fn cv2_p12_linking_opening_after_unsealed_no_resume() {
         None,
     );
     st::write_records(&d.0, &[&cp_live, &resume]);
-    assert!(
-        TrailReader::open(&d.0, TRAIL, None).is_err(),
-        "p12: reader rejects linking opening after unsealed with no resume",
-    );
+    assert_reader_corrupt(&d.0, "first successor lacks immediate resume", "p12");
     let out = classify_collect(&d.0);
-    assert!(
-        !out.violations.is_empty() || out.head_mismatch,
-        "p12: classify records a violation",
+    assert_eq!(
+        out.violations,
+        vec![
+            (
+                super::SegmentViolationPos {
+                    segment_index: 1,
+                    record_index_in_segment: 1,
+                },
+                super::Violation::FirstSuccessorLacksImmediateResume,
+            ),
+            (
+                super::SegmentViolationPos {
+                    segment_index: 2,
+                    record_index_in_segment: 0,
+                },
+                super::Violation::RecordRolledBack,
+            ),
+        ],
+        "p12: literal violation list (addendum 27.4)",
     );
     assert!(
         out.runs.is_empty(),
@@ -1473,14 +1525,38 @@ fn cv2_p13a_section_19_2_s0_deleted() {
     );
     st_runs::put(&d, 1, &[&o8, &e9], &[]);
     st::write_records(&d.0, &[&cp_live, &resume]);
-    assert!(
-        TrailReader::open(&d.0, TRAIL, None).is_err(),
-        "p13a: reader rejects P5 with prev != genesis as a lone base",
+    assert_reader_corrupt(
+        &d.0,
+        "checkpoint MMR differs from preceding records",
+        "p13a",
     );
     let out = classify_collect(&d.0);
-    assert!(
-        !out.violations.is_empty() || out.head_mismatch,
-        "p13a: classify records a violation",
+    assert_eq!(
+        out.violations,
+        vec![
+            (
+                super::SegmentViolationPos {
+                    segment_index: 0,
+                    record_index_in_segment: 2,
+                },
+                super::Violation::CheckpointMmrDiffers,
+            ),
+            (
+                super::SegmentViolationPos {
+                    segment_index: 1,
+                    record_index_in_segment: 0,
+                },
+                super::Violation::FirstSuccessorDoesNotCloseRun,
+            ),
+            (
+                super::SegmentViolationPos {
+                    segment_index: 2,
+                    record_index_in_segment: 0,
+                },
+                super::Violation::RecordRolledBack,
+            ),
+        ],
+        "p13a: literal violation list (addendum 27.4)",
     );
     assert!(
         out.runs.is_empty(),
@@ -1520,14 +1596,27 @@ fn cv2_p13b_section_19_2_s0_kept() {
     );
     st_runs::put(&d, 2, &[&o8, &e9], &[]);
     st::write_records(&d.0, &[&cp_live, &resume]);
-    assert!(
-        TrailReader::open(&d.0, TRAIL, None).is_err(),
-        "p13b: reader rejects P5 that does not link cp0.hash",
-    );
+    assert_reader_corrupt(&d.0, "first successor does not close sealed run", "p13b");
     let out = classify_collect(&d.0);
-    assert!(
-        !out.violations.is_empty() || out.head_mismatch,
-        "p13b: classify records a violation",
+    assert_eq!(
+        out.violations,
+        vec![
+            (
+                super::SegmentViolationPos {
+                    segment_index: 2,
+                    record_index_in_segment: 0,
+                },
+                super::Violation::FirstSuccessorDoesNotCloseRun,
+            ),
+            (
+                super::SegmentViolationPos {
+                    segment_index: 3,
+                    record_index_in_segment: 0,
+                },
+                super::Violation::RecordRolledBack,
+            ),
+        ],
+        "p13b: literal violation list (addendum 27.4)",
     );
     assert!(
         out.runs.is_empty(),
@@ -1565,15 +1654,259 @@ fn cv3_p09_and_p10_digest_only_with_and_without_spans() {
     assert_eq!(out_p10.runs.len(), 1, "CV3 p10: one run");
     let rr_p10 = &out_p10.runs[0];
     assert!(rr_p10.loss_points.is_empty(), "CV3 p10: no loss points");
+    // Ruling 197-d1 addendum 27.4: literal span list and run_digest pin
+    // (captured at head on this slice; a drift in `verify::lines::stream`,
+    // span `seg` renumbering or the gap hash flips the pin).
     assert_eq!(
         rr_p10.spans.len(),
         1,
         "CV3 p10: one span (fragment-only S1)"
     );
-    assert_eq!(rr_p10.spans[0].seg, 0, "CV3 p10: span seg run-local 0");
+    let span0 = &rr_p10.spans[0];
+    assert_eq!(span0.seg, 0, "CV3 p10: span seg run-local 0");
     assert_eq!(
-        rr_p10.spans[0].after,
+        span0.after,
         u64::MAX,
         "CV3 p10: span starts at segment first byte (after == u64::MAX)",
+    );
+    assert_eq!(
+        span0.len, 8,
+        "CV3 p10: span len == 8 (bytes of `{{\\\"torn\\\":`)",
+    );
+    assert_eq!(
+        digest_hex(&span0.digest),
+        "blake3:e06678ed944e90a6f28636da719dc9b8267f8fec6688720495123ec237d761a4",
+        "CV3 p10: span digest literal pin",
+    );
+    let run_digest = crate::audit::verify::lines::run_digest(&[], &rr_p10.spans);
+    assert_eq!(
+        digest_hex(&run_digest),
+        "blake3:83abd6e7c857e0660c5cc69ff6cf0966bddfce1c06d6d36fb4b010ea2aa329ed",
+        "CV3 p10: run_digest literal pin",
+    );
+}
+
+// ============================================================
+// B2 / addendum 28.5: two distinct killer rows per report mutant
+// for O2 (`boundary_resume` inverted), O4 (any membership-changing
+// mutant on the class/grouping), O6 (`final_state: None`) and O8
+// (a closer's spans dropped).
+// ============================================================
+
+/// O2 killer 1 — A1 per-segment `boundary_resume` literal.
+/// With `boundary_resume = role_opening && !storage::sealed(prior)`,
+/// A1's values are `[false, true, false]` (S0 prior=None, S1 prior=cp0-
+/// sealed is-false-since-sealed inverted, S2 prior=S1-unsealed is-true,
+/// live prior=cp5-sealed is-false). The O2 mutant inverts the sealed
+/// check and flips the row to `[false, false, true]`.
+#[test]
+fn b2_o2_a1_boundary_resume_per_segment_literal() {
+    let a = build_a1();
+    TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
+    let out = classify_collect(&a.dir_path);
+    let br: Vec<bool> = out.segments.iter().map(|s| s.boundary_resume).collect();
+    assert_eq!(
+        br,
+        vec![false, true, false],
+        "O2 kill: A1 boundary_resume literal (inverting storage::sealed flips this row)",
+    );
+}
+
+/// O2 killer 2 — A3 per-segment `boundary_resume` literal.
+/// A3's four segments are all at sealed boundaries (cp2 / cp5 / cp8
+/// all seal), so every `boundary_resume` is `false`. Inverting the
+/// sealed check turns every segment with a prior state into `true`.
+#[test]
+fn b2_o2_a3_boundary_resume_per_segment_literal() {
+    let a = build_a3();
+    TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
+    let out = classify_collect(&a.dir_path);
+    let br: Vec<bool> = out.segments.iter().map(|s| s.boundary_resume).collect();
+    assert_eq!(
+        br,
+        vec![false, false, false, false],
+        "O2 kill: A3 boundary_resume literal (inverting storage::sealed flips three segments)",
+    );
+}
+
+/// O4 killer 1 — A1 per-segment `SegmentClass` literal
+/// (`[Base, InRun, Closer]`). Any mutant that reroutes the class
+/// derivation changes this row.
+#[test]
+fn b2_o4_a1_segment_classes_literal() {
+    let a = build_a1();
+    TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
+    let out = classify_collect(&a.dir_path);
+    let classes: Vec<super::SegmentClass> = out.segments.iter().map(|s| s.class).collect();
+    use super::SegmentClass::{Base, Closer, InRun};
+    assert_eq!(
+        classes,
+        vec![Base, InRun, Closer],
+        "O4 kill: A1 class order (any membership-changing mutant flips one entry)",
+    );
+    let membership: Vec<Option<usize>> = out.segments.iter().map(|s| s.run_membership).collect();
+    assert_eq!(
+        membership,
+        vec![None, Some(0), Some(0)],
+        "O4 kill: A1 run_membership literal",
+    );
+}
+
+/// O4 killer 2 — A3 per-segment `SegmentClass` literal
+/// (`[Base, InRun, InRun, Closer]`).
+#[test]
+fn b2_o4_a3_segment_classes_literal() {
+    let a = build_a3();
+    TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
+    let out = classify_collect(&a.dir_path);
+    let classes: Vec<super::SegmentClass> = out.segments.iter().map(|s| s.class).collect();
+    use super::SegmentClass::{Base, Closer, InRun};
+    assert_eq!(
+        classes,
+        vec![Base, InRun, InRun, Closer],
+        "O4 kill: A3 class order (membership-changing mutants flip at least one entry)",
+    );
+    let membership: Vec<Option<usize>> = out.segments.iter().map(|s| s.run_membership).collect();
+    assert_eq!(
+        membership,
+        vec![None, Some(0), Some(0), Some(0)],
+        "O4 kill: A3 run_membership literal",
+    );
+}
+
+/// O6 killer 1 — A1 per-segment `final_state.is_some()` literal
+/// (all `true`). A mutant that forces `final_state: None` on any
+/// segment flips an entry.
+#[test]
+fn b2_o6_a1_final_state_is_some_per_segment() {
+    let a = build_a1();
+    TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
+    let out = classify_collect(&a.dir_path);
+    let states: Vec<bool> = out
+        .segments
+        .iter()
+        .map(|s| s.final_state.is_some())
+        .collect();
+    assert_eq!(
+        states,
+        vec![true, true, true],
+        "O6 kill: A1 final_state.is_some() literal",
+    );
+}
+
+/// O6 killer 2 — A3 per-segment `final_state.is_some()` literal
+/// (all four `true`).
+#[test]
+fn b2_o6_a3_final_state_is_some_per_segment() {
+    let a = build_a3();
+    TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
+    let out = classify_collect(&a.dir_path);
+    let states: Vec<bool> = out
+        .segments
+        .iter()
+        .map(|s| s.final_state.is_some())
+        .collect();
+    assert_eq!(
+        states,
+        vec![true, true, true, true],
+        "O6 kill: A3 final_state.is_some() literal",
+    );
+}
+
+/// O8 killer 1 — p10 plus a live torn tail `{"half`. Reader is `Ok`
+/// (torn trailing fragment on the live file is tolerated). The run
+/// has `first_segment=1` (fragment-only `S1`) and `last_segment=2`
+/// (live, the closer) — both contribute one span each. Expected
+/// span shapes: `[(0, u64::MAX, 8), (1, 5, 6)]`. A mutant that
+/// drops the closer segment's spans flips this to `[(0, u64::MAX, 8)]`.
+#[test]
+fn b2_o8_p10_live_torn_tail_half_spans() {
+    let d = st::Temp::new();
+    let first = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&first], &[]);
+    st_runs::put(&d, 1, &[], b"{\"torn\":");
+    let fold = st::seeded(&first);
+    let (_close, resume) = st_runs::close_run(&d, &first, &fold);
+    st::append_bytes(&d.0.join("audit.jsonl"), b"{\"half");
+    TrailReader::open(&d.0, TRAIL, None).expect("O8: reader Ok on p10 + torn tail");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "O8: no violations");
+    assert_eq!(out.runs.len(), 1, "O8: one run");
+    let rr = &out.runs[0];
+    let shapes: Vec<(u32, u64, u64)> = rr.spans.iter().map(|s| (s.seg, s.after, s.len)).collect();
+    assert_eq!(
+        shapes,
+        vec![(0, u64::MAX, 8), (1, resume.context.seq, 6)],
+        "O8 kill: p10+torn-tail spans literal — closer (live) contributes `(1, 5, 6)`",
+    );
+    assert_eq!(resume.context.seq, 5, "O8: resume.seq pin (sanity)");
+    // Pin the closer-span digest so even a mutant that preserves the
+    // tuple shapes but reorders content flips the row.
+    assert_eq!(
+        digest_hex(&rr.spans[1].digest),
+        "blake3:d9a5b587318eff723676e5ae0e4f95bc2b2617255722fea8409d547b4cb020cc",
+        "O8 kill: closer span digest literal",
+    );
+}
+
+/// O8 killer 2 — A9 (multi-segment record-free) run spans with the
+/// closer's spans as the trailing pair. If an O8-style mutant drops
+/// the closer segment or truncates the per-segment span concatenation,
+/// the full `[(0, MAX, 9), (1, MAX, 14)]` pair collapses.
+#[test]
+fn b2_o8_a9_span_shapes_literal() {
+    let a = build_a9();
+    TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
+    let out = classify_collect(&a.dir_path);
+    assert_eq!(out.runs.len(), 1, "O8/A9: one run");
+    let rr = &out.runs[0];
+    let shapes: Vec<(u32, u64, u64)> = rr.spans.iter().map(|s| (s.seg, s.after, s.len)).collect();
+    assert_eq!(
+        shapes,
+        vec![(0, u64::MAX, 9), (1, u64::MAX, 14)],
+        "O8 kill: A9 span shapes literal (dropping any run-segment's span changes the list)",
+    );
+}
+
+// ============================================================
+// B3 (addendum 28.5): meaningful rows for the new mutants N1 made
+// available on the walker closer-fired signal. `closer_fired` is now
+// the Classifier's own (i)+(ii) latch, no inference from `ctx.run`.
+// ============================================================
+
+/// M-N1a kill — `closer_fired` stuck `false`. Any run that closes
+/// (A1) no longer has a Closer segment, `runs` becomes empty.
+#[test]
+fn b3_n1a_closer_fired_stuck_false_kill() {
+    let a = build_a1();
+    TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
+    let out = classify_collect(&a.dir_path);
+    assert_eq!(out.runs.len(), 1, "M-N1a kill: A1 still has one closed run");
+    assert_eq!(
+        out.segments[2].class,
+        super::SegmentClass::Closer,
+        "M-N1a kill: A1 live is Closer (stuck-false mutant drops this)",
+    );
+}
+
+/// M-N1b kill — `closer_fired = ctx.run` (inherited-run inference).
+/// Needs a layout where `ctx.run` is true on a non-closing strict
+/// pass: A1's `S1` is in a run (`run_in_before=true`) and does NOT
+/// close it. Pinning `segments[1].class == InRun` kills the
+/// inferred mutant (which would latch `Closer` on S1).
+#[test]
+fn b3_n1b_closer_fired_from_ctx_run_kill() {
+    let a = build_a1();
+    TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
+    let out = classify_collect(&a.dir_path);
+    assert_eq!(
+        out.segments[1].class,
+        super::SegmentClass::InRun,
+        "M-N1b kill: A1 S1 stays InRun (mutant with closer_fired=ctx.run would flip it to Closer)",
+    );
+    assert_eq!(
+        out.segments[1].run_membership,
+        Some(0),
+        "M-N1b kill: A1 S1 belongs to run 0",
     );
 }
