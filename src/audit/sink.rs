@@ -1,6 +1,7 @@
 //! Internal durable writer behind the public `AuditTrail` and `AuditConfig`.
 use super::{
     format::{Kind, request},
+    runs::Reaction,
     storage::{Head, State, TrailReader, existing, history_segment, scan_staged},
     *,
 };
@@ -328,7 +329,8 @@ fn predecessor_run(dir: &File, trail: [u8; 16]) -> Result<(Option<State>, bool),
     let mut state = None;
     let mut run = false;
     for name in rotate::rotated_names_at(dir, "audit").map_err(io_error)? {
-        state = history_segment(
+        let (next, _) = history_segment(
+            Reaction::Stop,
             &existing(dir, &name, false)?,
             trail,
             state,
@@ -337,9 +339,11 @@ fn predecessor_run(dir: &File, trail: [u8; 16]) -> Result<(Option<State>, bool),
             &mut None,
             &mut run,
         )?;
+        state = next;
     }
     if exists(dir, "audit.jsonl")? && !linked_live(dir)? {
-        state = history_segment(
+        let (next, _) = history_segment(
+            Reaction::Stop,
             &existing(dir, Path::new("audit.jsonl"), false)?,
             trail,
             state,
@@ -348,6 +352,7 @@ fn predecessor_run(dir: &File, trail: [u8; 16]) -> Result<(Option<State>, bool),
             &mut None,
             &mut run,
         )?;
+        state = next;
     }
     Ok((state, run))
 }
