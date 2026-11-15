@@ -959,7 +959,7 @@ pub(crate) fn scan_closing(
         },
     )
 }
-fn sealed(state: &State) -> bool {
+pub(crate) fn sealed(state: &State) -> bool {
     // A complete JSON checkpoint without LF is still a record (ADR-0005 d5).
     state.run.checkpoint && state.gap.is_none() && !state.run.pending_resume
 }

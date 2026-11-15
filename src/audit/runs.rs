@@ -1,7 +1,7 @@
 //! Shared pure per-record state machine for the reader (`storage.rs`) and
-//! future verifier (#13 V4a/V4b). ADR-0005 amendment 6 "Base", "Sequence
-//! gaps inside a run", "Run boundaries", amendment 9 part 1 (genesis base),
-//! and rulings 13-V4-d1/d3/d4, B3d1-d1/d3/d4, 107-d1. Issue #197 R1/R2.
+//! verifier (#13 V4a). ADR-0005 amendment 6 "Base", "Sequence gaps inside
+//! a run", "Run boundaries", amendment 9 part 1 (genesis base), and
+//! rulings 13-V4-d1/d3/d4, B3d1-d1/d3/d4, 107-d1.
 //!
 //! No I/O. No locks. No writer-only state. Owns `apply_checked`, the
 //! resume-declaration validator and the MMR fold (iii). The reader embeds
@@ -9,43 +9,20 @@
 //! (`checkpoint_time`, `since_checkpoint`), the walk cursor (`offset`,
 //! `length`, `newline`) and the gap-hasher stay in `State`.
 //!
-//! The strict and tolerant [`Classifier`] paths, with [`check_attestation`],
-//! are the reader's first-violation oracle (the reader's per-path order
-//! binds; ruling 197-d1 addenda 7 and 12). Classification sites return
-//! typed [`Violation`] variants (ruling 197-d1 addendum 16, point 3), and
-//! the one dispatcher [`Classifier::on_violation`] turns a [`Violation`]
-//! into the reader's [`AuditError`] under reaction [`Reaction::Stop`] or
-//! records it into the per-segment violations vector under reaction
-//! [`Reaction::Collect`] (addendum 16 point 1). The every-violation
-//! collector (see [`Classifier::new_collect`]) accumulates each typed
-//! [`Violation`] for the verifier's V4a walk; the `classify` iterator
-//! wrapper (#197 R2b S3b) consumes it. Nothing outside the reader or the
-//! verifier may call this module as a first-violation oracle.
+//! ## Complete first-violation oracle
 //!
-//! **S3a scope (ruling 197-d1 addendum 18):** [`Reaction::Collect`] in
-//! this slice runs **tolerant mode only** -- the only constructor is
-//! [`Classifier::new_collect`], which builds a tolerant classifier.
-//! Strict-mode Collect, a Collect entry for a `Record(Err)` line, and
-//! the collector-first-equals-reader-first sweep over the strict
-//! single-segment paths land in **#197 R2b S3a′**; until then the
-//! collector is not a first-violation oracle for any strict path, and
-//! no caller may treat it as one.
+//! - **Per segment** (ruling 197-d1 addendum 24.3), [`Classifier`] /
+//!   [`check_attestation`] run through the one [`dispatch_line`] helper
+//!   shared by [`scan_segment`] (strict single-pass) and
+//!   [`history_segment`] (strict -> tolerant fallback); each site
+//!   constructs a typed [`Violation`] directly (addendum 16.3).
+//! - **Across segments** (addendum 25.1), [`classify`] threads
+//!   `(state, found, run)` through a sequence of [`storage::SegmentBytes`]
+//!   yielded by [`storage::SegmentSource`] under
+//!   [`Reaction::Stop`] (the reader) or [`Reaction::Collect`] (V4a).
 //!
-//! Addendum 16 point 2 and ruling 197-d1 addendum 17.3: on a fold (iii)
-//! mismatch the record-apply callsite inside the [`Classifier`]
-//! special-cases [`Reaction::Collect`] and re-applies through
-//! [`apply_checked`] with `compare_mmr = false`, so the MMR continues as
-//! **the computed fold including the checkpoint's own leaf** -- the state
-//! the trail would have if the checkpoint had been honest (no hand-built
-//! MMR, no hand-built `RunState`, the checkpoint's declared size/root/
-//! peaks are discarded). Any other violation ends the run under
-//! consideration and resumes at the next segment boundary
-//! ([`Classifier::reset_at_boundary`]); the tolerant finish-time checks
-//! (`invalid undamaged segment`, `first successor lacks resume`,
-//! `resume checkpoint lacks its declaration`) are recorded in Collect mode
-//! too (addendum 16 point 5). A recorded fold-(iii) mismatch marks its
-//! segment damaged for the end-of-segment checks (ruling 197-d1 addendum
-//! 19.2), so no follow-on `InvalidUndamagedSegment` derives from it.
+//! No other site in the crate may treat this module as a first-violation
+//! oracle (ruling 13-V4-d1 point 1).
 use super::{
     AuditError, AuditErrorKind, Mmr, Record,
     format::Kind,
@@ -828,6 +805,25 @@ pub(crate) struct ClassifyOutput {
         expect(dead_code, reason = "read by the Collect proof in this crate's tests")
     )]
     pub(crate) head_mismatch: bool,
+    /// #197 ruling addendum 25.5: one [`SegmentReport`] per segment
+    /// classify yielded, in base order. Read by the V4a walk at this
+    /// head (see `#[cfg(test)] mod classify_v4a_walk`); V4a's
+    /// `verify::fold::check_runs` consumes the same shape through
+    /// `Collection` without going through `classify`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
+    )]
+    pub(crate) segments: Vec<SegmentReport>,
+    /// #197 ruling addendum 25.5: one [`RunReport`] per closed run,
+    /// covering first_segment..=last_segment of the preceding
+    /// [`segments`](Self::segments). Empty when the trail has no
+    /// closed run.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
+    )]
+    pub(crate) runs: Vec<RunReport>,
 }
 
 /// Ruling 197-d1 addendum 25.3: Collect tags a (segment, record-in-
@@ -840,6 +836,171 @@ pub(crate) struct ClassifyOutput {
 pub(crate) struct SegmentViolationPos {
     pub(crate) segment_index: usize,
     pub(crate) record_index_in_segment: usize,
+}
+
+/// #197 ruling addendum 25.5: segment classification the V4a walk
+/// consumes. Computed in [`classify`] from the segment's position in
+/// the plan, the state threaded across the boundary, and whether the
+/// segment recorded any violations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SegmentClass {
+    /// Segment 0 with `run_in == false` whose walker returned `Some`
+    /// state and recorded no violations (ADR-0005 "Base" / ruling
+    /// 107-d1; archived prefix allowed).
+    Base,
+    /// Segment that entered with `run_in == true` (prior run active)
+    /// and whose walker did not close the run.
+    InRun,
+    /// Segment that entered with `run_in == true` and closed the run
+    /// (ADR amendment 6 (i)+(ii)): `run_out == false` with no recorded
+    /// violation. May also be run-triggering in its own tail and start
+    /// run 2 (`run_out == true`); classify emits a separate
+    /// [`SegmentReport`] for that case iff the walker re-latches
+    /// `run` in the same segment.
+    Closer,
+    /// Segment that recorded at least one violation (any kind), or
+    /// entered `run_in == false` and left `run_out == true` without a
+    /// closing (i)+(ii). Addendum 19.2: a fold-(iii) mismatch marks
+    /// its segment damaged for the end-of-segment checks.
+    Damaged,
+}
+
+/// #197 ruling addendum 25.5: per-segment report the V4a walk reads.
+/// Per-field `expect(dead_code)` on each field only the `mod
+/// classify_v4a_walk` rows read; `class` is read by the run-grouping
+/// loop in `classify` (non-test code), so it carries no expect.
+#[derive(Clone)]
+pub(crate) struct SegmentReport {
+    pub(crate) class: SegmentClass,
+    /// `Some(i)` when this segment belongs to [`ClassifyOutput::runs`]`[i]`;
+    /// `None` for [`SegmentClass::Base`] and for segments that
+    /// recorded a violation with no closing (i)+(ii). Written in
+    /// non-test code by the run-grouping loop; read only by the V4a
+    /// walk in this crate's tests.
+    pub(crate) run_membership: Option<usize>,
+    /// True iff this segment recorded at least one violation.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
+    )]
+    pub(crate) damage: bool,
+    /// Entry-side `unsealed_boundary`: `opening && prior_state`
+    /// mid-run. Addendum 19.2 / B3d1-d3: forbids deferring the
+    /// immediate resume across an unsealed boundary.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
+    )]
+    pub(crate) boundary_resume: bool,
+    /// Walker's returned `RunState` (the `run` part of `State`) when
+    /// `Some`. `None` iff the walker folded no complete record on
+    /// this trail.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
+    )]
+    pub(crate) final_state: Option<RunState>,
+}
+
+/// #197 ruling addendum 25.5: one entry per closed run. Spans the
+/// range `first_segment..=last_segment` of
+/// [`ClassifyOutput::segments`]. Every field is only read by the
+/// V4a walk at this head (the run-grouping loop in `classify` uses
+/// local `usize` variables, not these fields).
+#[derive(Clone)]
+pub(crate) struct RunReport {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
+    )]
+    pub(crate) first_segment: usize,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
+    )]
+    pub(crate) last_segment: usize,
+    /// `Some(head)` of the closer's opening checkpoint (ADR (i));
+    /// `None` only on partially populated reports under
+    /// [`Reaction::Collect`] when the trail never reached a closer.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
+    )]
+    pub(crate) closing_opening: Option<Head>,
+    /// Loss points in run-walk order. Each `(first, count)` pair feeds
+    /// `verify::lines::run_digest`'s ranges. V4a pins equality against
+    /// the digest at this head.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
+    )]
+    pub(crate) loss_points: Vec<LossPoint>,
+    /// Spans concatenated per segment with each span's `seg`
+    /// rewritten to the run-local segment index (ruling 13-V4-d2
+    /// point 2).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
+    )]
+    pub(crate) spans: Vec<super::verify::lines::Span>,
+}
+
+/// #197 ruling addendum 25.5: one loss point inside a run (B3d1-d4 /
+/// 13-V4-d2 point 3). Arithmetic is checked (`u64::checked_sub` /
+/// `checked_add`): a non-increasing seq at the would-be loss point
+/// drops only that run's finding (ruling 13-V4-d3 point 2 last bullet).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LossPoint {
+    pub(crate) loss_seq: u64,
+    pub(crate) first: u64,
+    pub(crate) count: u64,
+}
+
+/// Per-record head info classify collects during each segment's span/record
+/// pass. Private: classify groups these into `RunReport.loss_points` and
+/// pins the closer's opening-checkpoint `Head`.
+#[derive(Clone, Copy, Debug)]
+struct RecordHeadInfo {
+    seq: u64,
+    hash: [u8; 32],
+    previous: [u8; 32],
+}
+
+/// Addendum 25.5 (spans/records): one pass of `verify::lines::stream`
+/// over a segment file to collect spans (with per-segment `after =
+/// u64::MAX` sentinel) AND the `(seq, hash, previous)` of every
+/// complete record on this trail. Classify re-runs it under Collect
+/// only, once per segment, so no loss-point arithmetic lives on the
+/// Stop path. The file handle is sought to byte 0 by the walker.
+fn collect_segment_spans_and_records(
+    file: &mut std::fs::File,
+    trail: [u8; 16],
+    segment_index: usize,
+) -> (Vec<super::verify::lines::Span>, Vec<RecordHeadInfo>) {
+    use std::io::{BufReader, Seek, SeekFrom};
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return (Vec::new(), Vec::new());
+    }
+    let reader = BufReader::new(file);
+    let mut records: Vec<RecordHeadInfo> = Vec::new();
+    let seg_u32: u32 = u32::try_from(segment_index).unwrap_or(u32::MAX);
+    let spans = super::verify::lines::stream(reader, seg_u32, |item| {
+        if let super::verify::lines::Content::Records(recs) = &item.content {
+            for r in recs {
+                if r.context.trail == trail {
+                    records.push(RecordHeadInfo {
+                        seq: r.context.seq,
+                        hash: Head::of(r).hash,
+                        previous: r.context.previous,
+                    });
+                }
+            }
+        }
+    });
+    match spans {
+        Ok(v) => (v, records),
+        Err(_) => (Vec::new(), records),
+    }
 }
 
 /// Ruling 197-d1 addendum 25.1 and addendum 27.1: THE ONE multi-segment
@@ -886,9 +1047,47 @@ pub(crate) fn classify(
     let mut live_file: Option<std::fs::File> = None;
     let mut final_state: Option<State> = None;
     let mut violations: Vec<(SegmentViolationPos, Violation)> = Vec::new();
+    let mut segments: Vec<SegmentReport> = Vec::new();
+    // Addendum 28 point 1: reports are a Collect product. Under Stop
+    // we build nothing; under Collect we gather SegmentReports and
+    // group them into RunReports after the loop. Addendum 28 point 4:
+    // per-run span/record heads are collected once during the walk
+    // (one segment at a time) by re-streaming the segment bytes
+    // through `verify::lines::stream` after the walker call.
+    let build_reports = matches!(reaction, Reaction::Collect);
+    let mut seg_spans: Vec<Vec<super::verify::lines::Span>> = Vec::new();
+    let mut seg_records: Vec<Vec<RecordHeadInfo>> = Vec::new();
     let mut segment_index: usize = 0;
     while let Some(seg) = source.next_segment()? {
         let in_state = state.take();
+        // Addendum 25.5: capture entry-side signals the per-segment
+        // report needs. `opening` is derived from the ReaderPath+role
+        // pair; `boundary_resume` is `opening && prior mid-run`
+        // (inlined `storage::sealed` so classify stays I/O-free).
+        let (role_opening, _role_prelude) = match (path, &seg) {
+            (ReaderPath::LiveOpen { .. }, SegmentRead::Sealed { .. })
+            | (ReaderPath::LiveOpen { .. }, SegmentRead::Live(_))
+            | (ReaderPath::RefreshRotate, SegmentRead::Sealed { prelude: false, .. })
+            | (ReaderPath::RefreshRotate, SegmentRead::Live(_)) => (true, false),
+            (ReaderPath::RefreshRotate, SegmentRead::Sealed { prelude: true, .. }) => (false, true),
+            (ReaderPath::RefreshAppend, _) => (false, false),
+        };
+        let boundary_resume =
+            role_opening && in_state.as_ref().is_some_and(|s| !storage::sealed(s));
+        let run_in_before = run;
+        // Addendum 25.5 (spans/records): under Collect, clone the
+        // segment's file handle BEFORE the walker consumes it so a
+        // second seek-to-0 pass through `verify::lines::stream` can
+        // produce the per-segment spans + record head list the
+        // RunReport needs. The clone is independent in Rust's
+        // `std::fs::File::try_clone` contract (an OS-level `dup`).
+        let span_handle: Option<std::fs::File> = if build_reports {
+            match &seg {
+                SegmentRead::Sealed { file, .. } | SegmentRead::Live(file) => file.try_clone().ok(),
+            }
+        } else {
+            None
+        };
         let (next_state, seg_violations, live) = match (path, seg) {
             (ReaderPath::LiveOpen { expected }, SegmentRead::Sealed { file, .. }) => {
                 let (s, v) = storage::history_segment(
@@ -945,6 +1144,27 @@ pub(crate) fn classify(
                 (s, v, Some(file))
             }
         };
+        // Addendum 25.5: capture per-segment report inputs before
+        // the Stop-identical `state`/`live_file`/`final_state`
+        // bookkeeping consumes `next_state`.
+        let next_state_run = next_state.as_ref().map(|s| s.run.clone());
+        let next_state_is_some = next_state.is_some();
+        let damage = !seg_violations.is_empty();
+        let is_live = live.is_some();
+        // Addendum 25.5: run the span/record-head pass for this
+        // segment under Collect. We rewind the dup handle to byte 0
+        // (base-identical: `verify::lines::stream` sets `after =
+        // u64::MAX` on the first span of each segment per 13-V4-d2
+        // point 2). On I/O failure under Collect we silently drop
+        // this segment's span data (spans are a report input, not a
+        // reader-side invariant).
+        if build_reports {
+            let (spans, records) = span_handle
+                .map(|mut f| collect_segment_spans_and_records(&mut f, trail, segment_index))
+                .unwrap_or_else(|| (Vec::new(), Vec::new()));
+            seg_spans.push(spans);
+            seg_records.push(records);
+        }
         if let Some(file) = live {
             live_file = Some(file);
             final_state = next_state.clone();
@@ -971,10 +1191,182 @@ pub(crate) fn classify(
                 v,
             ));
         }
+        // Addendum 25.5: derive the segment class from the run
+        // transition and the damage flag. `Closer` is the segment
+        // that ends a prior run without recording a violation;
+        // `InRun` is a run-inheriting segment whose walker left the
+        // run still open; `Base` is segment 0 entering with no prior
+        // run and no damage; everything else is `Damaged`.
+        //
+        // The live segment is terminal: it does not thread the
+        // `*run` out-parameter back to classify (storage's
+        // `scan_closing` takes `run: bool` by value, not `&mut`),
+        // so a live segment with `run_in_before && !damage` is
+        // treated as a Closer by inspection of its role (i)+(ii)
+        // completed by the walker without violation.
+        let run_out = run;
+        let class = if damage {
+            SegmentClass::Damaged
+        } else if run_in_before && (is_live || !run_out) {
+            SegmentClass::Closer
+        } else if run_in_before {
+            SegmentClass::InRun
+        } else if segment_index == 0 && next_state_is_some {
+            SegmentClass::Base
+        } else if run_out {
+            // `run_in == false && run_out == true`: walker latched a
+            // new run inside this segment with no (i)+(ii) closing
+            // before the segment boundary. 13-V4-d2 point 1: an
+            // unclosed run emits no run finding.
+            SegmentClass::Damaged
+        } else {
+            SegmentClass::InRun
+        };
+        if build_reports {
+            segments.push(SegmentReport {
+                class,
+                run_membership: None, // backfilled after the loop
+                damage,
+                boundary_resume,
+                final_state: next_state_run,
+            });
+        }
         segment_index += 1;
     }
+    // Addendum 25.5 + 28 point 2: group consecutive segments into
+    // closed runs. A closed run spans from the first non-Base,
+    // non-Closer run-triggering segment up through the first Closer.
+    // Unclosed candidate runs (ending in Damaged with no later Closer)
+    // emit no RunReport (13-V4-d2 point 1). `Base` segments break run
+    // membership. Addendum 28 point 2: `runs` stays empty whenever
+    // `violations` is non-empty or `head_mismatch` is set; `segments`
+    // is still filled with its damage flags.
     let head_mismatch_condition =
         matches!(path, ReaderPath::LiveOpen { expected: Some(_) }) && found.is_none();
+    let mut runs_out: Vec<RunReport> = Vec::new();
+    let suppress_runs = !violations.is_empty() || head_mismatch_condition;
+    if build_reports && !suppress_runs {
+        let mut i = 0;
+        while i < segments.len() {
+            if matches!(
+                segments[i].class,
+                SegmentClass::InRun | SegmentClass::Damaged
+            ) {
+                let first_segment = i;
+                let mut j = i;
+                let mut closed_at: Option<usize> = None;
+                while j < segments.len() {
+                    match segments[j].class {
+                        SegmentClass::Closer => {
+                            closed_at = Some(j);
+                            break;
+                        }
+                        SegmentClass::Base => break,
+                        SegmentClass::InRun | SegmentClass::Damaged => {}
+                    }
+                    j += 1;
+                }
+                if let Some(last_segment) = closed_at {
+                    let run_idx = runs_out.len();
+                    // Addendum 25.5: compute spans by concatenating
+                    // the per-segment spans (each with `after =
+                    // u64::MAX` iff it starts at the segment's first
+                    // byte) and rewriting `seg` to the run-local
+                    // segment index (0, 1, ...). 13-V4-d2 point 2.
+                    let mut spans: Vec<super::verify::lines::Span> = Vec::new();
+                    for (local_idx, seg_spans_k) in seg_spans
+                        .iter()
+                        .enumerate()
+                        .take(last_segment + 1)
+                        .skip(first_segment)
+                        .map(|(k, s)| (k - first_segment, s))
+                    {
+                        let local: u32 = u32::try_from(local_idx).unwrap_or(u32::MAX);
+                        for sp in seg_spans_k {
+                            let mut sp2 = sp.clone();
+                            sp2.seg = local;
+                            spans.push(sp2);
+                        }
+                    }
+                    // Addendum 25.5 + B3d1-d4: compute loss_points by
+                    // walking the run's record heads in order. The
+                    // "preceding complete record" for the run's first
+                    // record is the last record on the prior segment
+                    // (if any) -- but under Collect, segments[k-1]
+                    // may have been Base or part of another run. We
+                    // use the last record from seg_records[k-1] if
+                    // it exists, else None (ruling 13-V4-d2 point 3:
+                    // a run segment adds a loss point only when a
+                    // complete record precedes it on the trail).
+                    let mut loss_points: Vec<LossPoint> = Vec::new();
+                    let mut prev_complete: Option<&RecordHeadInfo> = None;
+                    if first_segment > 0 {
+                        prev_complete = seg_records[first_segment - 1].last();
+                    }
+                    let mut skip_run = false;
+                    'outer: for seg_records_k in seg_records
+                        .iter()
+                        .take(last_segment + 1)
+                        .skip(first_segment)
+                    {
+                        for (ri, r) in seg_records_k.iter().enumerate() {
+                            if ri == 0
+                                && let Some(p) = prev_complete
+                                && r.previous != p.hash
+                            {
+                                // Loss point at the hash-link break;
+                                // checked arithmetic (13-V4-d3 point 2
+                                // last bullet): overflow or non-
+                                // increasing seq drops only THIS run.
+                                let Some(first) = p.seq.checked_add(1) else {
+                                    skip_run = true;
+                                    break 'outer;
+                                };
+                                let Some(count) = r.seq.checked_sub(first) else {
+                                    skip_run = true;
+                                    break 'outer;
+                                };
+                                loss_points.push(LossPoint {
+                                    loss_seq: r.seq,
+                                    first,
+                                    count,
+                                });
+                            }
+                            prev_complete = Some(r);
+                        }
+                    }
+                    // Addendum 25.5: capture the closer's opening
+                    // checkpoint Head (ADR (i)). That is the first
+                    // record on the Closer segment.
+                    let closing_opening = seg_records[last_segment].first().map(|r| Head {
+                        seq: r.seq,
+                        hash: r.hash,
+                    });
+                    if !skip_run {
+                        runs_out.push(RunReport {
+                            first_segment,
+                            last_segment,
+                            closing_opening,
+                            loss_points,
+                            spans,
+                        });
+                        for seg in segments
+                            .iter_mut()
+                            .take(last_segment + 1)
+                            .skip(first_segment)
+                        {
+                            seg.run_membership = Some(run_idx);
+                        }
+                    }
+                    i = last_segment + 1;
+                } else {
+                    i = j;
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
     if head_mismatch_condition && matches!(reaction, Reaction::Stop) {
         // Ruling 197-d1 addendum 27.1: the single HeadMismatch
         // construction site in this function. Under Collect the flag
@@ -993,6 +1385,8 @@ pub(crate) fn classify(
         sealed_before: source.newest().map(std::path::Path::to_path_buf),
         violations,
         head_mismatch: head_mismatch_condition,
+        segments,
+        runs: runs_out,
     })
 }
 
@@ -2356,16 +2750,9 @@ fn runs_trial_apply(prior: Option<&RunState>, record: &Record, genesis: bool) ->
 
 #[cfg(test)]
 mod collector_tests {
-    //! Minimal collector-API smoke rows. S3a's own unit coverage is a
-    //! deliberately small set that exercises every added surface so no
-    //! item is `dead_code` in either configuration.
-    //!
-    //! Per ruling 197-d1 addendum 18, S3a ships Collect for **tolerant
-    //! mode only**: the tolerant collector-first-equals-reader-first
-    //! sweep over the `history_segment` single-segment paths is the
-    //! mandatory PR proof for S3a. Strict×Collect, the Collect entry for
-    //! a `Record(Err)` line, the remaining killing rows and the strict
-    //! first-equality sweep land in #197 R2b S3a′.
+    //! Minimal collector-API smoke rows. Each exercises an added
+    //! surface so no item is `dead_code` in either configuration
+    //! (ruling 197-d1 addendum 18 per-slice proof pattern).
     use super::*;
     use crate::audit::{AuditError, CheckpointFields, Entry, Mmr, Record, RecordContext};
 
@@ -3845,3 +4232,21 @@ fn build_source_for_test<'dir>(
 #[cfg(test)]
 #[path = "runs_classify_tests.rs"]
 mod classify_tests;
+
+/// #197 ruling addendum 25.5 / 28: the V4a walk reads
+/// [`ClassifyOutput::runs`], [`ClassifyOutput::segments`] and each
+/// [`SegmentReport`] / [`RunReport`] field at this head.
+///
+/// - **CV1** digest pins for A1 / A3 / A8 / A9 (per-row, literal).
+/// - **CV2** p01..p13 reader-and-classify agreement rows.
+/// - **CV3** p09+p10 fragment-only digest rows.
+/// - **CV4** fold-(iii) mismatch records the violation and runs stays empty.
+/// - **CV5** A1 run-structure detail-level pin.
+/// - **CV6** A8 empty-ranges digest.
+/// - **CV7** A9 span `seg` renumbering.
+/// - **CV8** non-increasing seq records violation and drops this run.
+/// - **CV9** module doc has no history/round wording (source lint).
+/// - **CV11** reports built only under Collect (empty under Stop).
+#[cfg(test)]
+#[path = "runs_v4a_tests.rs"]
+mod classify_v4a_walk;
