@@ -2746,3 +2746,327 @@ fn damaged_closer_live_trailing_rollback_a3_shape_classes_closer() {
     );
     assert!(out.runs.is_empty(), "damaged-closer-a3: addendum 28.2");
 }
+
+// ============================================================
+// Tolerant walker closed-run gate: rows that exercise the tolerant
+// pass (strict fails first, via a sealed segment with an unparsable
+// tail) with `ctx.run == false` entering and an accepted resume at
+// `count == 1 && closing` through the unsealed-boundary disjunct of
+// `inherited = *run || unsealed_boundary`. The tolerant latch is
+// gated on `self.ctx.run` and falls under `apply_checked`'s Ok arm;
+// a mutant that drops the `ctx.run` gate (or swaps it for
+// `self.inherited`) would latch `closed_run = true` while
+// `run_in_before` is false, firing the walker-invariant
+// `debug_assert!` in `classify` (`!closed_run || run_in_before`).
+// Cargo's test profile runs with debug assertions on, so the panic
+// is a kill. No tolerant-walked layout can tell these mutants apart
+// without triggering the invariant panic -- the latch's observable
+// output (class flip from `Damaged` to `Closer`) and the invariant
+// are co-located, so the two rows below are distinct layouts
+// hitting the same panic site.
+// ============================================================
+
+/// Minimal tolerant-walked `ctx.run`-gate kill. Layout:
+/// `S0=[cp0, e1]` (sealed, unsealed exit),
+/// `S1=[cp2, resume(e1), "not json\n"]` (sealed; strict fails on
+/// the unparsable tail and tolerant walks the segment; cp2 sets
+/// `closing = inherited (via unsealed-boundary) && trial_ok`; the
+/// resume at `count == 1` is accepted by `apply_checked`),
+/// `live=[cp4]`. `ctx.run` is false entering S1, so the tolerant
+/// latch stays false at head. Dropping the `ctx.run` gate latches
+/// `closed_run = true` with `run_in_before` false, firing the
+/// `classify` debug_assert.
+#[test]
+fn tolerant_resume_without_open_run_classes_damaged_debug_assert() {
+    let d = Temp::new();
+    // S0 = [cp0, e1] sealed; unsealed exit (e1 is an entry).
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    put_segment(&d.0, 0, &[&cp0, &e1], &[]);
+    // S1 = [cp2, resume(head=1:e1), unparsable_tail] sealed; strict
+    // fails on "not json\n" -> tolerant falls back.
+    let cp2 = signed_cp(2, e1.hash(), &mmr1);
+    let resume = resume_decl(&cp2, e1.context.seq, e1.hash(), e1.context.seq);
+    put_segment(&d.0, 1, &[&cp2, &resume], b"not json\n");
+    let mmr2 = pushed(&mmr1, &cp2);
+    let mmr3 = pushed(&mmr2, &resume);
+    // live = [cp4] (ctx.run entering live is true since tolerant
+    // promotes run_flag on damaged; live finish_strict_check records
+    // `ResumeCheckpointLacksDeclaration` -- this is not what we're
+    // pinning, but we include it so the reader has a terminal
+    // segment to walk).
+    let cp4 = signed_cp(resume.context.seq + 1, resume.hash(), &mmr3);
+    write_records(&d.0, &[&cp4]);
+    // We only pin the shape that distinguishes the mutant: S1's
+    // class stays `Damaged` (not `Closer`). Under the mutant the
+    // `debug_assert!` in classify fires on S1, panicking the test.
+    let out = classify_collect(&d.0);
+    use super::SegmentClass::{Base, InRun};
+    assert_eq!(
+        out.segments[0].class, Base,
+        "tolerant-resume-no-run: S0 base",
+    );
+    // S1 at head: run_in_before=false (ctx.run false), run_out=true
+    // (tolerant's damaged latch promotes run_flag), `damage` field is
+    // false (the unparsable-line path does not push a typed violation
+    // into the collected list in Collect, it only sets the internal
+    // `damaged` latch), closed_run=false (gated on ctx.run) ->
+    // (false, true, false) = InRun. Under a mutant that drops the
+    // `ctx.run` gate the tolerant latch fires, closed_run=true while
+    // run_in_before=false, firing the walker-invariant debug_assert
+    // in classify (panic, kill); if debug_assert were disabled, the
+    // class would flip to Closer (this `assert_eq!` kills the mutant
+    // on either path).
+    assert_eq!(
+        out.segments[1].class, InRun,
+        "tolerant-resume-no-run: S1 is InRun under tolerant walk \
+         (ctx.run false; the tolerant latch's `ctx.run` gate keeps \
+         `closed_run` false; damaged latch promotes run_flag)",
+    );
+}
+
+/// Second tolerant-walked `ctx.run`-gate kill with a distinct
+/// `inherited`-via-unsealed-boundary layout: S0 ends with a bare
+/// opening checkpoint (unsealed), S1 opens with a checkpoint +
+/// accepted resume + unparsable tail. Same discriminant as above
+/// (tolerant latch would fire under the mutant, firing the
+/// walker-invariant `debug_assert!`), different concrete bytes so
+/// the two rows cannot be made equivalent by renaming or layout
+/// shift.
+#[test]
+fn tolerant_resume_without_open_run_classes_damaged_distinct_layout() {
+    let d = Temp::new();
+    // S0 = [cp0, e1, e2] sealed; unsealed exit after e2.
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let e2 = entry_rec(2, e1.hash());
+    let mmr2 = pushed(&mmr1, &e2);
+    put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
+    // S1 = [cp3, resume(head=2:e2), unparsable_tail] sealed; tolerant
+    // walks. closing is set on cp3 via unsealed-boundary; the resume
+    // at count == 1 is accepted; latch gated on ctx.run (false).
+    let cp3 = signed_cp(3, e2.hash(), &mmr2);
+    let resume = resume_decl(&cp3, e2.context.seq, e2.hash(), e2.context.seq);
+    put_segment(&d.0, 1, &[&cp3, &resume], b"malformed-trailing-bytes\n");
+    let mmr3 = pushed(&mmr2, &cp3);
+    let mmr4 = pushed(&mmr3, &resume);
+    // live = [cp5] (terminal segment).
+    let cp5 = signed_cp(resume.context.seq + 1, resume.hash(), &mmr4);
+    write_records(&d.0, &[&cp5]);
+    let out = classify_collect(&d.0);
+    use super::SegmentClass::{Base, InRun};
+    assert_eq!(
+        out.segments[0].class, Base,
+        "tolerant-resume-no-run-distinct: S0 base",
+    );
+    // Same discriminant as the minimal row above: at head S1 is InRun
+    // (closed_run=false, member=true, damage=false); under the mutant
+    // the tolerant latch fires with run_in_before=false, panicking via
+    // the walker-invariant debug_assert, or flipping the class to
+    // Closer if the invariant were disabled.
+    assert_eq!(
+        out.segments[1].class, InRun,
+        "tolerant-resume-no-run-distinct: S1 is InRun under tolerant \
+         walk (ctx.run false; the tolerant latch's `ctx.run` gate \
+         keeps `closed_run` false; damaged latch promotes run_flag)",
+    );
+}
+
+// ============================================================
+// Tolerant walker latch-before-apply (G1 tolerant half): a tolerant
+// latch moved back ABOVE `apply_checked` would latch `closed_run =
+// true` on a resume that `apply_checked` then rejects (e.g.
+// `ResumeDeclarationDoesNotDescribeGap`). The segment must stay
+// `Damaged`, not `Closer`.
+// ============================================================
+
+/// Layout: `S0=[cp0, e1, e2]` (sealed), `S1=[headless, cp5]`
+/// (sealed; opens a run via tolerant), `S2=[cp6, wrong-hash
+/// resume, "not json\n"]` (sealed; tolerant walks due to the
+/// unparsable tail; `cp6` sets closing via `inherited = *run =
+/// true`; the resume at `count == 1` is rejected by `apply_checked`
+/// as `ResumeDeclarationDoesNotDescribeGap`), `live=[cp8]`. S2
+/// must class `Damaged`: at head the latch fires only after
+/// `apply_checked` accepts; a mutant moving the latch above
+/// `apply_checked` would class S2 as `Closer`.
+#[test]
+fn tolerant_latch_after_apply_rejected_resume_classes_damaged() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let e2 = entry_rec(2, e1.hash());
+    let mmr2 = pushed(&mmr1, &e2);
+    put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
+    // S1 opens a run via a headless record (seq=4 past e2@seq=2),
+    // closed by cp5.
+    let r4 = headless(&e2, 4);
+    let fold5 = pushed(&mmr2, &r4);
+    let cp5 = signed_cp(5, r4.hash(), &fold5);
+    put_segment(&d.0, 1, &[&r4, &cp5], &[]);
+    let fold6 = pushed(&fold5, &cp5);
+    // S2 = [cp6, wrong-hash resume, unparsable]. strict fails on the
+    // wrong-hash resume (and the unparsable tail); tolerant walks.
+    let cp6 = signed_cp(6, cp5.hash(), &fold6);
+    // WRONG head hash: resume names cp0's hash instead of cp5's.
+    let wrong = resume_decl(&cp6, 5, cp0.hash(), 5);
+    put_segment(&d.0, 2, &[&cp6, &wrong], b"not json\n");
+    let fold7 = pushed(&fold6, &cp6);
+    // live terminal segment.
+    let cp8 = signed_cp(wrong.context.seq + 1, wrong.hash(), &fold7);
+    write_records(&d.0, &[&cp8]);
+    let out = classify_collect(&d.0);
+    use super::SegmentClass::{Base, Damaged, InRun};
+    let classes: Vec<super::SegmentClass> = out.segments.iter().map(|s| s.class).collect();
+    // S2 is Damaged (walker records the rejected resume at (2, 1)
+    // and does NOT latch closed_run). A mutant that moves the
+    // tolerant latch above `apply_checked` classes S2 as `Closer`.
+    assert_eq!(classes[0], Base, "tolerant-reject-apply: S0 base");
+    assert_eq!(classes[1], InRun, "tolerant-reject-apply: S1 in-run");
+    assert_eq!(
+        classes[2], Damaged,
+        "tolerant-reject-apply: S2 is Damaged, NOT Closer (the \
+         tolerant latch fires only after `apply_checked` accepts \
+         the resume)",
+    );
+    assert!(
+        out.violations.iter().any(|(pos, v)| pos.segment_index == 2
+            && *v == super::Violation::ResumeDeclarationDoesNotDescribeGap),
+        "tolerant-reject-apply: S2 records ResumeDeclarationDoesNotDescribeGap",
+    );
+    assert!(
+        out.runs.is_empty(),
+        "tolerant-reject-apply: addendum 28.2 clears runs on violations",
+    );
+}
+
+/// Second distinct killer for the tolerant latch-before-apply
+/// mutant: a longer A3-like run (two-range) whose second-range
+/// closer has a resume with the wrong `lost_through` field. The
+/// rejection reason inside `apply_checked` is a different disjunct
+/// of `ResumeDeclarationDoesNotDescribeGap` (bound mismatch rather
+/// than hash mismatch); the tolerant latch still must stay false.
+#[test]
+fn tolerant_latch_after_apply_wrong_lost_through_classes_damaged() {
+    let d = Temp::new();
+    // S0 = [cp0, e1, cp2] sealed. unsealed? cp2 is checkpoint so
+    // S0 ends sealed. But the close_run-style `resume` at the next
+    // segment requires an open run first.
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let e2 = entry_rec(2, e1.hash());
+    let mmr2 = pushed(&mmr1, &e2);
+    put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
+    // S1 opens a run via a headless.
+    let r4 = headless(&e2, 4);
+    let fold5 = pushed(&mmr2, &r4);
+    let cp5 = signed_cp(5, r4.hash(), &fold5);
+    put_segment(&d.0, 1, &[&r4, &cp5], &[]);
+    let fold6 = pushed(&fold5, &cp5);
+    // S2 = [cp6, resume-with-wrong-lost-through, unparsable_tail].
+    // tolerant walks; apply_checked rejects the resume because
+    // `lost_through` (here 99) does not match the required bound
+    // (state.head.seq - 1 = 5).
+    let cp6 = signed_cp(6, cp5.hash(), &fold6);
+    let wrong_lost = resume_decl(&cp6, 5, cp5.hash(), 99);
+    put_segment(&d.0, 2, &[&cp6, &wrong_lost], b"garbage-tail\n");
+    let fold7 = pushed(&fold6, &cp6);
+    let cp8 = signed_cp(wrong_lost.context.seq + 1, wrong_lost.hash(), &fold7);
+    write_records(&d.0, &[&cp8]);
+    let out = classify_collect(&d.0);
+    use super::SegmentClass::{Base, Damaged, InRun};
+    let classes: Vec<super::SegmentClass> = out.segments.iter().map(|s| s.class).collect();
+    assert_eq!(classes[0], Base);
+    assert_eq!(classes[1], InRun);
+    assert_eq!(
+        classes[2], Damaged,
+        "tolerant-reject-apply-lost: S2 is Damaged under a wrong \
+         `lost_through` rejection (distinct disjunct from wrong \
+         head hash); the tolerant latch fires only after \
+         `apply_checked` accepts",
+    );
+    assert!(
+        out.violations.iter().any(|(pos, v)| pos.segment_index == 2
+            && *v == super::Violation::ResumeDeclarationDoesNotDescribeGap),
+        "tolerant-reject-apply-lost: S2 records \
+         ResumeDeclarationDoesNotDescribeGap",
+    );
+    assert!(out.runs.is_empty());
+}
+
+// ============================================================
+// Strict walker latch-before-apply, second killer: a strict-pass
+// (scan_closing) layout on the live segment with a rejected resume
+// while a run is open. The current killer
+// (`live_resume_wrong_head_hash_classes_live_damaged`) uses a
+// resume with the wrong head hash; this second killer uses a
+// distinct `apply_checked` rejection (wrong `lost_through`), so the
+// mutant must die on either row for different concrete reasons.
+// ============================================================
+
+/// A1-shape with the live resume declaring the WRONG `lost_through`
+/// value. Live is reached via `scan_closing` (strict); `ctx.run`
+/// enters live true (S1 opened a run). strict's `feed_record` on
+/// the resume rejects with `ResumeDeclarationDoesNotDescribeGap`
+/// (bound mismatch disjunct); the latch at head stays false
+/// because it is set only under `apply_checked`'s Ok arm. A mutant
+/// that moves the strict latch above `apply_checked` would class
+/// live as `Closer`.
+#[test]
+fn strict_live_resume_wrong_lost_through_classes_live_damaged() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let e2 = entry_rec(2, e1.hash());
+    let mmr2 = pushed(&mmr1, &e2);
+    put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
+    // S1 headless opens a run, closed by cp5.
+    let r4 = headless(&e2, 4);
+    let fold5 = pushed(&mmr2, &r4);
+    let cp5 = signed_cp(5, r4.hash(), &fold5);
+    put_segment(&d.0, 1, &[&r4, &cp5], &[]);
+    let fold6 = pushed(&fold5, &cp5);
+    // live = [cp6, resume with wrong `lost_through`].
+    let cp6 = signed_cp(6, cp5.hash(), &fold6);
+    // Correct resume names `lost_through = state.head.seq - 1 = 5`;
+    // 99 is deliberately wrong (bound mismatch).
+    let wrong_lost = resume_decl(&cp6, 5, cp5.hash(), 99);
+    write_records(&d.0, &[&cp6, &wrong_lost]);
+    let out = classify_collect(&d.0);
+    assert_eq!(
+        out.violations,
+        vec![(
+            super::SegmentViolationPos {
+                segment_index: 2,
+                record_index_in_segment: 1,
+            },
+            super::Violation::ResumeDeclarationDoesNotDescribeGap,
+        )],
+        "strict-wrong-lost: one literal violation at (2, 1)",
+    );
+    use super::SegmentClass::{Base, Damaged, InRun};
+    let classes: Vec<super::SegmentClass> = out.segments.iter().map(|s| s.class).collect();
+    assert_eq!(
+        classes,
+        vec![Base, InRun, Damaged],
+        "strict-wrong-lost: live is Damaged, NOT Closer (the strict \
+         latch fires only after `apply_checked` accepts the resume; \
+         a wrong `lost_through` rejects before the latch can fire)",
+    );
+    let membership: Vec<Option<usize>> = out.segments.iter().map(|s| s.run_membership).collect();
+    assert_eq!(
+        membership,
+        vec![None, None, None],
+        "strict-wrong-lost: addendum 28.2 clears membership on violations",
+    );
+    assert!(out.runs.is_empty());
+}
