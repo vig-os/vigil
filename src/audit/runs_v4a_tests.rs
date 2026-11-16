@@ -2877,9 +2877,9 @@ fn tolerant_resume_without_open_run_classes_damaged_distinct_layout() {
 }
 
 // ============================================================
-// Tolerant walker latch-before-apply (G1 tolerant half): a tolerant
-// latch moved back ABOVE `apply_checked` would latch `closed_run =
-// true` on a resume that `apply_checked` then rejects (e.g.
+// Tolerant walker latch-before-apply: a tolerant latch moved back
+// ABOVE `apply_checked` would latch `closed_run = true` on a resume
+// that `apply_checked` then rejects (e.g.
 // `ResumeDeclarationDoesNotDescribeGap`). The segment must stay
 // `Damaged`, not `Closer`.
 // ============================================================
