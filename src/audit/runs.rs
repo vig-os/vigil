@@ -2424,14 +2424,19 @@ impl Classifier {
             }
             self.run_flag = false;
             // Ruling 197-d1 addendum 28, 13-V4-d3 point 1: latch the
-            // walker's own closed-run evidence here. `self.closing`
-            // required `self.inherited` (set above), so `run_in` was
-            // already true on entry: the (i)+(ii) closing check we
-            // just accepted ends an inherited open run. `classify`
-            // reads this per segment to derive `SegmentClass::Closer`
-            // from the walker's run transition rather than from a
+            // walker's own closed-run evidence here, gated on
+            // `self.ctx.run` so an accepted tolerant closing check
+            // without an actual inherited open run (the tolerant
+            // walker also fires `closing` under
+            // `inherited = *run || unsealed_boundary`, i.e. for
+            // segments where the predecessor was unsealed but no
+            // run was open) is NOT a closer. `classify` reads this
+            // per segment to derive `SegmentClass::Closer` from the
+            // reader's own run transition rather than from a
             // heuristic over `(run_in, run_out, damage)`.
-            self.closed_run = true;
+            if self.ctx.run {
+                self.closed_run = true;
+            }
         }
         let before_loss = !(broken || self.state.as_ref().is_some_and(|s| s.run_loss));
         let compare_mmr = outside_run || before_loss;
