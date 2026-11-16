@@ -1895,11 +1895,13 @@ fn closed_run_stuck_false_drops_run_a1() {
 /// A `closed_run = ctx.run` inference (closer-fired tied to the
 /// inherited-run flag) would latch `Closer` on any mid-run segment
 /// whose walker inherits the run but does NOT accept a closing
-/// check. p02's S2 is exactly that: S2 inherits the run opened by
-/// S1 and does NOT close it (the live closer is a separate
-/// segment). Pinning `segments[2].class == InRun` kills the
-/// inferred mutant, which would split `cv2_p02`'s single run
-/// `[(1,3)]` into `[(1,2), (2,3)]`.
+/// check. p02's S2 is exactly that: S2 is headless (an entry
+/// without an opening checkpoint) and takes the tolerant pass,
+/// which inherits the run opened by S1 but does NOT fire the
+/// `count == 1 && closing` closer check. Pinning
+/// `segments[2].class == InRun` kills the inferred mutant, which
+/// would split `cv2_p02`'s single run `[(1, 3)]` into
+/// `[(1, 2), (2, 3)]`.
 #[test]
 fn closed_run_not_inferred_from_inherited_run_p02() {
     let d = st::Temp::new();
