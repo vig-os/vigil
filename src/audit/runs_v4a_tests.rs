@@ -564,10 +564,9 @@ fn cv4_fold_iii_mismatch_records_and_runs_empty() {
 }
 
 // ============================================================
-// CV4b (per C5 M-D4 second killer, also M-D9): a two-segment
-// fold-(iii) mismatch row with a (i)+(ii) closer in live. Pins
-// both the recorded CheckpointMmrDiffers and `runs.is_empty()`
-// under addendum 28.2.
+// CV4b: a two-segment fold-(iii) mismatch row with a (i)+(ii)
+// closer in live. Pins both the recorded CheckpointMmrDiffers and
+// `runs.is_empty()` under ruling 197-d1 addendum 28 point 2.
 // ============================================================
 
 #[test]
@@ -615,8 +614,8 @@ fn cv4b_fold_iii_mismatch_two_segment_layout() {
 }
 
 // ============================================================
-// CV4c (per C5 M-D9 second killer): fold-(iii) mismatch in a sealed
-// segment with a live closer that would otherwise form a (i)+(ii)
+// CV4c: fold-(iii) mismatch in a sealed segment with a live closer
+// that would otherwise form a (i)+(ii)
 // run. Addendum 28.2: `violations` non-empty keeps `runs` empty
 // even though a `RunReport` would group the segments. A mutant that
 // drops the `suppress_runs` guard on violations flips the pin.
@@ -711,7 +710,7 @@ fn cv8_non_increasing_seq_drops_only_this_run() {
 }
 
 // ============================================================
-// CV9 (per C3): source-check the module doc for banned history/round
+// CV9: source-check the module doc for banned history/round
 // wording. No git subprocess, no env skip.
 // ============================================================
 
@@ -758,7 +757,7 @@ fn cv9_module_doc_has_no_history_wording() {
 }
 
 // ============================================================
-// CV11 (per C1 / addendum 28 point 1): reports built only under
+// CV11 (ruling 197-d1 addendum 28 point 1): reports built only under
 // Collect. Under Stop, both `segments` and `runs` stay empty.
 // A1 and A3 under Stop give empty `segments` and `runs`.
 // ============================================================
@@ -931,7 +930,9 @@ fn cv0_every_field_is_read_here() {
     //   S1: prior=cp0   -> sealed            -> false
     //   S2: prior=S1    -> unsealed (headless r4 forced pending_resume
     //                       on the tolerant walk's state)
-    // -> count = 1. O2 kill rows (inverted sealed check) flip this.
+    // -> count = 1. Inverting the sealed check in classify's
+    // `boundary_resume` guard flips this (see the boundary_resume
+    // literal rows below).
     let br_true = out.segments.iter().filter(|s| s.boundary_resume).count();
     assert_eq!(
         br_true, 1,
@@ -988,8 +989,8 @@ fn run_bounds(out: &super::ClassifyOutput) -> Vec<(usize, usize)> {
 /// `S2=[close1, resume1, "broken\n"]`, live=`[close2, resume2]`.
 /// Reader: `Ok`.
 ///
-/// Ruling 197-d1 addendum 28 (B1): grouping uses the
-/// walker's own closer signal, so S2 is both the Closer of run 0
+/// Ruling 197-d1 addendum 28: grouping uses the walker's own
+/// closed-run signal, so S2 is both the Closer of run 0
 /// (its `close1+resume1` pair closes the run opened by S1) AND
 /// the first segment of run 1 (its trailing `"broken\n"` fragment
 /// reopens a run that the live closer in S3 closes). Run 0's
@@ -1028,7 +1029,7 @@ fn cv2_p01_closing_segment_can_start_second_run() {
     );
 }
 
-/// R-honest-mid (ruling 197-d1 addendum 28): an honest segment
+/// Ruling 197-d1 addendum 28, 13-V4-d3 point 1: an honest segment
 /// between the base and the run's start is NOT a run member.
 /// Layout: `S0=[cp0]`, sealed `S1=[signed(1, cp0.hash)]`
 /// (honest checkpoint-only middle), sealed `S2=[headless(cp1, 6)]`
@@ -1037,7 +1038,7 @@ fn cv2_p01_closing_segment_can_start_second_run() {
 /// then latches `run==true` in S2 (headless -> run opens), then
 /// clears it in live (closer). Grouping places S1 OUTSIDE the run.
 #[test]
-fn cv2_r_honest_mid_honest_middle_is_not_a_run_member() {
+fn cv2_honest_middle_is_not_a_run_member() {
     let d = st::Temp::new();
     let cp0 = st_runs::base(&d);
     st_runs::put(&d, 0, &[&cp0], &[]);
@@ -1053,22 +1054,22 @@ fn cv2_r_honest_mid_honest_middle_is_not_a_run_member() {
     fold.push(kept.hash()).unwrap();
     // live: close the run.
     let _ = st_runs::close_run(&d, &kept, &fold);
-    TrailReader::open(&d.0, TRAIL, None).expect("R-honest-mid: reader Ok");
+    TrailReader::open(&d.0, TRAIL, None).expect("honest-middle: reader Ok");
     let out = classify_collect(&d.0);
-    assert!(out.violations.is_empty(), "R-honest-mid: no violations");
+    assert!(out.violations.is_empty(), "honest-middle: no violations");
     assert_eq!(
         run_bounds(&out),
         vec![(2, 3)],
-        "R-honest-mid: run starts at S2 (headless), closes at live S3",
+        "honest-middle: run starts at S2 (headless), closes at live S3",
     );
     assert_eq!(
         membership(&out),
         vec![None, None, Some(0), Some(0)],
-        "R-honest-mid: S1 (honest middle) is NOT a run member",
+        "honest-middle: S1 (honest middle) is NOT a run member",
     );
 }
 
-/// R-honest-between (ruling 197-d1 addendum 28): two runs on the
+/// Ruling 197-d1 addendum 28, 13-V4-d3 point 1: two runs on the
 /// same trail. The layout chains run 0 (closed by S2's close1+resume1)
 /// directly into run 1's opening via a second headless in S3 (the
 /// `second_loss_keeps_first_run_acceptable` storage-tests pattern):
@@ -1079,12 +1080,12 @@ fn cv2_r_honest_mid_honest_middle_is_not_a_run_member() {
 ///   live=[close2, resume2] (closes run 1).
 ///
 /// S0 is Base (not in any run); S3 is the first segment of run 1 so
-/// S3 IS a run member. The "honest between" behaviour pinned here --
+/// S3 IS a run member. The honest-between behaviour pinned here --
 /// that classify's grouping does not extend run 0 past its closer
 /// S2 -- is the real invariant: S2 is in run 0 only, S3 belongs to
 /// run 1 only.
 #[test]
-fn cv2_r_honest_between_two_runs_on_same_trail() {
+fn cv2_honest_between_two_runs_on_same_trail() {
     let d = st::Temp::new();
     let cp0 = st_runs::base(&d);
     st_runs::put(&d, 0, &[&cp0], &[]);
@@ -1111,18 +1112,18 @@ fn cv2_r_honest_between_two_runs_on_same_trail() {
     fold.push(kept2.hash()).unwrap();
     // live: close run 1.
     let _ = st_runs::close_run(&d, &kept2, &fold);
-    TrailReader::open(&d.0, TRAIL, None).expect("R-honest-between: reader Ok");
+    TrailReader::open(&d.0, TRAIL, None).expect("honest-between: reader Ok");
     let out = classify_collect(&d.0);
-    assert!(out.violations.is_empty(), "R-honest-between: no violations");
+    assert!(out.violations.is_empty(), "honest-between: no violations");
     assert_eq!(
         run_bounds(&out),
         vec![(1, 2), (3, 4)],
-        "R-honest-between: two runs, S2 closes run 0 and does NOT bleed into run 1",
+        "honest-between: two runs, S2 closes run 0 and does NOT bleed into run 1",
     );
     assert_eq!(
         membership(&out),
         vec![None, Some(0), Some(0), Some(1), Some(1)],
-        "R-honest-between: S0 base; S1+S2 in run 0; S3+live in run 1",
+        "honest-between: S0 base; S1+S2 in run 0; S3+live in run 1",
     );
 }
 
@@ -1688,19 +1689,18 @@ fn cv3_p09_and_p10_digest_only_with_and_without_spans() {
 
 // ============================================================
 // B2 / addendum 28.5: two distinct killer rows per report mutant
-// for O2 (`boundary_resume` inverted), O4 (any membership-changing
-// mutant on the class/grouping), O6 (`final_state: None`) and O8
-// (a closer's spans dropped).
+// for `boundary_resume` inversions, membership-changing mutants on
+// the class/grouping, `final_state: None` and a closer's spans
+// dropped.
 // ============================================================
 
-/// O2 killer 1 — A1 per-segment `boundary_resume` literal.
-/// With `boundary_resume = role_opening && !storage::sealed(prior)`,
-/// A1's values are `[false, true, false]` (S0 prior=None, S1 prior=cp0-
-/// sealed is-false-since-sealed inverted, S2 prior=S1-unsealed is-true,
-/// live prior=cp5-sealed is-false). The O2 mutant inverts the sealed
-/// check and flips the row to `[false, false, true]`.
+/// A1 per-segment `boundary_resume` literal pin. With
+/// `boundary_resume = role_opening && !storage::sealed(prior)`,
+/// A1's values are `[false, true, false]` (S0 prior=None, S1
+/// prior=cp0-sealed, live prior=S1-unsealed). An inverted-sealed
+/// mutant flips the row to `[false, false, true]`.
 #[test]
-fn b2_o2_a1_boundary_resume_per_segment_literal() {
+fn boundary_resume_per_segment_a1_literal() {
     let a = build_a1();
     TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
     let out = classify_collect(&a.dir_path);
@@ -1708,16 +1708,16 @@ fn b2_o2_a1_boundary_resume_per_segment_literal() {
     assert_eq!(
         br,
         vec![false, true, false],
-        "O2 kill: A1 boundary_resume literal (inverting storage::sealed flips this row)",
+        "A1 boundary_resume literal (inverting storage::sealed flips this row)",
     );
 }
 
-/// O2 killer 2 — A3 per-segment `boundary_resume` literal.
-/// A3's four segments are all at sealed boundaries (cp2 / cp5 / cp8
-/// all seal), so every `boundary_resume` is `false`. Inverting the
-/// sealed check turns every segment with a prior state into `true`.
+/// A3 per-segment `boundary_resume` literal pin. A3's four segments
+/// are all at sealed boundaries (cp2 / cp5 / cp8 all seal), so
+/// every `boundary_resume` is `false`. Inverting the sealed check
+/// turns every segment with a prior state into `true`.
 #[test]
-fn b2_o2_a3_boundary_resume_per_segment_literal() {
+fn boundary_resume_per_segment_a3_literal() {
     let a = build_a3();
     TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
     let out = classify_collect(&a.dir_path);
@@ -1725,15 +1725,14 @@ fn b2_o2_a3_boundary_resume_per_segment_literal() {
     assert_eq!(
         br,
         vec![false, false, false, false],
-        "O2 kill: A3 boundary_resume literal (inverting storage::sealed flips three segments)",
+        "A3 boundary_resume literal (inverting storage::sealed flips three segments)",
     );
 }
 
-/// O4 killer 1 — A1 per-segment `SegmentClass` literal
-/// (`[Base, InRun, Closer]`). Any mutant that reroutes the class
-/// derivation changes this row.
+/// A1 per-segment `SegmentClass` literal (`[Base, InRun, Closer]`).
+/// Any mutant that reroutes the class derivation changes this row.
 #[test]
-fn b2_o4_a1_segment_classes_literal() {
+fn segment_classes_a1_literal() {
     let a = build_a1();
     TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
     let out = classify_collect(&a.dir_path);
@@ -1742,20 +1741,20 @@ fn b2_o4_a1_segment_classes_literal() {
     assert_eq!(
         classes,
         vec![Base, InRun, Closer],
-        "O4 kill: A1 class order (any membership-changing mutant flips one entry)",
+        "A1 class order (any membership-changing mutant flips one entry)",
     );
     let membership: Vec<Option<usize>> = out.segments.iter().map(|s| s.run_membership).collect();
     assert_eq!(
         membership,
         vec![None, Some(0), Some(0)],
-        "O4 kill: A1 run_membership literal",
+        "A1 run_membership literal",
     );
 }
 
-/// O4 killer 2 — A3 per-segment `SegmentClass` literal
+/// A3 per-segment `SegmentClass` literal
 /// (`[Base, InRun, InRun, Closer]`).
 #[test]
-fn b2_o4_a3_segment_classes_literal() {
+fn segment_classes_a3_literal() {
     let a = build_a3();
     TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
     let out = classify_collect(&a.dir_path);
@@ -1764,21 +1763,21 @@ fn b2_o4_a3_segment_classes_literal() {
     assert_eq!(
         classes,
         vec![Base, InRun, InRun, Closer],
-        "O4 kill: A3 class order (membership-changing mutants flip at least one entry)",
+        "A3 class order (membership-changing mutants flip at least one entry)",
     );
     let membership: Vec<Option<usize>> = out.segments.iter().map(|s| s.run_membership).collect();
     assert_eq!(
         membership,
         vec![None, Some(0), Some(0), Some(0)],
-        "O4 kill: A3 run_membership literal",
+        "A3 run_membership literal",
     );
 }
 
-/// O6 killer 1 — A1 per-segment `final_state.is_some()` literal
-/// (all `true`). A mutant that forces `final_state: None` on any
-/// segment flips an entry.
+/// A1 per-segment `final_state.is_some()` literal (all `true`). A
+/// mutant that forces `final_state: None` on any segment flips an
+/// entry.
 #[test]
-fn b2_o6_a1_final_state_is_some_per_segment() {
+fn final_state_is_some_per_segment_a1() {
     let a = build_a1();
     TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
     let out = classify_collect(&a.dir_path);
@@ -1790,14 +1789,13 @@ fn b2_o6_a1_final_state_is_some_per_segment() {
     assert_eq!(
         states,
         vec![true, true, true],
-        "O6 kill: A1 final_state.is_some() literal",
+        "A1 final_state.is_some() literal",
     );
 }
 
-/// O6 killer 2 — A3 per-segment `final_state.is_some()` literal
-/// (all four `true`).
+/// A3 per-segment `final_state.is_some()` literal (all four `true`).
 #[test]
-fn b2_o6_a3_final_state_is_some_per_segment() {
+fn final_state_is_some_per_segment_a3() {
     let a = build_a3();
     TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
     let out = classify_collect(&a.dir_path);
@@ -1809,18 +1807,19 @@ fn b2_o6_a3_final_state_is_some_per_segment() {
     assert_eq!(
         states,
         vec![true, true, true, true],
-        "O6 kill: A3 final_state.is_some() literal",
+        "A3 final_state.is_some() literal",
     );
 }
 
-/// O8 killer 1 — p10 plus a live torn tail `{"half`. Reader is `Ok`
-/// (torn trailing fragment on the live file is tolerated). The run
-/// has `first_segment=1` (fragment-only `S1`) and `last_segment=2`
-/// (live, the closer) — both contribute one span each. Expected
+/// p10 plus a live torn tail `{"half`. Reader is `Ok` (torn
+/// trailing fragment on the live file is tolerated). The run has
+/// `first_segment=1` (fragment-only `S1`) and `last_segment=2`
+/// (live, the closer) -- both contribute one span each. Expected
 /// span shapes: `[(0, u64::MAX, 8), (1, 5, 6)]`. A mutant that
-/// drops the closer segment's spans flips this to `[(0, u64::MAX, 8)]`.
+/// drops the closer segment's spans flips this to
+/// `[(0, u64::MAX, 8)]`.
 #[test]
-fn b2_o8_p10_live_torn_tail_half_spans() {
+fn closer_spans_survive_torn_live_tail_p10() {
     let d = st::Temp::new();
     let first = st_runs::base(&d);
     st_runs::put(&d, 0, &[&first], &[]);
@@ -1828,76 +1827,81 @@ fn b2_o8_p10_live_torn_tail_half_spans() {
     let fold = st::seeded(&first);
     let (_close, resume) = st_runs::close_run(&d, &first, &fold);
     st::append_bytes(&d.0.join("audit.jsonl"), b"{\"half");
-    TrailReader::open(&d.0, TRAIL, None).expect("O8: reader Ok on p10 + torn tail");
+    TrailReader::open(&d.0, TRAIL, None).expect("torn-tail: reader Ok on p10 + torn tail");
     let out = classify_collect(&d.0);
-    assert!(out.violations.is_empty(), "O8: no violations");
-    assert_eq!(out.runs.len(), 1, "O8: one run");
+    assert!(out.violations.is_empty(), "torn-tail: no violations");
+    assert_eq!(out.runs.len(), 1, "torn-tail: one run");
     let rr = &out.runs[0];
     let shapes: Vec<(u32, u64, u64)> = rr.spans.iter().map(|s| (s.seg, s.after, s.len)).collect();
     assert_eq!(
         shapes,
         vec![(0, u64::MAX, 8), (1, resume.context.seq, 6)],
-        "O8 kill: p10+torn-tail spans literal — closer (live) contributes `(1, 5, 6)`",
+        "p10+torn-tail spans literal: closer (live) contributes `(1, 5, 6)`",
     );
-    assert_eq!(resume.context.seq, 5, "O8: resume.seq pin (sanity)");
+    assert_eq!(resume.context.seq, 5, "torn-tail: resume.seq pin (sanity)");
     // Pin the closer-span digest so even a mutant that preserves the
     // tuple shapes but reorders content flips the row.
     assert_eq!(
         digest_hex(&rr.spans[1].digest),
         "blake3:d9a5b587318eff723676e5ae0e4f95bc2b2617255722fea8409d547b4cb020cc",
-        "O8 kill: closer span digest literal",
+        "closer span digest literal",
     );
 }
 
-/// O8 killer 2 — A9 (multi-segment record-free) run spans with the
-/// closer's spans as the trailing pair. If an O8-style mutant drops
-/// the closer segment or truncates the per-segment span concatenation,
-/// the full `[(0, MAX, 9), (1, MAX, 14)]` pair collapses.
+/// A9 (multi-segment record-free) run spans with the closer's spans
+/// as the trailing pair. Note: A9's closer segment itself carries
+/// no spans (its live is `[cp_opening, resume]` with no fragments);
+/// the spans here come from the two record-free sealed segments
+/// inside the run. Any mutant that truncates the per-segment span
+/// concatenation flips the `[(0, MAX, 9), (1, MAX, 14)]` pair.
 #[test]
-fn b2_o8_a9_span_shapes_literal() {
+fn span_shapes_record_free_a9_literal() {
     let a = build_a9();
     TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
     let out = classify_collect(&a.dir_path);
-    assert_eq!(out.runs.len(), 1, "O8/A9: one run");
+    assert_eq!(out.runs.len(), 1, "A9: one run");
     let rr = &out.runs[0];
     let shapes: Vec<(u32, u64, u64)> = rr.spans.iter().map(|s| (s.seg, s.after, s.len)).collect();
     assert_eq!(
         shapes,
         vec![(0, u64::MAX, 9), (1, u64::MAX, 14)],
-        "O8 kill: A9 span shapes literal (dropping any run-segment's span changes the list)",
+        "A9 span shapes literal (dropping any run-segment's span changes the list)",
     );
 }
 
 // ============================================================
-// B3 (addendum 28.5): meaningful rows for the new mutants N1 made
-// available on the walker closer-fired signal. `closer_fired` is now
-// the Classifier's own (i)+(ii) latch, no inference from `ctx.run`.
+// Walker closed-run signal (ruling 197-d1 addendum 28, 13-V4-d3
+// point 1). `closed_run` is the Classifier's own (i)+(ii) latch
+// gated by `run_in` (ctx.run) on the strict pass; grouping uses
+// it rather than inferring from `(ctx.run, strict-ok)`.
 // ============================================================
 
-/// M-N1a kill — `closer_fired` stuck `false`. Any run that closes
-/// (A1) no longer has a Closer segment, `runs` becomes empty.
+/// A stuck-false `closed_run` would drop every Closer: A1's one
+/// closed run becomes empty, and the live segment loses its
+/// `SegmentClass::Closer` pin.
 #[test]
-fn b3_n1a_closer_fired_stuck_false_kill() {
+fn closed_run_stuck_false_drops_run_a1() {
     let a = build_a1();
     TrailReader::open(&a.dir_path, TRAIL, None).unwrap();
     let out = classify_collect(&a.dir_path);
-    assert_eq!(out.runs.len(), 1, "M-N1a kill: A1 still has one closed run");
+    assert_eq!(out.runs.len(), 1, "A1 still has one closed run");
     assert_eq!(
         out.segments[2].class,
         super::SegmentClass::Closer,
-        "M-N1a kill: A1 live is Closer (stuck-false mutant drops this)",
+        "A1 live is Closer (stuck-false mutant drops this)",
     );
 }
 
-/// M-N1b kill — `closer_fired = ctx.run` (inherited-run inference).
-/// Needs a layout where `ctx.run` is true on a non-closing strict
-/// pass: p02 S2 inherits the run opened by S1 and does NOT close
-/// it (the live closer is a separate segment). Pinning `segments[2]
-/// .class == InRun` kills the inferred mutant (which would latch
-/// `Closer` on S2 because `run_in_before==true`), and would then
-/// split `cv2_p02`'s single run `[(1,3)]` into `[(1,2),(2,3)]`.
+/// A `closed_run = ctx.run` inference (closer-fired tied to the
+/// inherited-run flag) would latch `Closer` on any mid-run segment
+/// whose walker inherits the run but does NOT accept a closing
+/// check. p02's S2 is exactly that: S2 inherits the run opened by
+/// S1 and does NOT close it (the live closer is a separate
+/// segment). Pinning `segments[2].class == InRun` kills the
+/// inferred mutant, which would split `cv2_p02`'s single run
+/// `[(1,3)]` into `[(1,2), (2,3)]`.
 #[test]
-fn b3_n1b_closer_fired_from_ctx_run_kill() {
+fn closed_run_not_inferred_from_inherited_run_p02() {
     let d = st::Temp::new();
     let first = st_runs::base(&d);
     st_runs::put(&d, 0, &[&first], &[]);
@@ -1909,16 +1913,466 @@ fn b3_n1b_closer_fired_from_ctx_run_kill() {
     st_runs::put(&d, 2, &[&r_b], &[]);
     fold.push(r_b.hash()).unwrap();
     let _ = st_runs::close_run(&d, &r_b, &fold);
-    TrailReader::open(&d.0, TRAIL, None).expect("M-N1b: reader Ok on p02 layout");
+    TrailReader::open(&d.0, TRAIL, None).expect("p02-mid-run: reader Ok");
     let out = classify_collect(&d.0);
     assert_eq!(
         out.segments[2].class,
         super::SegmentClass::InRun,
-        "M-N1b kill: p02 S2 stays InRun (mutant closer_fired=run_in_before would latch Closer here)",
+        "p02 S2 stays InRun (a closed_run = run_in_before mutant would latch Closer here)",
     );
     assert_eq!(
         out.segments[2].run_membership,
         Some(0),
-        "M-N1b kill: p02 S2 belongs to run 0",
+        "p02 S2 belongs to run 0",
+    );
+}
+
+// ============================================================
+// Membership is defined by the reader's run flag, exactly
+// (ruling 197-d1 addendum 28, 13-V4-d3 point 1). Honest segments
+// whose `run` flag is false both entering and leaving stay `Base`,
+// even when their layout includes an opening checkpoint and an
+// immediate `vigil.audit.resume` entry (the reader's
+// `boundary_resume` guard fires on the unsealed-predecessor
+// condition without requiring an open run). An accepted resume
+// without an inherited open run (`ctx.run == false`) does NOT
+// count as a closer.
+// ============================================================
+
+/// Four-segment layout: `S0=[cp0, e1]`, `S1=[cp2, resume(e1)]`,
+/// `S2=[headless]`, `live=[closer]`. S1's `run_in` and `run_out`
+/// are both `false`; S1 is honest, not a run member. S2's headless
+/// opens a run; the live closer closes it. Classes are
+/// `[Base, Base, InRun, Closer]` and the run covers `(2, 3)`.
+/// A pre-fix build classes S1 as `Damaged` (the walker latched the
+/// strict closer check even without an open run) and extends the
+/// run to `(1, 3)`.
+#[test]
+fn honest_mid_segment_is_base_under_strict_resume_without_run() {
+    let d = Temp::new();
+    // S0 = [cp0, e1] (sealed; ends with entry => unsealed state).
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let e1 = entry_rec(1, cp0.hash());
+    put_segment(&d.0, 0, &[&cp0, &e1], &[]);
+    // S1 = [cp2, resume(e1)] (sealed; honest -- acknowledges the
+    // unsealed predecessor via the resume, but `ctx.run` is false
+    // entering and no run opens).
+    let mut fold = seeded(&cp0);
+    fold.push(e1.hash()).unwrap();
+    let cp2 = signed_cp(2, e1.hash(), &fold);
+    let resume1 = resume_decl(&cp2, e1.context.seq, e1.hash(), e1.context.seq);
+    put_segment(&d.0, 1, &[&cp2, &resume1], &[]);
+    fold.push(cp2.hash()).unwrap();
+    fold.push(resume1.hash()).unwrap();
+    // S2 = [headless off resume1] (opens a run via tolerant fallback).
+    let kept = Record::new(
+        context(resume1.context.seq + 5, entry_rec(1, resume1.hash()).hash()),
+        Entry::new("actor", "change", "object"),
+    )
+    .unwrap();
+    put_segment(&d.0, 2, &[&kept], &[]);
+    fold.push(kept.hash()).unwrap();
+    // live: close run 0.
+    let cp_close = signed_cp(kept.context.seq + 4, kept.hash(), &fold);
+    let resume_close = resume_decl(
+        &cp_close,
+        kept.context.seq,
+        kept.hash(),
+        cp_close.context.seq - 1,
+    );
+    write_records(&d.0, &[&cp_close, &resume_close]);
+    TrailReader::open(&d.0, TRAIL, None).expect("honest-mid-four: reader Ok");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "honest-mid-four: no violations");
+    use super::SegmentClass::{Base, Closer, InRun};
+    let classes: Vec<super::SegmentClass> = out.segments.iter().map(|s| s.class).collect();
+    assert_eq!(
+        classes,
+        vec![Base, Base, InRun, Closer],
+        "honest-mid-four classes: S1 is Base (ctx.run false, strict resume \
+         without open run is not a closer)",
+    );
+    let members: Vec<Option<usize>> = out.segments.iter().map(|s| s.run_membership).collect();
+    assert_eq!(
+        members,
+        vec![None, None, Some(0), Some(0)],
+        "honest-mid-four membership: S1 not a run member",
+    );
+    assert_eq!(
+        out.runs
+            .iter()
+            .map(|r| (r.first_segment, r.last_segment))
+            .collect::<Vec<_>>(),
+        vec![(2, 3)],
+        "honest-mid-four run bounds: run covers S2..=live, not S1..=live",
+    );
+    // No segment carries damage without a violation (specifically,
+    // S1 and the live closer must stay `damage == false`).
+    assert_eq!(
+        out.segments.iter().map(|s| s.damage).collect::<Vec<_>>(),
+        vec![false, false, false, false],
+        "honest-mid-four damage flags: no segment is marked damaged \
+         without a recorded violation",
+    );
+}
+
+/// Three-segment `unsealed_successor_probe` layout under Collect
+/// (storage_tests::runs::unsealed_predecessor_requires_resume_*):
+/// `S0=[cp0, e1]`, `S1=[cp2, resume(e1)]`, `live=[closer]`.
+/// Reader is `Ok`; `ctx.run` is false entering every segment; no
+/// run ever opens. Every class is `Base`, every `run_membership` is
+/// `None`, `runs` is empty. A pre-fix build classes S1 and live as
+/// `Damaged` without any recorded violation.
+#[test]
+fn unsealed_successor_probe_layout_under_collect() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let e1 = entry_rec(1, cp0.hash());
+    put_segment(&d.0, 0, &[&cp0, &e1], &[]);
+    let mut fold = seeded(&cp0);
+    fold.push(e1.hash()).unwrap();
+    let cp2 = signed_cp(2, e1.hash(), &fold);
+    let resume = resume_decl(&cp2, e1.context.seq, e1.hash(), e1.context.seq);
+    put_segment(&d.0, 1, &[&cp2, &resume], &[]);
+    fold.push(cp2.hash()).unwrap();
+    fold.push(resume.hash()).unwrap();
+    // live: closer that fires an accepted resume (ctx.run still
+    // false on live; walker gates the closed_run latch on ctx.run).
+    let cp_close = signed_cp(resume.context.seq + 4, resume.hash(), &fold);
+    let resume_close = resume_decl(
+        &cp_close,
+        resume.context.seq,
+        resume.hash(),
+        cp_close.context.seq - 1,
+    );
+    write_records(&d.0, &[&cp_close, &resume_close]);
+    TrailReader::open(&d.0, TRAIL, None).expect("probe-layout: reader Ok");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "probe-layout: no violations");
+    use super::SegmentClass::Base;
+    let classes: Vec<super::SegmentClass> = out.segments.iter().map(|s| s.class).collect();
+    assert_eq!(
+        classes,
+        vec![Base, Base, Base],
+        "probe-layout classes: every segment is Base (ctx.run never true)",
+    );
+    assert!(out.runs.is_empty(), "probe-layout: no closed runs");
+    assert_eq!(
+        out.segments.iter().map(|s| s.damage).collect::<Vec<_>>(),
+        vec![false, false, false],
+        "probe-layout damage flags: no violation, no damage",
+    );
+}
+
+// ============================================================
+// Refresh paths under Collect (ruling 197-d1 addendum 28 point 1).
+// classify builds its per-segment reports on every ReaderPath, and
+// the role-opening match arm pins `boundary_resume == false` for
+// `RefreshAppend`'s live segment and for `RefreshRotate`'s prelude.
+// A mutant flipping the `=> false` arm to `=> true` flips
+// `boundary_resume` from `false` to `true` on any layout whose
+// prior state is unsealed; these rows pin that layout.
+// ============================================================
+
+/// RefreshAppend under Collect with an unsealed prior state.
+/// Writes `cp0 + e1` to the live file, opens to capture the cache
+/// (state is unsealed: last record was an entry, so `checkpoint`
+/// is false), appends `e2`, then calls `classify` with
+/// `RefreshAppend` + `Reaction::Collect`. The single segment is
+/// Live; its `boundary_resume` is `false` because the role arm
+/// returns `false` for `RefreshAppend`. The segment has no run
+/// activity (`run_in == false`, `run_out == false`), so class is
+/// `Base`. A mutant flipping the `(RefreshAppend, _) => false`
+/// arm to `true` would make `boundary_resume = !sealed(prior) =
+/// true` and flip this row.
+#[test]
+fn refresh_append_under_collect_pins_boundary_resume_false() {
+    use super::storage::{Cache, TrailReader};
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let e1 = entry_rec(1, cp0.hash());
+    write_records(&d.0, &[&cp0, &e1]);
+    // Open to capture the cache (prior state is unsealed: last
+    // record is an entry, so `checkpoint == false`, `sealed == false`).
+    let reader = TrailReader::open(&d.0, TRAIL, None).expect("open");
+    let (state, file, sealed_before): (_, _, Option<PathBuf>) = reader
+        .with_current(
+            |_| Ok(()),
+            |_, file, s| {
+                let f = file.try_clone().unwrap();
+                Ok((s.clone(), f, None))
+            },
+        )
+        .unwrap();
+    assert!(
+        !super::storage::sealed(&state),
+        "refresh-append-collect: prior state must be unsealed",
+    );
+    let cache = Cache::new_for_test(state.clone(), file, sealed_before);
+    // Append e2 to the live file.
+    let e2 = entry_rec(2, e1.hash());
+    append_record(&d.0, &e2);
+    // Collect on RefreshAppend.
+    let dir = dirfile(&d.0);
+    let out = super::classify_for_test(
+        &dir,
+        TRAIL,
+        super::ReaderPath::RefreshAppend,
+        Some(state),
+        super::Reaction::Collect,
+        Some(&cache),
+    )
+    .unwrap();
+    assert_eq!(
+        out.segments.len(),
+        1,
+        "refresh-append-collect: RefreshAppend yields one Live segment",
+    );
+    assert!(
+        !out.segments[0].boundary_resume,
+        "refresh-append-collect: role-arm pins boundary_resume to false",
+    );
+    assert_eq!(
+        out.segments[0].class,
+        super::SegmentClass::Base,
+        "refresh-append-collect: no run activity => Base",
+    );
+    assert_eq!(
+        out.segments[0].run_membership, None,
+        "refresh-append-collect: Base has no run membership",
+    );
+    assert!(
+        !out.segments[0].damage,
+        "refresh-append-collect: no violation recorded",
+    );
+    assert!(
+        out.runs.is_empty(),
+        "refresh-append-collect: no closed run on a plain append",
+    );
+    assert!(
+        out.violations.is_empty(),
+        "refresh-append-collect: no violations expected",
+    );
+}
+
+/// RefreshRotate under Collect with an unsealed prior state. The
+/// layout starts with `cp0 + e1` on the live file (unsealed), is
+/// then rotated so the live becomes sealed `rotated_0`, and a new
+/// live `cp2` is written. The prelude segment (the re-read of the
+/// old live as a sealed segment, up to the cache's offset) pins
+/// `boundary_resume == false` because the role arm returns
+/// `prelude:true => false`. The rotated and live segments see the
+/// intra-trail state and complete without opening a run. A mutant
+/// flipping the prelude arm to `true` would make the prelude's
+/// `boundary_resume = !sealed(prior) = true`, flipping this row.
+#[test]
+fn refresh_rotate_under_collect_pins_boundary_resume_false_on_prelude() {
+    use super::storage::{Cache, TrailReader};
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let e1 = entry_rec(1, cp0.hash());
+    write_records(&d.0, &[&cp0, &e1]);
+    // Capture the cache with an unsealed state.
+    let reader = TrailReader::open(&d.0, TRAIL, None).expect("open");
+    let (state, file, _sealed_before): (_, _, Option<PathBuf>) = reader
+        .with_current(
+            |_| Ok(()),
+            |_, file, s| {
+                let f = file.try_clone().unwrap();
+                Ok((s.clone(), f, None))
+            },
+        )
+        .unwrap();
+    assert!(
+        !super::storage::sealed(&state),
+        "refresh-rotate-collect: prior state must be unsealed",
+    );
+    let cache = Cache::new_for_test(state.clone(), file, None);
+    // Finish the first run: write a closing cp and rotate to segment 0.
+    let mut fold = seeded(&cp0);
+    fold.push(e1.hash()).unwrap();
+    let close = signed_cp(e1.context.seq + 1, e1.hash(), &fold);
+    append_record(&d.0, &close);
+    fold.push(close.hash()).unwrap();
+    std::fs::rename(
+        d.0.join("audit.jsonl"),
+        d.0.join("audit-20260101T000000.000000000Z_000000.jsonl"),
+    )
+    .unwrap();
+    // New live: an opening checkpoint linking from close.
+    let opening = signed_cp(close.context.seq + 1, close.hash(), &fold);
+    std::fs::write(d.0.join("audit.jsonl"), line_bytes(&opening)).unwrap();
+    // Collect on RefreshRotate.
+    let dir = dirfile(&d.0);
+    let out = super::classify_for_test(
+        &dir,
+        TRAIL,
+        super::ReaderPath::RefreshRotate,
+        Some(state),
+        super::Reaction::Collect,
+        Some(&cache),
+    )
+    .unwrap();
+    // RefreshRotate's first segment is always the cached prelude
+    // (SegmentSource::for_refresh_rotate initializes
+    // `plan: vec![CachedPrelude]`). The rotated / live segments
+    // follow via `expand_rotate_after`. The exact segment count
+    // depends on `segments_after_from`'s filtering of the renamed
+    // inode, so the pin here is the prelude row only. The prelude
+    // sees the unsealed prior state via the role-arm guard
+    // (`RefreshRotate + Sealed { prelude: true } => false`); a
+    // mutant flipping that `=> false` to `=> true` would set
+    // `boundary_resume = !sealed(prior) = true` on the prelude.
+    assert!(
+        !out.segments.is_empty(),
+        "refresh-rotate-collect: at least the prelude is yielded",
+    );
+    assert!(
+        !out.segments[0].boundary_resume,
+        "refresh-rotate-collect: prelude pins boundary_resume to false \
+         under the `(RefreshRotate, Sealed{{prelude:true}}) => false` arm",
+    );
+    assert_eq!(
+        out.segments[0].class,
+        super::SegmentClass::Base,
+        "refresh-rotate-collect: prelude has no run activity => Base",
+    );
+    assert_eq!(
+        out.segments[0].run_membership, None,
+        "refresh-rotate-collect: prelude has no run membership",
+    );
+    assert!(
+        !out.segments[0].damage,
+        "refresh-rotate-collect: prelude has no recorded violation",
+    );
+    assert!(
+        out.runs.is_empty(),
+        "refresh-rotate-collect: no closed run on a plain rotate",
+    );
+    assert!(
+        out.violations.is_empty(),
+        "refresh-rotate-collect: no violations expected",
+    );
+}
+
+// ============================================================
+// Second killers for the digest and closer-span mutants
+// (ruling 197-d1 addendum 28 point 5): each report mutant needs
+// two distinct killer rows.
+// ============================================================
+
+/// Three-range run: loss_points literal pin.
+/// Layout: S0=`[cp0, e1, cp2]`, three sealed `headless+cp` segments
+/// (seq 3 lost, seq 6 lost, seq 9 lost), live closer. The run
+/// covers S1..=live with three loss ranges. A mutant that reverses
+/// the range order inside classify before storing them flips the
+/// literal (second killer for the "range order reversed" mutant;
+/// A3's two-range row is the first).
+#[test]
+fn three_range_run_loss_points_literal() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let cp2 = signed_cp(2, e1.hash(), &mmr1);
+    put_segment(&d.0, 0, &[&cp0, &e1, &cp2], &[]);
+    let mmr2 = pushed(&mmr1, &cp2);
+    let r4 = headless(&cp2, 4);
+    let mmr4 = pushed(&mmr2, &r4);
+    let cp5 = signed_cp(5, r4.hash(), &mmr4);
+    put_segment(&d.0, 1, &[&r4, &cp5], &[]);
+    let mmr5 = pushed(&mmr4, &cp5);
+    let r7 = headless(&cp5, 7);
+    let mmr7 = pushed(&mmr5, &r7);
+    let cp8 = signed_cp(8, r7.hash(), &mmr7);
+    put_segment(&d.0, 2, &[&r7, &cp8], &[]);
+    let mmr8 = pushed(&mmr7, &cp8);
+    let r10 = headless(&cp8, 10);
+    let mmr10 = pushed(&mmr8, &r10);
+    let cp11 = signed_cp(11, r10.hash(), &mmr10);
+    put_segment(&d.0, 3, &[&r10, &cp11], &[]);
+    let mmr11 = pushed(&mmr10, &cp11);
+    let cp13 = signed_cp(13, cp11.hash(), &mmr11);
+    let resume = resume_decl(&cp13, 11, cp11.hash(), 12);
+    write_records(&d.0, &[&cp13, &resume]);
+    TrailReader::open(&d.0, TRAIL, None).expect("three-range: reader Ok");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "three-range: no violations");
+    assert_eq!(out.runs.len(), 1, "three-range: one closed run");
+    let rr = &out.runs[0];
+    assert_eq!(
+        rr.loss_points,
+        vec![
+            super::LossPoint {
+                loss_seq: 4,
+                first: 3,
+                count: 1,
+            },
+            super::LossPoint {
+                loss_seq: 7,
+                first: 6,
+                count: 1,
+            },
+            super::LossPoint {
+                loss_seq: 10,
+                first: 9,
+                count: 1,
+            },
+        ],
+        "three-range: three loss points in walk order (reversing the \
+         list before run_digest flips the digest; the literal here \
+         flips first)",
+    );
+    // Digest pin: reversing the ranges changes the digest.
+    let ranges: Vec<(u64, u64)> = rr
+        .loss_points
+        .iter()
+        .map(|lp| (lp.first, lp.count))
+        .collect();
+    let forward = crate::audit::verify::lines::run_digest(&ranges, &rr.spans);
+    let mut rev = ranges.clone();
+    rev.reverse();
+    let reversed = crate::audit::verify::lines::run_digest(&rev, &rr.spans);
+    assert_ne!(
+        forward, reversed,
+        "three-range: range order matters for run_digest",
+    );
+}
+
+/// Second killer where the closer carries spans: p01's `S2` is a
+/// sealed closer (close1 + resume1 + trailing `"broken\n"`
+/// fragment). Run 0 spans across S1 (headless, no fragments) and
+/// S2 (closer, one span). A mutant that drops the closer segment's
+/// spans in classify removes S2's span from run 0's `spans`, flipping
+/// this literal.
+#[test]
+fn closer_spans_survive_in_sealed_closer_p01() {
+    let d = st::Temp::new();
+    let first = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&first], &[]);
+    let kept = st_runs::headless(&first, 3);
+    st_runs::put(&d, 1, &[&kept], &[]);
+    let mut fold = st::seeded_pair(&first, &kept);
+    let (checkpoint, resume) = st_runs::close_run(&d, &kept, &fold);
+    st_runs::put(&d, 2, &[&checkpoint, &resume], b"broken\n");
+    fold.push(checkpoint.hash()).unwrap();
+    fold.push(resume.hash()).unwrap();
+    let _ = st_runs::close_run(&d, &resume, &fold);
+    TrailReader::open(&d.0, TRAIL, None).expect("p01-closer-spans: reader Ok");
+    let out = classify_collect(&d.0);
+    assert!(out.violations.is_empty(), "p01-closer-spans: no violations");
+    assert_eq!(out.runs.len(), 2, "p01-closer-spans: two closed runs");
+    let rr0 = &out.runs[0];
+    // Run 0 covers S1 (headless, no fragments => 0 spans) + S2
+    // (sealed closer with a `"broken\n"` trailing fragment =>
+    // 1 span). Run 0's `spans` = [S2's span], with run-local
+    // segment index 1 (S2 is the second segment of this run).
+    let shapes: Vec<(u32, u64, u64)> = rr0.spans.iter().map(|s| (s.seg, s.after, s.len)).collect();
+    assert_eq!(
+        shapes,
+        vec![(1, resume.context.seq, 7)],
+        "p01-closer-spans: closer S2 contributes one span \
+         (run-local seg=1, after=resume.seq, len=7 bytes)",
     );
 }

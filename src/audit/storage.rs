@@ -26,15 +26,17 @@ use super::{
 /// positions with its own segment index to build
 /// `(SegmentViolationPos, Violation)`.
 ///
-/// `closer_fired` surfaces the inner [`super::runs::Classifier`]'s own
-/// closer-fired latch (ruling 197-d1 addendum 28): the walker set it
-/// where it accepted a closing segment's immediate resume. `classify`
-/// reads this per segment to decide run membership from the walker's
-/// own event rather than inferring from `(run_in, run_out, damage)`.
+/// `closed_run` surfaces the inner [`super::runs::Classifier`]'s own
+/// closed-run latch (ruling 197-d1 addendum 28, 13-V4-d3 point 1): the
+/// walker set it when, with `run_in` true on entry, it accepted the
+/// closing check that ends that open run. `classify` reads this per
+/// segment to decide run membership from the walker's own event
+/// rather than inferring from `(run_in, run_out, damage)`. An accepted
+/// resume with no open run is not a closer.
 pub(crate) struct SegmentOutcome {
     pub(crate) state: Option<State>,
     pub(crate) violations: Vec<(CollectorPos, Violation)>,
-    pub(crate) closer_fired: bool,
+    pub(crate) closed_run: bool,
 }
 use crate::rotate::Directory;
 use rustix::fs::{self as rfs, Mode, OFlags};
@@ -817,13 +819,14 @@ pub(crate) fn history_segment(
     // under outer Collect — base's strict pass short-circuits on any
     // violation and then the tolerant fallback records. Only the
     // tolerant fallback below sees the outer reaction.
-    // Ruling 197-d1 addendum 28: thread the strict pass's own
-    // `closer_fired` latch up alongside the final State. `classify`
-    // reads this walker-level signal to derive `SegmentClass::Closer`
-    // directly, rather than inferring from `(ctx.run, strict-ok)`.
+    // Ruling 197-d1 addendum 28, 13-V4-d3 point 1: thread the strict
+    // pass's own `closed_run` latch up alongside the final State.
+    // `classify` reads this walker-level signal to derive
+    // `SegmentClass::Closer` directly, rather than inferring from
+    // `(ctx.run, strict-ok)`.
     #[rustfmt::skip]
     let strict = move || scan_inner(Reaction::Stop, file, trail, strict_state, expected, &mut fc.borrow_mut(), ctx)
-        .map(|out| (out.state.expect("scan_inner Stop implies state=Some"), out.closer_fired));
+        .map(|out| (out.state.expect("scan_inner Stop implies state=Some"), out.closed_run));
     // Lazy tolerant byte source. The seek, the glued-byte / LF check,
     // `read_line`, `decode_line_kind` AND the tolerant-side byte
     // bookkeeping (`last_offset` / `last_newline` / `offset_cursor`,
@@ -894,24 +897,24 @@ pub(crate) fn history_segment(
     // caller even when record N+1 broke the fold.
     *found = found_cell.into_inner();
     match walk? {
-        HistorySegmentWalk::Strict((next, strict_closer_fired)) => {
-            // Strict completed with no violations. `strict_closer_fired`
+        HistorySegmentWalk::Strict((next, strict_closed_run)) => {
+            // Strict completed with no violations. `strict_closed_run`
             // is the inner Classifier's own latch (ruling 197-d1
-            // addendum 28): true iff the walker accepted an immediate
-            // resume after a `boundary_resume` boundary -- the (i)+(ii)
-            // closer the walk itself detected, not an inference from
-            // `(ctx.run, strict-ok)`.
+            // addendum 28, 13-V4-d3 point 1): true iff the walker
+            // accepted a closing check that ends an inherited open
+            // run -- the (i)+(ii) closer the walk itself detected,
+            // not an inference from `(ctx.run, strict-ok)`.
             *run = false;
             Ok(SegmentOutcome {
                 state: Some(next),
                 violations: Vec::new(),
-                closer_fired: strict_closer_fired,
+                closed_run: strict_closed_run,
             })
         }
         HistorySegmentWalk::Tolerant(outcome) => {
             let outcome = *outcome;
             *run = outcome.run_flag;
-            let closer_fired = outcome.closer_fired;
+            let closed_run = outcome.closed_run;
             let bytes = bytes.into_inner();
             let violations = outcome.violations;
             // Thread the classifier's own folded state (identical to
@@ -935,7 +938,7 @@ pub(crate) fn history_segment(
                     gap: outcome.gap,
                 }),
                 violations,
-                closer_fired,
+                closed_run,
             })
         }
     }
@@ -1244,8 +1247,8 @@ pub(crate) fn scan(
 /// composes through this shim, so a single strict walk serves every
 /// reader path (`scan` ×3, `scan_staged` ×2, `scan_closing` ×2,
 /// `history_segment`'s strict pass). The Classifier's own
-/// `closer_fired` latch (ruling 197-d1 addendum 28) surfaces through
-/// the returned [`SegmentOutcome`].
+/// `closed_run` latch (ruling 197-d1 addendum 28, 13-V4-d3 point 1)
+/// surfaces through the returned [`SegmentOutcome`].
 fn scan_inner(
     reaction: Reaction,
     file: &File,
@@ -1346,7 +1349,7 @@ fn scan_inner(
     Ok(SegmentOutcome {
         state,
         violations: outcome.violations,
-        closer_fired: outcome.closer_fired,
+        closed_run: outcome.closed_run,
     })
 }
 fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<(), AuditError> {
