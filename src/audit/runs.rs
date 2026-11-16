@@ -2088,44 +2088,46 @@ impl Classifier {
         // closed-run evidence. The walker latches it when, with
         // `ctx.run` true on entry (an inherited open run), it
         // accepts an immediate resume after a `boundary_resume`
-        // boundary -- the (i)+(ii) closer that ends the open run.
-        // An accepted resume without an inherited open run
-        // (`ctx.run == false`, e.g. a honest intermediate segment
-        // like `[cp, resume]` whose boundary_resume came from an
-        // unsealed predecessor but no run was open) is NOT a closer.
+        // boundary AND `apply_checked` accepts that resume -- the
+        // (i)+(ii) closer that ends the open run. An accepted
+        // resume without an inherited open run (`ctx.run == false`,
+        // e.g. an honest intermediate segment like `[cp, resume]`
+        // whose boundary_resume came from an unsealed predecessor
+        // but no run was open) is NOT a closer. A resume whose
+        // declaration is rejected by `apply_checked` (e.g.
+        // `ResumeDeclarationDoesNotDescribeGap`) is NOT a closer
+        // either: the latch is set only after the resume has been
+        // accepted by both `apply_checked` and the earlier
+        // `UnclosedSegmentLacksResume` guard above.
         //
-        // N1 proof. On the strict pass, `ctx.run == true` means a
-        // run was open entering this segment. For the walker to
-        // reach this latch site, three invariants hold:
-        //   1. `self.boundary_resume` was set in `scan_inner` from
-        //      `opening && (ctx.run || !sealed(prior))` (storage.rs);
-        //      with `ctx.run == true` it is always set.
-        //   2. `!self.first` means this is at least the second
-        //      record of the segment; the first record is handled by
-        //      the `missing opening checkpoint` check above.
-        //   3. The `is_resume` guard here means the current record
-        //      is `vigil.audit.resume`. Combined with (1) and (2),
-        //      this is the reader's own (i)+(ii) closer check: on
-        //      strict-ok the resume completes and `finish_strict_check`
-        //      would reject the segment via
-        //      `Violation::UnclosedSegmentLacksResume` if the resume
-        //      were missing. Therefore `ctx.run && strict-ok` implies
-        //      the closing check passed; the latch is the direct
-        //      event, not an inference.
-        if self.ctx.run
-            && self.boundary_resume
-            && !self.first
-            && matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume")
-        {
-            self.closed_run = true;
-        }
+        // Proof. On the strict pass `ctx.run` implies an opening
+        // segment (the refresh-rotate prelude is walked first with
+        // `run == false`), so `initial_boundary_resume = opening &&
+        // (ctx.run || !sealed(prior))` is true. `feed_record`
+        // rejects a non-resume second record via
+        // `UnclosedSegmentLacksResume`, and `finish_strict_check`
+        // rejects a segment without a resume via
+        // `ResumeCheckpointLacksDeclaration`. The latch moved below
+        // `apply_checked` therefore fires only when the resume
+        // record is both well-formed and describes the gap; a
+        // resume rejected as `ResumeDeclarationDoesNotDescribeGap`
+        // returns `Err` from `apply_checked` and the segment is
+        // classed `Damaged` rather than `Closer`.
+        //
         // ADR-0005 amendment 9 part 1: a run-opened segment with no predecessor
         // state still requires a genesis link (same disjunct as `scan_inner`).
         let genesis = self.ctx.genesis || (self.ctx.run && self.state.is_none());
+        let is_resume_record =
+            matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume");
+        let closer_candidate =
+            self.ctx.run && self.boundary_resume && !self.first && is_resume_record;
         let next_opt = match apply_checked(self.state.as_ref(), record, genesis, false, true) {
             Ok(opt) => opt,
             Err(v) => return Err(self.on_violation(v)),
         };
+        if closer_candidate {
+            self.closed_run = true;
+        }
         let Some(mut next) = next_opt else {
             // Collector-style identical duplicate: state unchanged, cursor
             // still advances in the reader's shim. Clear `run_loss` on the
@@ -2417,26 +2419,13 @@ impl Classifier {
             &record.kind,
             Kind::Entry(e) if e.action == "vigil.audit.resume"
         );
-        if self.count == 1 && self.closing {
+        let closer_candidate = self.count == 1 && self.closing;
+        if closer_candidate {
             self.must_close = false;
             if !is_resume {
                 return Err(self.on_violation(Violation::FirstSuccessorLacksImmediateResume));
             }
             self.run_flag = false;
-            // Ruling 197-d1 addendum 28, 13-V4-d3 point 1: latch the
-            // walker's own closed-run evidence here, gated on
-            // `self.ctx.run` so an accepted tolerant closing check
-            // without an actual inherited open run (the tolerant
-            // walker also fires `closing` under
-            // `inherited = *run || unsealed_boundary`, i.e. for
-            // segments where the predecessor was unsealed but no
-            // run was open) is NOT a closer. `classify` reads this
-            // per segment to derive `SegmentClass::Closer` from the
-            // reader's own run transition rather than from a
-            // heuristic over `(run_in, run_out, damage)`.
-            if self.ctx.run {
-                self.closed_run = true;
-            }
         }
         let before_loss = !(broken || self.state.as_ref().is_some_and(|s| s.run_loss));
         let compare_mmr = outside_run || before_loss;
@@ -2498,6 +2487,20 @@ impl Classifier {
         };
         if self.count == 1 && self.closing {
             next.run_loss = false;
+        }
+        // Ruling 197-d1 addendum 28, 13-V4-d3 point 1: latch the
+        // walker's own closed-run evidence here, AFTER `apply_checked`
+        // accepted the resume record. Gating on `self.ctx.run`
+        // excludes tolerant closer firings whose `inherited` flag
+        // came from an unsealed boundary rather than an actual open
+        // run (tolerant's `closing` uses
+        // `inherited = *run || unsealed_boundary`). Gating below
+        // `apply_checked` excludes resumes whose declaration is
+        // rejected (e.g. `ResumeDeclarationDoesNotDescribeGap`):
+        // such a resume returns `Err` from `apply_checked`, the
+        // segment is classed `Damaged`, not `Closer`.
+        if closer_candidate && self.ctx.run {
+            self.closed_run = true;
         }
         self.state = Some(next);
         self.first = false;
@@ -4427,16 +4430,22 @@ mod classify_tests;
 /// [`ClassifyOutput::runs`], [`ClassifyOutput::segments`] and each
 /// [`SegmentReport`] / [`RunReport`] field at this head.
 ///
-/// - **CV1** digest pins for A1 / A3 / A8 / A9 (per-row, literal).
-/// - **CV2** p01..p13 reader-and-classify agreement rows.
-/// - **CV3** p09+p10 fragment-only digest rows.
-/// - **CV4** fold-(iii) mismatch records the violation and runs stays empty.
-/// - **CV5** A1 run-structure detail-level pin.
-/// - **CV6** A8 empty-ranges digest.
-/// - **CV7** A9 span `seg` renumbering.
-/// - **CV8** non-increasing seq records violation and drops this run.
-/// - **CV9** module doc has no history/round wording (source lint).
-/// - **CV11** reports built only under Collect (empty under Stop).
+/// - Digest pins for A1 / A3 / A8 / A9 (per-row, literal).
+/// - p01..p13 reader-and-classify agreement rows.
+/// - p09 + p10 fragment-only digest rows.
+/// - Fold-(iii) mismatch records the violation; runs stays empty
+///   (ruling 197-d1 addendum 28 point 2).
+/// - A1 run-structure detail-level pin (first_segment,
+///   last_segment, closing_opening, loss_points, spans).
+/// - A8 empty-ranges digest equality.
+/// - A9 span `seg` renumbered run-local.
+/// - Non-increasing seq records violation and drops this run
+///   (ruling 13-V4-d3 point 2 last bullet).
+/// - Module-doc source lint: no history/round wording in the
+///   module header.
+/// - Reports built only under `Reaction::Collect`; `segments` and
+///   `runs` empty under `Reaction::Stop` (ruling 197-d1 addendum
+///   28 point 1).
 #[cfg(test)]
 #[path = "runs_v4a_tests.rs"]
 mod classify_v4a_walk;
