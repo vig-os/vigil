@@ -1965,9 +1965,9 @@ fn closed_run_not_inferred_from_inherited_run_p02() {
 /// are both `false`; S1 is honest, not a run member. S2's headless
 /// opens a run; the live closer closes it. Classes are
 /// `[Base, Base, InRun, Closer]` and the run covers `(2, 3)`.
-/// A pre-fix build classes S1 as `Damaged` (the walker latched the
-/// strict closer check even without an open run) and extends the
-/// run to `(1, 3)`.
+/// S1's accepted resume without an open run (`ctx.run == false`)
+/// is not a closer, so the walker leaves `closed_run` false on S1
+/// and S1 stays out of the run.
 #[test]
 fn honest_mid_segment_is_base_under_strict_resume_without_run() {
     let d = Temp::new();
@@ -2042,8 +2042,8 @@ fn honest_mid_segment_is_base_under_strict_resume_without_run() {
 /// `S0=[cp0, e1]`, `S1=[cp2, resume(e1)]`, `live=[closer]`.
 /// Reader is `Ok`; `ctx.run` is false entering every segment; no
 /// run ever opens. Every class is `Base`, every `run_membership` is
-/// `None`, `runs` is empty. A pre-fix build classes S1 and live as
-/// `Damaged` without any recorded violation.
+/// `None`, `runs` is empty. Accepted resumes without `ctx.run`
+/// leave `closed_run` false and record no violations.
 #[test]
 fn unsealed_successor_probe_layout_under_collect() {
     let d = Temp::new();
@@ -2240,13 +2240,17 @@ fn refresh_rotate_under_collect_pins_boundary_resume_false_on_prelude() {
     // segment the formerly-live file became is filtered out by
     // `segments_after_from` because its inode is the renamed
     // original. Classes are `[Base, Base]`, `boundary_resume` is
-    // `[false, false]` (role-arm `(RefreshRotate,
-    // Sealed{prelude:true}) => false` on the prelude and
-    // `(LiveOpen, _)` / `(RefreshRotate, _) => false` on the
-    // live), `run_membership` is `[None, None]`, and `runs` is
-    // empty (no closed run). A mutant flipping the prelude role
-    // arm to `=> true` would set `boundary_resume = !sealed(prior)
-    // = true` on the prelude; a mutant that drops the whole
+    // `[false, false]`. The prelude's role arm is
+    // `(RefreshRotate, Sealed{prelude:true}) => false`, so its
+    // `boundary_resume` is pinned false by the role. The live's
+    // role arm is `(RefreshRotate, Live(_)) => true`; its
+    // `boundary_resume` is false only because the prior state
+    // (the closing checkpoint of the rotated segment) is sealed,
+    // so `role_opening && !sealed(prior)` collapses to false.
+    // `run_membership` is `[None, None]` and `runs` is empty (no
+    // closed run). A mutant flipping the prelude role arm to
+    // `=> true` would set `boundary_resume = !sealed(prior) =
+    // true` on the prelude; a mutant that drops the whole
     // refresh-rotate under-Collect dispatch would change the
     // segment count.
     let classes: Vec<super::SegmentClass> = out.segments.iter().map(|s| s.class).collect();
@@ -2417,9 +2421,9 @@ fn closer_spans_survive_in_sealed_closer_p01() {
 // run whose live segment is `[cp, resume naming the WRONG head
 // hash]` is rejected by `apply_checked` as
 // `ResumeDeclarationDoesNotDescribeGap`; the live segment must be
-// classed `Damaged`, not `Closer`. Before the fix the walker
-// latched `closed_run = true` on the resume attempt, before
-// `apply_checked` validated the declaration.
+// classed `Damaged`, not `Closer`. The walker latches
+// `closed_run = true` only after `apply_checked` accepts the
+// resume record; a rejected resume leaves the latch false.
 // ============================================================
 
 /// A1 layout with the live resume naming the WRONG head hash:
@@ -2430,9 +2434,10 @@ fn closer_spans_survive_in_sealed_closer_p01() {
 /// `Violation::ResumeDeclarationDoesNotDescribeGap` at `(2, 1)`.
 /// Expected: classes `[Base, InRun, Damaged]`; `out.runs` empty
 /// (addendum 28 point 2: runs stays empty when violations are
-/// non-empty); `run_membership` `[None, None, None]`. A pre-fix
-/// build classed the live as `Closer` because the latch fired
-/// before `apply_checked` validated the resume.
+/// non-empty); `run_membership` `[None, None, None]`. The walker
+/// latches `closed_run` only after `apply_checked` accepts the
+/// resume, so a rejected resume leaves the segment `Damaged`
+/// rather than `Closer`.
 #[test]
 fn live_resume_wrong_head_hash_classes_live_damaged() {
     let d = Temp::new();
@@ -2476,8 +2481,8 @@ fn live_resume_wrong_head_hash_classes_live_damaged() {
         classes,
         vec![Base, InRun, Damaged],
         "wrong-resume: live is Damaged, NOT Closer \
-         (pre-fix: live was Closer because the walker latched \
-         closed_run before apply_checked validated the resume)",
+         (the walker latches closed_run only after apply_checked \
+         accepts the resume; a rejected resume leaves it false)",
     );
     let membership: Vec<Option<usize>> = out.segments.iter().map(|s| s.run_membership).collect();
     assert_eq!(

@@ -1241,21 +1241,32 @@ pub(crate) fn classify(
         //   - `run_in_before`: the reader's `*run` flag entering the
         //     segment;
         //   - `run_out`: the reader's `*run` flag leaving it (`run`);
-        //   - `closed_run`: the walker's own closed-run evidence,
-        //     latched only when `run_in_before` was true (strict:
-        //     `ctx.run && boundary_resume && !first && is_resume`;
-        //     tolerant: `count == 1 && closing && is_resume`, where
-        //     `closing` itself requires `inherited`).
+        //   - `closed_run`: the walker's own closed-run evidence.
+        //     Both passes gate it on `ctx.run` and latch it only
+        //     after `apply_checked` accepts the resume record:
+        //     strict (`feed_record`) when
+        //     `ctx.run && boundary_resume && !first && is_resume`
+        //     and `apply_checked` is Ok; tolerant
+        //     (`feed_record_apply_tolerant`) when
+        //     `count == 1 && closing && is_resume && ctx.run` and
+        //     `apply_checked` is Ok. Tolerant's `closing` requires
+        //     `inherited = *run || unsealed_boundary`, which the
+        //     `ctx.run` gate narrows back to an actual open run;
+        //     a resume rejected by `apply_checked` (e.g.
+        //     `ResumeDeclarationDoesNotDescribeGap`) leaves the
+        //     latch false on both passes.
         //
         // Membership is `run_in_before || run_out` (ruling 197-d1
         // addendum 28, 13-V4-d3 point 1). The match below is
         // exhaustive over `(closed_run, member, damage)` and carries
-        // no catch-all arm: `closed_run` implies membership (its
-        // invariant is asserted by the debug_assert! above the
-        // match), so `(true, false, _)` is unreachable in practice,
-        // but the pattern is still listed so the match is total and
-        // a mutant flipping the Closer arm fails loudly rather than
-        // silently falling through a wildcard.
+        // no catch-all arm; the walker invariant `closed_run =>
+        // run_in_before` (asserted by the debug_assert! above the
+        // match) implies `closed_run => member` because
+        // `run_in_before` is one of membership's disjuncts. The
+        // `(true, _, _) => Closer` arm reaches it with `member`
+        // bound to true in practice; the wildcard keeps the match
+        // total so a mutant flipping the Closer arm fails loudly
+        // rather than silently falling through.
         if build_reports {
             let damage = !seg_violations.is_empty();
             let next_state_run = next_state.as_ref().map(|s| s.run.clone());
