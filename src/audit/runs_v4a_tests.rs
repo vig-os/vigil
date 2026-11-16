@@ -1,7 +1,7 @@
 //! V4a walk tests (ruling 197-d1 addendum 25.5 and 28): pin
 //! `ClassifyOutput::segments` / `ClassifyOutput::runs` at this head.
 //!
-//! Each CV row builds a trail directory, (i) runs
+//! Each row builds a trail directory, (i) runs
 //! `TrailReader::open` and records `Ok` or `Err(CorruptTrail: <detail>)`,
 //! (ii) runs `classify` under `Reaction::Collect`, (iii) asserts the
 //! full literal outcome.
