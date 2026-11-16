@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-11-03T10:18:01Z
-updated: 2026-11-09T03:35:24Z
+updated: 2026-11-15T19:43:26Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/197
-comments: 28
+comments: 30
 labels: priority:medium
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-09T09:15:01.059Z
+synced: 2026-11-16T09:05:45.304Z
 ---
 
 # [Issue 197]: [refactor(audit): extract the reader's run classification into one shared pure module (#13 V4 prerequisite)](https://github.com/vig-os/vigil/issues/197)
@@ -558,5 +558,39 @@ _Posted on November 9, 2026 at 03:35 AM_
     4. **Rows are literal and base-measured.**
        - Every reader pin's expected `Err` kind and detail, or its `Ok` tuple, is taken from running that row at base e1c45a3, and the row passes there. The detail strings the brief proposed are the planner's guesses until measured.
        - Every Collect row asserts a complete literal list, with no `...`. Its first entry agrees with the base reader's outcome for that layout.
+
+
+---
+
+# [Comment #29]() by [gerchowl]()
+
+_Posted on November 15, 2026 at 07:24 PM_
+
+**R2b S3b1b merged: #212 (ba7ef3e).** `runs::classify` is now the one multi-segment orchestration (addenda 25 and 27). `initial_record` and `refresh` are thin callers. `storage.rs` keeps byte I/O and the lazy segment source, and a structural test enforces that it contains no segment loop and no bypass.
+
+The independent review proved:
+- **Stop is unchanged:** the base-vs-head reader differential shows 0 differences over 163,968 rows, and a planted regression is detected.
+- **Collect equals the reader:** full equality (first violation on `Err` paths; final state and `found` on `Ok` paths) shows 0 mismatches over 276,990 multi-segment rows.
+- **Mutants:** every behaviour-changing mutant in scope is killed by a reader pin and/or Collect rows, as addendum 27.2 requires.
+- **Gate and size:** the syn gate is unchanged at 49, and the PR adds +161 net non-test code lines.
+
+Review nits are tracked in #215. Next: S3b2 (the V4a-facing reports and walk, plus the `runs.rs` caveat).
+
+
+---
+
+# [Comment #30]() by [gerchowl]()
+
+_Posted on November 15, 2026 at 07:43 PM_
+
+
+### Addendum 28 to ruling 197-d1 (S3b2: the V4a-facing reports)
+
+28. The S3b2 plan adds `segments: Vec<SegmentReport>` and `runs: Vec<RunReport>` to `ClassifyOutput`, filled by `classify`. Four points are ruled here.
+    1. **Reports are a Collect product.** `classify` builds `segments` and `runs` only under `Reaction::Collect`. Under `Reaction::Stop` both stay empty, so the reader does no extra work (no per-segment span stream) and its behaviour is unchanged. A row pins the empty vectors under `Stop`.
+    2. **Ruling 13-V4-d3 point 1 lives in `classify`.** `runs` is empty whenever the reader would reject the trail, that is whenever `violations` is non-empty or `head_mismatch` is set. `segments` is still reported, with its damage flags. Addendum 19.2 (a fold-(iii) mismatch marks its segment damaged and derives no further violation) is about violations only; it never keeps a run alive. So `[cp0,e1,bad_cp2,e3,cp4]` gives exactly `[(2, CheckpointMmrDiffers)]` and an empty `runs`, and a non-increasing sequence gives its violation and an empty `runs`. It never panics.
+    3. **Source checks read the source, not a subprocess.** The module-doc wording check reads `runs.rs` with `include_str!`, scans only `//!` lines, and has no skip switch. No unit test spawns `git`.
+    4. **No proof without a mechanism.** A row whose mechanism cannot be built as described (a counting wrapper around the concrete `SegmentSource`) is dropped rather than approximated. That `classify` holds one segment at a time follows from its signature and is checked by review.
+    5. **Addendum 27.2 applies to report mutants.** Each mutant that changes a report needs two distinct killer rows, each actually run (exit 101, then 0 after revert). A module-doc mutant needs only its one source-check row.
 
 
