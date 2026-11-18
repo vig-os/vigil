@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-10-09T14:07:47Z
-updated: 2026-11-16T02:43:21Z
+updated: 2026-11-17T18:10:53Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/vigil/issues/20
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-11-16T09:05:45.626Z
+synced: 2026-11-18T09:48:49.729Z
 ---
 
 # [Issue 20]: [Dependency Dashboard](https://github.com/vig-os/vigil/issues/20)
@@ -24,7 +24,9 @@ This issue lists Renovate updates and detected dependencies. Read the [Dependenc
 
 The following updates are currently rate-limited. To force their creation now, click on a checkbox below.
 
+ - [ ] <!-- unlimit-branch=renovate/zeroize-1.x-lockfile -->build(cargo): update rust crate zeroize to v1.9.2
  - [ ] <!-- unlimit-branch=renovate/syn-3.x -->build(cargo): update rust crate syn to v3
+ - [ ] <!-- create-all-rate-limited-prs -->🔐 **Create all rate-limited PRs at once** 🔐
 
 ## Open
 
@@ -53,14 +55,14 @@ The following updates have all been created. To force a retry/rebase of any, cli
  - `base64 0.22` → [Updates: `0.23`]
  - `blake3 1`
  - `ed25519-dalek 2` → [Updates: `3`]
- - `zeroize 1`
- - `opentelemetry 0.33` → [Updates: `0.33`]
- - `opentelemetry_sdk 0.33` → [Updates: `0.33`]
- - `opentelemetry-proto 0.33` → [Updates: `0.33`]
+ - `zeroize 1` → [Updates: `lock file @ 1.9.2`]
+ - `opentelemetry 0.33` → [Updates: `lock file @ 0.33.1`]
+ - `opentelemetry_sdk 0.33` → [Updates: `lock file @ 0.33.1`]
+ - `opentelemetry-proto 0.33` → [Updates: `lock file @ 0.33.1`]
  - `serde 1`
- - `serde_json 1` → [Updates: `1`]
+ - `serde_json 1` → [Updates: `lock file @ 1.0.154`]
  - `rustix 1.1.5`
- - `opentelemetry-appender-tracing 0.33` → [Updates: `0.33`]
+ - `opentelemetry-appender-tracing 0.33` → [Updates: `lock file @ 0.33.1`]
  - `tracing-opentelemetry 0.34`
  - `tracing 0.1`
  - `tracing-core 0.1`
@@ -68,10 +70,10 @@ The following updates have all been created. To force a retry/rebase of any, cli
  - `tracing-log 0.2`
  - `rustix 1.1.5`
  - `allocation-counter 0.8.1`
- - `flate2 1` → [Updates: `1`]
+ - `flate2 1` → [Updates: `lock file @ 1.1.11`]
  - `criterion 0.8.2`
- - `proptest 1` → [Updates: `1`]
- - `log 0.4` → [Updates: `0.4`]
+ - `proptest 1` → [Updates: `lock file @ 1.12.0`]
+ - `log 0.4` → [Updates: `lock file @ 0.4.35`]
  - `syn 2` → [Updates: `3`]
  - `proc-macro2 1`
 
