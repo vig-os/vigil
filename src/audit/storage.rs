@@ -331,7 +331,7 @@ impl TrailReader {
 pub(super) fn corrupt(detail: &str) -> AuditError {
     AuditError::new(AuditErrorKind::CorruptTrail, detail)
 }
-fn io_error(error: io::Error) -> AuditError {
+pub(super) fn io_error(error: io::Error) -> AuditError {
     AuditError::new(AuditErrorKind::Io, error.to_string())
 }
 /// Ruling 197-d1 addendum 24.3 / 20.1: the ONE `Line` -> `LineEventKind`
@@ -382,6 +382,162 @@ pub(crate) fn existing(dir: &File, name: &Path, writable: bool) -> Result<File, 
     })
 }
 
+/// Per-segment byte source the shim walks. Ruling 13-V4-d6 point 1:
+/// portable across Linux and macOS (#46), so `rustix::fs::memfd_create`
+/// is not used; and ruling 13-V4-d5 (b) asks the walkers to be generic
+/// over a reader instead of `File` so a future verifier-provided
+/// snapshot source lands under this same surface with no on-disk
+/// backing.
+///
+/// Carried owned through [`SegmentRead`] and consumed by
+/// [`SegmentBytes::new`]; cloneable so that the strict pass, the lazy
+/// tolerant pass, and `classify`'s Collect report pass each hold their
+/// own handle. Cloning is a `File::try_clone()` on this variant (an
+/// OS-level `dup`). Rulings 13-V4-d5 (b) and 13-V4-d6 point 1 fix the
+/// `Read` / `Seek` / `try_clone` contract so a non-file variant can be
+/// added without widening it.
+pub(crate) enum ByteSource {
+    File(File),
+    /// Test seam for ruling 13-V4-d5 (d) and issue #218: the Collect
+    /// report pass must surface I/O errors instead of swallowing them.
+    /// `counter` is a shared pre-increment counter that trips exactly
+    /// once at `fail_at`; ops before and after that index pass through,
+    /// so a test can let the walker's clone/seek/read succeed and
+    /// fail only the later Collect pass's op (or vice versa).
+    #[cfg(test)]
+    Failing {
+        inner: File,
+        mode: ByteSourceFailure,
+        counter: std::rc::Rc<std::cell::Cell<usize>>,
+        fail_at: usize,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ByteSourceFailure {
+    TryClone,
+    Seek,
+    Read,
+}
+
+#[cfg(test)]
+type TestFailingSlot = (
+    File,
+    ByteSourceFailure,
+    std::rc::Rc<std::cell::Cell<usize>>,
+    usize,
+    bool,
+);
+
+#[cfg(test)]
+fn check_or_fail(
+    mode: ByteSourceFailure,
+    this: ByteSourceFailure,
+    counter: &std::rc::Rc<std::cell::Cell<usize>>,
+    fail_at: usize,
+    label: &'static str,
+) -> io::Result<()> {
+    if mode != this {
+        return Ok(());
+    }
+    let n = counter.get() + 1;
+    counter.set(n);
+    if n == fail_at {
+        return Err(io::Error::other(label));
+    }
+    Ok(())
+}
+
+impl ByteSource {
+    pub(crate) fn try_clone(&self) -> io::Result<ByteSource> {
+        match self {
+            ByteSource::File(f) => Ok(ByteSource::File(f.try_clone()?)),
+            #[cfg(test)]
+            ByteSource::Failing {
+                inner,
+                mode,
+                counter,
+                fail_at,
+            } => {
+                check_or_fail(
+                    *mode,
+                    ByteSourceFailure::TryClone,
+                    counter,
+                    *fail_at,
+                    "ByteSource test seam: try_clone",
+                )?;
+                Ok(ByteSource::Failing {
+                    inner: inner.try_clone()?,
+                    mode: *mode,
+                    counter: std::rc::Rc::clone(counter),
+                    fail_at: *fail_at,
+                })
+            }
+        }
+    }
+
+    /// Extract the underlying `File`. Used by `runs::classify`'s live
+    /// arms to populate `ClassifyOutput::live_file` (which the reader
+    /// stashes in `Cache::file`). Production has only the `File`
+    /// variant; the test seam variant carries one too.
+    pub(crate) fn into_file(self) -> File {
+        match self {
+            ByteSource::File(f) => f,
+            #[cfg(test)]
+            ByteSource::Failing { inner, .. } => inner,
+        }
+    }
+}
+
+impl Read for ByteSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ByteSource::File(f) => f.read(buf),
+            #[cfg(test)]
+            ByteSource::Failing {
+                inner,
+                mode,
+                counter,
+                fail_at,
+            } => {
+                check_or_fail(
+                    *mode,
+                    ByteSourceFailure::Read,
+                    counter,
+                    *fail_at,
+                    "ByteSource test seam: read",
+                )?;
+                inner.read(buf)
+            }
+        }
+    }
+}
+
+impl Seek for ByteSource {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            ByteSource::File(f) => f.seek(pos),
+            #[cfg(test)]
+            ByteSource::Failing {
+                inner,
+                mode,
+                counter,
+                fail_at,
+            } => {
+                check_or_fail(
+                    *mode,
+                    ByteSourceFailure::Seek,
+                    counter,
+                    *fail_at,
+                    "ByteSource test seam: seek",
+                )?;
+                inner.seek(pos)
+            }
+        }
+    }
+}
+
 /// Ruling 197-d1 addendum 20.1 / S3b1a: per-segment byte source. Owns
 /// the seek, the glued-byte / LF check, the physical `read_line`, the
 /// [`decode_line_kind`] step, and the offset/length/newline bookkeeping
@@ -390,8 +546,8 @@ pub(crate) fn existing(dir: &File, name: &Path, writable: bool) -> Result<File, 
 /// `runs::classify` (ruling 197-d1 addendum 25); this PR is a
 /// behaviour-preserving extraction.
 pub(crate) struct SegmentBytes {
-    pending_file: Option<File>,
-    reader: Option<BufReader<File>>,
+    pending_source: Option<ByteSource>,
+    reader: Option<BufReader<ByteSource>>,
     initial_offset: u64,
     needs_glue_check: bool,
     did_glue_check: bool,
@@ -402,15 +558,14 @@ pub(crate) struct SegmentBytes {
 
 impl SegmentBytes {
     pub(crate) fn new(
-        file: &File,
+        source: ByteSource,
         initial_offset: u64,
         needs_glue_check: bool,
         last_offset: u64,
         last_newline: bool,
     ) -> Result<Self, AuditError> {
-        let pending_file = file.try_clone().map_err(io_error)?;
         Ok(Self {
-            pending_file: Some(pending_file),
+            pending_source: Some(source),
             reader: None,
             initial_offset,
             needs_glue_check,
@@ -421,15 +576,15 @@ impl SegmentBytes {
         })
     }
 
-    fn ensure_reader(&mut self) -> Result<&mut BufReader<File>, AuditError> {
+    fn ensure_reader(&mut self) -> Result<&mut BufReader<ByteSource>, AuditError> {
         if self.reader.is_none() {
-            let mut f = self
-                .pending_file
+            let mut s = self
+                .pending_source
                 .take()
                 .expect("SegmentBytes: reader seeded before new() or twice");
-            f.seek(SeekFrom::Start(self.initial_offset))
+            s.seek(SeekFrom::Start(self.initial_offset))
                 .map_err(io_error)?;
-            self.reader = Some(BufReader::new(f));
+            self.reader = Some(BufReader::new(s));
         }
         Ok(self
             .reader
@@ -544,6 +699,14 @@ pub(crate) struct SegmentSource<'dir> {
     cached: Option<File>,
     pending: Option<PendingRotateAfter>,
     newest: Option<PathBuf>,
+    /// Test seam (issue #218): one segment backed by a failing
+    /// [`ByteSource`]. Set on construction via
+    /// [`SegmentSource::for_test_failing_sealed`] /
+    /// [`SegmentSource::for_test_failing_live`]; consumed by the
+    /// [`PlanStep::TestFailing`] / [`PlanStep::TestFailingLive`] arms.
+    /// Production code never touches it.
+    #[cfg(test)]
+    test_failing: Option<TestFailingSlot>,
 }
 
 enum PlanStep {
@@ -559,6 +722,14 @@ enum PlanStep {
     /// The live file (`audit.jsonl`), opened writable = true
     /// (`scan_closing`).
     ClosingLive,
+    /// Test seam (issue #218): the sole segment is a sealed
+    /// [`ByteSource::Failing`]; no file is opened.
+    #[cfg(test)]
+    TestFailing,
+    /// Test seam (issue #218): the sole segment is a live
+    /// [`ByteSource::Failing`]; no file is opened.
+    #[cfg(test)]
+    TestFailingLive,
 }
 
 /// Refresh-rotate: inputs captured at construction so `segments_after`
@@ -579,10 +750,10 @@ pub(crate) enum SegmentRead {
     /// cached-file prelude (`history_segment(opening = false)`);
     /// otherwise this is a rotated name opened writable = false
     /// (`history_segment(opening = true)`).
-    Sealed { file: File, prelude: bool },
+    Sealed { source: ByteSource, prelude: bool },
     /// The live file (refresh-append same-inode, or the trailing live
     /// close in live-open / refresh-rotate).
-    Live(File),
+    Live(ByteSource),
 }
 
 impl<'dir> SegmentSource<'dir> {
@@ -600,6 +771,8 @@ impl<'dir> SegmentSource<'dir> {
             cached: None,
             pending: None,
             newest,
+            #[cfg(test)]
+            test_failing: None,
         })
     }
 
@@ -614,6 +787,8 @@ impl<'dir> SegmentSource<'dir> {
             cached: Some(cached),
             pending: None,
             newest: None,
+            #[cfg(test)]
+            test_failing: None,
         })
     }
 
@@ -636,7 +811,59 @@ impl<'dir> SegmentSource<'dir> {
                 sealed_before: cache.sealed_before.clone(),
             }),
             newest: None,
+            #[cfg(test)]
+            test_failing: None,
         })
+    }
+
+    /// Test seam for issue #218: a one-segment source whose sole sealed
+    /// segment is a [`ByteSource::Failing`]. `classify` under Collect
+    /// must surface the configured failure (clone / seek / read) as
+    /// [`AuditError::Io`] instead of swallowing it into empty spans
+    /// (ADR-0005 decision 11; rulings 13-V4-d5 (d), 107-d2, 107-d3).
+    #[cfg(test)]
+    pub(crate) fn for_test_failing_sealed(
+        dir: &'dir File,
+        inner: File,
+        mode: ByteSourceFailure,
+        counter: std::rc::Rc<std::cell::Cell<usize>>,
+        fail_at: usize,
+        prelude: bool,
+    ) -> Self {
+        Self {
+            dir,
+            plan: vec![PlanStep::TestFailing],
+            cursor: 0,
+            cached: None,
+            pending: None,
+            newest: None,
+            test_failing: Some((inner, mode, counter, fail_at, prelude)),
+        }
+    }
+
+    /// Test seam for issue #218 on the Live arm: yield the sole segment
+    /// as `SegmentRead::Live(ByteSource::Failing { .. })` so the
+    /// `(LiveOpen, Live)` match arm in `classify` fires `scan_closing`
+    /// and the extra `source.try_clone()` the Live arm itself makes to
+    /// preserve `live_file`.
+    #[cfg(test)]
+    pub(crate) fn for_test_failing_live(
+        dir: &'dir File,
+        inner: File,
+        mode: ByteSourceFailure,
+        counter: std::rc::Rc<std::cell::Cell<usize>>,
+        fail_at: usize,
+    ) -> Self {
+        Self {
+            dir,
+            plan: vec![PlanStep::TestFailingLive],
+            cursor: 0,
+            cached: None,
+            pending: None,
+            newest: None,
+            // `prelude` is unused for live; the field layout stays shared.
+            test_failing: Some((inner, mode, counter, fail_at, false)),
+        }
     }
 
     /// Lazy base-order open. Each file is opened only inside the
@@ -663,7 +890,7 @@ impl<'dir> SegmentSource<'dir> {
                     .take()
                     .expect("SegmentSource: prelude slot already consumed");
                 Ok(Some(SegmentRead::Sealed {
-                    file,
+                    source: ByteSource::File(file),
                     prelude: true,
                 }))
             }
@@ -672,18 +899,47 @@ impl<'dir> SegmentSource<'dir> {
                     .cached
                     .take()
                     .expect("SegmentSource: append slot already consumed");
-                Ok(Some(SegmentRead::Live(file)))
+                Ok(Some(SegmentRead::Live(ByteSource::File(file))))
             }
             PlanStep::Rotated(name) => {
                 let file = existing(self.dir, name, false)?;
                 Ok(Some(SegmentRead::Sealed {
-                    file,
+                    source: ByteSource::File(file),
                     prelude: false,
                 }))
             }
             PlanStep::ClosingLive => {
                 let file = existing(self.dir, Path::new("audit.jsonl"), true)?;
-                Ok(Some(SegmentRead::Live(file)))
+                Ok(Some(SegmentRead::Live(ByteSource::File(file))))
+            }
+            #[cfg(test)]
+            PlanStep::TestFailing => {
+                let (inner, mode, counter, fail_at, prelude) = self
+                    .test_failing
+                    .take()
+                    .expect("SegmentSource: test_failing slot already consumed");
+                Ok(Some(SegmentRead::Sealed {
+                    source: ByteSource::Failing {
+                        inner,
+                        mode,
+                        counter,
+                        fail_at,
+                    },
+                    prelude,
+                }))
+            }
+            #[cfg(test)]
+            PlanStep::TestFailingLive => {
+                let (inner, mode, counter, fail_at, _prelude) = self
+                    .test_failing
+                    .take()
+                    .expect("SegmentSource: test_failing slot already consumed");
+                Ok(Some(SegmentRead::Live(ByteSource::Failing {
+                    inner,
+                    mode,
+                    counter,
+                    fail_at,
+                })))
             }
         }
     }
@@ -779,7 +1035,7 @@ fn initial_record(
 )]
 pub(crate) fn history_segment(
     reaction: Reaction,
-    file: &File,
+    source: ByteSource,
     trail: [u8; 16],
     state: Option<State>,
     opening: bool,
@@ -824,8 +1080,13 @@ pub(crate) fn history_segment(
     // `classify` reads this walker-level signal to derive
     // `SegmentClass::Closer` directly, rather than inferring from
     // `(ctx.run, strict-ok)`.
+    // Ruling 13-V4-d6 point 1: `ByteSource` is owned and consumed by
+    // each walker; `try_clone` takes an independent handle (an OS-level
+    // `dup` on the `File` variant). The strict pass takes one clone,
+    // the lazy tolerant byte source takes the original.
+    let strict_source = source.try_clone().map_err(io_error)?;
     #[rustfmt::skip]
-    let strict = move || scan_inner(Reaction::Stop, file, trail, strict_state, expected, &mut fc.borrow_mut(), ctx)
+    let strict = move || scan_inner(Reaction::Stop, strict_source, trail, strict_state, expected, &mut fc.borrow_mut(), ctx)
         .map(|out| (out.state.expect("scan_inner Stop implies state=Some"), out.closed_run));
     // Lazy tolerant byte source. The seek, the glued-byte / LF check,
     // `read_line`, `decode_line_kind` AND the tolerant-side byte
@@ -835,7 +1096,7 @@ pub(crate) fn history_segment(
     let initial_last_offset = state.as_ref().map_or(initial_offset, |s| s.offset);
     let initial_last_newline = state.as_ref().is_none_or(|s| s.newline);
     let bytes = RefCell::new(SegmentBytes::new(
-        file,
+        source,
         initial_offset,
         needs_glue_check,
         initial_last_offset,
@@ -946,14 +1207,14 @@ pub(crate) fn history_segment(
 /// Validates a staging successor, requiring a genesis link without a predecessor
 /// and an immediate resume when the predecessor history ends inside a run.
 pub(crate) fn scan_staged(
-    file: &File,
+    source: ByteSource,
     trail: [u8; 16],
     state: Option<State>,
     run: bool,
 ) -> Result<State, AuditError> {
     let SegmentOutcome { state, .. } = scan_inner(
         Reaction::Stop,
-        file,
+        source,
         trail,
         state,
         None,
@@ -968,7 +1229,7 @@ pub(crate) fn scan_staged(
 }
 pub(crate) fn scan_closing(
     reaction: Reaction,
-    file: &File,
+    source: ByteSource,
     trail: [u8; 16],
     state: Option<State>,
     expected: Option<Head>,
@@ -977,7 +1238,7 @@ pub(crate) fn scan_closing(
 ) -> Result<SegmentOutcome, AuditError> {
     scan_inner(
         reaction,
-        file,
+        source,
         trail,
         state,
         expected,
@@ -1212,7 +1473,7 @@ const MAX_READ_BYTES: u64 = MAX_PAYLOAD_BYTES as u64 + 2; // LF plus one excess 
 )]
 pub(crate) fn scan(
     reaction: Reaction,
-    file: &File,
+    source: ByteSource,
     trail: [u8; 16],
     state: Option<State>,
     opening: bool,
@@ -1222,7 +1483,7 @@ pub(crate) fn scan(
 ) -> Result<SegmentOutcome, AuditError> {
     scan_inner(
         reaction,
-        file,
+        source,
         trail,
         state,
         expected,
@@ -1251,7 +1512,7 @@ pub(crate) fn scan(
 /// surfaces through the returned [`SegmentOutcome`].
 fn scan_inner(
     reaction: Reaction,
-    file: &File,
+    source: ByteSource,
     trail: [u8; 16],
     state: Option<State>,
     expected: Option<Head>,
@@ -1283,7 +1544,7 @@ fn scan_inner(
     // consumed by a prior walk; the first byte here terminates it and
     // is not a blank line or a repair gap.
     let bytes = RefCell::new(SegmentBytes::new(
-        file,
+        source,
         start,
         needs_glue,
         initial_last_offset,

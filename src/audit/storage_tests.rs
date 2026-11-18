@@ -1743,7 +1743,7 @@ fn resume_base_refuses_non_checkpoint_without_archived_predecessor() {
     let file = File::open(d.0.join("audit.jsonl")).unwrap();
     let result = history_segment(
         crate::audit::runs::Reaction::Stop,
-        &file,
+        crate::audit::storage::ByteSource::File(file),
         TRAIL,
         None,
         true,
@@ -1763,7 +1763,7 @@ fn inherited_run_reaches_first_strict_scan_of_later_history() {
     let mut run = false;
     let state = history_segment(
         crate::audit::runs::Reaction::Stop,
-        &file,
+        crate::audit::storage::ByteSource::File(file),
         TRAIL,
         None,
         true,
@@ -1782,7 +1782,7 @@ fn inherited_run_reaches_first_strict_scan_of_later_history() {
     bad(
         history_segment(
             crate::audit::runs::Reaction::Stop,
-            &file,
+            crate::audit::storage::ByteSource::File(file),
             TRAIL,
             state,
             true,
@@ -1936,7 +1936,7 @@ mod details {
         let mut r = run;
         history_segment(
             crate::audit::runs::Reaction::Stop,
-            f,
+            crate::audit::storage::ByteSource::File(f.try_clone().unwrap()),
             TRAIL,
             state,
             opening,
@@ -1960,7 +1960,7 @@ mod details {
         let mut found = None;
         let res = history_segment(
             crate::audit::runs::Reaction::Stop,
-            f,
+            crate::audit::storage::ByteSource::File(f.try_clone().unwrap()),
             TRAIL,
             state,
             opening,
@@ -1974,7 +1974,7 @@ mod details {
     fn scc(f: &File, state: Option<State>, opening: bool) -> Result<State, AuditError> {
         scan(
             crate::audit::runs::Reaction::Stop,
-            f,
+            crate::audit::storage::ByteSource::File(f.try_clone().unwrap()),
             TRAIL,
             state,
             opening,
@@ -3589,7 +3589,12 @@ mod details {
         // `scan` is Ok on this file (R0a's accepted_archived_base).
         assert!(scc(&o(&d), None, true).is_ok());
         assert_corrupt(
-            scan_staged(&o(&d), TRAIL, None, false),
+            scan_staged(
+                crate::audit::storage::ByteSource::File(o(&d)),
+                TRAIL,
+                None,
+                false,
+            ),
             "initial checkpoint does not link genesis",
             0,
         );
@@ -3724,7 +3729,7 @@ mod details {
         let mut run = false;
         let state = history_segment(
             crate::audit::runs::Reaction::Stop,
-            &seg0,
+            crate::audit::storage::ByteSource::File(seg0),
             TRAIL,
             None,
             true,

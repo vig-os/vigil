@@ -2,7 +2,7 @@
 use super::{
     format::{Kind, request},
     runs::Reaction,
-    storage::{Head, State, TrailReader, existing, history_segment, scan_staged},
+    storage::{self, Head, State, TrailReader, existing, history_segment, scan_staged},
     *,
 };
 use crate::rotate::{self, Directory};
@@ -331,7 +331,7 @@ fn predecessor_run(dir: &File, trail: [u8; 16]) -> Result<(Option<State>, bool),
     for name in rotate::rotated_names_at(dir, "audit").map_err(io_error)? {
         let out = history_segment(
             Reaction::Stop,
-            &existing(dir, &name, false)?,
+            storage::ByteSource::File(existing(dir, &name, false)?),
             trail,
             state,
             true,
@@ -344,7 +344,7 @@ fn predecessor_run(dir: &File, trail: [u8; 16]) -> Result<(Option<State>, bool),
     if exists(dir, "audit.jsonl")? && !linked_live(dir)? {
         let out = history_segment(
             Reaction::Stop,
-            &existing(dir, Path::new("audit.jsonl"), false)?,
+            storage::ByteSource::File(existing(dir, Path::new("audit.jsonl"), false)?),
             trail,
             state,
             true,
@@ -439,7 +439,11 @@ pub(crate) fn promote_resume(
         }
         _ => false,
     };
-    let valid = valid_file && scan_staged(staged, trail, prior, run).is_ok();
+    let valid = valid_file
+        && staged
+            .try_clone()
+            .ok()
+            .is_some_and(|f| scan_staged(storage::ByteSource::File(f), trail, prior, run).is_ok());
     if valid {
         if live {
             #[cfg(test)]
@@ -501,7 +505,9 @@ fn settle(dir: &File, trail: [u8; 16], poisoned: &AtomicBool) -> Result<(), Audi
                     == prior
                         .as_ref()
                         .map_or(0, |s| s.run.head.seq.saturating_add(1))
-                && scan_staged(&staged, trail, prior.clone(), run).is_ok()
+                && staged.try_clone().ok().is_some_and(|f| {
+                    scan_staged(storage::ByteSource::File(f), trail, prior.clone(), run).is_ok()
+                })
         });
         if valid {
             if exists(dir, "audit.jsonl")? {

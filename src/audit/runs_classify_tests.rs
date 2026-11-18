@@ -1731,3 +1731,212 @@ mod classify_first_equality {
         c
     }
 }
+
+// ============================================================
+// Issue #218: classify (Collect) propagates report-pass I/O errors.
+// ============================================================
+
+/// Each row drives `classify` under `Reaction::Collect` over a one-
+/// segment trail backed by a [`storage::ByteSource::Failing`] that the
+/// counter lets pass through the walker's seek/read/try_clone and then
+/// trips on the Collect report pass's own op. Before #218 the swallow
+/// turned each failure into an empty-span result; after the fix each
+/// one surfaces as [`AuditError::Io`] (ADR-0005 decision 11; rulings
+/// 13-V4-d5 (d), 107-d2, 107-d3). Each row reverts to a Vec-based
+/// swallow to show it is a real kill.
+mod classify_collect_io_tests {
+    use super::*;
+    use crate::audit::runs::{ClassifyArgs, ReaderPath, classify};
+    use crate::audit::storage::{ByteSource, ByteSourceFailure, SegmentSource};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// Minimal fixture: a sealed audit.jsonl containing exactly cp0 and
+    /// nothing else. Strict `history_segment(opening=true)` accepts it
+    /// as an archived-base initial checkpoint (ADR-0005 decision 2);
+    /// the walker then returns `Ok` and the Collect report pass runs
+    /// against the test seam.
+    fn classify_against_failing_sealed(
+        mode: ByteSourceFailure,
+        fail_at: usize,
+    ) -> Result<super::super::ClassifyOutput, AuditError> {
+        let d = Temp::new();
+        let _first = fixture(&d.0);
+        let dir = dirfile(&d.0);
+        let inner = fs::File::open(d.0.join("audit.jsonl")).unwrap();
+        let counter = Rc::new(Cell::new(0_usize));
+        let mut source =
+            SegmentSource::for_test_failing_sealed(&dir, inner, mode, counter, fail_at, false);
+        classify(
+            ClassifyArgs {
+                trail: TRAIL,
+                prior_state: None,
+            },
+            ReaderPath::LiveOpen { expected: None },
+            &mut source,
+            crate::audit::runs::Reaction::Collect,
+        )
+    }
+
+    fn classify_against_failing_live(
+        mode: ByteSourceFailure,
+        fail_at: usize,
+    ) -> Result<super::super::ClassifyOutput, AuditError> {
+        let d = Temp::new();
+        let _first = fixture(&d.0);
+        let dir = dirfile(&d.0);
+        let inner = fs::File::open(d.0.join("audit.jsonl")).unwrap();
+        let counter = Rc::new(Cell::new(0_usize));
+        let mut source = SegmentSource::for_test_failing_live(&dir, inner, mode, counter, fail_at);
+        classify(
+            ClassifyArgs {
+                trail: TRAIL,
+                prior_state: None,
+            },
+            ReaderPath::LiveOpen { expected: None },
+            &mut source,
+            crate::audit::runs::Reaction::Collect,
+        )
+    }
+
+    fn expect_io_err(result: Result<super::super::ClassifyOutput, AuditError>, reason: &str) {
+        match result {
+            Ok(_) => panic!("{reason}: expected Err, got Ok -- classify produced a report pass"),
+            Err(e) => assert_eq!(e.kind(), AuditErrorKind::Io, "{reason}: wrong kind"),
+        }
+    }
+
+    /// #218 row 1 (sealed arm): `span_handle = source.try_clone()?`
+    /// fails on the Nth=1st matching op. Fix: `classify` returns
+    /// Err(Io) because the `?` propagates. Mutant re-introducing
+    /// `.ok()`: span_handle = None, walker's 2nd try_clone passes,
+    /// walker Ok, Collect pass runs with span_handle = None producing
+    /// empty spans, classify returns Ok. KILL: fix Err vs mutant Ok.
+    #[test]
+    fn issue_218_classify_collect_propagates_try_clone_error_sealed() {
+        expect_io_err(
+            classify_against_failing_sealed(ByteSourceFailure::TryClone, 1),
+            "issue #218 kills the span_handle `.ok()` swallow on sealed arm",
+        );
+    }
+
+    /// #218 row 2 (live arm): same `span_handle` try_clone failure at
+    /// the Live arm, where `scan_closing` + the live-arm walker clone
+    /// run instead of `history_segment` + the strict clone. Second
+    /// distinct killer for the span_handle swallow mutant (the
+    /// mutated line is the same `span_handle` capture, exercised
+    /// through the Live walker call chain).
+    #[test]
+    fn issue_218_classify_collect_propagates_try_clone_error_live() {
+        expect_io_err(
+            classify_against_failing_live(ByteSourceFailure::TryClone, 1),
+            "issue #218 second killer for span_handle `.ok()` swallow",
+        );
+    }
+
+    /// #218 row 3 (sealed arm): the Collect report pass's seek-to-0
+    /// trips. Walker's own seek passes (counter advances past it);
+    /// `collect_segment_spans_and_records`'s `source.seek(Start(0))`
+    /// then fails. Fix: `?` propagates to `AuditError::Io`. Mutant
+    /// re-introducing `if seek.is_err() { return (Vec::new(), None); }`:
+    /// Collect returns the empty result, classify returns Ok. KILL.
+    #[test]
+    fn issue_218_classify_collect_propagates_seek_error_sealed() {
+        expect_io_err(
+            classify_against_failing_sealed(ByteSourceFailure::Seek, 2),
+            "issue #218 kills the seek swallow on sealed arm",
+        );
+    }
+
+    /// #218 row 4 (live arm): seek failure at the same semantic
+    /// position but through the Live arm's `scan_closing` chain.
+    /// Second distinct killer for the seek swallow mutant.
+    #[test]
+    fn issue_218_classify_collect_propagates_seek_error_live() {
+        expect_io_err(
+            classify_against_failing_live(ByteSourceFailure::Seek, 2),
+            "issue #218 second killer for the seek swallow",
+        );
+    }
+
+    /// #218 row 5 (sealed arm): the Collect report pass's
+    /// `verify::lines::stream` read trips. Walker's reads pass; the
+    /// Collect pass's BufReader fill trips. Fix: `.map_err(io_error)?`
+    /// propagates. Mutant re-introducing
+    /// `match spans { Err(_) => (Vec::new(), heads), .. }`: empty
+    /// spans, classify Ok. KILL.
+    #[test]
+    fn issue_218_classify_collect_propagates_read_error_sealed() {
+        expect_io_err(
+            classify_against_failing_sealed(ByteSourceFailure::Read, 3),
+            "issue #218 kills the lines::stream Err swallow on sealed arm",
+        );
+    }
+
+    /// #218 row 6 (live arm): read failure through the Live arm.
+    /// Second distinct killer for the lines::stream swallow mutant.
+    #[test]
+    fn issue_218_classify_collect_propagates_read_error_live() {
+        expect_io_err(
+            classify_against_failing_live(ByteSourceFailure::Read, 3),
+            "issue #218 second killer for the lines::stream Err swallow",
+        );
+    }
+
+    /// #218 row 7 (segment-index overflow, sealed File arm): drive
+    /// `collect_segment_spans_and_records` directly with an index
+    /// just past the `u32::MAX` cap through a working
+    /// `ByteSource::File` backed by an empty audit file. The seek to
+    /// byte 0 succeeds, then the checked `u32::try_from` errors. Fix:
+    /// `collect_segment_spans_and_records` returns `Err(Io)`. Mutant
+    /// re-introducing `u32::try_from(..).unwrap_or(u32::MAX)` silently
+    /// clamps to `u32::MAX`, `verify::lines::stream` streams the (empty)
+    /// bytes and returns `Ok((vec![], None))`, so the row sees `Ok`.
+    /// KILL on the `Err` vs `Ok` boundary.
+    #[test]
+    fn issue_218_collect_segment_spans_overflow_above_u32_max() {
+        use super::super::collect_segment_spans_and_records;
+        let d = Temp::new();
+        let path = d.0.join("audit.jsonl");
+        fs::write(&path, b"").unwrap();
+        let mut source = ByteSource::File(fs::File::open(&path).unwrap());
+        let r = collect_segment_spans_and_records(&mut source, TRAIL, (u32::MAX as usize) + 1);
+        match r {
+            Ok(_) => panic!(
+                "issue #218 kills the segment-index sentinel at u32::MAX + 1: \
+                 expected Err(Io), got Ok"
+            ),
+            Err(e) => assert_eq!(
+                e.kind(),
+                AuditErrorKind::Io,
+                "issue #218 segment-index overflow: wrong error kind"
+            ),
+        }
+    }
+
+    /// #218 row 8 (segment-index overflow, second index): same
+    /// checked-conversion kill, exercised at `usize::MAX` through a
+    /// `ByteSource::File` backed by a non-empty audit file. A second
+    /// distinct row so the mutant has two killers that each exercise
+    /// the checked `u32::try_from`.
+    #[test]
+    fn issue_218_collect_segment_spans_overflow_usize_max() {
+        use super::super::collect_segment_spans_and_records;
+        let d = Temp::new();
+        let path = d.0.join("audit.jsonl");
+        fs::write(&path, b"some bytes\n").unwrap();
+        let mut source = ByteSource::File(fs::File::open(&path).unwrap());
+        let r = collect_segment_spans_and_records(&mut source, TRAIL, usize::MAX);
+        match r {
+            Ok(_) => panic!(
+                "issue #218 kills the segment-index sentinel at usize::MAX: \
+                 expected Err(Io), got Ok"
+            ),
+            Err(e) => assert_eq!(
+                e.kind(),
+                AuditErrorKind::Io,
+                "issue #218 segment-index overflow usize::MAX: wrong error kind"
+            ),
+        }
+    }
+}

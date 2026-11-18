@@ -62,7 +62,7 @@ fn public_receipt_checkpoint_and_close_roundtrip() {
     let mut found = None;
     let storage::SegmentOutcome { state, .. } = storage::scan(
         crate::audit::runs::Reaction::Stop,
-        &fs::File::open(temp.0.join("audit.jsonl")).unwrap(),
+        storage::ByteSource::File(fs::File::open(temp.0.join("audit.jsonl")).unwrap()),
         receipt.trail(),
         None,
         true,
