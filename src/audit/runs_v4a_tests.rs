@@ -2522,12 +2522,13 @@ fn live_resume_wrong_head_hash_classes_live_damaged() {
 /// Minimal strict-pass layout: `S0=[cp0, e1]` (sealed with an
 /// unsealed exit) and `live=[cp2, resume(e1)]`. Live is reached
 /// by `scan_closing` (strict); `ctx.run` is false entering live
-/// and no violation is recorded. Pins that an accepted closing-
-/// shape resume at `count == 1` on this two-segment layout
-/// classes live as `Base` with no closed run (`classes == [Base,
-/// Base]`, `violations.is_empty()`, `runs.is_empty()`).
+/// and no violation is recorded. Pins that an accepted
+/// strict-pass resume (gated by `ctx.run && boundary_resume &&
+/// !first && is_resume`) on this two-segment layout classes
+/// live as `Base` with no closed run (`classes == [Base, Base]`,
+/// `violations.is_empty()`, `runs.is_empty()`).
 #[test]
-fn tolerant_closer_without_open_run_live_is_base() {
+fn strict_closer_without_open_run_live_is_base() {
     let d = Temp::new();
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
     let e1 = entry_rec(1, cp0.hash());
@@ -2537,23 +2538,23 @@ fn tolerant_closer_without_open_run_live_is_base() {
     let cp2 = signed_cp(2, e1.hash(), &fold);
     let resume = resume_decl(&cp2, e1.context.seq, e1.hash(), e1.context.seq);
     write_records(&d.0, &[&cp2, &resume]);
-    TrailReader::open(&d.0, TRAIL, None).expect("tolerant-closer-no-open-run: reader Ok");
+    TrailReader::open(&d.0, TRAIL, None).expect("strict-closer-no-open-run: reader Ok");
     let out = classify_collect(&d.0);
     assert!(
         out.violations.is_empty(),
-        "tolerant-closer-no-open-run: no violations"
+        "strict-closer-no-open-run: no violations"
     );
     use super::SegmentClass::Base;
     let classes: Vec<super::SegmentClass> = out.segments.iter().map(|s| s.class).collect();
     assert_eq!(
         classes,
         vec![Base, Base],
-        "tolerant-closer-no-open-run: live is Base (tolerant closer \
+        "strict-closer-no-open-run: live is Base (strict closer \
          without an open run must NOT latch closed_run)",
     );
     assert!(
         out.runs.is_empty(),
-        "tolerant-closer-no-open-run: no closed runs"
+        "strict-closer-no-open-run: no closed runs"
     );
 }
 
@@ -2903,10 +2904,11 @@ fn tolerant_resume_without_open_run_second_layout() {
 ///
 /// At head: `classes == [Base, InRun, Damaged, Base]` (S2 is
 /// `Damaged` because the walker records the rejected resume and
-/// does NOT latch `closed_run`; live is `Base` because `apply_checked`
-/// rejected the resume so state.head stayed at cp6 and cp8's
-/// `previous = wrong.hash()` is behind the state head, which
-/// `apply_checked` records as `RecordRolledBack` at (3, 0)).
+/// does NOT latch `closed_run`; live is `Base` because `run` is
+/// false entering and leaving it; its `damage` is true because
+/// state.head stayed at cp6 (seq 6) and cp8 (seq 8) links to the
+/// rejected resume's hash rather than cp6's, which `apply_checked`
+/// records as `RecordRolledBack` (broken hash link) at (3, 0)).
 /// `run_membership == [None, None, None, None]`, `runs` empty
 /// (addendum 28.2 clears runs on violations). A mutant moving
 /// the tolerant latch above `apply_checked` classes S2 as
@@ -2968,7 +2970,10 @@ fn tolerant_latch_after_apply_rejected_resume_classes_damaged() {
             ),
         ],
         "tolerant-reject-apply: literal violation list (S2's rejected \
-         resume + live's rolled-back cp8 behind the unadvanced head)",
+         resume at (2, 1), plus `RecordRolledBack` at (3, 0) because \
+         state.head stayed at cp6 and live's cp8 links to the rejected \
+         resume's hash rather than cp6's -- a broken hash link, not a \
+         seq rollback)",
     );
     let membership: Vec<Option<usize>> = out.segments.iter().map(|s| s.run_membership).collect();
     assert_eq!(
@@ -2983,15 +2988,18 @@ fn tolerant_latch_after_apply_rejected_resume_classes_damaged() {
 }
 
 /// Second distinct killer for the tolerant latch-before-apply
-/// mutant: the same layout as
-/// `tolerant_latch_after_apply_rejected_resume_classes_damaged`
-/// with ONLY S2's resume `lost_through` field changed (5 -> 99).
-/// The rejection reason inside `apply_checked` is a different
-/// disjunct of `ResumeDeclarationDoesNotDescribeGap` (bound
-/// mismatch rather than hash mismatch); the full report at head
-/// matches the wrong-hash row byte-for-byte (`classes`, violations,
-/// membership, `runs`), so the latch-before-apply mutant must die
-/// on either row for a distinct concrete reason.
+/// mutant, same four-segment shape as
+/// `tolerant_latch_after_apply_rejected_resume_classes_damaged`.
+/// Here S2's resume names the CORRECT head hash (`cp5.hash()`)
+/// but a wrong `lost_through = 99` (against `cp0.hash()` / 5 in
+/// the wrong-hash row), and the tail bytes differ
+/// (`"garbage-tail\n"` against `"not json\n"`); the rejection
+/// inside `apply_checked` is therefore a different disjunct of
+/// `ResumeDeclarationDoesNotDescribeGap` (bound mismatch rather
+/// than hash mismatch). The full report at head still matches
+/// the wrong-hash row (`classes`, violations, membership,
+/// `runs`), so the latch-before-apply mutant must die on either
+/// row for a distinct concrete reason.
 #[test]
 fn tolerant_latch_after_apply_wrong_lost_through_classes_damaged() {
     let d = Temp::new();
@@ -3048,8 +3056,10 @@ fn tolerant_latch_after_apply_wrong_lost_through_classes_damaged() {
             ),
         ],
         "tolerant-reject-apply-lost: literal violation list matches the \
-         wrong-hash row (same `ResumeDeclarationDoesNotDescribeGap` \
-         violation and same trailing `RecordRolledBack` at live)",
+         wrong-hash row (S2's rejected resume at (2, 1), plus \
+         `RecordRolledBack` at (3, 0) because state.head stayed at cp6 \
+         and live's cp8 links to the rejected resume's hash rather than \
+         cp6's -- a broken hash link, not a seq rollback)",
     );
     let membership: Vec<Option<usize>> = out.segments.iter().map(|s| s.run_membership).collect();
     assert_eq!(
