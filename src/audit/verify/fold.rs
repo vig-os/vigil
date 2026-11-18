@@ -65,27 +65,22 @@ pub(super) fn check_runs(collection: &Collection, trail: [u8; 16], findings: &mu
     // `ClassifyOutput::runs` (no segment, no closer).
     //
     // Ruling 13-V4-d8 point 4 (classifier `Err` audit on a
-    // `for_snapshot` source under `Reaction::Collect` at this head):
-    // the only `?` in `runs::classify` that can surface an `Err` is
-    // `collect_segment_spans_and_records` (`src/audit/runs.rs:1061`)
-    // via `u32::try_from(segment_index)` at `runs.rs:1066`. Every
-    // other `?` goes through `storage::ByteSource::Memory`, whose
-    // `try_clone` / `seek` / `read` paths (`storage.rs:476` /
-    // `:549` / `:522`) are all infallible on an in-memory cursor;
-    // the walker's tolerant fallback in `runs::history_segment`
-    // (`runs.rs:614`) catches `CorruptTrail` for Collect and the
-    // strict pass sees no I/O error; and `source.next_segment()` on
-    // a `Snapshot` plan step (`storage.rs:1006`) only returns `Ok`.
-    // The `u32::try_from` path overflows only on a crafted
-    // `Collection` with 2^32 + 1 native segments (≥ 4 GiB of
-    // `Vec<Input>` and `BTreeMap<Inode, …>` entries built in
-    // `input::collect` before `check_runs` ever runs), which is
-    // unreachable from any crafted input the verifier could
-    // actually produce. One `expect` therefore documents the
-    // construction argument instead of silently swallowing the
-    // unreachable `Err`; its path is driven by every run-emitting
-    // row in `src/audit/verify/runs_tests.rs` (R1..R13 each enter
-    // this `expect` through `Verifier::verify_*`).
+    // `for_snapshot` source under `Reaction::Collect`): the only `?`
+    // in `runs::classify` that can surface an `Err` is
+    // `runs::collect_segment_spans_and_records`, via
+    // `u32::try_from(segment_index)`. Every other `?` goes through
+    // `storage::ByteSource::Memory`, whose `try_clone` / `seek` /
+    // `read` paths are all infallible on an in-memory cursor; the
+    // walker's tolerant fallback in `runs::history_segment` catches
+    // `CorruptTrail` for Collect; and `source.next_segment()` on a
+    // `PlanStep::Snapshot` only returns `Ok`. The `u32::try_from`
+    // path overflows only on a crafted `Collection` with more than
+    // `u32::MAX` native segments (≥ 4 GiB of `Vec<Input>` and
+    // `BTreeMap<Inode, …>` entries built in `input::collect` before
+    // `check_runs` ever runs), unreachable from any crafted input
+    // the verifier could actually produce. One `expect` therefore
+    // documents the construction argument; every run-emitting row in
+    // `src/audit/verify/runs_tests.rs` enters it on the Ok side.
     let out = runs::classify(
         ClassifyArgs {
             trail,
@@ -97,11 +92,11 @@ pub(super) fn check_runs(collection: &Collection, trail: [u8; 16], findings: &mu
     )
     .expect(
         "runs::classify on a SegmentSource::for_snapshot under Reaction::Collect \
-         is Err only on `u32::try_from(segment_index)` in \
-         `runs::collect_segment_spans_and_records` (runs.rs:1066), which overflows \
-         only above u32::MAX native segments — unreachable from any Collection \
+         is Err only on `u32::try_from(segment_index)` inside \
+         `runs::collect_segment_spans_and_records`, which overflows only above \
+         u32::MAX native segments — unreachable from any Collection \
          `input::collect` could build. ByteSource::Memory's try_clone/seek/read \
-         (storage.rs:476/549/522) are infallible on an in-memory cursor.",
+         are infallible on an in-memory cursor.",
     );
     for run in &out.runs {
         emit_run_finding(&natives, collection, trail, run, findings);
@@ -135,9 +130,9 @@ fn emit_run_finding(
         .find(|r| r.trail == trail)
         .map_or((None, None), |r| (Some(r.line), Some(r.seq)));
     // Ruling 13-V4-d8 point 1: ranges then spans then digest. Ranges
-    // in `seq` order come from `run.loss_points`'s own order
-    // (`runs.rs:1570` pushes them in walk order, which is `seq`
-    // order; addendum 28 point 2 drops the whole run on arithmetic
+    // in `seq` order come from `run.loss_points`'s own order (the
+    // classifier pushes them in walk order, which is `seq` order;
+    // 197-d1 addendum 28 point 2 drops the whole run on arithmetic
     // overflow before any range is pushed).
     let ranges: Vec<(u64, u64)> = run
         .loss_points
