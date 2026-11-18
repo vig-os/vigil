@@ -858,11 +858,8 @@ pub(crate) struct ClassifyOutput {
     /// #197 ruling addendum 25.5: one [`RunReport`] per closed run,
     /// covering first_segment..=last_segment of the preceding
     /// [`segments`](Self::segments). Empty when the trail has no
-    /// closed run.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
-    )]
+    /// closed run. Consumed by `crate::audit::verify::fold::check_runs`
+    /// (#13 V4a).
     pub(crate) runs: Vec<RunReport>,
 }
 
@@ -968,19 +965,22 @@ pub(crate) struct SegmentReport {
 
 /// #197 ruling addendum 25.5: one entry per closed run. Spans the
 /// range `first_segment..=last_segment` of
-/// [`ClassifyOutput::segments`]. Every field is only read by the
-/// V4a walk at this head (the run-grouping loop in `classify` uses
-/// local `usize` variables, not these fields).
+/// [`ClassifyOutput::segments`]. `first_segment`, `loss_points` and
+/// `spans` are consumed by
+/// `crate::audit::verify::fold::check_runs` (#13 V4a); `last_segment`
+/// and `closing_opening` wait for #13 V4b's MMR fold and
+/// opening-vs-rule-2 check.
 #[derive(Clone)]
 pub(crate) struct RunReport {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
-    )]
+    /// Base index of the run's first segment in
+    /// [`ClassifyOutput::segments`]. V4a reads it to recover the
+    /// segment's path and first record (ruling 13-V4-d5 (a),
+    /// 13-V4-d8 point 5) through `Collection::native_segments()`,
+    /// whose parallel order is guaranteed by construction.
     pub(crate) first_segment: usize,
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
+        expect(dead_code, reason = "read by #13 V4b's opening/rule-2 compare")
     )]
     pub(crate) last_segment: usize,
     /// `Some(head)` of the closer's opening checkpoint (ADR (i));
@@ -988,24 +988,17 @@ pub(crate) struct RunReport {
     /// [`Reaction::Collect`] when the trail never reached a closer.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
+        expect(dead_code, reason = "read by #13 V4b's opening/rule-2 compare")
     )]
     pub(crate) closing_opening: Option<Head>,
     /// Loss points in run-walk order. Each `(first, count)` pair feeds
-    /// `verify::lines::run_digest`'s ranges. V4a pins equality against
-    /// the digest at this head.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
-    )]
+    /// `verify::lines::run_digest`'s ranges. Consumed by
+    /// `crate::audit::verify::fold::check_runs` (#13 V4a).
     pub(crate) loss_points: Vec<LossPoint>,
     /// Spans concatenated per segment with each span's `seg`
     /// rewritten to the run-local segment index (ruling 13-V4-d2
-    /// point 2).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
-    )]
+    /// point 2). Consumed by
+    /// `crate::audit::verify::fold::check_runs` (#13 V4a).
     pub(crate) spans: Vec<super::verify::lines::Span>,
 }
 

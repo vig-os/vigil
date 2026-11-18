@@ -291,6 +291,16 @@ mod trail_tests;
 #[cfg(test)]
 mod schema_writer_tests;
 
+/// V4a fixture seam (rulings 13-V4-d3, 13-V4-d4, 13-V4-d5, 13-V4-d6,
+/// 13-V4-d8): the A1 / A3 / A8 / A9 layout builders, their helpers
+/// and captured run-digest literals, shared by both V4a readers --
+/// `runs::classify_v4a_walk` (classify-level pins) and
+/// `verify::runs_tests` (V4a verifier rows through `Verifier::verify_*`).
+/// Duplicating this fixture code across the two consumers is a
+/// review blocker.
+#[cfg(test)]
+pub(crate) mod runs_v4a_fixtures;
+
 /// Starts the decision-5 gap digest shared by storage and verifier spans.
 pub(crate) fn gap_hasher() -> blake3::Hasher {
     let mut hash = blake3::Hasher::new();

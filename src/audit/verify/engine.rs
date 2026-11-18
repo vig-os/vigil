@@ -13,7 +13,7 @@
 //! attributed to the native copy when present; a malformed declaration leaves
 //! any `SeqGap` the chain loop emitted.
 use super::{
-    Finding, Report,
+    Finding, Report, fold,
     input::{Collection, Input, LineContent, Summary},
     resume,
 };
@@ -459,6 +459,17 @@ pub(super) fn check(collection: Collection, trail: [u8; 16]) -> Report {
     // Validated structural-resume tuples (ruling 13-V3-d5 points 1, 5, 10);
     // consumed by #13 V4 (rule 2 fold), V6 (start) and V7 (confirmation).
     let _pending_resumes = resume::candidates(&declarations);
+    // #13 V4a (rulings 13-V4-d3, 13-V4-d4, 13-V4-d5, 13-V4-d6, 13-V4-d8):
+    // one `SegmentStructure` run finding per closed run the shared
+    // classifier returns under `Reaction::Collect` over the
+    // verifier's confirmed snapshot. The classifier runs once, over
+    // the already-retained native bytes (`input::collect` with
+    // `keep_bytes = native(path)`) through
+    // `storage::SegmentSource::for_snapshot`, which opens nothing.
+    // Shipped-copy runs are out of scope (owner decision 13-V4-d7;
+    // spike #224); runs that rejection empties keep no finding
+    // (addendum 28 point 2).
+    fold::check_runs(&collection, trail, &mut findings);
     let first_seq = groups.first_key_value().map(|(&s, _)| s);
     let last_seq = groups.last_key_value().map(|(&s, _)| s);
     if let (Some(first), Some(last)) = (first_seq, last_seq) {
