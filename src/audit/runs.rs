@@ -1021,22 +1021,33 @@ struct RecordHeadInfo {
 /// is kept. Classify re-runs this pass once per segment under
 /// Collect, so no loss-point arithmetic lives on the Stop path. The
 /// file handle is sought to byte 0 by the walker.
-fn collect_segment_spans_and_records(
-    file: &mut std::fs::File,
-    trail: [u8; 16],
-    segment_index: usize,
-) -> (
+///
+/// Issue #218: every I/O failure in this report pass propagates out
+/// of `classify` as `AuditError::Io`, instead of being swallowed into
+/// an empty-span, empty-heads result that silently makes a well-
+/// formed but wrong digest (ADR-0005 decision 11; rulings 13-V4-d5
+/// (d), 107-d2, 107-d3). The segment-index conversion is checked and
+/// propagates as `AuditError::Io` on overflow; no `u32::MAX` sentinel.
+type SegmentSpansAndHeads = (
     Vec<super::verify::lines::Span>,
     Option<(RecordHeadInfo, RecordHeadInfo)>,
-) {
+);
+
+fn collect_segment_spans_and_records(
+    source: &mut storage::ByteSource,
+    trail: [u8; 16],
+    segment_index: usize,
+) -> Result<SegmentSpansAndHeads, AuditError> {
     use std::io::{BufReader, Seek, SeekFrom};
-    if file.seek(SeekFrom::Start(0)).is_err() {
-        return (Vec::new(), None);
-    }
-    let reader = BufReader::new(file);
+    source.seek(SeekFrom::Start(0)).map_err(storage::io_error)?;
+    let reader = BufReader::new(source);
     let mut first: Option<RecordHeadInfo> = None;
     let mut last: Option<RecordHeadInfo> = None;
-    let seg_u32: u32 = u32::try_from(segment_index).unwrap_or(u32::MAX);
+    let seg_u32: u32 = u32::try_from(segment_index).map_err(|_| {
+        storage::io_error(std::io::Error::other(format!(
+            "segment index {segment_index} overflows u32",
+        )))
+    })?;
     let spans = super::verify::lines::stream(reader, seg_u32, |item| {
         if let super::verify::lines::Content::Records(recs) = &item.content {
             for r in recs {
@@ -1053,12 +1064,10 @@ fn collect_segment_spans_and_records(
                 }
             }
         }
-    });
+    })
+    .map_err(storage::io_error)?;
     let heads = first.zip(last);
-    match spans {
-        Ok(v) => (v, heads),
-        Err(_) => (Vec::new(), heads),
-    }
+    Ok((spans, heads))
 }
 
 /// Ruling 197-d1 addendum 25.1 and addendum 27.1: THE ONE multi-segment
@@ -1164,36 +1173,74 @@ pub(crate) fn classify(
         };
         let run_in_before = run;
         // Addendum 25.5 (spans/records): under Collect, clone the
-        // segment's file handle BEFORE the walker consumes it so a
+        // segment's byte source BEFORE the walker consumes it so a
         // second seek-to-0 pass through `verify::lines::stream` can
         // produce the per-segment spans + record head list the
         // RunReport needs. The clone is independent in Rust's
         // `std::fs::File::try_clone` contract (an OS-level `dup`).
-        let span_handle: Option<std::fs::File> = if build_reports {
-            match &seg {
-                SegmentRead::Sealed { file, .. } | SegmentRead::Live(file) => file.try_clone().ok(),
-            }
+        //
+        // Issue #218: a failure here previously dropped the span pass
+        // silently (`file.try_clone().ok()`), leaving a well-formed
+        // but incomplete `RunReport` whose digest a reviewer could
+        // `accept-run` on. Under Collect the failure now propagates
+        // out of `classify` as an `AuditError::Io` (ADR-0005 decision
+        // 11; rulings 13-V4-d5 (d), 107-d2, 107-d3).
+        let span_handle: Option<storage::ByteSource> = if build_reports {
+            let cloned = match &seg {
+                SegmentRead::Sealed { source, .. } | SegmentRead::Live(source) => {
+                    source.try_clone().map_err(storage::io_error)?
+                }
+            };
+            Some(cloned)
         } else {
             None
         };
         let (next_state, seg_violations, closed_run, live) = match (path, seg) {
-            (ReaderPath::LiveOpen { expected }, SegmentRead::Sealed { file, .. }) => {
+            (ReaderPath::LiveOpen { expected }, SegmentRead::Sealed { source, .. }) => {
                 let out = storage::history_segment(
-                    reaction, &file, trail, in_state, true, expected, &mut found, &mut run,
+                    reaction, source, trail, in_state, true, expected, &mut found, &mut run,
                 )?;
                 (out.state, out.violations, out.closed_run, None)
             }
-            (ReaderPath::LiveOpen { expected }, SegmentRead::Live(file)) => {
+            (ReaderPath::LiveOpen { expected }, SegmentRead::Live(source)) => {
+                // Preserve a `File` handle for `ClassifyOutput::live_file`
+                // (the reader stashes it in `Cache::file`). Clone first;
+                // the walker consumes the clone.
+                let walker_source = source.try_clone().map_err(storage::io_error)?;
                 let out = storage::scan_closing(
-                    reaction, &file, trail, in_state, expected, &mut found, run,
+                    reaction,
+                    walker_source,
+                    trail,
+                    in_state,
+                    expected,
+                    &mut found,
+                    run,
                 )?;
-                (out.state, out.violations, out.closed_run, Some(file))
+                (
+                    out.state,
+                    out.violations,
+                    out.closed_run,
+                    Some(source.into_file()),
+                )
             }
-            (ReaderPath::RefreshAppend, SegmentRead::Live(file)) => {
+            (ReaderPath::RefreshAppend, SegmentRead::Live(source)) => {
+                let walker_source = source.try_clone().map_err(storage::io_error)?;
                 let out = storage::scan(
-                    reaction, &file, trail, in_state, false, None, &mut found, false,
+                    reaction,
+                    walker_source,
+                    trail,
+                    in_state,
+                    false,
+                    None,
+                    &mut found,
+                    false,
                 )?;
-                (out.state, out.violations, out.closed_run, Some(file))
+                (
+                    out.state,
+                    out.violations,
+                    out.closed_run,
+                    Some(source.into_file()),
+                )
             }
             (ReaderPath::RefreshAppend, SegmentRead::Sealed { .. }) => {
                 // `SegmentSource::for_refresh_append` yields only a
@@ -1205,31 +1252,44 @@ pub(crate) fn classify(
             (
                 ReaderPath::RefreshRotate,
                 SegmentRead::Sealed {
-                    file,
+                    source,
                     prelude: true,
                 },
             ) => {
                 let out = storage::history_segment(
-                    reaction, &file, trail, in_state, false, None, &mut found, &mut run,
+                    reaction, source, trail, in_state, false, None, &mut found, &mut run,
                 )?;
                 (out.state, out.violations, out.closed_run, None)
             }
             (
                 ReaderPath::RefreshRotate,
                 SegmentRead::Sealed {
-                    file,
+                    source,
                     prelude: false,
                 },
             ) => {
                 let out = storage::history_segment(
-                    reaction, &file, trail, in_state, true, None, &mut found, &mut run,
+                    reaction, source, trail, in_state, true, None, &mut found, &mut run,
                 )?;
                 (out.state, out.violations, out.closed_run, None)
             }
-            (ReaderPath::RefreshRotate, SegmentRead::Live(file)) => {
-                let out =
-                    storage::scan_closing(reaction, &file, trail, in_state, None, &mut found, run)?;
-                (out.state, out.violations, out.closed_run, Some(file))
+            (ReaderPath::RefreshRotate, SegmentRead::Live(source)) => {
+                let walker_source = source.try_clone().map_err(storage::io_error)?;
+                let out = storage::scan_closing(
+                    reaction,
+                    walker_source,
+                    trail,
+                    in_state,
+                    None,
+                    &mut found,
+                    run,
+                )?;
+                (
+                    out.state,
+                    out.violations,
+                    out.closed_run,
+                    Some(source.into_file()),
+                )
             }
         };
         // Ruling 197-d1 addendum 28 point 1: per-segment report work
@@ -1273,12 +1333,17 @@ pub(crate) fn classify(
             // Ruling 197-d1 addendum 25.5: rewind the dup handle to
             // byte 0 so `verify::lines::stream` sets `after =
             // u64::MAX` on each segment's first span (13-V4-d2 point
-            // 2). On I/O failure we silently drop this segment's
-            // spans and records -- they are a report input, not a
-            // reader invariant.
-            let (spans, heads) = span_handle
-                .map(|mut f| collect_segment_spans_and_records(&mut f, trail, segment_index))
-                .unwrap_or((Vec::new(), None));
+            // 2). Issue #218: an I/O failure here propagates out of
+            // `classify` so no `ClassifyOutput` is produced from a
+            // partial pass. `span_handle` is `Some` by construction
+            // here: it is built in the same `if build_reports` gate
+            // above and never touched elsewhere, so the `expect`
+            // documents the invariant and never fires.
+            let mut s = span_handle.expect(
+                "span_handle is Some under Reaction::Collect by construction: \
+                 it is built in the same `if build_reports` gate above",
+            );
+            let (spans, heads) = collect_segment_spans_and_records(&mut s, trail, segment_index)?;
             seg_spans.push(spans);
             seg_records.push(heads);
             let run_out = run;
@@ -1399,7 +1464,24 @@ pub(crate) fn classify(
                         .skip(first_segment)
                         .map(|(k, s)| (k - first_segment, s))
                     {
-                        let local: u32 = u32::try_from(local_idx).unwrap_or(u32::MAX);
+                        // `local_idx = k - first_segment` with k in
+                        // `[first_segment, last_segment]`, so
+                        // `local_idx <= seg_spans.len() - 1`.
+                        // `seg_spans` is only pushed to after the
+                        // checked `u32::try_from(segment_index)` in
+                        // `collect_segment_spans_and_records`
+                        // succeeds, so every pushed segment's index
+                        // fits in u32 and `seg_spans.len() - 1 <=
+                        // u32::MAX`. The conversion is therefore
+                        // total and the `expect` documents the
+                        // invariant instead of saturating to a
+                        // sentinel.
+                        let local: u32 = u32::try_from(local_idx).expect(
+                            "run-local segment index fits in u32: the outer \
+                             `collect_segment_spans_and_records` only pushes \
+                             a span vector after `u32::try_from(segment_index)` \
+                             succeeds, so `seg_spans.len() <= u32::MAX + 1`",
+                        );
                         for sp in seg_spans_k {
                             let mut sp2 = sp.clone();
                             sp2.seg = local;

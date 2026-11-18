@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A read error while building the classifier's run reports under `Reaction::Collect` is now an `AuditError::Io`, not a silently empty-span result that would otherwise pin a well-formed but wrong digest (ADR-0005 decision 11; rulings 13-V4-d5 (d), 107-d2, 107-d3; #218).
+
 ### Security
 
 ## [0.2.0](https://github.com/vig-os/vigil/releases/tag/0.2.0) - 2026-11-02

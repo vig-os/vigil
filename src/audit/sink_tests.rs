@@ -2939,7 +2939,7 @@ fn resume_discovery_requires_full_validation_before_writing() {
     let file = existing(&dir, &names[0], false).unwrap();
     let mut state = history_segment(
         crate::audit::runs::Reaction::Stop,
-        &file,
+        crate::audit::storage::ByteSource::File(file),
         writer.trail,
         None,
         true,
