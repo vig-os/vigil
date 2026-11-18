@@ -392,12 +392,26 @@ pub(crate) fn existing(dir: &File, name: &Path, writable: bool) -> Result<File, 
 /// Carried owned through [`SegmentRead`] and consumed by
 /// [`SegmentBytes::new`]; cloneable so that the strict pass, the lazy
 /// tolerant pass, and `classify`'s Collect report pass each hold their
-/// own handle. Cloning is a `File::try_clone()` on this variant (an
-/// OS-level `dup`). Rulings 13-V4-d5 (b) and 13-V4-d6 point 1 fix the
+/// own handle. On the `File` variant cloning is a `File::try_clone()`
+/// (a POSIX `dup`; the two `File`s then share one OS file offset,
+/// which is fine because every walker seeks its own source before
+/// each read). Rulings 13-V4-d5 (b) and 13-V4-d6 point 1 fix the
 /// `Read` / `Seek` / `try_clone` contract so a non-file variant can be
 /// added without widening it.
 pub(crate) enum ByteSource {
     File(File),
+    /// Rulings 13-V4-d5 (b) and 13-V4-d6 point 1: shared bytes the
+    /// verifier's [`super::verify::input::collect`] already read from
+    /// disk, so the segment source opens the file zero times for the
+    /// classify pass over its confirmed snapshot. `Rc<[u8]>` holds the
+    /// bytes once; each [`try_clone`](ByteSource::try_clone) makes a
+    /// fresh [`std::io::Cursor`] at offset 0 over the same `Rc` --
+    /// the two cursors are independent (`File::try_clone`, by
+    /// contrast, is a POSIX `dup` and the two `File` objects share a
+    /// single OS file offset; both arms are consistent because the
+    /// walker seeks the source to its intended offset before every
+    /// read, see [`SegmentBytes::ensure_reader`]).
+    Memory(std::io::Cursor<std::rc::Rc<[u8]>>),
     /// Test seam for ruling 13-V4-d5 (d) and issue #218: the Collect
     /// report pass must surface I/O errors instead of swallowing them.
     /// `counter` is a shared pre-increment counter that trips exactly
@@ -450,9 +464,21 @@ fn check_or_fail(
 }
 
 impl ByteSource {
+    /// Rulings 13-V4-d5 (b) and 13-V4-d6 point 1: construct a
+    /// `ByteSource::Memory` from the verifier's retained bytes. Opens
+    /// nothing, writes nothing; the walker reads via
+    /// [`std::io::Cursor`] and the shared `Rc<[u8]>` keeps the bytes
+    /// alive for every clone.
+    pub(crate) fn memory(bytes: std::rc::Rc<[u8]>) -> Self {
+        ByteSource::Memory(std::io::Cursor::new(bytes))
+    }
+
     pub(crate) fn try_clone(&self) -> io::Result<ByteSource> {
         match self {
             ByteSource::File(f) => Ok(ByteSource::File(f.try_clone()?)),
+            ByteSource::Memory(cursor) => Ok(ByteSource::Memory(std::io::Cursor::new(
+                std::rc::Rc::clone(cursor.get_ref()),
+            ))),
             #[cfg(test)]
             ByteSource::Failing {
                 inner,
@@ -477,15 +503,19 @@ impl ByteSource {
         }
     }
 
-    /// Extract the underlying `File`. Used by `runs::classify`'s live
-    /// arms to populate `ClassifyOutput::live_file` (which the reader
-    /// stashes in `Cache::file`). Production has only the `File`
-    /// variant; the test seam variant carries one too.
-    pub(crate) fn into_file(self) -> File {
+    /// Extract the underlying `File` when one exists. Used by
+    /// `runs::classify`'s live arms to populate
+    /// `ClassifyOutput::live_file` (which the reader stashes in
+    /// `Cache::file`). Returns `None` for `Memory`: snapshot plans
+    /// read bytes the verifier already captured, so there is no
+    /// writable handle for the reader to cache (snapshot plans only
+    /// drive `Reaction::Collect`, which never stashes the file).
+    pub(crate) fn into_file(self) -> Option<File> {
         match self {
-            ByteSource::File(f) => f,
+            ByteSource::File(f) => Some(f),
+            ByteSource::Memory(_) => None,
             #[cfg(test)]
-            ByteSource::Failing { inner, .. } => inner,
+            ByteSource::Failing { inner, .. } => Some(inner),
         }
     }
 }
@@ -494,6 +524,7 @@ impl Read for ByteSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             ByteSource::File(f) => f.read(buf),
+            ByteSource::Memory(cursor) => cursor.read(buf),
             #[cfg(test)]
             ByteSource::Failing {
                 inner,
@@ -518,6 +549,7 @@ impl Seek for ByteSource {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match self {
             ByteSource::File(f) => f.seek(pos),
+            ByteSource::Memory(cursor) => cursor.seek(pos),
             #[cfg(test)]
             ByteSource::Failing {
                 inner,
@@ -693,7 +725,12 @@ impl SegmentBytes {
 /// loops in `initial_record` and `refresh` drive it; S3b1b moves the
 /// loops themselves into `runs::classify`.
 pub(crate) struct SegmentSource<'dir> {
-    dir: &'dir File,
+    /// `Some` for file-backed plans (live-open / refresh-append /
+    /// refresh-rotate / the test seams). `None` for snapshot plans
+    /// from [`SegmentSource::for_snapshot`], which open nothing and
+    /// need no directory handle (ruling 13-V4-d5 (b)). Each file-
+    /// opening plan arm requires it; snapshot arms never read it.
+    dir: Option<&'dir File>,
     plan: Vec<PlanStep>,
     cursor: usize,
     cached: Option<File>,
@@ -722,6 +759,18 @@ enum PlanStep {
     /// The live file (`audit.jsonl`), opened writable = true
     /// (`scan_closing`).
     ClosingLive,
+    /// Rulings 13-V4-d5 (b) and 13-V4-d6 point 2: one segment backed
+    /// by the verifier's retained bytes (`Rc<[u8]>` shared through
+    /// [`ByteSource::Memory`]). `is_live` picks the yield: `true`
+    /// hands back [`SegmentRead::Live`], `false` hands back
+    /// [`SegmentRead::Sealed`] with `prelude: false`. No file is
+    /// opened. A snapshot without a live file (`is_live` `false` on
+    /// every step) is the archive case: the walker ends when the
+    /// plan does, and the classifier owns closure semantics.
+    Snapshot {
+        bytes: std::rc::Rc<[u8]>,
+        is_live: bool,
+    },
     /// Test seam (issue #218): the sole segment is a sealed
     /// [`ByteSource::Failing`]; no file is opened.
     #[cfg(test)]
@@ -765,7 +814,7 @@ impl<'dir> SegmentSource<'dir> {
         let mut plan: Vec<PlanStep> = names.into_iter().map(PlanStep::Rotated).collect();
         plan.push(PlanStep::ClosingLive);
         Ok(Self {
-            dir,
+            dir: Some(dir),
             plan,
             cursor: 0,
             cached: None,
@@ -781,7 +830,7 @@ impl<'dir> SegmentSource<'dir> {
     pub(crate) fn for_refresh_append(dir: &'dir File, cache: &Cache) -> Result<Self, AuditError> {
         let cached = cache.file.try_clone().map_err(io_error)?;
         Ok(Self {
-            dir,
+            dir: Some(dir),
             plan: vec![PlanStep::CachedLive],
             cursor: 0,
             cached: Some(cached),
@@ -802,7 +851,7 @@ impl<'dir> SegmentSource<'dir> {
         let cached = cache.file.try_clone().map_err(io_error)?;
         let old = cache.file.metadata().map_err(io_error)?;
         Ok(Self {
-            dir,
+            dir: Some(dir),
             plan: vec![PlanStep::CachedPrelude],
             cursor: 0,
             cached: Some(cached),
@@ -814,6 +863,42 @@ impl<'dir> SegmentSource<'dir> {
             #[cfg(test)]
             test_failing: None,
         })
+    }
+
+    /// Rulings 13-V4-d5 (b) and 13-V4-d6 point 2: build a plan over
+    /// the verifier's confirmed native segments (ruling 13-V3-d2's
+    /// one-snapshot rule). Each entry becomes one
+    /// [`PlanStep::Snapshot`]; the source opens nothing and writes
+    /// nothing, and holds no directory handle. `is_live` picks the
+    /// segment's yield shape: `true` yields
+    /// [`SegmentRead::Live`], `false` yields
+    /// [`SegmentRead::Sealed`] with `prelude: false`. A snapshot with
+    /// no live file (`is_live` `false` on every entry) is the archive
+    /// case: every segment walks as sealed and the loop ends with
+    /// [`SegmentSource::next_segment`] returning `None`; the
+    /// classifier owns closure semantics (ruling 13-V4-d3 point 1's
+    /// `closed_run` latch, ruling 13-V4-d2 point 1 on an open run).
+    /// Shipped inputs are out of scope here (ruling 13-V4-d5 (a)
+    /// restricts the fold to native inputs) and have no byte retention
+    /// in `input::Data`.
+    pub(crate) fn for_snapshot(segments: &[(std::rc::Rc<[u8]>, bool)]) -> Self {
+        let plan: Vec<PlanStep> = segments
+            .iter()
+            .map(|(bytes, is_live)| PlanStep::Snapshot {
+                bytes: std::rc::Rc::clone(bytes),
+                is_live: *is_live,
+            })
+            .collect();
+        Self {
+            dir: None,
+            plan,
+            cursor: 0,
+            cached: None,
+            pending: None,
+            newest: None,
+            #[cfg(test)]
+            test_failing: None,
+        }
     }
 
     /// Test seam for issue #218: a one-segment source whose sole sealed
@@ -831,7 +916,7 @@ impl<'dir> SegmentSource<'dir> {
         prelude: bool,
     ) -> Self {
         Self {
-            dir,
+            dir: Some(dir),
             plan: vec![PlanStep::TestFailing],
             cursor: 0,
             cached: None,
@@ -855,7 +940,7 @@ impl<'dir> SegmentSource<'dir> {
         fail_at: usize,
     ) -> Self {
         Self {
-            dir,
+            dir: Some(dir),
             plan: vec![PlanStep::TestFailingLive],
             cursor: 0,
             cached: None,
@@ -902,15 +987,33 @@ impl<'dir> SegmentSource<'dir> {
                 Ok(Some(SegmentRead::Live(ByteSource::File(file))))
             }
             PlanStep::Rotated(name) => {
-                let file = existing(self.dir, name, false)?;
+                let dir = self
+                    .dir
+                    .expect("SegmentSource: file-backed plan without a directory");
+                let file = existing(dir, name, false)?;
                 Ok(Some(SegmentRead::Sealed {
                     source: ByteSource::File(file),
                     prelude: false,
                 }))
             }
             PlanStep::ClosingLive => {
-                let file = existing(self.dir, Path::new("audit.jsonl"), true)?;
+                let dir = self
+                    .dir
+                    .expect("SegmentSource: file-backed plan without a directory");
+                let file = existing(dir, Path::new("audit.jsonl"), true)?;
                 Ok(Some(SegmentRead::Live(ByteSource::File(file))))
+            }
+            PlanStep::Snapshot { bytes, is_live } => {
+                let is_live = *is_live;
+                let source = ByteSource::memory(std::rc::Rc::clone(bytes));
+                Ok(Some(if is_live {
+                    SegmentRead::Live(source)
+                } else {
+                    SegmentRead::Sealed {
+                        source,
+                        prelude: false,
+                    }
+                }))
             }
             #[cfg(test)]
             PlanStep::TestFailing => {
@@ -949,7 +1052,10 @@ impl<'dir> SegmentSource<'dir> {
     /// after the prelude's own walk (addendum 25.2: on refresh rotate
     /// the prelude walks first, then the newer segments are listed).
     fn expand_rotate_after(&mut self, pending: PendingRotateAfter) -> Result<(), AuditError> {
-        let (names, newest) = segments_after_from(self.dir, &pending.old, &pending.sealed_before)?;
+        let dir = self
+            .dir
+            .expect("SegmentSource: refresh-rotate plan without a directory");
+        let (names, newest) = segments_after_from(dir, &pending.old, &pending.sealed_before)?;
         self.plan.reserve(names.len() + 1);
         self.plan.extend(names.into_iter().map(PlanStep::Rotated));
         self.plan.push(PlanStep::ClosingLive);
@@ -1081,9 +1187,14 @@ pub(crate) fn history_segment(
     // `SegmentClass::Closer` directly, rather than inferring from
     // `(ctx.run, strict-ok)`.
     // Ruling 13-V4-d6 point 1: `ByteSource` is owned and consumed by
-    // each walker; `try_clone` takes an independent handle (an OS-level
-    // `dup` on the `File` variant). The strict pass takes one clone,
-    // the lazy tolerant byte source takes the original.
+    // each walker; `try_clone` takes a fresh `ByteSource` handle (a
+    // POSIX `dup` on the `File` variant -- two `File`s sharing one
+    // OS file offset -- and a fresh `Cursor` at offset 0 over the
+    // same `Rc<[u8]>` on the `Memory` variant). Each walker then
+    // seeks its source to its own offset before reading, so a shared
+    // offset on the `File` arm does not make the passes interfere.
+    // The strict pass takes one clone, the lazy tolerant byte source
+    // takes the original.
     let strict_source = source.try_clone().map_err(io_error)?;
     #[rustfmt::skip]
     let strict = move || scan_inner(Reaction::Stop, strict_source, trail, strict_state, expected, &mut fc.borrow_mut(), ctx)
