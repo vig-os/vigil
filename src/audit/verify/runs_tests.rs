@@ -18,6 +18,7 @@ use crate::audit::{
 };
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -1009,5 +1010,103 @@ fn r13_agreement_verifier_run_findings_equal_classify_output_runs() {
         split_verify_runs, full_verify_runs,
         "R13 split-form agreement: archive_dir + trail_dir == full_dir \
          (ruling 13-V4-d8 point 2: one classify over the merged Collection)",
+    );
+}
+
+// ============================================================
+// R14 — ruling 13-V4-d9: a torn fragment appended to the live
+// (closing) segment is excluded from the run's spans and digest.
+// The run finding's digest stays pinned to A1's `79d8cb1c…`, and
+// the detail carries no `span` entry from the closer.
+// ============================================================
+
+#[test]
+fn r14_d9_a1_torn_live_tail_run_digest_unchanged() {
+    let a = build_a1();
+    // Append a torn JSON fragment to the live closer. Ruling 13-V4-d9:
+    // this fragment lands in the closer segment (last_segment), so it
+    // is excluded from the run's spans and its run digest.
+    fs::OpenOptions::new()
+        .append(true)
+        .open(a.dir_path.join("audit.jsonl"))
+        .unwrap()
+        .write_all(b"{\"half")
+        .unwrap();
+    let findings = verify_dir(&a.dir_path);
+    let a1_digest = parse_digest(A1_DIGEST);
+    // Detail: A1's one loss range, no span entries, A1's pinned digest.
+    let run_detail = make_run_detail(&[(4, 3, 1)], &[], &a1_digest);
+    let run_rows: Vec<_> = rows(&findings)
+        .into_iter()
+        .filter(|r| r.5.is_some())
+        .collect();
+    assert_eq!(run_rows.len(), 1, "A1+torn: one run finding");
+    assert_eq!(
+        run_rows[0].4, run_detail,
+        "A1+torn: detail excludes closer span"
+    );
+    assert_eq!(
+        run_rows[0].5,
+        Some(digest_string(&a1_digest)),
+        "A1+torn: run digest unchanged (`79d8cb1c…`) per ruling 13-V4-d9",
+    );
+    // Belt-and-braces: no `span ` segment appears in the detail.
+    assert!(
+        !run_rows[0].4.contains("span "),
+        "A1+torn: detail must not carry any `span` entry (closer excluded)",
+    );
+}
+
+// ============================================================
+// R15 — ruling 13-V4-d9: p01 shape (sealed closer that re-opens)
+// places the closer segment's trailing fragment in run 2 ONLY,
+// never run 1. Asserts literal spans on both runs.
+// ============================================================
+
+#[test]
+fn r15_d9_p01_closer_span_in_second_run_only() {
+    // p01 shape built with the shared classifier-level helpers so
+    // the layout matches `closer_spans_excluded_in_sealed_closer_p01`.
+    use crate::audit::storage::tests::{self as st, runs as st_runs};
+    let d = st::Temp::new();
+    let first = st_runs::base(&d);
+    st_runs::put(&d, 0, &[&first], &[]);
+    let kept = st_runs::headless(&first, 3);
+    st_runs::put(&d, 1, &[&kept], &[]);
+    let mut fold = st::seeded_pair(&first, &kept);
+    let (checkpoint, resume) = st_runs::close_run(&d, &kept, &fold);
+    st_runs::put(&d, 2, &[&checkpoint, &resume], b"broken\n");
+    fold.push(checkpoint.hash()).unwrap();
+    fold.push(resume.hash()).unwrap();
+    let _ = st_runs::close_run(&d, &resume, &fold);
+    let findings = Verifier::new(policy_trail())
+        .verify_dir(&d.0)
+        .unwrap()
+        .findings()
+        .to_vec();
+    let run_rows: Vec<_> = rows(&findings)
+        .into_iter()
+        .filter(|r| r.5.is_some())
+        .collect();
+    assert_eq!(run_rows.len(), 2, "p01: two run findings");
+    // Run 0's detail has no `span` entry (closer S2 excluded; S1
+    // carries no fragments → zero spans).
+    assert!(
+        !run_rows[0].4.contains("span "),
+        "p01 run 0: no span entry (ruling 13-V4-d9 excludes closer S2)",
+    );
+    // Run 1 (index 1 here is the SECOND run; `engine::check`'s stable
+    // sort keeps run findings ordered). Its detail must carry exactly
+    // one `span seg 0 after <resume.seq> len 7` for S2's `broken\n`.
+    assert_eq!(
+        run_rows[1].4.matches("span ").count(),
+        1,
+        "p01 run 2: exactly one span (S2's trailing `broken\\n`)",
+    );
+    let expected_fragment = format!("span seg 0 after {} len 7 ", resume.context.seq);
+    assert!(
+        run_rows[1].4.contains(&expected_fragment),
+        "p01 run 2: detail carries `{expected_fragment}…`; got `{}`",
+        run_rows[1].4,
     );
 }

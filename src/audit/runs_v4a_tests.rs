@@ -1543,15 +1543,21 @@ fn final_state_is_some_per_segment_a3() {
     );
 }
 
-/// p10 plus a live torn tail `{"half`. Reader is `Ok` (torn
+/// Ruling 13-V4-d9: a run's spans come from the run's own segments
+/// only (`first_segment..last_segment`, exclusive), so a torn tail
+/// appended to the closing (live) segment never enters the run's
+/// spans or its run digest.
+///
+/// Layout: p10 plus a live torn tail `{"half`. Reader is `Ok` (torn
 /// trailing fragment on the live file is tolerated). The run has
 /// `first_segment=1` (fragment-only `S1`) and `last_segment=2`
-/// (live, the closer) -- both contribute one span each. Expected
-/// span shapes: `[(0, u64::MAX, 8), (1, 5, 6)]`. A mutant that
-/// drops the closer segment's spans flips this to
-/// `[(0, u64::MAX, 8)]`.
+/// (live, the closer). Only S1 contributes spans; the live closer's
+/// own `{"half` fragment is excluded. Expected span shapes:
+/// `[(0, u64::MAX, 8)]`. A mutant that re-includes the closer
+/// (`.take(last_segment + 1)`) flips this list to
+/// `[(0, u64::MAX, 8), (1, 5, 6)]`.
 #[test]
-fn closer_spans_survive_torn_live_tail_p10() {
+fn closer_spans_excluded_torn_live_tail_p10() {
     let d = st::Temp::new();
     let first = st_runs::base(&d);
     st_runs::put(&d, 0, &[&first], &[]);
@@ -1564,19 +1570,25 @@ fn closer_spans_survive_torn_live_tail_p10() {
     assert!(out.violations.is_empty(), "torn-tail: no violations");
     assert_eq!(out.runs.len(), 1, "torn-tail: one run");
     let rr = &out.runs[0];
+    assert_eq!(rr.first_segment, 1, "torn-tail: first_segment=1 (S1)");
+    assert_eq!(
+        rr.last_segment, 2,
+        "torn-tail: last_segment=2 (live closer)"
+    );
     let shapes: Vec<(u32, u64, u64)> = rr.spans.iter().map(|s| (s.seg, s.after, s.len)).collect();
     assert_eq!(
         shapes,
-        vec![(0, u64::MAX, 8), (1, resume.context.seq, 6)],
-        "p10+torn-tail spans literal: closer (live) contributes `(1, 5, 6)`",
+        vec![(0, u64::MAX, 8)],
+        "p10+torn-tail: closer (live, seg=2) excluded from the run's spans \
+         (ruling 13-V4-d9); only S1's `{{\\\"torn\\\":` fragment contributes",
     );
     assert_eq!(resume.context.seq, 5, "torn-tail: resume.seq pin (sanity)");
-    // Pin the closer-span digest so even a mutant that preserves the
-    // tuple shapes but reorders content flips the row.
+    // Pin S1's span digest so even a mutant that preserves the tuple
+    // shape but reorders content flips the row.
     assert_eq!(
-        digest_hex(&rr.spans[1].digest),
-        "blake3:d9a5b587318eff723676e5ae0e4f95bc2b2617255722fea8409d547b4cb020cc",
-        "closer span digest literal",
+        digest_hex(&rr.spans[0].digest),
+        "blake3:e06678ed944e90a6f28636da719dc9b8267f8fec6688720495123ec237d761a4",
+        "S1 (first_segment) span digest literal",
     );
 }
 
@@ -2091,14 +2103,18 @@ fn three_range_run_loss_points_literal() {
     );
 }
 
-/// Second killer where the closer carries spans: p01's `S2` is a
-/// sealed closer (close1 + resume1 + trailing `"broken\n"`
-/// fragment). Run 0 spans across S1 (headless, no fragments) and
-/// S2 (closer, one span). A mutant that drops the closer segment's
-/// spans in classify removes S2's span from run 0's `spans`, flipping
-/// this literal.
+/// Ruling 13-V4-d9: the closer's own spans belong to the NEXT run
+/// if one begins on it, never the run it closes. p01's `S2` is a
+/// sealed closer (close1 + resume1 + trailing `"broken\n"` fragment)
+/// that closes run 0 and re-opens into run 2. Run 0's segments are
+/// `first_segment..last_segment` (exclusive) = `[S1]`, which carries
+/// no fragments; run 0's `spans` is empty. Run 2 spans
+/// `[S2]..live`; the `"broken\n"` fragment appears there as a
+/// run-local seg=0 span. A mutant that re-includes the closer
+/// (`.take(last_segment + 1)`) adds S2's `"broken\n"` to run 0,
+/// flipping this row.
 #[test]
-fn closer_spans_survive_in_sealed_closer_p01() {
+fn closer_spans_excluded_in_sealed_closer_p01() {
     let d = st::Temp::new();
     let first = st_runs::base(&d);
     st_runs::put(&d, 0, &[&first], &[]);
@@ -2114,17 +2130,32 @@ fn closer_spans_survive_in_sealed_closer_p01() {
     let out = classify_collect(&d.0);
     assert!(out.violations.is_empty(), "p01-closer-spans: no violations");
     assert_eq!(out.runs.len(), 2, "p01-closer-spans: two closed runs");
+    // Run 0 covers S1 (headless, no fragments) and closes at S2.
+    // Ruling 13-V4-d9: spans come from `first_segment..last_segment`
+    // (exclusive) = `[S1]`, which has no fragments → empty.
     let rr0 = &out.runs[0];
-    // Run 0 covers S1 (headless, no fragments => 0 spans) + S2
-    // (sealed closer with a `"broken\n"` trailing fragment =>
-    // 1 span). Run 0's `spans` = [S2's span], with run-local
-    // segment index 1 (S2 is the second segment of this run).
-    let shapes: Vec<(u32, u64, u64)> = rr0.spans.iter().map(|s| (s.seg, s.after, s.len)).collect();
+    assert_eq!(rr0.first_segment, 1, "run 0: first_segment=1 (S1)");
+    assert_eq!(rr0.last_segment, 2, "run 0: last_segment=2 (S2 closer)");
+    let shapes0: Vec<(u32, u64, u64)> = rr0.spans.iter().map(|s| (s.seg, s.after, s.len)).collect();
     assert_eq!(
-        shapes,
-        vec![(1, resume.context.seq, 7)],
-        "p01-closer-spans: closer S2 contributes one span \
-         (run-local seg=1, after=resume.seq, len=7 bytes)",
+        shapes0,
+        Vec::<(u32, u64, u64)>::new(),
+        "p01-closer-spans: run 0's closer S2 is excluded from its spans \
+         (ruling 13-V4-d9); S1 has no fragments → empty",
+    );
+    // Run 2 re-opens on S2 (so S2 is run 2's `first_segment`, not a
+    // closer for run 2 — live is). Its `first_segment..last_segment`
+    // (exclusive) = `[S2]`, which contributes its `"broken\n"`
+    // fragment at run-local seg=0.
+    let rr2 = &out.runs[1];
+    assert_eq!(rr2.first_segment, 2, "run 2: first_segment=2 (S2)");
+    assert_eq!(rr2.last_segment, 3, "run 2: last_segment=3 (live closer)");
+    let shapes2: Vec<(u32, u64, u64)> = rr2.spans.iter().map(|s| (s.seg, s.after, s.len)).collect();
+    assert_eq!(
+        shapes2,
+        vec![(0, resume.context.seq, 7)],
+        "p01-closer-spans: run 2's S2 (now first_segment) contributes \
+         `(0, resume.seq, 7)` for the trailing `broken\\n` fragment",
     );
 }
 
