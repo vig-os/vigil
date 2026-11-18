@@ -79,6 +79,21 @@ pub(super) struct Data {
     pub(super) records: Vec<Summary>,
     pub(super) items: Vec<LineItem>,
     pub(super) spans: Vec<Span>,
+    /// Rulings 13-V3-d2 and 13-V4-d5 (b): the verifier's confirmed
+    /// snapshot is read once. On native inputs the raw bytes are
+    /// retained here so V4a's one classify pass drives
+    /// [`crate::audit::storage::SegmentSource::for_snapshot`] over
+    /// them without re-opening the file. Shipped inputs are out of
+    /// the classifier's scope and `decode` would set `bytes` to
+    /// `None` on them if decoded in isolation; a shipped path that
+    /// hard-links to an already-decoded native path (same inode)
+    /// shares the native's `Rc<Data>` through the inode cache, so it
+    /// also sees `bytes = Some(...)` here. That is fine: only
+    /// `native_segments` reads `bytes`, and it filters to
+    /// `input.native` paths. Known cost: one `Rc<[u8]>` of segment
+    /// size per native segment stays alive for the verification
+    /// (the price of the one-snapshot rule).
+    pub(super) bytes: Option<Rc<[u8]>>,
 }
 pub(super) struct Input {
     pub(super) path: PathBuf,
@@ -90,6 +105,81 @@ pub(super) struct Collection {
     pub(super) inputs: Vec<Input>,
     /// (input index, summary index), sorted across shipped files and batches.
     pub(super) shipped: Vec<(usize, usize)>,
+}
+
+/// Rulings 13-V4-d5 (a) and (b): one native segment the V4a classify
+/// pass walks, in `Collection::inputs` order. V4a feeds a slice of
+/// these into
+/// [`crate::audit::storage::SegmentSource::for_snapshot`] so the
+/// confirmed snapshot is classified in a single pass with no
+/// re-listing and no re-open of the trail directory (ruling 13-V3-d2).
+/// Shipped inputs are out of scope: the classifier's fold runs over
+/// native segments only (ruling 13-V4-d5 (a)); shipped inputs feed
+/// `engine::check`'s record-level cross-copy checks instead.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "V4a lands with `verify::fold::check_runs` later")
+)]
+pub(super) struct NativeSegment {
+    /// The native input's path, for diagnostics. Not opened by
+    /// `for_snapshot`; carried alongside the bytes.
+    pub(super) path: PathBuf,
+    /// Bytes retained by [`decode`] under `keep_bytes = native(path)`.
+    pub(super) bytes: Rc<[u8]>,
+    /// `true` iff this is the live input (file name `audit.jsonl`).
+    /// Ruling 13-V4-d5 (b): a snapshot with no live file (`is_live`
+    /// `false` on every entry) is the archive case.
+    pub(super) is_live: bool,
+    /// Index into [`Collection::inputs`]. V4a uses it to recover each
+    /// segment's first complete record `(line, seq)` on this trail
+    /// (ruling 13-V4-d5 (a)); the classifier's own per-segment
+    /// outputs keep a parallel index by construction (both arrays are
+    /// driven by this same `Vec`).
+    pub(super) input_index: usize,
+}
+
+impl Collection {
+    /// Rulings 13-V4-d5 (a) and (b): the V4a classify pass's input --
+    /// native inputs only, in [`Collection::inputs`] order (per-trail
+    /// filtering happens inside [`crate::audit::runs::classify`]).
+    /// Shipped inputs are excluded (ruling 13-V4-d5 (a); they do not
+    /// flow through the classifier). The returned vec drives
+    /// [`crate::audit::storage::SegmentSource::for_snapshot`].
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "V4a lands with `verify::fold::check_runs` later")
+    )]
+    pub(super) fn native_segments(&self) -> Vec<NativeSegment> {
+        self.inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.native)
+            .map(|(input_index, input)| NativeSegment {
+                path: input.path.clone(),
+                // Invariant that makes the `expect` unreachable in
+                // production: `copy` sorts paths by `key` before it
+                // decodes them (shipped `rank = 2`, so every native
+                // path is decoded first), and `decode` is called with
+                // `keep_bytes = native(path)`, so every inode a
+                // native path visits is first decoded with retention
+                // on. A later shipped path that hard-links to the
+                // same inode shares the native's `Rc<Data>` through
+                // the inode cache, so its `data.bytes` is also
+                // `Some` -- the only way an `Input` with `native =
+                // true` can have `data.bytes = None` is if a mutant
+                // bypassed the filter, which is exactly what this
+                // `expect` catches for M-SNAP-7.
+                bytes: input
+                    .data
+                    .bytes
+                    .as_ref()
+                    .map(Rc::clone)
+                    .expect("native input retained bytes in decode(keep_bytes=true)"),
+                is_live: input.path.file_name().is_some_and(|n| n == "audit.jsonl"),
+                input_index,
+            })
+            .collect()
+    }
 }
 
 fn native(path: &Path) -> bool {
@@ -107,13 +197,24 @@ fn key(path: &Path) -> (u8, (String, u64), PathBuf) {
     };
     (rank, rotate::segment_key(path, "audit"), path.to_owned())
 }
-fn decode(file: File) -> io::Result<Data> {
+fn decode(file: File, keep_bytes: bool) -> io::Result<Data> {
     let mut data = Data {
         records: Vec::new(),
         items: Vec::new(),
         spans: Vec::new(),
+        bytes: None,
     };
-    data.spans = lines::stream(BufReader::new(file), 0, |item| {
+    let bytes: Option<Rc<[u8]>> = if keep_bytes {
+        let mut raw = Vec::new();
+        {
+            let mut handle = &file;
+            io::Read::read_to_end(&mut handle, &mut raw)?;
+        }
+        Some(Rc::from(raw.into_boxed_slice()))
+    } else {
+        None
+    };
+    let mut emit = |item: lines::Item| {
         let content = match item.content {
             Content::Records(records) => {
                 let start = data.records.len();
@@ -129,7 +230,12 @@ fn decode(file: File) -> io::Result<Data> {
             line: item.line,
             content,
         });
-    })?;
+    };
+    data.spans = match &bytes {
+        Some(buf) => lines::stream(io::Cursor::new(buf.as_ref()), 0, &mut emit)?,
+        None => lines::stream(BufReader::new(file), 0, &mut emit)?,
+    };
+    data.bytes = bytes;
     Ok(data)
 }
 
@@ -153,7 +259,11 @@ fn copy(
         let data = match local.get(&inode) {
             Some(data) => data.clone(),
             None => {
-                let data = Rc::new(decode(file)?);
+                // Ruling 13-V4-d5 (a): V4a classifies only native
+                // segments; retain bytes there and skip the extra
+                // memory cost on shipped inputs.
+                let keep_bytes = native(&path);
+                let data = Rc::new(decode(file, keep_bytes)?);
                 local.insert(inode, data.clone());
                 data
             }

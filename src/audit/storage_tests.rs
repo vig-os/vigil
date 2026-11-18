@@ -5747,3 +5747,7 @@ mod classify_reader_pins {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "storage_snapshot_tests.rs"]
+mod snapshot_tests;

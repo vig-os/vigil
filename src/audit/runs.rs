@@ -794,13 +794,34 @@ pub(crate) struct ClassifyArgs {
 /// `#[cfg(test)]`: they are read only by this crate's Collect proof
 /// at this head.
 pub(crate) struct ClassifyOutput {
-    /// `None` only under `Reaction::Collect` when the live segment's
-    /// walker folded no complete record (strict Collect may latch
-    /// `recovery_pending` before any apply).
+    /// The walker's post-segment [`State`] out of the live segment, or
+    /// `None` when no live segment contributed one. Every `None` case:
+    ///
+    /// - [`Reaction::Collect`] on a layout whose live-segment walker
+    ///   folded no complete record (strict Collect may latch
+    ///   `recovery_pending` before any apply);
+    /// - a snapshot plan from
+    ///   [`storage::SegmentSource::for_snapshot`] whose entries all
+    ///   carry `is_live = false` -- the archive case (rulings
+    ///   13-V4-d5 (b), 13-V4-d6 point 2): the loop walks every
+    ///   segment as sealed and threads state onwards via the local
+    ///   `state` variable, but never reaches a live arm to promote
+    ///   it to `final_state`.
     pub(crate) final_state: Option<State>,
-    /// `None` only if the live arm was never reached (I/O error from
-    /// `SegmentSource::next_segment` on a sealed segment propagates
-    /// before the live is opened).
+    /// The live segment's underlying [`std::fs::File`], when one
+    /// exists; the reader stashes it in `Cache::file`. Every `None`
+    /// case:
+    ///
+    /// - the live arm was never reached -- an I/O error from
+    ///   [`storage::SegmentSource::next_segment`] on a sealed
+    ///   segment, or a snapshot plan that carries no live entry
+    ///   (archive case);
+    /// - the live arm was reached but the source carries no file
+    ///   handle -- a snapshot's live segment reads from
+    ///   [`storage::ByteSource::Memory`], whose
+    ///   [`storage::ByteSource::into_file`] returns `None` by design
+    ///   (snapshot plans only drive [`Reaction::Collect`], which
+    ///   never stashes the file).
     pub(crate) live_file: Option<std::fs::File>,
     pub(crate) found: Option<Record>,
     /// `source.newest()` after the plan finished expanding; the caller
@@ -1172,12 +1193,26 @@ pub(crate) fn classify(
             false
         };
         let run_in_before = run;
+        // Carry "this segment is the live segment" as its own fact
+        // (rulings 13-V4-d5 (b), 13-V4-d6 point 2): `ByteSource::Memory`
+        // has no backing `File`, so `source.into_file()` returns `None`
+        // for a snapshot's live segment even though the live arm fired.
+        // The live-arm bookkeeping below branches on this flag rather
+        // than on `live.is_some()`; the `live_file` handle (file-backed
+        // paths) and `final_state` (every path) are then set
+        // independently, each from the source that actually carries
+        // them.
+        let is_live_segment = matches!(&seg, SegmentRead::Live(_));
         // Addendum 25.5 (spans/records): under Collect, clone the
         // segment's byte source BEFORE the walker consumes it so a
         // second seek-to-0 pass through `verify::lines::stream` can
         // produce the per-segment spans + record head list the
-        // RunReport needs. The clone is independent in Rust's
-        // `std::fs::File::try_clone` contract (an OS-level `dup`).
+        // RunReport needs. `BufReader<ByteSource>` is created afresh
+        // on each pass and the walker seeks the source to its own
+        // offset before reading (`SegmentBytes::ensure_reader` at
+        // `storage.rs`), so a shared file offset under
+        // `File::try_clone` (POSIX `dup` keeps one offset) does not
+        // make the passes interfere.
         //
         // Issue #218: a failure here previously dropped the span pass
         // silently (`file.try_clone().ok()`), leaving a well-formed
@@ -1220,7 +1255,7 @@ pub(crate) fn classify(
                     out.state,
                     out.violations,
                     out.closed_run,
-                    Some(source.into_file()),
+                    source.into_file(),
                 )
             }
             (ReaderPath::RefreshAppend, SegmentRead::Live(source)) => {
@@ -1239,7 +1274,7 @@ pub(crate) fn classify(
                     out.state,
                     out.violations,
                     out.closed_run,
-                    Some(source.into_file()),
+                    source.into_file(),
                 )
             }
             (ReaderPath::RefreshAppend, SegmentRead::Sealed { .. }) => {
@@ -1288,7 +1323,7 @@ pub(crate) fn classify(
                     out.state,
                     out.violations,
                     out.closed_run,
-                    Some(source.into_file()),
+                    source.into_file(),
                 )
             }
         };
@@ -1368,9 +1403,14 @@ pub(crate) fn classify(
             });
             seg_run_out.push(run);
         }
-        // Base reader bookkeeping, unchanged under Stop.
-        if let Some(file) = live {
-            live_file = Some(file);
+        // Base reader bookkeeping, unchanged under Stop. The live arm
+        // is authoritative for `final_state`: carry the walker's
+        // post-segment state out of the loop whenever the segment was
+        // live, regardless of whether a `File` handle came back from
+        // `source.into_file()` (snapshot's `ByteSource::Memory` yields
+        // `None` there by design).
+        if is_live_segment {
+            live_file = live;
             final_state = next_state.clone();
         } else if next_state.is_some() {
             // Thread the per-segment state into the next sealed

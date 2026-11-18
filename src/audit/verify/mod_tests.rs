@@ -225,6 +225,7 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
         path: PathBuf::from("copy"),
         native: false,
         data: Rc::new(Data {
+            bytes: None,
             records: vec![broken_record],
             items,
             spans: vec![],

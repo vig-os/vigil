@@ -550,3 +550,435 @@ fn pruning_already_read_segment_during_later_open_error() {
         vec![2]
     );
 }
+
+// ---------------------------------------------------------------
+// Rulings 13-V4-d5 (a), (b), 13-V4-d6 points 1 and 2: the verifier's
+// one classify pass drives `SegmentSource::for_snapshot` over the
+// native inputs that `collect` already read and retained.
+// ---------------------------------------------------------------
+
+/// Reusable: a single-record base checkpoint for trail
+/// `[17; 16]`. Golden line 2 is `audit.checkpoint seq=0` on that
+/// trail, so a fixture built from it is a valid one-segment trail.
+fn checkpoint_line() -> &'static str {
+    GOLDEN.lines().nth(1).unwrap()
+}
+
+fn classify_snapshot(segments: &[super::NativeSegment]) -> crate::audit::runs::ClassifyOutput {
+    let tuples: Vec<(std::rc::Rc<[u8]>, bool)> = segments
+        .iter()
+        .map(|seg| (std::rc::Rc::clone(&seg.bytes), seg.is_live))
+        .collect();
+    let mut source = crate::audit::storage::SegmentSource::for_snapshot(&tuples);
+    crate::audit::runs::classify(
+        crate::audit::runs::ClassifyArgs {
+            trail: [17; 16],
+            prior_state: None,
+        },
+        crate::audit::runs::ReaderPath::LiveOpen { expected: None },
+        &mut source,
+        crate::audit::runs::Reaction::Collect,
+    )
+    .unwrap()
+}
+
+fn segment_bytes_vec(c: &Collection) -> Vec<(PathBuf, Vec<u8>, bool)> {
+    c.native_segments()
+        .into_iter()
+        .map(|s| (s.path, s.bytes.to_vec(), s.is_live))
+        .collect()
+}
+
+#[test]
+fn snapshot_collect_dir_matches_collect_explicit_paths() {
+    // Ruling 13-V4-d5 (a), (b): a real archive -- no live file,
+    // and a closed run entirely inside the archive. `collect([dir])`
+    // and `collect([explicit seg paths])` must produce the same
+    // `native_segments` sequence (sort + live-last by `key`), the
+    // same `ClassifyOutput` through `for_snapshot`, and exactly
+    // one `RunReport` whose fields are pinned here (ruling 197-d1
+    // addendum 27.4).
+    use crate::audit::Mmr;
+    use crate::audit::storage::tests as st;
+    let dir = st::Temp::new();
+    // S0 = base checkpoint, S1 = headless (opens run), S2 =
+    // closer (opening cp + resume closes it). No `audit.jsonl`.
+    let base = st::runs::signed(
+        0,
+        crate::audit::format::Record::genesis(&[17; 16]),
+        &Mmr::new(),
+    );
+    st::runs::put(&dir, 0, &[&base], &[]);
+    let r = st::runs::headless(&base, 5);
+    let mut fold = st::seeded(&base);
+    fold.push(r.hash()).unwrap();
+    st::runs::put(&dir, 1, &[&r], &[]);
+    let closer = st::runs::signed(r.context.seq + 4, r.hash(), &fold);
+    let decl = st::declaration(
+        &closer,
+        r.context.seq,
+        r.hash(),
+        closer.context.seq - 1,
+        None,
+    );
+    st::runs::put(&dir, 2, &[&closer, &decl], &[]);
+    let seg0 = st::segment(&dir.0, 0);
+    let seg1 = st::segment(&dir.0, 1);
+    let seg2 = st::segment(&dir.0, 2);
+    let via_dir = load(vec![dir.0.clone()]);
+    let via_paths = load(vec![seg0, seg1, seg2]);
+    let dir_segments = via_dir.native_segments();
+    let path_segments = via_paths.native_segments();
+    // Equal shape: paths, bytes, is_live, input_index all match.
+    assert_eq!(
+        segment_bytes_vec(&via_dir),
+        segment_bytes_vec(&via_paths),
+        "native_segments should match across collect variants",
+    );
+    assert_eq!(
+        dir_segments
+            .iter()
+            .map(|s| (s.input_index, s.is_live))
+            .collect::<Vec<_>>(),
+        path_segments
+            .iter()
+            .map(|s| (s.input_index, s.is_live))
+            .collect::<Vec<_>>(),
+        "input_index and is_live align per segment",
+    );
+    // Archive snapshot: every entry is sealed.
+    assert!(
+        dir_segments.iter().all(|s| !s.is_live),
+        "archive: every native segment is_live=false",
+    );
+    // Snapshot-driven classify: full `ClassifyOutput` equality.
+    let dir_out = classify_snapshot(&dir_segments);
+    let path_out = classify_snapshot(&path_segments);
+    assert_eq!(dir_out.violations, path_out.violations);
+    assert_eq!(dir_out.head_mismatch, path_out.head_mismatch);
+    assert_eq!(
+        dir_out
+            .segments
+            .iter()
+            .map(|s| (s.class, s.damage))
+            .collect::<Vec<_>>(),
+        path_out
+            .segments
+            .iter()
+            .map(|s| (s.class, s.damage))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        dir_out.final_state.as_ref().map(|s| s.run.head),
+        path_out.final_state.as_ref().map(|s| s.run.head),
+    );
+    assert_eq!(
+        dir_out.found.as_ref().map(|r| (r.context.seq, r.hash())),
+        path_out.found.as_ref().map(|r| (r.context.seq, r.hash())),
+    );
+    assert_eq!(dir_out.runs.len(), path_out.runs.len());
+    for (a, b) in dir_out.runs.iter().zip(path_out.runs.iter()) {
+        assert_eq!(a.first_segment, b.first_segment);
+        assert_eq!(a.last_segment, b.last_segment);
+        assert_eq!(a.closing_opening, b.closing_opening);
+        assert_eq!(a.loss_points, b.loss_points);
+        assert_eq!(a.spans, b.spans);
+    }
+    // Literal pin: one `RunReport` with the exact closed-run shape
+    // (ruling 13-V4-d3 point 1 + addendum 25.5): S0 Base, S1
+    // opens, S2 closes.
+    assert_eq!(dir_out.runs.len(), 1, "exactly one RunReport");
+    let report = &dir_out.runs[0];
+    assert_eq!(report.first_segment, 1, "first_segment pins to S1");
+    assert_eq!(report.last_segment, 2, "last_segment pins to S2");
+    assert_eq!(
+        report.closing_opening,
+        Some(crate::audit::storage::Head::of(&closer)),
+        "closing_opening is the closer's Head",
+    );
+    assert_eq!(
+        report.loss_points.len(),
+        1,
+        "exactly one loss point for the S1 headless",
+    );
+    assert_eq!(
+        report.loss_points[0].loss_seq, r.context.seq,
+        "loss_seq is the headless record seq",
+    );
+}
+
+#[test]
+fn snapshot_native_segments_panic_on_shipped_pretending_to_be_native() {
+    // Ruling 13-V4-d5 (a): shipped inputs are out of the classifier's
+    // scope and keep `Data::bytes` as `None` (ruling 13-V4-d6 point 1).
+    // `native_segments` filters shipped inputs out; emitting them
+    // panics the `expect("native input retained bytes ...")` because
+    // shipped inputs never retain bytes. A second, independent
+    // killer for M-SNAP-7 beyond
+    // `snapshot_native_segments_excludes_shipped_inputs`: a mutant
+    // that lifts the filter trips an attention-getting panic the
+    // moment any Collection with shipped content calls the method.
+    let dir = Dir::new();
+    let line_cp = checkpoint_line();
+    dir.put(&format!("{STAMP}_000000.jsonl"), line_cp);
+    let shipped = dir.0.join("extra-copy");
+    fs::write(&shipped, line_cp).unwrap();
+    let c = load(vec![dir.0.clone(), shipped.clone()]);
+    // Natives are retained; shipped aren't.
+    let natives: Vec<_> = c.inputs.iter().filter(|i| i.native).collect();
+    let shipped_inputs: Vec<_> = c.inputs.iter().filter(|i| !i.native).collect();
+    assert!(!natives.is_empty(), "fixture: at least one native");
+    assert!(
+        !shipped_inputs.is_empty(),
+        "fixture: at least one shipped input",
+    );
+    for s in shipped_inputs {
+        assert!(
+            s.data.bytes.is_none(),
+            "shipped inputs must not retain bytes",
+        );
+    }
+    // Correct: no panic, exactly natives are returned.
+    let segs = c.native_segments();
+    assert_eq!(
+        segs.len(),
+        natives.len(),
+        "native_segments returns exactly the native inputs",
+    );
+    for seg in &segs {
+        assert!(super::native(&seg.path));
+    }
+}
+
+#[test]
+fn snapshot_collect_archive_plus_trail_dir_matches_full_single_dir() {
+    // Ruling 13-V4-d5 (b), 13-V3-d2 decision 2 step 6: a split
+    // archive -- archive part (base checkpoint + run opener) in
+    // one directory, trail part (closer: opening cp + resume) in
+    // another. `collect([arch, trail])` and `collect([full])`
+    // (same segments under one roof) must produce the same
+    // `native_segments` order and the same `ClassifyOutput`
+    // through `for_snapshot`, with exactly one closed `RunReport`
+    // whose fields are pinned here. A row with corrupt
+    // equal-on-both-sides outputs (e.g.
+    // `OpeningCheckpointDuplicatesPredecessor`) is specifically
+    // avoided.
+    use crate::audit::Mmr;
+    use crate::audit::storage::tests as st;
+    let arch = st::Temp::new();
+    let trail = st::Temp::new();
+    let full = st::Temp::new();
+    // Build the records once.
+    let base = st::runs::signed(
+        0,
+        crate::audit::format::Record::genesis(&[17; 16]),
+        &Mmr::new(),
+    );
+    let r = st::runs::headless(&base, 5);
+    let mut fold = st::seeded(&base);
+    fold.push(r.hash()).unwrap();
+    let closer = st::runs::signed(r.context.seq + 4, r.hash(), &fold);
+    let decl = st::declaration(
+        &closer,
+        r.context.seq,
+        r.hash(),
+        closer.context.seq - 1,
+        None,
+    );
+    // Archive part: S0, S1.
+    st::runs::put(&arch, 0, &[&base], &[]);
+    st::runs::put(&arch, 1, &[&r], &[]);
+    // Trail part: S2. Different counter so the file name does
+    // not collide with the archive's (both dirs share the test
+    // helpers' fixed stamp).
+    st::runs::put(&trail, 2, &[&closer, &decl], &[]);
+    // Full: all three in one directory.
+    st::runs::put(&full, 0, &[&base], &[]);
+    st::runs::put(&full, 1, &[&r], &[]);
+    st::runs::put(&full, 2, &[&closer, &decl], &[]);
+    let via_split = load(vec![arch.0.clone(), trail.0.clone()]);
+    let via_full = load(vec![full.0.clone()]);
+    // Paths differ by dir; compare bytes and is_live (order).
+    let split_bytes_live: Vec<(Vec<u8>, bool)> = via_split
+        .native_segments()
+        .into_iter()
+        .map(|s| (s.bytes.to_vec(), s.is_live))
+        .collect();
+    let full_bytes_live: Vec<(Vec<u8>, bool)> = via_full
+        .native_segments()
+        .into_iter()
+        .map(|s| (s.bytes.to_vec(), s.is_live))
+        .collect();
+    assert_eq!(
+        split_bytes_live, full_bytes_live,
+        "archive+trail-dir native_segments must match full single-dir",
+    );
+    let split_out = classify_snapshot(&via_split.native_segments());
+    let full_out = classify_snapshot(&via_full.native_segments());
+    assert_eq!(split_out.violations, full_out.violations);
+    assert_eq!(split_out.head_mismatch, full_out.head_mismatch);
+    assert_eq!(
+        split_out
+            .segments
+            .iter()
+            .map(|s| (s.class, s.damage))
+            .collect::<Vec<_>>(),
+        full_out
+            .segments
+            .iter()
+            .map(|s| (s.class, s.damage))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        split_out.final_state.as_ref().map(|s| s.run.head),
+        full_out.final_state.as_ref().map(|s| s.run.head),
+    );
+    assert_eq!(
+        split_out.found.as_ref().map(|r| (r.context.seq, r.hash())),
+        full_out.found.as_ref().map(|r| (r.context.seq, r.hash())),
+    );
+    assert_eq!(split_out.runs.len(), full_out.runs.len());
+    for (a, b) in split_out.runs.iter().zip(full_out.runs.iter()) {
+        assert_eq!(a.first_segment, b.first_segment);
+        assert_eq!(a.last_segment, b.last_segment);
+        assert_eq!(a.closing_opening, b.closing_opening);
+        assert_eq!(a.loss_points, b.loss_points);
+        assert_eq!(a.spans, b.spans);
+    }
+    // Literal pin: the closer in the trail part closes the run
+    // that opened in the archive part.
+    assert_eq!(split_out.runs.len(), 1, "exactly one RunReport");
+    let report = &split_out.runs[0];
+    assert_eq!(report.first_segment, 1, "first_segment pins to S1 (arch)");
+    assert_eq!(report.last_segment, 2, "last_segment pins to S2 (trail)");
+    assert_eq!(
+        report.closing_opening,
+        Some(crate::audit::storage::Head::of(&closer)),
+    );
+    assert_eq!(report.loss_points.len(), 1);
+    assert_eq!(report.loss_points[0].loss_seq, r.context.seq);
+}
+
+#[test]
+fn snapshot_native_segments_excludes_shipped_inputs() {
+    // Ruling 13-V4-d5 (a): V4a classifies only native segments;
+    // `native_segments` filters shipped inputs out. Kills
+    // M-SNAP-7: emitting shipped inputs would change the vec.
+    let dir = Dir::new();
+    let line_cp = checkpoint_line();
+    let _seg = dir.put(&format!("{STAMP}_000000.jsonl"), line_cp);
+    let shipped = dir.0.join("extra-copy");
+    fs::write(&shipped, line_cp).unwrap();
+    let c = load(vec![dir.0.clone(), shipped.clone()]);
+    let natives = c.native_segments();
+    assert!(
+        !natives.is_empty(),
+        "fixture should expose at least one native segment",
+    );
+    for seg in &natives {
+        assert!(
+            super::native(&seg.path),
+            "native_segments must only hold native-named paths; got {}",
+            seg.path.display(),
+        );
+    }
+    // Every retained-byte input shows up; nothing extra does.
+    let retained = c.inputs.iter().filter(|i| i.data.bytes.is_some()).count();
+    assert_eq!(
+        natives.len(),
+        retained,
+        "exactly one NativeSegment per native (retained-bytes) input",
+    );
+}
+
+#[test]
+fn snapshot_native_segments_is_live_true_only_on_audit_jsonl() {
+    // Ruling 13-V4-d5 (b): a native segment is the live input iff
+    // its file name is `audit.jsonl`. Literal row: assert the
+    // per-segment `(path file name, is_live)` on a layout with
+    // rotated sealed segments and the live file, so a mutant that
+    // sets `is_live = false` (or always `true`) on
+    // `NativeSegment` fails on the `is_live` assertion directly.
+    let dir = Dir::new();
+    let line_cp = checkpoint_line();
+    dir.put(&format!("{STAMP}_000000.jsonl"), line_cp);
+    dir.put("audit.jsonl", line_cp);
+    let c = load(vec![dir.0.clone()]);
+    let segs = c.native_segments();
+    let names_live: Vec<(String, bool)> = segs
+        .iter()
+        .map(|s| {
+            (
+                s.path.file_name().unwrap().to_string_lossy().into_owned(),
+                s.is_live,
+            )
+        })
+        .collect();
+    assert_eq!(
+        names_live,
+        vec![
+            (format!("{STAMP}_000000.jsonl"), false),
+            ("audit.jsonl".to_owned(), true),
+        ],
+        "is_live=true only on audit.jsonl; sealed segments stay \
+         is_live=false",
+    );
+}
+
+#[test]
+fn snapshot_native_segments_order_is_sort_live_last_literal() {
+    // Ruling 13-V4-d5 (a): `native_segments` returns native inputs
+    // in `Collection::inputs` order, which is (stamp, counter)
+    // sorted with the live file last. Literal row: assert the
+    // exact sequence of path file names so a reversed or shuffled
+    // order fails here directly (independent of any classify run).
+    let dir = Dir::new();
+    let line_cp = checkpoint_line();
+    dir.put(&format!("{STAMP}_000000.jsonl"), line_cp);
+    dir.put(&format!("{STAMP}_000001.jsonl"), line_cp);
+    dir.put("audit.jsonl", line_cp);
+    let c = load(vec![dir.0.clone()]);
+    let segs = c.native_segments();
+    let names: Vec<String> = segs
+        .iter()
+        .map(|s| s.path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            format!("{STAMP}_000000.jsonl"),
+            format!("{STAMP}_000001.jsonl"),
+            "audit.jsonl".to_owned(),
+        ],
+        "sealed segments come first in (stamp, counter) order; live last",
+    );
+}
+
+#[test]
+fn snapshot_native_segments_bytes_equal_file_contents() {
+    // Ruling 13-V4-d5 (b): a native segment's `bytes` is the
+    // whole file exactly as it was on disk when `collect` ran
+    // (the one-snapshot rule, 13-V3-d2). Literal row: write
+    // fixtures with known byte contents and assert
+    // `native_segments().bytes` matches byte for byte, and pin
+    // `is_live` on each entry so this row is also a killer for
+    // a mutation that drops the `is_live` discrimination (a
+    // second one beyond
+    // `snapshot_native_segments_is_live_true_only_on_audit_jsonl`).
+    // Any retention path that drops bytes (e.g. an off-by-one
+    // truncation) also fails on the bytes comparison.
+    let dir = Dir::new();
+    let sealed_bytes = b"line-one\nline-two\n";
+    let live_bytes = b"live-only\n";
+    dir.put(&format!("{STAMP}_000000.jsonl"), sealed_bytes);
+    dir.put("audit.jsonl", live_bytes);
+    let c = load(vec![dir.0.clone()]);
+    let segs = c.native_segments();
+    let got: Vec<(Vec<u8>, bool)> = segs.iter().map(|s| (s.bytes.to_vec(), s.is_live)).collect();
+    assert_eq!(
+        got,
+        vec![(sealed_bytes.to_vec(), false), (live_bytes.to_vec(), true),],
+        "native_segments bytes must equal the file contents on \
+         disk and is_live must pin per segment",
+    );
+}
