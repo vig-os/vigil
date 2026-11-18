@@ -17,15 +17,27 @@ use super::{
     },
 };
 
-/// Addendum 27.1: per-segment Collect return of the three shims
+/// Addendum 27.1: per-segment return of the three shims
 /// (`history_segment`, `scan`, `scan_closing`). Under
-/// [`Reaction::Stop`] the vector is empty and the Option is always
-/// `Some`; under [`Reaction::Collect`] the vector carries the inner
-/// classifier's `(CollectorPos, Violation)` list and the Option may be
+/// [`Reaction::Stop`] `violations` is empty and `state` is always
+/// `Some`; under [`Reaction::Collect`] `violations` carries the inner
+/// classifier's `(CollectorPos, Violation)` list and `state` may be
 /// `None` when no record was folded. `classify` in `runs.rs` pairs the
 /// positions with its own segment index to build
 /// `(SegmentViolationPos, Violation)`.
-pub(crate) type SegmentOutcome = (Option<State>, Vec<(CollectorPos, Violation)>);
+///
+/// `closed_run` surfaces the inner [`super::runs::Classifier`]'s own
+/// closed-run latch (ruling 197-d1 addendum 28, 13-V4-d3 point 1): the
+/// walker set it when, with `run_in` true on entry, it accepted the
+/// closing check that ends that open run. `classify` reads this per
+/// segment to decide run membership from the walker's own event
+/// rather than inferring from `(run_in, run_out, damage)`. An accepted
+/// resume with no open run is not a closer.
+pub(crate) struct SegmentOutcome {
+    pub(crate) state: Option<State>,
+    pub(crate) violations: Vec<(CollectorPos, Violation)>,
+    pub(crate) closed_run: bool,
+}
 use crate::rotate::Directory;
 use rustix::fs::{self as rfs, Mode, OFlags};
 use std::cell::RefCell;
@@ -807,9 +819,14 @@ pub(crate) fn history_segment(
     // under outer Collect — base's strict pass short-circuits on any
     // violation and then the tolerant fallback records. Only the
     // tolerant fallback below sees the outer reaction.
+    // Ruling 197-d1 addendum 28, 13-V4-d3 point 1: thread the strict
+    // pass's own `closed_run` latch up alongside the final State.
+    // `classify` reads this walker-level signal to derive
+    // `SegmentClass::Closer` directly, rather than inferring from
+    // `(ctx.run, strict-ok)`.
     #[rustfmt::skip]
     let strict = move || scan_inner(Reaction::Stop, file, trail, strict_state, expected, &mut fc.borrow_mut(), ctx)
-        .map(|(s, _)| s.expect("scan_inner Stop implies state=Some"));
+        .map(|out| (out.state.expect("scan_inner Stop implies state=Some"), out.closed_run));
     // Lazy tolerant byte source. The seek, the glued-byte / LF check,
     // `read_line`, `decode_line_kind` AND the tolerant-side byte
     // bookkeeping (`last_offset` / `last_newline` / `offset_cursor`,
@@ -870,8 +887,9 @@ pub(crate) fn history_segment(
 
     #[rustfmt::skip]
     let walk_args = HistorySegmentArgs { ctx, prior_run, unsealed_boundary, run_in: *run, trail };
-    let walk =
-        runs::history_segment::<State, _, _, _>(reaction, walk_args, strict, events, on_feed);
+    let walk = runs::history_segment::<(State, bool), _, _, _>(
+        reaction, walk_args, strict, events, on_feed,
+    );
     // Addendum 22.2: writeback `found` BEFORE propagating Err, so the
     // strict pass's partial writes survive on `CorruptTrail` and on a
     // tolerant-side Err. Base threaded `&mut found` directly through
@@ -879,13 +897,24 @@ pub(crate) fn history_segment(
     // caller even when record N+1 broke the fold.
     *found = found_cell.into_inner();
     match walk? {
-        HistorySegmentWalk::Strict(next) => {
+        HistorySegmentWalk::Strict((next, strict_closed_run)) => {
+            // Strict completed with no violations. `strict_closed_run`
+            // is the inner Classifier's own latch (ruling 197-d1
+            // addendum 28, 13-V4-d3 point 1): true iff the walker
+            // accepted a closing check that ends an inherited open
+            // run -- the (i)+(ii) closer the walk itself detected,
+            // not an inference from `(ctx.run, strict-ok)`.
             *run = false;
-            Ok((Some(next), Vec::new()))
+            Ok(SegmentOutcome {
+                state: Some(next),
+                violations: Vec::new(),
+                closed_run: strict_closed_run,
+            })
         }
         HistorySegmentWalk::Tolerant(outcome) => {
             let outcome = *outcome;
             *run = outcome.run_flag;
+            let closed_run = outcome.closed_run;
             let bytes = bytes.into_inner();
             let violations = outcome.violations;
             // Thread the classifier's own folded state (identical to
@@ -895,11 +924,11 @@ pub(crate) fn history_segment(
             // `running_state` would stay `None` where the classifier
             // already has `Some`. Using `outcome.state` keeps Stop
             // byte-identical and gives Collect the same `Ok(state)`
-            // Stop returns on `[cp0, close1, garbage\n]` (#197
-            // ruling addendum 27.1 Collect-vs-Stop Ok-path equality).
+            // Stop returns on `[cp0, close1, garbage\n]` (ruling 197-d1
+            // addendum 27.1 Collect-vs-Stop Ok-path equality).
             let final_run = outcome.state.clone().or(running_state);
-            Ok((
-                final_run.map(|run_state| State {
+            Ok(SegmentOutcome {
+                state: final_run.map(|run_state| State {
                     run: run_state,
                     offset: bytes.last_offset(),
                     length: bytes.offset_cursor(),
@@ -909,7 +938,8 @@ pub(crate) fn history_segment(
                     gap: outcome.gap,
                 }),
                 violations,
-            ))
+                closed_run,
+            })
         }
     }
 }
@@ -921,7 +951,7 @@ pub(crate) fn scan_staged(
     state: Option<State>,
     run: bool,
 ) -> Result<State, AuditError> {
-    let (state, _) = scan_inner(
+    let SegmentOutcome { state, .. } = scan_inner(
         Reaction::Stop,
         file,
         trail,
@@ -959,7 +989,7 @@ pub(crate) fn scan_closing(
         },
     )
 }
-fn sealed(state: &State) -> bool {
+pub(crate) fn sealed(state: &State) -> bool {
     // A complete JSON checkpoint without LF is still a record (ADR-0005 d5).
     state.run.checkpoint && state.gap.is_none() && !state.run.pending_resume
 }
@@ -1216,7 +1246,9 @@ pub(crate) fn scan(
 /// 24.2: "No second strict loop may exist anywhere"); `history_segment`
 /// composes through this shim, so a single strict walk serves every
 /// reader path (`scan` ×3, `scan_staged` ×2, `scan_closing` ×2,
-/// `history_segment`'s strict pass).
+/// `history_segment`'s strict pass). The Classifier's own
+/// `closed_run` latch (ruling 197-d1 addendum 28, 13-V4-d3 point 1)
+/// surfaces through the returned [`SegmentOutcome`].
 fn scan_inner(
     reaction: Reaction,
     file: &File,
@@ -1314,7 +1346,11 @@ fn scan_inner(
         newline: bytes.last_newline(),
         gap: outcome.gap,
     });
-    Ok((state, outcome.violations))
+    Ok(SegmentOutcome {
+        state,
+        violations: outcome.violations,
+        closed_run: outcome.closed_run,
+    })
 }
 fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<(), AuditError> {
     apply_checked(record, state, genesis, false, true)?;
@@ -1377,7 +1413,7 @@ fn next_cp_fields(prior: Option<(u64, u64)>, record: &Record) -> (u64, u64) {
 
 #[cfg(test)]
 #[path = "storage_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 thread_local! { static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }

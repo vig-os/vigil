@@ -2948,7 +2948,7 @@ fn resume_discovery_requires_full_validation_before_writing() {
         &mut false,
     )
     .unwrap()
-    .0
+    .state
     .unwrap();
     // The header declares an acceptable bound, but its MMR omits the retained
     // application record. Discovery must never turn that into write authority.

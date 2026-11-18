@@ -3,7 +3,7 @@ use super::{AuditError, AuditErrorKind, FindingKind, TrustPolicy};
 use std::path::{Path, PathBuf};
 mod engine;
 mod input;
-mod lines;
+pub(crate) mod lines;
 mod resume;
 
 /// Severity of a finding produced by the offline verifier (#13).

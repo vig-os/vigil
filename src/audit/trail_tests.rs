@@ -60,7 +60,7 @@ fn public_receipt_checkpoint_and_close_roundtrip() {
     assert_eq!(receipt.unsigned_records(), 0);
     assert_eq!(receipt.hash_string(), digest_string(&receipt.hash()));
     let mut found = None;
-    let (state, _) = storage::scan(
+    let storage::SegmentOutcome { state, .. } = storage::scan(
         crate::audit::runs::Reaction::Stop,
         &fs::File::open(temp.0.join("audit.jsonl")).unwrap(),
         receipt.trail(),

@@ -329,7 +329,7 @@ fn predecessor_run(dir: &File, trail: [u8; 16]) -> Result<(Option<State>, bool),
     let mut state = None;
     let mut run = false;
     for name in rotate::rotated_names_at(dir, "audit").map_err(io_error)? {
-        let (next, _) = history_segment(
+        let out = history_segment(
             Reaction::Stop,
             &existing(dir, &name, false)?,
             trail,
@@ -339,10 +339,10 @@ fn predecessor_run(dir: &File, trail: [u8; 16]) -> Result<(Option<State>, bool),
             &mut None,
             &mut run,
         )?;
-        state = next;
+        state = out.state;
     }
     if exists(dir, "audit.jsonl")? && !linked_live(dir)? {
-        let (next, _) = history_segment(
+        let out = history_segment(
             Reaction::Stop,
             &existing(dir, Path::new("audit.jsonl"), false)?,
             trail,
@@ -352,7 +352,7 @@ fn predecessor_run(dir: &File, trail: [u8; 16]) -> Result<(Option<State>, bool),
             &mut None,
             &mut run,
         )?;
-        state = next;
+        state = out.state;
     }
     Ok((state, run))
 }
