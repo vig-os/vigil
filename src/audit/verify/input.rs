@@ -130,11 +130,16 @@ pub(super) struct NativeSegment {
     /// Ruling 13-V4-d5 (b): a snapshot with no live file (`is_live`
     /// `false` on every entry) is the archive case.
     pub(super) is_live: bool,
-    /// Index into [`Collection::inputs`]. V4a uses it to recover each
-    /// segment's first complete record `(line, seq)` on this trail
-    /// (ruling 13-V4-d5 (a)); the classifier's own per-segment
-    /// outputs keep a parallel index by construction (both arrays are
-    /// driven by this same `Vec`).
+    /// Index into [`Collection::inputs`]. V4a reads this to recover
+    /// each segment's first complete record `(line, seq)` on this
+    /// trail (ruling 13-V4-d5 (a)); the classifier's own per-segment
+    /// outputs keep a parallel index by construction (both arrays
+    /// are driven by this same `Vec`). This PR has no non-test
+    /// reader for the field -- V4a's fold verifier lands with
+    /// `verify::fold::check_runs` later, so until then only the
+    /// `input_tests` rows read it. The field stays on the struct
+    /// because the V4a landing already builds on it; the
+    /// struct-level `expect(dead_code)` covers it.
     pub(super) input_index: usize,
 }
 

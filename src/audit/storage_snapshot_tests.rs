@@ -10,9 +10,11 @@
 //! - `snapshot_equals_live_open_on_simple_run_collect`: live-file
 //!   present, one closed run in the live file; pins every
 //!   [`ClassifyOutput`] field the snapshot and the live-open paths
-//!   must agree on (`violations`, `head_mismatch`, `segments.len()`,
-//!   `runs.len()` + each pinned [`RunReport`] field, `found`,
-//!   `final_state.run.head`).
+//!   must agree on (`violations`, `head_mismatch`, `segments.len()`
+//!   + every pinned per-segment field (`class`, `damage`,
+//!     `run_membership`, `boundary_resume`, `final_state`),
+//!     `runs.len()` + every pinned [`RunReport`] field, `found`,
+//!     and `final_state` in full).
 //! - `snapshot_equals_live_open_on_empty_live_file_collect`: base
 //!   segment + empty `audit.jsonl`. Pins that the snapshot path
 //!   reaches the live arm exactly where the file-backed live-open
@@ -44,10 +46,54 @@
 use super::runs::{close_run, signed};
 use super::*;
 use crate::audit::runs::{
-    ClassifyArgs, ClassifyOutput, Reaction, ReaderPath, RunReport, SegmentClass, classify,
+    ClassifyArgs, ClassifyOutput, Reaction, ReaderPath, RunReport, RunState, SegmentClass, classify,
 };
-use crate::audit::storage::SegmentSource;
+use crate::audit::storage::{SegmentSource, State};
 use std::{fs, io::Read, path::Path, rc::Rc};
+
+/// Projects [`RunState`] to a tuple with `PartialEq`. [`Mmr`] has no
+/// `PartialEq`; the `(size, peaks)` pair uniquely identifies the fold
+/// (ruling 13-V4-d3 point 1 + fold (iii) B3d1-d1/d4), so compare on
+/// those two.
+type RunStateSig = (
+    Head,
+    u64,
+    Vec<[u8; 32]>,
+    bool,
+    bool,
+    bool,
+    Option<Head>,
+    [u8; 32],
+);
+fn run_state_sig(s: &RunState) -> RunStateSig {
+    (
+        s.head,
+        s.mmr.size(),
+        s.mmr.peaks().to_vec(),
+        s.checkpoint,
+        s.pending_resume,
+        s.run_loss,
+        s.checkpoint_predecessor,
+        s.checkpoint_previous,
+    )
+}
+
+/// Projects [`State`] to a tuple with `PartialEq`: the `run` fold via
+/// [`run_state_sig`], `length`, `checkpoint_time`, `since_checkpoint`,
+/// the test-only `offset`, `tail_newline`, and the raw `gap_digest_raw`
+/// (ruling 197-d1 addendum 27.4).
+type StateSig = (RunStateSig, u64, u64, u64, u64, bool, Option<[u8; 32]>);
+fn state_sig(s: &State) -> StateSig {
+    (
+        run_state_sig(&s.run),
+        s.length,
+        s.checkpoint_time,
+        s.since_checkpoint,
+        s.offset(),
+        s.tail_newline(),
+        s.gap_digest_raw(),
+    )
+}
 
 // ---------------------------------------------------------------
 // Local helpers (file:line-stable; these do not duplicate helpers
@@ -123,16 +169,22 @@ fn classify_live_open(dir: &Path) -> ClassifyOutput {
 
 /// Field-by-field equality on the Collect-relevant parts of
 /// [`ClassifyOutput`]. Compares `violations`, `head_mismatch`,
-/// `segments.len()`, every pinned [`RunReport`] field, `found` (by
-/// `(seq, hash)`), and `final_state.run.head` (`Head` already has
-/// `PartialEq`/`Eq`): the fields that must agree on
-/// `for_snapshot` and `for_live_open` over the same bytes (rulings
-/// 13-V4-d5 (b), 13-V4-d6 point 2).
+/// `segments.len()`, every pinned [`SegmentReport`] field
+/// (`class`, `damage`, `run_membership`, `boundary_resume`, and
+/// `final_state` in full via [`run_state_sig`]), every pinned
+/// [`RunReport`] field, `found` (by `(seq, hash)`), and
+/// `final_state` in full via [`state_sig`] (rulings 13-V4-d5 (b),
+/// 13-V4-d6 point 2).
 ///
-/// `live_file` is excluded by construction: a snapshot's live
-/// segment reads from [`crate::audit::storage::ByteSource::Memory`]
-/// which has no backing `File`, so `into_file` returns `None` there
-/// by design.
+/// Two fields are excluded by construction and so not compared:
+/// - `sealed_before`: the snapshot source carries no `newest`
+///   path, so [`classify`] leaves it `None`; the live-open path
+///   records the newest sealed name observed, so the two never
+///   agree.
+/// - `live_file`: a snapshot's live segment reads from
+///   [`crate::audit::storage::ByteSource::Memory`], whose
+///   `into_file` returns `None` by design; the live-open path's
+///   source carries the live [`std::fs::File`].
 fn assert_classify_equal(snap: &ClassifyOutput, live: &ClassifyOutput) {
     assert_eq!(
         snap.violations, live.violations,
@@ -147,16 +199,35 @@ fn assert_classify_equal(snap: &ClassifyOutput, live: &ClassifyOutput) {
         live.segments.len(),
         "segments.len differs",
     );
+    let snap_segments: Vec<_> = snap
+        .segments
+        .iter()
+        .map(|s| {
+            (
+                s.class,
+                s.damage,
+                s.run_membership,
+                s.boundary_resume,
+                s.final_state.as_ref().map(run_state_sig),
+            )
+        })
+        .collect();
+    let live_segments: Vec<_> = live
+        .segments
+        .iter()
+        .map(|s| {
+            (
+                s.class,
+                s.damage,
+                s.run_membership,
+                s.boundary_resume,
+                s.final_state.as_ref().map(run_state_sig),
+            )
+        })
+        .collect();
     assert_eq!(
-        snap.segments
-            .iter()
-            .map(|s| (s.class, s.damage))
-            .collect::<Vec<_>>(),
-        live.segments
-            .iter()
-            .map(|s| (s.class, s.damage))
-            .collect::<Vec<_>>(),
-        "per-segment (class, damage) differ",
+        snap_segments, live_segments,
+        "per-segment (class, damage, run_membership, boundary_resume, final_state) differ",
     );
     assert_eq!(
         snap.found.as_ref().map(|r| (r.context.seq, r.hash())),
@@ -164,9 +235,9 @@ fn assert_classify_equal(snap: &ClassifyOutput, live: &ClassifyOutput) {
         "found (seq, hash) differs",
     );
     assert_eq!(
-        snap.final_state.as_ref().map(|s| s.run.head),
-        live.final_state.as_ref().map(|s| s.run.head),
-        "final_state.run.head differs",
+        snap.final_state.as_ref().map(state_sig),
+        live.final_state.as_ref().map(state_sig),
+        "final_state differs (full, except sealed_before/live_file)",
     );
     assert_eq!(snap.runs.len(), live.runs.len(), "runs.len differs");
     for (i, (s, l)) in snap.runs.iter().zip(live.runs.iter()).enumerate() {
@@ -193,12 +264,9 @@ fn assert_classify_equal(snap: &ClassifyOutput, live: &ClassifyOutput) {
 // ---------------------------------------------------------------
 // Row: snapshot ≡ live-open on a one-range run (live present).
 // Kills M-SNAP-1 (plan reorder: different `RunReport.first_segment`
-// / `last_segment`); M-SNAP-9 (streaming through the original file
-// after `read_to_end`: an empty span set changes `RunReport.spans`).
-// Also kills the "native_segments is_live always false" probe
-// because `final_state.run.head` is set by the live arm and left
-// `None` by every sealed arm, so any mutant that stops the walker
-// from entering the live arm changes `final_state`.
+// / `last_segment`). This row does not exercise
+// [`Collection::native_segments`] directly -- the input-side
+// `native_segments` probes are pinned by the `in::snapshot_*` rows.
 // ---------------------------------------------------------------
 
 #[test]
