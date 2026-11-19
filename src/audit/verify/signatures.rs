@@ -1,10 +1,9 @@
 //! Checkpoint signature and key-trust checks (ADR-0005 decisions 8 and 9,
-//! ruling 13-V5-d1 points 1-3).
-//!
-//! Iterates every distinct `(seq, hash)` checkpoint in the verified set --
-//! native and shipped-only, inside runs and outside them -- in `seq` order.
-//! A byte-identical duplicate yields one finding at its first occurrence
-//! (the one the engine's merge keeps).
+//! ruling 13-V5-d1 points 1-3). Called by [`super::engine::check`] once
+//! per distinct `(seq, hash)` checkpoint candidate the engine's merge
+//! retains, at that candidate's own `(path, line)` -- native or
+//! shipped, inside runs or outside. A byte-identical duplicate yields
+//! one finding at the first-occurrence copy the engine keeps.
 //!
 //! `BadSignature` fires when `verify_strict` over the 58-byte checkpoint
 //! signing message fails, which includes an undecodable key, a small-order
@@ -35,14 +34,11 @@ use std::path::Path;
     )
 )]
 pub(crate) fn trusted(trail: [u8; 16], trust: &TrustPolicy, record: &Summary) -> bool {
-    let (Some(cp), Some(msg)) = (
-        record.checkpoint.as_ref(),
-        record.signing_message.as_deref(),
-    ) else {
+    let Some(cp) = record.checkpoint.as_ref() else {
         return false;
     };
-    verify_signature(&cp.key, msg, cp.signature()).is_ok()
-        && trust.trusted_at(&trail, &cp.key, record.seq)
+    verify_signature(&cp.fields.key, &cp.signing_message, cp.fields.signature()).is_ok()
+        && trust.trusted_at(&trail, &cp.fields.key, record.seq)
 }
 
 /// Appends `BadSignature` and/or `UntrustedKey` for one distinct `(seq, hash)`
@@ -58,12 +54,8 @@ pub(super) fn check(
     let Some(cp) = record.checkpoint.as_ref() else {
         return;
     };
-    let msg = record
-        .signing_message
-        .as_deref()
-        .expect("checkpoint summary retains its signing message");
     let seq = record.seq;
-    let key = cp.key;
+    let key = cp.fields.key;
     let at = |detail: String, kind: K| {
         Finding::new(
             kind,
@@ -73,7 +65,7 @@ pub(super) fn check(
             detail,
         )
     };
-    if verify_signature(&key, msg, cp.signature()).is_err() {
+    if verify_signature(&key, &cp.signing_message, cp.fields.signature()).is_err() {
         findings.push(at(format!("key {}", hex(&key)), K::BadSignature));
     }
     if !trust.trusted_at(&trail, &key, seq) {

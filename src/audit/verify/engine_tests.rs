@@ -33,7 +33,6 @@ fn record(seq: u64, hash: u8, previous: [u8; 32], time: u64) -> Summary {
         time,
         repaired: None,
         checkpoint: None,
-        signing_message: None,
         operator: None,
         line: seq.saturating_add(1),
     }
@@ -243,9 +242,11 @@ mod ctx {
         let unsigned = Record::checkpoint(ctx.clone(), fields([0; 64])).unwrap();
         let sig = signer.sign(&unsigned.signing_message().unwrap()).unwrap();
         let signed = Record::checkpoint(ctx, fields(sig)).unwrap();
-        let signing_message = signed.signing_message();
-        let checkpoint = match signed.kind {
-            crate::audit::format::Kind::Checkpoint(cp) => Some(cp),
+        let signing_message = signed
+            .signing_message()
+            .expect("fabricated checkpoint exposes its signing message");
+        let fields = match signed.kind {
+            crate::audit::format::Kind::Checkpoint(cp) => cp,
             _ => unreachable!(),
         };
         Summary {
@@ -255,8 +256,10 @@ mod ctx {
             previous,
             time: seq,
             repaired: None,
-            checkpoint,
-            signing_message,
+            checkpoint: Some(crate::audit::verify::input::SignedCheckpoint {
+                fields,
+                signing_message,
+            }),
             operator: None,
             line: seq + 1,
         }
@@ -270,7 +273,6 @@ mod ctx {
             time: seq,
             repaired: None,
             checkpoint: None,
-            signing_message: None,
             operator: Some((
                 "vigil.audit.resume".into(),
                 "operator".into(),

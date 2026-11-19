@@ -196,7 +196,6 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
             time: seq,
             repaired: None,
             checkpoint: None,
-            signing_message: None,
             operator: None,
             line: seq + 1,
         }
