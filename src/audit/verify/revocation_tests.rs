@@ -36,14 +36,6 @@ use std::{fs, path::PathBuf, sync::Arc};
 const FIXTURE_KEY_HEX: &str = "ee45ecb9aca01a0abd83ef56dd985c8c874e6e7f4aebcedf20bd8d88c2a0add7";
 /// Alternative "new key" signing seed `0x22` repeated.
 const NEW_KEY_HEX: &str = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0";
-/// Trail id for the "other trail" sections (V11, V12). All-`0x01` bytes
-/// so it precedes `TRAIL` (`[17; 16]`) in `BTreeMap` byte order, which
-/// matters for the "first section only" scope mutant.
-const OTHER_TRAIL_HEX: &str = "01010101010101010101010101010101";
-/// Hex of V9's other trail id, kept at `[0x99; 16]` since that row
-/// verifies a specific section cross-check and does not probe the
-/// first-section mutant.
-const V9_TRAIL_HEX: &str = "99999999999999999999999999999999";
 
 /// Hex of `runs_v4a_fixtures::TRAIL` = `[17; 16]`.
 const TRAIL_HEX: &str = "11111111111111111111111111111111";
@@ -58,10 +50,6 @@ const CP2_HONEST_DIGEST: &str =
 /// Record hash of entry e1 (seq=1, previous = cp0.hash).
 const E1_HONEST_DIGEST: &str =
     "blake3:c121282b5135adfe7a17142cae6bfc4c9040c4aed26d74bddc923b8dafcdb6e8";
-/// V2 close checkpoint: `signed_cp(1, cp0.hash(), &mmr0)`. Pinned so V2's
-/// `through=1:blake3:<...>` detail carries no computed value.
-const CLOSE_CP_V2_DIGEST: &str =
-    "blake3:8a7785644d05dbdbcd8b128eb1f17aca5206eca1b9448483a49e5cdfb7ed4c42";
 /// V6 twin cp2: `signed_cp_explicit(2, e1.hash, 2, [0xde;32], [[0x22;32]])`.
 /// Pinned so V6's `SeqConflict` detail carries no computed value. Lies
 /// above `CP2_HONEST_DIGEST` in byte order, which fixes the pair
@@ -78,14 +66,6 @@ const CP0_TWIN_V6B_DIGEST: &str =
 /// in several rows.
 const BOUND_HASH_5A_DIGEST: &str =
     "blake3:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
-/// Hand-crafted bound hash `[0xcc; 32]` used as a wrong-pin-hash value
-/// for V12's out-of-scope bound.
-const BOUND_HASH_CC_DIGEST: &str =
-    "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-/// Hand-crafted bound hash `[0xaa; 32]` used as a wrong-pin-hash value
-/// for V11's X-side bound.
-const BOUND_HASH_AA_DIGEST: &str =
-    "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 /// Hand-crafted bound hash `[0xee; 32]` used by V13/V13b's absent
 /// second bound.
 const BOUND_HASH_EE_DIGEST: &str =
@@ -94,13 +74,19 @@ const BOUND_HASH_EE_DIGEST: &str =
 /// failing absent-seq bound.
 const C_KEY_HEX: &str = "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48";
 /// New-key checkpoint at seq=1 (`sign_with(new, 1, cp0.hash, &mmr0)`).
-/// Reused by the Q3 probes.
+/// Reused by the other-key-cp precedence rows.
 const NEW_CP1_DIGEST: &str =
     "blake3:1acb508d66bef3c41553d03c3ad762cc53915716f882ac8a01b080b246d4937e";
-/// Old-key checkpoint at seq=3 (`signed_cp(3, cp2.hash, &mmr_after_cp2)`),
-/// used by the hand-built compromise-branch row.
-const OLD_CP3_DIGEST: &str =
-    "blake3:dfbf4e5a7173125e6d43847fa1c1b05420adc1c09022566ebbb292b72cf0203c";
+/// New-key checkpoint at seq=1 with explicit alternative fields
+/// (`sign_with_fields(new, 1, cp0.hash, 1, [0xbb;32], vec![[0xbb;32]])`).
+/// Pinned so the seq=1 fork-with-other-key probes carry no computed
+/// value.
+const NEW_CP1_TWIN_DIGEST: &str =
+    "blake3:ec9e7df483d272013bce736629ee51feeb2657bfe2bd5eb68ea53c74cfe4e68f";
+/// Entry at seq=2 chained from `entry_rec(1, cp0.hash)` on the shared
+/// fixture trail (`entry_rec(2, e1.hash)`). Pinned so the entry-at-
+/// seq=2 wrong-hash row carries no computed value.
+const E2_DIGEST: &str = "blake3:8a5ea9c989aad7e89033b58ad6f59a6384af43dfe6df5bada042420c0040c306";
 
 // =====================================================================
 // Helpers.
@@ -180,16 +166,30 @@ fn flip_signature(signed: &Record) -> Record {
     with_signature(signed, flipped)
 }
 fn sign_with(signer: &dyn Signer, seq: u64, previous: [u8; 32], mmr: &Mmr) -> Record {
-    let fields = |sig| {
-        CheckpointFields::new(
-            mmr.size(),
-            mmr.root(),
-            mmr.peaks().to_vec(),
-            signer.public_key(),
-            sig,
-        )
-        .unwrap()
-    };
+    sign_with_fields(
+        signer,
+        seq,
+        previous,
+        mmr.size(),
+        mmr.root(),
+        mmr.peaks().to_vec(),
+    )
+}
+/// As `sign_with` but with explicit `(size, root, peaks)` fields. Lets
+/// a fork at `s` carry two distinct checkpoints signed by the SAME
+/// non-bounded key, so the key-identity check fires on either copy
+/// regardless of merge-order sort. `peaks.len() == size.count_ones()`
+/// must hold (`CheckpointFields::new` invariant).
+fn sign_with_fields(
+    signer: &dyn Signer,
+    seq: u64,
+    previous: [u8; 32],
+    size: u64,
+    root: [u8; 32],
+    peaks: Vec<[u8; 32]>,
+) -> Record {
+    let fields =
+        |sig| CheckpointFields::new(size, root, peaks.clone(), signer.public_key(), sig).unwrap();
     let unsigned = Record::checkpoint(context(seq, previous), fields([0; 64])).unwrap();
     let sig = signer.sign(&unsigned.signing_message().unwrap()).unwrap();
     Record::checkpoint(context(seq, previous), fields(sig)).unwrap()
@@ -914,6 +914,11 @@ fn v12_bound_only_on_another_trail_is_scoped_out() {
 // through the absence of any A-side revocation finding. Under a
 // confirmation that counts native copies only, the shipped cp2 is
 // dropped and A's bound emits `RevocationUnconfirmed` at cp0.
+//
+// Red on base (`revocation::check` stubbed to emit nothing): the
+// expected list carries a `RevocationMismatch "…no record at seq 99"`
+// and `RevocationUnconfirmed` for C's absent bound; neither is emitted
+// on base, so the `assert_findings` literal comparison fails first.
 // =====================================================================
 #[test]
 fn v13_shipped_only_confirming_checkpoint_confirms() {
@@ -958,6 +963,10 @@ fn v13_shipped_only_confirming_checkpoint_confirms() {
 // V13b — ACCEPTANCE. As V13 but the shipped confirming checkpoint is
 // at seq=1 (just above the bound). Pairs with V13 so a native-only
 // confirmation leaves two failing rows.
+//
+// Red on base (`revocation::check` stubbed): same mechanism as V13 —
+// the C-side `RevocationMismatch "…no record at seq 99"` and its
+// `RevocationUnconfirmed` are missing on base.
 // =====================================================================
 #[test]
 fn v13b_shipped_only_confirming_checkpoint_at_seq_one_confirms() {
@@ -1230,16 +1239,16 @@ fn v15c_forked_wins_over_has_hash_at_seq_zero() {
 }
 
 // =====================================================================
-// Q3-A — ACCEPTANCE. Probe for a strict-vs-inclusive confirmation. At
-// `s=1` the record is a checkpoint signed by B ≠ A, so d4's key check
-// emits `RevocationMismatch "…signed by key B"`. Confirmation strictly
-// above `s=1` has no records → `RevocationUnconfirmed`. A confirmation
-// that uses `>= s` (not `> s`) would accept cp1 itself as a confirming
-// other-key checkpoint and drop `RevocationUnconfirmed`. A pin that
-// skips the key check (Q10) would drop `RevocationMismatch`.
+// Bound at an other-key cp, strict confirmation. At `s=1` the record
+// is a checkpoint signed by B ≠ A, so the key-identity pin emits
+// `RevocationMismatch "…signed by key B"`. Confirmation strictly above
+// `s=1` has no records → `RevocationUnconfirmed`. An inclusive
+// confirmation would accept cp1 itself as the confirming other-key
+// checkpoint and drop `RevocationUnconfirmed`; a pin that skips the
+// key-identity check would drop `RevocationMismatch`.
 // =====================================================================
 #[test]
-fn q3a_bound_at_other_key_cp_strict_confirmation() {
+fn bound_at_other_key_cp_strict_confirmation_is_unconfirmed_and_pin_fails_on_key() {
     let d = Temp::new();
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
     let mmr0 = seeded(&cp0);
@@ -1274,20 +1283,20 @@ fn q3a_bound_at_other_key_cp_strict_confirmation() {
             ),
         ),
     ];
-    assert_findings(&findings, &expected, "Q3-A");
+    assert_findings(&findings, &expected, "bound_at_other_key_cp");
 }
 
 // =====================================================================
-// Q3-B — ACCEPTANCE. As Q3-A plus an entry at `seq=2` above the bound,
-// so cp1 is not the only record above `s`. The record at `seq=2` is
-// an entry, not a checkpoint, so strict confirmation still has no
+// As the preceding row plus an entry at `seq=2` above the bound, so
+// cp1 is not the only record above `s`. The record at `seq=2` is an
+// entry, not a checkpoint, so strict confirmation still has no
 // confirming cp → `RevocationUnconfirmed`. An inclusive confirmation
-// (`>= s`) still accepts cp1 and drops `RevocationUnconfirmed`. The
+// would still accept cp1 and drop `RevocationUnconfirmed`. The
 // coverage pass promotes the trail through seq=1 (cp1 trusted) so
 // `UncoveredTail` names the entry at seq=2 only.
 // =====================================================================
 #[test]
-fn q3b_bound_at_other_key_cp_with_entry_above() {
+fn bound_at_other_key_cp_with_entry_above_is_unconfirmed_and_pin_fails_on_key() {
     let d = Temp::new();
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
     let mmr0 = seeded(&cp0);
@@ -1324,7 +1333,317 @@ fn q3b_bound_at_other_key_cp_with_entry_above() {
         ),
         uncovered(2, 2),
     ];
-    assert_findings(&findings, &expected, "Q3-B");
+    assert_findings(
+        &findings,
+        &expected,
+        "bound_at_other_key_cp_with_entry_above",
+    );
+}
+
+// =====================================================================
+// V1 — REGRESSION (ADR-0005 decision 11 revocation bullet:
+// "Following the procedure exactly after a clean stop → no error").
+// Drives the real `AuditConfig::rotate` on a freshly closed trail: the
+// bound names the old key's close checkpoint, and the rotate writes a
+// `vigil.audit.key_rotated` operator entry followed by a new-key
+// checkpoint. The verified list is empty.
+//
+// Measured over-strict mutant kills (runtime exit 101 on this row):
+// - confirmation that requires the same key as the bounded one
+//   (Q1R): the new-key checkpoint no longer confirms, so the row
+//   emits `RevocationUnconfirmed`;
+// - confirmation that requires the confirming checkpoint at exactly
+//   `s + 1` (R2): seq `s + 1` is the `key_rotated` entry on a clean
+//   stop, not a checkpoint, so the row emits `RevocationUnconfirmed`.
+// =====================================================================
+#[test]
+fn v1_clean_stop_rotation_is_clean() {
+    let temp = Temp::new();
+    let dir = temp.0.clone();
+    let old = old_signer();
+    let new = new_signer();
+    let (trail_id, close) = {
+        let handle = AuditConfig::new("svc")
+            .dir(&dir)
+            .create(old.clone())
+            .unwrap();
+        let trail_id = handle.trail();
+        handle
+            .record(&crate::audit::Entry::new("actor", "change", "obj"))
+            .unwrap();
+        let close = handle.close().unwrap();
+        (trail_id, close)
+    };
+    let (_r, _c) = AuditConfig::new("svc")
+        .dir(&dir)
+        .rotate(
+            new.clone(),
+            (close.seq(), close.hash()),
+            (close.seq(), close.hash()),
+            "operator",
+            "scheduled",
+        )
+        .unwrap();
+    let trust = TrustPolicy::builder()
+        .trail(trail_id)
+        .key_through(old.public_key(), close.seq(), close.hash())
+        .key(new.public_key())
+        .build()
+        .unwrap();
+    let findings = verify_dir_with(&dir, trust);
+    assert_findings(&findings, &[], "V1");
+}
+
+// =====================================================================
+// P1 — ACCEPTANCE. Precedence under d4 point 3: the record at `s=1`
+// is a checkpoint signed by the OTHER key (B) and the bound carries a
+// wrong hash. Hash precedence (3) wins over signed-by-another-key (5),
+// so the pin emits `"…has hash …"`, located at the first copy. A pin
+// that runs the key check before the hash check (M7) swaps the two
+// details and emits `"…is signed by key …"`; a pin that runs the key
+// check before the fork check (M8) also fires the key detail since
+// no fork exists at `s=1`.
+// =====================================================================
+#[test]
+fn p1_other_key_cp_with_wrong_hash_emits_hash_detail() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let new = new_signer();
+    let cp1 = sign_with(&*new, 1, cp0.hash(), &mmr0);
+    put_segment(&d.0, 0, &[&cp0, &cp1], &[]);
+    let path = segment_path(&d.0, 0);
+    let bound_hash: [u8; 32] = [0x5a; 32];
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key_through(fixture_pubkey(), 1, bound_hash)
+        .key(new.public_key())
+        .build()
+        .unwrap();
+    let findings = verify_files_with(vec![path.clone()], trust);
+    let expected = vec![
+        located(
+            K::RevocationMismatch,
+            path.clone(),
+            2,
+            1,
+            format!(
+                "key {FIXTURE_KEY_HEX} through=1:{BOUND_HASH_5A_DIGEST}: record at seq 1 has hash {NEW_CP1_DIGEST}"
+            ),
+        ),
+        located(
+            K::RevocationUnconfirmed,
+            path,
+            2,
+            1,
+            format!(
+                "key {FIXTURE_KEY_HEX} through=1: no trusted checkpoint by another key above the bound"
+            ),
+        ),
+    ];
+    assert_findings(&findings, &expected, "P1");
+}
+
+// =====================================================================
+// P1b — ACCEPTANCE. As P1 plus a byte-identical shipped copy of the
+// pinned record. Pairs with P1 so a key-check-before-hash reordering
+// leaves two failing rows for M7.
+// =====================================================================
+#[test]
+fn p1b_other_key_cp_with_wrong_hash_duplicated_emits_hash_detail() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let new = new_signer();
+    let cp1 = sign_with(&*new, 1, cp0.hash(), &mmr0);
+    put_segment(&d.0, 0, &[&cp0, &cp1], &[]);
+    let native = segment_path(&d.0, 0);
+    let shipped = d.0.join("cp1.copy");
+    fs::write(&shipped, line_bytes(&cp1)).unwrap();
+    let bound_hash: [u8; 32] = [0x5a; 32];
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key_through(fixture_pubkey(), 1, bound_hash)
+        .key(new.public_key())
+        .build()
+        .unwrap();
+    let findings = verify_files_with(vec![native.clone(), shipped], trust);
+    let expected = vec![
+        located(
+            K::DuplicateRecord,
+            native.clone(),
+            2,
+            1,
+            "2 copies of 1 distinct records".into(),
+        ),
+        located(
+            K::RevocationMismatch,
+            native.clone(),
+            2,
+            1,
+            format!(
+                "key {FIXTURE_KEY_HEX} through=1:{BOUND_HASH_5A_DIGEST}: record at seq 1 has hash {NEW_CP1_DIGEST}"
+            ),
+        ),
+        located(
+            K::RevocationUnconfirmed,
+            native,
+            2,
+            1,
+            format!(
+                "key {FIXTURE_KEY_HEX} through=1: no trusted checkpoint by another key above the bound"
+            ),
+        ),
+    ];
+    assert_findings(&findings, &expected, "P1b");
+}
+
+// =====================================================================
+// P2 — ACCEPTANCE. Precedence under d4 point 3: `s=1` is forked, and
+// every copy at `s` is a checkpoint signed by the OTHER key (B).
+// Fork precedence (2) wins over signed-by-another-key (5), so the pin
+// emits `"…seq s is forked"`, unlocated. A pin that runs the key
+// check before the fork check (M8) fires the key detail instead,
+// located at the first copy.
+// =====================================================================
+#[test]
+fn p2_other_key_cp_fork_emits_forked_detail() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let new = new_signer();
+    let cp1 = sign_with(&*new, 1, cp0.hash(), &mmr0);
+    let twin_cp1 = sign_with_fields(&*new, 1, cp0.hash(), 1, [0xbb; 32], vec![[0xbb; 32]]);
+    put_segment(&d.0, 0, &[&cp0, &cp1], &[]);
+    let native = segment_path(&d.0, 0);
+    let shipped = d.0.join("cp1.twin");
+    fs::write(&shipped, line_bytes(&twin_cp1)).unwrap();
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key_through(fixture_pubkey(), 1, cp1.hash())
+        .key(new.public_key())
+        .build()
+        .unwrap();
+    let findings = verify_files_with(vec![native.clone(), shipped], trust);
+    let expected = vec![
+        unlocated(
+            K::RevocationMismatch,
+            Some(1),
+            format!("key {FIXTURE_KEY_HEX} through=1:{NEW_CP1_DIGEST}: seq 1 is forked"),
+        ),
+        unlocated(
+            K::RevocationUnconfirmed,
+            Some(1),
+            format!(
+                "key {FIXTURE_KEY_HEX} through=1: no trusted checkpoint by another key above the bound"
+            ),
+        ),
+        located(
+            K::SeqConflict,
+            native,
+            2,
+            1,
+            format!("conflicting hashes: {NEW_CP1_DIGEST}, {NEW_CP1_TWIN_DIGEST}"),
+        ),
+    ];
+    assert_findings(&findings, &expected, "P2");
+}
+
+// =====================================================================
+// P2b — ACCEPTANCE. As P2 plus an entry at seq=2 above the forked
+// seq, so the layout differs from P2 even though the fork mechanism
+// is the same. Pairs with P2 so a key-check-before-fork reordering
+// leaves two failing rows for M8.
+// =====================================================================
+#[test]
+fn p2b_other_key_cp_fork_with_entry_above_emits_forked_detail() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let new = new_signer();
+    let cp1 = sign_with(&*new, 1, cp0.hash(), &mmr0);
+    let twin_cp1 = sign_with_fields(&*new, 1, cp0.hash(), 1, [0xbb; 32], vec![[0xbb; 32]]);
+    let e2 = entry_rec(2, cp1.hash());
+    put_segment(&d.0, 0, &[&cp0, &cp1, &e2], &[]);
+    let native = segment_path(&d.0, 0);
+    let shipped = d.0.join("cp1.twin");
+    fs::write(&shipped, line_bytes(&twin_cp1)).unwrap();
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key_through(fixture_pubkey(), 1, cp1.hash())
+        .key(new.public_key())
+        .build()
+        .unwrap();
+    let findings = verify_files_with(vec![native.clone(), shipped], trust);
+    let expected = vec![
+        unlocated(
+            K::RevocationMismatch,
+            Some(1),
+            format!("key {FIXTURE_KEY_HEX} through=1:{NEW_CP1_DIGEST}: seq 1 is forked"),
+        ),
+        unlocated(
+            K::RevocationUnconfirmed,
+            Some(1),
+            format!(
+                "key {FIXTURE_KEY_HEX} through=1: no trusted checkpoint by another key above the bound"
+            ),
+        ),
+        located(
+            K::SeqConflict,
+            native,
+            2,
+            1,
+            format!("conflicting hashes: {NEW_CP1_DIGEST}, {NEW_CP1_TWIN_DIGEST}"),
+        ),
+        uncovered(2, 2),
+    ];
+    assert_findings(&findings, &expected, "P2b");
+}
+
+// =====================================================================
+// V15d — ACCEPTANCE. Precedence under d4 point 3: an entry at `s=2`
+// with a wrong hash. Hash precedence (3) wins over not-a-checkpoint
+// (4), so the pin emits `"…has hash …"`. Pairs with V15 (same
+// scenario at `s=1`) so a swap of those two details leaves two
+// failing rows for M2r.
+// =====================================================================
+#[test]
+fn v15d_entry_at_seq_two_wrong_hash_emits_hash_detail() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let e1 = entry_rec(1, cp0.hash());
+    let e2 = entry_rec(2, e1.hash());
+    put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
+    let path = segment_path(&d.0, 0);
+    let bound_hash: [u8; 32] = [0x5a; 32];
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key_through(fixture_pubkey(), 2, bound_hash)
+        .build()
+        .unwrap();
+    let findings = verify_files_with(vec![path.clone()], trust);
+    let expected = vec![
+        located(
+            K::RevocationMismatch,
+            path.clone(),
+            3,
+            2,
+            format!(
+                "key {FIXTURE_KEY_HEX} through=2:{BOUND_HASH_5A_DIGEST}: record at seq 2 has hash {E2_DIGEST}"
+            ),
+        ),
+        located(
+            K::RevocationUnconfirmed,
+            path,
+            3,
+            2,
+            format!(
+                "key {FIXTURE_KEY_HEX} through=2: no trusted checkpoint by another key above the bound"
+            ),
+        ),
+        uncovered(1, 2),
+    ];
+    assert_findings(&findings, &expected, "V15d");
 }
 
 // =====================================================================
@@ -1337,10 +1656,6 @@ fn fixture_hashes_match_literals() {
     assert_eq!(hex(&fixture_pubkey()), FIXTURE_KEY_HEX);
     assert_eq!(hex(&new_pubkey()), NEW_KEY_HEX);
     assert_eq!(hex(&TRAIL), TRAIL_HEX);
-    let other: [u8; 16] = [0x01; 16];
-    assert_eq!(hex(&other), OTHER_TRAIL_HEX);
-    let v9_other: [u8; 16] = [0x99; 16];
-    assert_eq!(hex(&v9_other), V9_TRAIL_HEX);
     let fx = two_checkpoints();
     assert_eq!(digest_string(&fx.cp0.hash()), CP0_HONEST_DIGEST);
     assert_eq!(digest_string(&fx.e1.hash()), E1_HONEST_DIGEST);
@@ -1348,9 +1663,6 @@ fn fixture_hashes_match_literals() {
     let _keep = fx.dir;
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
     let mmr0 = seeded(&cp0);
-    // V2's close checkpoint hash.
-    let close_cp = signed_cp(1, cp0.hash(), &mmr0);
-    assert_eq!(digest_string(&close_cp.hash()), CLOSE_CP_V2_DIGEST);
     let e1 = entry_rec(1, cp0.hash());
     // V6's twin cp2 hash.
     let twin_v6 = signed_cp_explicit(2, e1.hash(), 2, [0xde; 32], vec![[0x22; 32]]);
@@ -1358,20 +1670,18 @@ fn fixture_hashes_match_literals() {
     // V6b's twin cp0 hash.
     let twin_v6b = signed_cp_explicit(0, Record::genesis(&TRAIL), 0, [0xde; 32], vec![]);
     assert_eq!(digest_string(&twin_v6b.hash()), CP0_TWIN_V6B_DIGEST);
-    // Q3's cp1 hash (new-key sign of seq=1 chained from cp0).
+    // Other-key cp1 hash (new-key sign of seq=1 chained from cp0).
     let new = new_signer();
     let new_cp1 = sign_with(&*new, 1, cp0.hash(), &mmr0);
     assert_eq!(digest_string(&new_cp1.hash()), NEW_CP1_DIGEST);
-    // V10b's cp3 hash (old-key sign of seq=3 chained from cp2).
-    let mmr1 = pushed(&mmr0, &e1);
-    let cp2 = signed_cp(2, e1.hash(), &mmr1);
-    let mmr2 = pushed(&mmr1, &cp2);
-    let cp3 = signed_cp(3, cp2.hash(), &mmr2);
-    assert_eq!(digest_string(&cp3.hash()), OLD_CP3_DIGEST);
+    // Twin other-key cp1 hash (new-key sign with alt fields).
+    let twin_new_cp1 = sign_with_fields(&*new, 1, cp0.hash(), 1, [0xbb; 32], vec![[0xbb; 32]]);
+    assert_eq!(digest_string(&twin_new_cp1.hash()), NEW_CP1_TWIN_DIGEST);
+    // Entry at seq=2 chained from e1.
+    let e2 = entry_rec(2, e1.hash());
+    assert_eq!(digest_string(&e2.hash()), E2_DIGEST);
     // Hand-crafted bound hashes.
     assert_eq!(digest_string(&[0x5a; 32]), BOUND_HASH_5A_DIGEST);
-    assert_eq!(digest_string(&[0xcc; 32]), BOUND_HASH_CC_DIGEST);
-    assert_eq!(digest_string(&[0xaa; 32]), BOUND_HASH_AA_DIGEST);
     assert_eq!(digest_string(&[0xee; 32]), BOUND_HASH_EE_DIGEST);
     // V13/V13b's C key (seed `0x44`).
     let c = Arc::new(KeyFileSigner::from_hex(&"44".repeat(32)).unwrap());
