@@ -13,7 +13,7 @@
 //! kind_debug)`), so no per-row sort runs here.
 
 use crate::audit::{
-    Entry, FindingKind as K, KeyFileSigner, Mmr, Record, Signer as _, TrustPolicy, digest_string,
+    Entry, FindingKind as K, Mmr, Record, RecordContext, TrustPolicy, digest_string,
     format::Kind,
     gap_hasher, hex,
     runs_v4a_fixtures::{
@@ -29,7 +29,8 @@ use std::{fs, path::PathBuf};
 // =====================================================================
 
 const FIXTURE_KEY_HEX: &str = "ee45ecb9aca01a0abd83ef56dd985c8c874e6e7f4aebcedf20bd8d88c2a0add7";
-const NEW_KEY_HEX: &str = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0";
+const TRAIL_HEX: &str = "11111111111111111111111111111111";
+const OTHER_TRAIL_HEX: &str = "01010101010101010101010101010101";
 const CP0_HONEST_DIGEST: &str =
     "blake3:fc26c6f2bb830592aaaca5413da1599489d86ac6e240a4a7a010681e0d4c8e77";
 const E1_HONEST_DIGEST: &str =
@@ -56,8 +57,15 @@ const CRASHED_E1_DIGEST: &str =
 /// repaired e1, so its hash differs from `two_checkpoints()`'s cp2.
 const CRASHED_CP2_DIGEST: &str =
     "blake3:9c0055973508dfe13d166f4ebabbfac7dd981e2471dc518c051c59f8832e3c66";
+/// `e2` hash in the `[cp0, e1, frag, e2(repaired=FRAG), e3]`
+/// repair-below-end layout (E10c). The entry carries the gap's
+/// `audit.repaired` digest at `seq=2`, so its hash differs from
+/// `two_checkpoints()`'s cp2.
+const E10C_ATTESTER_DIGEST: &str =
+    "blake3:5ab426a15266f81c6e5aed306a88cf2cfdb0634c814dce0ddd683cf22a6692f3";
 
-// Secondary trail id used by E8/E12 to probe mutant T11 (scope).
+// Secondary trail id used to carry an `end=` in another trail's
+// section (E8, E12) and to plant foreign-trail records (E2f, E2f2).
 const OTHER_TRAIL: [u8; 16] = [0x01; 16];
 
 // =====================================================================
@@ -94,14 +102,15 @@ fn report_on_trail(files: Vec<PathBuf>, trust: TrustPolicy, trail: [u8; 16]) -> 
         .unwrap()
 }
 
-fn new_pubkey() -> [u8; 32] {
-    KeyFileSigner::from_hex(&"22".repeat(32))
-        .unwrap()
-        .public_key()
-}
-
 fn entry_with_repaired(seq: u64, previous: [u8; 32], repair: [u8; 32]) -> Record {
     let ctx = context(seq, previous).repaired(repair);
+    Record::new(ctx, Entry::new("a", "change", "c")).unwrap()
+}
+/// Entry record on an arbitrary trail. The engine's trail filter
+/// gates these out of the verified-trail `groups` with a
+/// `TrailMismatch`, so chain fields need not be honest.
+fn entry_on_trail(trail: [u8; 16], seq: u64, previous: [u8; 32]) -> Record {
+    let ctx = RecordContext::new(trail, seq, 100 + seq, "test", previous);
     Record::new(ctx, Entry::new("a", "change", "c")).unwrap()
 }
 fn repair_digest(frag: &[u8]) -> [u8; 32] {
@@ -197,8 +206,8 @@ fn e1_wrong_hash_at_end_seq_emits_has_hash() {
 // =====================================================================
 // E2 — ACCEPTANCE. Records above a matching `end=` emit one
 // `TrailEnded` at the first such record, with the `a..=b` seq range.
-// Pairs with E11 to pin the location at the FIRST record above
-// (mutant T12) and the `seq > s` boundary (mutant T2).
+// Pairs with E11 to pin the location at the FIRST record above and
+// the `seq > s` boundary (not `>=` and not at the last record).
 // =====================================================================
 #[test]
 fn e2_records_above_end_emit_records_above() {
@@ -231,6 +240,102 @@ fn e2_records_above_end_emit_records_above() {
     ];
     assert_findings(report.findings(), &expected, "E2");
     assert!(!report.is_strict_valid(), "E2 strict fails on TrailEnded");
+    assert_eq!(report.covered_through(), Some(2));
+}
+
+// =====================================================================
+// E2f — ACCEPTANCE. Records of ANOTHER trail at seqs above `s` do
+// NOT count for the "above" check: only records of the verified
+// trail do. The verified trail stops at `s=2` with cp2, and the
+// same native segment carries foreign records at `seq=3` and `4`;
+// each foreign record emits `TrailMismatch` and the match at `s=2`
+// holds (no `TrailEnded`). Pairs with E2f2 to pin "above reads the
+// verified trail only" across native and shipped layouts.
+// =====================================================================
+#[test]
+fn e2f_foreign_records_above_end_in_native_file_do_not_count() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let cp2 = signed_cp(2, e1.hash(), &mmr1);
+    let foreign_a = entry_on_trail(OTHER_TRAIL, 3, [0; 32]);
+    let foreign_b = entry_on_trail(OTHER_TRAIL, 4, [0; 32]);
+    put_segment(&d.0, 0, &[&cp0, &e1, &cp2, &foreign_a, &foreign_b], &[]);
+    let path = segment_path(&d.0, 0);
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key(fixture_pubkey())
+        .end(2, cp2.hash())
+        .build()
+        .unwrap();
+    let report = report_of(vec![path.clone()], trust);
+    let expected = vec![
+        located(
+            K::TrailMismatch,
+            path.clone(),
+            4,
+            3,
+            format!("expected trail {TRAIL_HEX}, found {OTHER_TRAIL_HEX}"),
+        ),
+        located(
+            K::TrailMismatch,
+            path,
+            5,
+            4,
+            format!("expected trail {TRAIL_HEX}, found {OTHER_TRAIL_HEX}"),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "E2f");
+    assert!(!report.is_strict_valid(), "E2f strict fails: TrailMismatch");
+    assert_eq!(report.covered_through(), Some(2));
+}
+
+// =====================================================================
+// E2f2 — ACCEPTANCE. Second "foreign records above `s`" row, with
+// the foreign records in a SHIPPED copy instead of the native
+// segment: layout differs from E2f but the ruling is the same,
+// foreign-trail records above `s` are ignored for the "above"
+// check.
+// =====================================================================
+#[test]
+fn e2f2_foreign_records_above_end_in_shipped_copy_do_not_count() {
+    let fx = two_checkpoints();
+    let foreign_a = entry_on_trail(OTHER_TRAIL, 3, [0; 32]);
+    let foreign_b = entry_on_trail(OTHER_TRAIL, 4, [0; 32]);
+    let mut bytes = line_bytes(&foreign_a);
+    bytes.extend_from_slice(&line_bytes(&foreign_b));
+    let shipped_path = fx._dir.0.join("foreign.jsonl");
+    fs::write(&shipped_path, &bytes).unwrap();
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key(fixture_pubkey())
+        .end(2, fx.cp2.hash())
+        .build()
+        .unwrap();
+    let report = report_of(vec![fx.path.clone(), shipped_path.clone()], trust);
+    let expected = vec![
+        located(
+            K::TrailMismatch,
+            shipped_path.clone(),
+            1,
+            3,
+            format!("expected trail {TRAIL_HEX}, found {OTHER_TRAIL_HEX}"),
+        ),
+        located(
+            K::TrailMismatch,
+            shipped_path,
+            2,
+            4,
+            format!("expected trail {TRAIL_HEX}, found {OTHER_TRAIL_HEX}"),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "E2f2");
+    assert!(
+        !report.is_strict_valid(),
+        "E2f2 strict fails: TrailMismatch"
+    );
     assert_eq!(report.covered_through(), Some(2));
 }
 
@@ -303,7 +408,8 @@ fn e2v_forged_checkpoint_above_bound_also_emits_untrusted_key() {
 // E3 — ACCEPTANCE. The `end=` `seq` is absent from the verified
 // files: `TrailEnded "no record at seq 5"`, no location, no tail
 // exemption (`TrailEnded` is an error so strict fails). Pairs with
-// E3b to pin "absent" precedence (mutant T4).
+// E3b to pin that "absent at `s`" fires (an absent `seq` is not a
+// match).
 // =====================================================================
 #[test]
 fn e3_absent_at_end_seq_emits_no_record_unlocated() {
@@ -334,8 +440,8 @@ fn e3_absent_at_end_seq_emits_no_record_unlocated() {
 
 // =====================================================================
 // E3b — ACCEPTANCE. Second absent-at-end-seq row at a different
-// `seq`: pairs with E3 so mutant T4 (absent counts as match) is
-// killed on two rows.
+// `seq`: pairs with E3 so the "absent at `s`" check firing (rather
+// than silently matching) is pinned on two independent rows.
 // =====================================================================
 #[test]
 fn e3b_absent_at_different_end_seq_also_emits_no_record() {
@@ -396,9 +502,9 @@ fn e4_forked_at_end_seq_emits_forked_and_seq_conflict() {
 }
 
 // =====================================================================
-// E4b — ACCEPTANCE. Second forked-at-end-seq row at `seq=0`:
-// pairs with E4 so mutant T3 (no fork check at s; first copy wins)
-// is killed on two rows.
+// E4b — ACCEPTANCE. Second forked-at-end-seq row at `seq=0`: pairs
+// with E4 so the fork check at `s` firing (rather than the first
+// copy quietly matching) is pinned on two independent rows.
 // =====================================================================
 #[test]
 fn e4b_forked_at_end_seq_zero_emits_forked_and_seq_conflict() {
@@ -505,8 +611,9 @@ fn e6_end_and_bound_at_last_checkpoint_verifies_clean() {
 
 // =====================================================================
 // E6b — ACCEPTANCE. Second `end=` and bound at the same last record,
-// at `seq=0` instead of `seq=2`: pairs with E6 so mutant T8 (bound
-// confirmation uses `<` instead of `<=`) is killed on two rows.
+// at `seq=0` instead of `seq=2`: pairs with E6 so bound confirmation
+// at `seq == s` (the `<=` boundary) is pinned on two independent
+// rows.
 // =====================================================================
 #[test]
 fn e6b_end_and_bound_at_single_checkpoint_verifies_clean() {
@@ -578,12 +685,13 @@ fn e7_bound_earlier_end_at_last_confirms_bound_and_flags_later_cps() {
 // =====================================================================
 // E8 — REGRESSION (d11 l.931 "without `end=`, the bound is
 // `RevocationUnconfirmed`"). Same retired-trail layout as E7 but
-// WITHOUT `end=` on `TRAIL` (the only live section with a bound).
-// A foreign section carries an `end=` so mutant T11 (scope: use the
-// first section's `end=`) applies that `end=` to `TRAIL` under the
-// mutant, confirms the bound and drops `RevocationUnconfirmed` ---
-// which kills T11. Base already reports `RevocationUnconfirmed` and
-// the two `UntrustedKey` findings, so this is a regression row.
+// WITHOUT `end=` on `TRAIL` (the only live section with a bound). A
+// foreign section carries an `end=`, so the row also pins that the
+// verifier reads only the verified trail's section's `end=`
+// (scope): the foreign `end=` does not reach `TRAIL`, the bound
+// stays unconfirmed, and the two `UntrustedKey` findings stay.
+// Base already reports `RevocationUnconfirmed` and both
+// `UntrustedKey` findings, so this is a regression row.
 // =====================================================================
 #[test]
 fn e8_retired_trail_without_end_is_revocation_unconfirmed() {
@@ -723,9 +831,9 @@ fn e9b_crashed_repair_without_end_stays_torn_write() {
 
 // =====================================================================
 // E9c — ACCEPTANCE. Second matched-`end=` repair promotion with
-// the attester at `seq == matched_end` but at a different `seq`,
-// pairs with E9a so mutant T9 (repair promotion uses `<`) is killed
-// on two rows.
+// the attester at `seq == matched_end` but at a different `seq`:
+// pairs with E9a so promotion at `seq == matched_end` (the `<=`
+// boundary) is pinned on two independent rows.
 // =====================================================================
 #[test]
 fn e9c_crashed_repair_at_seq_two_with_matching_end_is_torn_write_repaired() {
@@ -839,10 +947,12 @@ fn e10_mismatched_end_grants_no_exemption_no_confirmation_no_promotion() {
 // =====================================================================
 // E10b — ACCEPTANCE. Second mismatched-`end=` scenario where the
 // MISMATCH is on the "above" side (records above the end) rather
-// than the "at `s`" side. Pairs with E10 so mutants T6 (mismatched
-// confirms bounds) and T7 (mismatched promotes repairs) are each
-// killed on two rows. `end=1:e1.hash` matches at `s=1` but cp2 at
-// seq=2 above makes the overall end= a MISMATCH.
+// than the "at `s`" side. Pairs with E10 so the two
+// grants-only-on-match rules (bound confirmation and repair
+// promotion) are each pinned on two independent rows, one where the
+// "at `s`" side fails and one where the "above" side does.
+// `end=1:e1.hash` matches at `s=1` but cp2 at `seq=2` above makes
+// the overall `end=` a MISMATCH.
 // =====================================================================
 #[test]
 fn e10b_mismatched_above_end_grants_none_of_the_three() {
@@ -896,10 +1006,67 @@ fn e10b_mismatched_above_end_grants_none_of_the_three() {
 }
 
 // =====================================================================
+// E10c — ACCEPTANCE. Second mismatched-"above" scenario where the
+// repair's attester is AT OR BELOW `s` but the overall `end=` is a
+// mismatch because a record lies above `s`. The repair must stay
+// `TornWrite`, which pins "the match is computed once for every
+// consumer": any attempt to recompute the match for the repair
+// consumer using the "at `s`" side only would see `s=2` matched and
+// promote. Layout differs from E10b (repair at `s`, record above
+// at `s+1`, no checkpoint above).
+// =====================================================================
+#[test]
+fn e10c_mismatched_above_with_repair_at_s_stays_torn_write() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let e1 = entry_rec(1, cp0.hash());
+    let gap = repair_digest(FRAG);
+    let e2 = entry_with_repaired(2, e1.hash(), gap);
+    let e3 = entry_rec(3, e2.hash());
+    let mut bytes = line_bytes(&cp0);
+    bytes.extend_from_slice(&line_bytes(&e1));
+    bytes.extend_from_slice(FRAG);
+    bytes.extend_from_slice(&line_bytes(&e2));
+    bytes.extend_from_slice(&line_bytes(&e3));
+    let path = segment_path(&d.0, 0);
+    write_bytes(&path, &bytes);
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key(fixture_pubkey())
+        .end(2, e2.hash())
+        .build()
+        .unwrap();
+    let report = report_of(vec![path.clone()], trust);
+    let expected = vec![
+        located(
+            K::TornWrite,
+            path.clone(),
+            3,
+            2,
+            format!(
+                "lines 3..=3 ({len} bytes), attested at line 4 seq 2",
+                len = FRAG.len()
+            ),
+        ),
+        located(
+            K::TrailEnded,
+            path,
+            5,
+            3,
+            format!("end=2:{E10C_ATTESTER_DIGEST}: records seq 3..=3 above the end"),
+        ),
+        uncovered(1, 3),
+    ];
+    assert_findings(report.findings(), &expected, "E10c");
+    assert!(!report.is_strict_valid(), "E10c strict fails: not exempt");
+    assert_eq!(report.covered_through(), Some(0));
+}
+
+// =====================================================================
 // E11 — ACCEPTANCE. Both conditions fail at once: a wrong hash at
 // `s=2` AND records above `s=2`. Two independent `TrailEnded`
-// findings fire. Pairs with E2 so mutant T12 (above location at
-// last record) is killed on two rows.
+// findings fire. Pairs with E2 so the "above" location at the FIRST
+// record above (not the last) is pinned on two independent rows.
 // =====================================================================
 #[test]
 fn e11_both_conditions_fail_emits_two_trail_ended() {
@@ -946,11 +1113,12 @@ fn e11_both_conditions_fail_emits_two_trail_ended() {
 // E12 — REGRESSION. An `end=` ONLY in another trail's section is
 // ignored on the verified trail. The verified trail includes a
 // fragment-gap attester at `seq=1` and a torn-write target at
-// `seq=2` (so under mutant T11, the foreign `end=2:cp2.hash` would
-// apply to `TRAIL`, confirm the bound at `seq=0`, promote the
-// attester, and exempt the tail --- three distinct finding-list
-// changes). Base already reports the layout's `RevocationUnconfirmed`,
-// `TornWrite` and `UncoveredTail`, so this is a regression row.
+// `seq=2`, so if the foreign `end=2:cp2.hash` were ever applied to
+// `TRAIL` the bound at `seq=0` would be confirmed, the attester
+// promoted, and the tail exempted --- three distinct finding-list
+// changes. Base already reports `RevocationUnconfirmed`,
+// `TornWrite`, `UntrustedKey` and `UncoveredTail`, so this is a
+// regression row.
 // =====================================================================
 #[test]
 fn e12_end_only_in_another_section_is_ignored() {
@@ -1004,7 +1172,8 @@ fn e12_end_only_in_another_section_is_ignored() {
 #[test]
 fn fixture_hashes_match_literals() {
     assert_eq!(hex(&fixture_pubkey()), FIXTURE_KEY_HEX);
-    assert_eq!(hex(&new_pubkey()), NEW_KEY_HEX);
+    assert_eq!(hex(&TRAIL), TRAIL_HEX);
+    assert_eq!(hex(&OTHER_TRAIL), OTHER_TRAIL_HEX);
     let fx = two_checkpoints();
     assert_eq!(digest_string(&fx.cp0.hash()), CP0_HONEST_DIGEST);
     assert_eq!(digest_string(&fx.e1.hash()), E1_HONEST_DIGEST);
@@ -1020,6 +1189,13 @@ fn fixture_hashes_match_literals() {
     assert_eq!(digest_string(&crashed.cp0.hash()), CP0_HONEST_DIGEST);
     assert_eq!(digest_string(&crashed.e1.hash()), CRASHED_E1_DIGEST);
     assert_eq!(digest_string(&crashed.cp2.hash()), CRASHED_CP2_DIGEST);
+    // E10c's attester `e2` carries the gap digest, so its hash
+    // differs from `two_checkpoints()`'s cp2.
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let e1 = entry_rec(1, cp0.hash());
+    let gap = repair_digest(FRAG);
+    let e2 = entry_with_repaired(2, e1.hash(), gap);
+    assert_eq!(digest_string(&e2.hash()), E10C_ATTESTER_DIGEST);
     // Checkpoint-kind sanity: the fixture cp0 is a checkpoint, so
     // the `signed_cp` helper did not drift.
     assert!(matches!(fx.cp0.kind, Kind::Checkpoint(_)));
