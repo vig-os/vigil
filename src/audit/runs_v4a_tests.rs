@@ -20,281 +20,25 @@
 //! - module-doc lint: module doc lint (source-check via `include_str!`).
 //! - reports-under-stop pin: reports built only under Collect.
 
-use super::*;
 use crate::audit::{
-    AuditError, AuditErrorKind, CheckpointFields, Entry, KeyFileSigner, Mmr, Record, RecordContext,
-    Signer, storage::TrailReader,
+    Entry, Mmr, Record,
+    runs_v4a_fixtures::{
+        A1_DIGEST, A3_DIGEST, A8_DIGEST, A9_DIGEST, TRAIL, Temp, append, assert_reader_corrupt,
+        build_a1, build_a3, build_a8, build_a9, context, entry_rec, headless, line_bytes, pushed,
+        put_segment, resume_decl, seeded, signed_cp, write_records,
+    },
+    storage::TrailReader,
 };
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
 };
 
-const TRAIL: [u8; 16] = [17; 16];
-static NEXT: AtomicUsize = AtomicUsize::new(0);
-
-struct Temp(PathBuf);
-impl Temp {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "vigil-audit-v4a-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        Self(path)
-    }
-}
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn context(seq: u64, previous: [u8; 32]) -> RecordContext {
-    RecordContext::new(TRAIL, seq, 100 + seq, "test", previous)
-}
-fn signed_cp(seq: u64, previous: [u8; 32], mmr: &Mmr) -> Record {
-    let key = KeyFileSigner::from_hex(&"27".repeat(32)).unwrap();
-    let fields = |sig| {
-        CheckpointFields::new(
-            mmr.size(),
-            mmr.root(),
-            mmr.peaks().to_vec(),
-            key.public_key(),
-            sig,
-        )
-        .unwrap()
-    };
-    let unsigned = Record::checkpoint(context(seq, previous), fields([0; 64])).unwrap();
-    let signature = key.sign(&unsigned.signing_message().unwrap()).unwrap();
-    Record::checkpoint(context(seq, previous), fields(signature)).unwrap()
-}
-fn entry_rec(seq: u64, previous: [u8; 32]) -> Record {
-    Record::new(
-        context(seq, previous),
-        Entry::new("actor", "change", "object"),
-    )
-    .unwrap()
-}
-fn line_bytes(record: &Record) -> Vec<u8> {
-    use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
-    let extra = AnyValue {
-        value: Some(any_value::Value::StringValue("context".into())),
-    };
-    let mut l = crate::logs::encode_line(&crate::audit::format::request(record, extra).unwrap())
-        .unwrap()
-        .into_bytes();
-    l.push(b'\n');
-    l
-}
-fn write_bytes(path: &Path, bytes: &[u8]) {
-    fs::write(path, bytes).unwrap();
-}
-fn append(path: &Path, bytes: &[u8]) {
-    fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .unwrap()
-        .write_all(bytes)
-        .unwrap();
-}
-fn segment_path(dir: &Path, id: usize) -> PathBuf {
-    dir.join(format!("audit-20260101T000000.000000000Z_{id:06}.jsonl"))
-}
-fn put_segment(dir: &Path, id: usize, records: &[&Record], suffix: &[u8]) {
-    let mut bytes: Vec<u8> = records.iter().flat_map(|r| line_bytes(r)).collect();
-    bytes.extend(suffix);
-    fs::write(segment_path(dir, id), bytes).unwrap();
-}
-fn write_records(dir: &Path, records: &[&Record]) {
-    let bytes: Vec<u8> = records.iter().flat_map(|r| line_bytes(r)).collect();
-    write_bytes(&dir.join("audit.jsonl"), &bytes);
-}
 fn append_record(dir: &Path, record: &Record) {
     append(&dir.join("audit.jsonl"), &line_bytes(record));
 }
 fn dirfile(path: &Path) -> fs::File {
     fs::File::open(path).unwrap()
-}
-fn seeded(record: &Record) -> Mmr {
-    let mut mmr = Mmr::new();
-    mmr.push(record.hash()).unwrap();
-    mmr
-}
-fn pushed(mmr: &Mmr, record: &Record) -> Mmr {
-    let mut m = mmr.clone();
-    m.push(record.hash()).unwrap();
-    m
-}
-
-/// A "headless" record simulating a broken boundary after `last`: the
-/// previous-hash is the hash of the hypothetical `entry(last.seq+1,
-/// last.hash)` record that would have followed `last` on an honest
-/// trail, so this record's `previous` matches no record actually
-/// present on this trail. Matches `storage_tests::runs::headless`.
-fn headless(last: &Record, seq: u64) -> Record {
-    let ghost = entry_rec(last.context.seq + 1, last.hash());
-    entry_rec(seq, ghost.hash())
-}
-
-/// Build a resume declaration record for the gap between `previous` and `checkpoint`.
-/// Uses `Record::new_internal` to bypass the reserved-prefix check, as
-/// the storage tests' own `declaration` helper does.
-fn resume_decl(
-    checkpoint: &Record,
-    head_seq: u64,
-    head_hash: [u8; 32],
-    lost_through: u64,
-) -> Record {
-    let ctx = context(checkpoint.context.seq + 1, checkpoint.hash());
-    Record::new_internal(
-        ctx,
-        Entry::new("operator", "vigil.audit.resume", "trail")
-            .reason("incident")
-            .details(format!(
-                "head={head_seq}:{hex} lost_through={lost_through} file=-",
-                hex = crate::audit::digest_string(&head_hash)
-            )),
-    )
-    .unwrap()
-}
-
-// ============================================================
-// A1 fixture (one-range run)
-// Layout:
-//   S0 = [cp0, e1, e2] (sealed)
-//   S1 = [e4(prev=e2.hash), cp5(prev=e4.hash)] (headless, closes earlier)
-//   live = [cp6(prev=cp5.hash, size matching fold), resume7(head=5:cp5, lost_through=5)]
-// ============================================================
-struct A1 {
-    _dir: Temp,
-    dir_path: PathBuf,
-    /// The closer's opening checkpoint (cp6) — for A1 run-structure pin.
-    cp6_head: Head,
-}
-
-fn build_a1() -> A1 {
-    let d = Temp::new();
-    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
-    let mmr0 = seeded(&cp0);
-    let e1 = entry_rec(1, cp0.hash());
-    let mmr1 = pushed(&mmr0, &e1);
-    let e2 = entry_rec(2, e1.hash());
-    let mmr2 = pushed(&mmr1, &e2);
-    // Sealed S0:
-    put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
-    // S1 headless: broken-boundary entry at seq=4 (prev points to
-    // the hypothetical lost record at seq=3). The reader's tolerant
-    // fallback treats this as a run boundary.
-    let r4 = headless(&e2, 4);
-    // Honest fold for cp5 includes S0 fully (cp0, e1, e2) + r4.
-    let fold = pushed(&mmr2, &r4);
-    let cp5 = signed_cp(5, r4.hash(), &fold);
-    put_segment(&d.0, 1, &[&r4, &cp5], &[]);
-    // live: cp6 (closer opening) + resume7
-    let fold6 = pushed(&fold, &cp5);
-    let cp6 = signed_cp(6, cp5.hash(), &fold6);
-    let resume = resume_decl(&cp6, 5, cp5.hash(), 5);
-    write_records(&d.0, &[&cp6, &resume]);
-    let cp6_head = Head::of(&cp6);
-    A1 {
-        dir_path: d.0.clone(),
-        _dir: d,
-        cp6_head,
-    }
-}
-
-// ============================================================
-// A8 fixture (closed run, zero records — empty S1)
-//   S0 = [cp0], S1 = [] (empty), live = [cp_opening(seq=1, prev=cp0), resume]
-// ============================================================
-struct A8 {
-    _dir: Temp,
-    dir_path: PathBuf,
-}
-
-fn build_a8() -> A8 {
-    let d = Temp::new();
-    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
-    put_segment(&d.0, 0, &[&cp0], &[]);
-    // S1 empty:
-    put_segment(&d.0, 1, &[], &[]);
-    // live:
-    let fold = seeded(&cp0);
-    let cp_opening = signed_cp(1, cp0.hash(), &fold);
-    let resume = resume_decl(&cp_opening, 0, cp0.hash(), 0);
-    write_records(&d.0, &[&cp_opening, &resume]);
-    A8 {
-        dir_path: d.0.clone(),
-        _dir: d,
-    }
-}
-
-// ============================================================
-// A9 fixture (multi-segment record-free)
-//   S0 = [cp0], S1 = b"not json\n", S2 = b"also not json\n"
-//   live = [cp_opening(seq=1, prev=cp0), resume]
-// ============================================================
-struct A9 {
-    _dir: Temp,
-    dir_path: PathBuf,
-}
-
-fn build_a9() -> A9 {
-    let d = Temp::new();
-    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
-    put_segment(&d.0, 0, &[&cp0], &[]);
-    put_segment(&d.0, 1, &[], b"not json\n");
-    put_segment(&d.0, 2, &[], b"also not json\n");
-    let fold = seeded(&cp0);
-    let cp_opening = signed_cp(1, cp0.hash(), &fold);
-    let resume = resume_decl(&cp_opening, 0, cp0.hash(), 0);
-    write_records(&d.0, &[&cp_opening, &resume]);
-    A9 {
-        dir_path: d.0.clone(),
-        _dir: d,
-    }
-}
-
-// ============================================================
-// A3 fixture (two headless segments two-range)
-//   S0=[cp0, e1, cp2], S1=[e4(prev=cp2.hash), cp5], S2=[e7, cp8]
-//   live=[cp10(prev=cp8.hash), resume11(head=8, lost_through=9)]
-// ============================================================
-struct A3 {
-    _dir: Temp,
-    dir_path: PathBuf,
-}
-
-fn build_a3() -> A3 {
-    let d = Temp::new();
-    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
-    let mmr0 = seeded(&cp0);
-    let e1 = entry_rec(1, cp0.hash());
-    let mmr1 = pushed(&mmr0, &e1);
-    let cp2 = signed_cp(2, e1.hash(), &mmr1);
-    put_segment(&d.0, 0, &[&cp0, &e1, &cp2], &[]);
-    let mmr2 = pushed(&mmr1, &cp2);
-    let r4 = headless(&cp2, 4);
-    let mmr4 = pushed(&mmr2, &r4);
-    let cp5 = signed_cp(5, r4.hash(), &mmr4);
-    put_segment(&d.0, 1, &[&r4, &cp5], &[]);
-    let mmr5 = pushed(&mmr4, &cp5);
-    let r7 = headless(&cp5, 7);
-    let mmr7 = pushed(&mmr5, &r7);
-    let cp8 = signed_cp(8, r7.hash(), &mmr7);
-    put_segment(&d.0, 2, &[&r7, &cp8], &[]);
-    let mmr8 = pushed(&mmr7, &cp8);
-    let cp10 = signed_cp(10, cp8.hash(), &mmr8);
-    let resume = resume_decl(&cp10, 8, cp8.hash(), 9);
-    write_records(&d.0, &[&cp10, &resume]);
-    A3 {
-        dir_path: d.0.clone(),
-        _dir: d,
-    }
 }
 
 // ============================================================
@@ -330,37 +74,6 @@ fn classify_stop(path: &Path) -> super::ClassifyOutput {
 fn digest_hex(digest: &[u8; 32]) -> String {
     crate::audit::digest_string(digest)
 }
-
-/// Pin the reader's exact `CorruptTrail` detail for a rejected trail
-/// (ruling 197-d1 addendum 27.4: literal reader-detail pins at base
-/// `ba7ef3e` for p06, p07, p12, p13a, p13b).
-fn assert_reader_corrupt(dir: &Path, expected_detail: &str, label: &str) {
-    let err: AuditError = TrailReader::open(dir, TRAIL, None)
-        .err()
-        .unwrap_or_else(|| panic!("{label}: expected Err(CorruptTrail), got Ok"));
-    assert_eq!(
-        err.kind(),
-        AuditErrorKind::CorruptTrail,
-        "{label}: wrong kind: {err}",
-    );
-    let got = format!("{err}")
-        .strip_prefix("CorruptTrail: ")
-        .map(ToString::to_string)
-        .unwrap_or_default();
-    assert_eq!(
-        got, expected_detail,
-        "{label}: reader detail mismatch at base ba7ef3e",
-    );
-}
-
-// Captured at head on this slice (re-computed on every build by the
-// digest pins rows; committed here as a literal per ruling 197-d1 addendum
-// 27.4 so a drift in `run_digest`, span `seg` renumbering or
-// loss-point arithmetic flips the pin).
-const A1_DIGEST: &str = "blake3:79d8cb1c4dfc89a80a4911120280e63ed383108f3199f05291bcb51f625f3931";
-const A3_DIGEST: &str = "blake3:78d5088883d54faa6aefe350948c217bb5ef3c32a468f22184bc07e56d84c63d";
-const A8_DIGEST: &str = "blake3:1c02f080d9c70df74de0c13a4a30323f1b49ee624bab2c5d68fa5ee31c4400e4";
-const A9_DIGEST: &str = "blake3:4905b9e63aa3fd9248f5c3605fe4beaf4af5a956f3f108b6dcecdbfbfda54026";
 
 // ============================================================
 // digest pins: digest pins for A1 / A3 / A8 / A9 (captured at head).
@@ -1830,15 +1543,21 @@ fn final_state_is_some_per_segment_a3() {
     );
 }
 
-/// p10 plus a live torn tail `{"half`. Reader is `Ok` (torn
+/// Ruling 13-V4-d9: a run's spans come from the run's own segments
+/// only (`first_segment..last_segment`, exclusive), so a torn tail
+/// appended to the closing (live) segment never enters the run's
+/// spans or its run digest.
+///
+/// Layout: p10 plus a live torn tail `{"half`. Reader is `Ok` (torn
 /// trailing fragment on the live file is tolerated). The run has
 /// `first_segment=1` (fragment-only `S1`) and `last_segment=2`
-/// (live, the closer) -- both contribute one span each. Expected
-/// span shapes: `[(0, u64::MAX, 8), (1, 5, 6)]`. A mutant that
-/// drops the closer segment's spans flips this to
-/// `[(0, u64::MAX, 8)]`.
+/// (live, the closer). Only S1 contributes spans; the live closer's
+/// own `{"half` fragment is excluded. Expected span shapes:
+/// `[(0, u64::MAX, 8)]`. A mutant that re-includes the closer
+/// (`.take(last_segment + 1)`) flips this list to
+/// `[(0, u64::MAX, 8), (1, 5, 6)]`.
 #[test]
-fn closer_spans_survive_torn_live_tail_p10() {
+fn closer_spans_excluded_torn_live_tail_p10() {
     let d = st::Temp::new();
     let first = st_runs::base(&d);
     st_runs::put(&d, 0, &[&first], &[]);
@@ -1851,28 +1570,35 @@ fn closer_spans_survive_torn_live_tail_p10() {
     assert!(out.violations.is_empty(), "torn-tail: no violations");
     assert_eq!(out.runs.len(), 1, "torn-tail: one run");
     let rr = &out.runs[0];
+    assert_eq!(rr.first_segment, 1, "torn-tail: first_segment=1 (S1)");
+    assert_eq!(
+        rr.last_segment, 2,
+        "torn-tail: last_segment=2 (live closer)"
+    );
     let shapes: Vec<(u32, u64, u64)> = rr.spans.iter().map(|s| (s.seg, s.after, s.len)).collect();
     assert_eq!(
         shapes,
-        vec![(0, u64::MAX, 8), (1, resume.context.seq, 6)],
-        "p10+torn-tail spans literal: closer (live) contributes `(1, 5, 6)`",
+        vec![(0, u64::MAX, 8)],
+        "p10+torn-tail: closer (live, seg=2) excluded from the run's spans \
+         (ruling 13-V4-d9); only S1's `{{\\\"torn\\\":` fragment contributes",
     );
     assert_eq!(resume.context.seq, 5, "torn-tail: resume.seq pin (sanity)");
-    // Pin the closer-span digest so even a mutant that preserves the
-    // tuple shapes but reorders content flips the row.
+    // Pin S1's span digest so even a mutant that preserves the tuple
+    // shape but reorders content flips the row.
     assert_eq!(
-        digest_hex(&rr.spans[1].digest),
-        "blake3:d9a5b587318eff723676e5ae0e4f95bc2b2617255722fea8409d547b4cb020cc",
-        "closer span digest literal",
+        digest_hex(&rr.spans[0].digest),
+        "blake3:e06678ed944e90a6f28636da719dc9b8267f8fec6688720495123ec237d761a4",
+        "S1 (first_segment) span digest literal",
     );
 }
 
-/// A9 (multi-segment record-free) run spans with the closer's spans
-/// as the trailing pair. Note: A9's closer segment itself carries
-/// no spans (its live is `[cp_opening, resume]` with no fragments);
-/// the spans here come from the two record-free sealed segments
-/// inside the run. Any mutant that truncates the per-segment span
-/// concatenation flips the `[(0, MAX, 9), (1, MAX, 14)]` pair.
+/// A9 (multi-segment record-free) run spans. Ruling 13-V4-d9 excludes
+/// the closer segment from a run's spans, so the two entries here
+/// come from the two record-free sealed segments inside the run
+/// (`first_segment..last_segment`, exclusive); A9's closer segment
+/// itself carries no spans anyway (its live is `[cp_opening, resume]`
+/// with no fragments). Any mutant that truncates the per-segment
+/// span concatenation flips the `[(0, MAX, 9), (1, MAX, 14)]` pair.
 #[test]
 fn span_shapes_record_free_a9_literal() {
     let a = build_a9();
@@ -2378,14 +2104,18 @@ fn three_range_run_loss_points_literal() {
     );
 }
 
-/// Second killer where the closer carries spans: p01's `S2` is a
-/// sealed closer (close1 + resume1 + trailing `"broken\n"`
-/// fragment). Run 0 spans across S1 (headless, no fragments) and
-/// S2 (closer, one span). A mutant that drops the closer segment's
-/// spans in classify removes S2's span from run 0's `spans`, flipping
-/// this literal.
+/// Ruling 13-V4-d9: the closer's own spans belong to the NEXT run
+/// if one begins on it, never the run it closes. p01's `S2` is a
+/// sealed closer (close1 + resume1 + trailing `"broken\n"` fragment)
+/// that closes run 0 and re-opens into run 2. Run 0's segments are
+/// `first_segment..last_segment` (exclusive) = `[S1]`, which carries
+/// no fragments; run 0's `spans` is empty. Run 2 spans
+/// `[S2]..live`; the `"broken\n"` fragment appears there as a
+/// run-local seg=0 span. A mutant that re-includes the closer
+/// (`.take(last_segment + 1)`) adds S2's `"broken\n"` to run 0,
+/// flipping this row.
 #[test]
-fn closer_spans_survive_in_sealed_closer_p01() {
+fn closer_spans_excluded_in_sealed_closer_p01() {
     let d = st::Temp::new();
     let first = st_runs::base(&d);
     st_runs::put(&d, 0, &[&first], &[]);
@@ -2401,17 +2131,32 @@ fn closer_spans_survive_in_sealed_closer_p01() {
     let out = classify_collect(&d.0);
     assert!(out.violations.is_empty(), "p01-closer-spans: no violations");
     assert_eq!(out.runs.len(), 2, "p01-closer-spans: two closed runs");
+    // Run 0 covers S1 (headless, no fragments) and closes at S2.
+    // Ruling 13-V4-d9: spans come from `first_segment..last_segment`
+    // (exclusive) = `[S1]`, which has no fragments → empty.
     let rr0 = &out.runs[0];
-    // Run 0 covers S1 (headless, no fragments => 0 spans) + S2
-    // (sealed closer with a `"broken\n"` trailing fragment =>
-    // 1 span). Run 0's `spans` = [S2's span], with run-local
-    // segment index 1 (S2 is the second segment of this run).
-    let shapes: Vec<(u32, u64, u64)> = rr0.spans.iter().map(|s| (s.seg, s.after, s.len)).collect();
+    assert_eq!(rr0.first_segment, 1, "run 0: first_segment=1 (S1)");
+    assert_eq!(rr0.last_segment, 2, "run 0: last_segment=2 (S2 closer)");
+    let shapes0: Vec<(u32, u64, u64)> = rr0.spans.iter().map(|s| (s.seg, s.after, s.len)).collect();
     assert_eq!(
-        shapes,
-        vec![(1, resume.context.seq, 7)],
-        "p01-closer-spans: closer S2 contributes one span \
-         (run-local seg=1, after=resume.seq, len=7 bytes)",
+        shapes0,
+        Vec::<(u32, u64, u64)>::new(),
+        "p01-closer-spans: run 0's closer S2 is excluded from its spans \
+         (ruling 13-V4-d9); S1 has no fragments → empty",
+    );
+    // Run 2 re-opens on S2 (so S2 is run 2's `first_segment`, not a
+    // closer for run 2 — live is). Its `first_segment..last_segment`
+    // (exclusive) = `[S2]`, which contributes its `"broken\n"`
+    // fragment at run-local seg=0.
+    let rr2 = &out.runs[1];
+    assert_eq!(rr2.first_segment, 2, "run 2: first_segment=2 (S2)");
+    assert_eq!(rr2.last_segment, 3, "run 2: last_segment=3 (live closer)");
+    let shapes2: Vec<(u32, u64, u64)> = rr2.spans.iter().map(|s| (s.seg, s.after, s.len)).collect();
+    assert_eq!(
+        shapes2,
+        vec![(0, resume.context.seq, 7)],
+        "p01-closer-spans: run 2's S2 (now first_segment) contributes \
+         `(0, resume.seq, 7)` for the trailing `broken\\n` fragment",
     );
 }
 

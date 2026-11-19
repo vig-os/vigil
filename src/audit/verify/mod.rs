@@ -2,6 +2,7 @@
 use super::{AuditError, AuditErrorKind, FindingKind, TrustPolicy};
 use std::path::{Path, PathBuf};
 mod engine;
+mod fold;
 mod input;
 pub(crate) mod lines;
 mod resume;
@@ -53,7 +54,9 @@ impl Finding {
         self.accepted_kind = Some(kind);
         self
     }
-    #[cfg_attr(not(test), expect(dead_code, reason = "run verification, #13 V4"))]
+    /// Sets a run's `blake3` digest on its `SegmentStructure`
+    /// finding. Consumed by `verify::fold::check_runs` (#13 V4a) for
+    /// the ADR-0005 decision 11 `accept-run` pinning.
     pub(crate) fn with_run_digest(mut self, digest: [u8; 32]) -> Self {
         assert_eq!(self.kind, FindingKind::SegmentStructure);
         self.run_digest = Some(digest);
@@ -225,6 +228,8 @@ fn severity(kind: FindingKind) -> Severity {
 
 #[cfg(test)]
 mod mod_tests;
+#[cfg(test)]
+mod runs_tests;
 
 /// Verifies a directory using a cloned, validated trust policy.
 ///

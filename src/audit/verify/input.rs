@@ -116,10 +116,7 @@ pub(super) struct Collection {
 /// Shipped inputs are out of scope: the classifier's fold runs over
 /// native segments only (ruling 13-V4-d5 (a)); shipped inputs feed
 /// `engine::check`'s record-level cross-copy checks instead.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "V4a lands with `verify::fold::check_runs` later")
-)]
+/// Consumed by [`super::fold::check_runs`] (#13 V4a).
 pub(super) struct NativeSegment {
     /// The native input's path, for diagnostics. Not opened by
     /// `for_snapshot`; carried alongside the bytes.
@@ -130,16 +127,12 @@ pub(super) struct NativeSegment {
     /// Ruling 13-V4-d5 (b): a snapshot with no live file (`is_live`
     /// `false` on every entry) is the archive case.
     pub(super) is_live: bool,
-    /// Index into [`Collection::inputs`]. V4a reads this to recover
-    /// each segment's first complete record `(line, seq)` on this
-    /// trail (ruling 13-V4-d5 (a)); the classifier's own per-segment
-    /// outputs keep a parallel index by construction (both arrays
-    /// are driven by this same `Vec`). This PR has no non-test
-    /// reader for the field -- V4a's fold verifier lands with
-    /// `verify::fold::check_runs` later, so until then only the
-    /// `input_tests` rows read it. The field stays on the struct
-    /// because the V4a landing already builds on it; the
-    /// struct-level `expect(dead_code)` covers it.
+    /// Index into [`Collection::inputs`]. [`super::fold::check_runs`]
+    /// reads this to recover each segment's first complete record
+    /// `(line, seq)` on the verified trail (ruling 13-V4-d5 (a),
+    /// 13-V4-d8 point 5); the classifier's own per-segment outputs
+    /// keep a parallel index by construction (both arrays are
+    /// driven by this same `Vec`).
     pub(super) input_index: usize,
 }
 
@@ -149,11 +142,8 @@ impl Collection {
     /// filtering happens inside [`crate::audit::runs::classify`]).
     /// Shipped inputs are excluded (ruling 13-V4-d5 (a); they do not
     /// flow through the classifier). The returned vec drives
-    /// [`crate::audit::storage::SegmentSource::for_snapshot`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "V4a lands with `verify::fold::check_runs` later")
-    )]
+    /// [`crate::audit::storage::SegmentSource::for_snapshot`] from
+    /// [`super::fold::check_runs`].
     pub(super) fn native_segments(&self) -> Vec<NativeSegment> {
         self.inputs
             .iter()

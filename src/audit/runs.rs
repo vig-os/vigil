@@ -858,11 +858,8 @@ pub(crate) struct ClassifyOutput {
     /// #197 ruling addendum 25.5: one [`RunReport`] per closed run,
     /// covering first_segment..=last_segment of the preceding
     /// [`segments`](Self::segments). Empty when the trail has no
-    /// closed run.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
-    )]
+    /// closed run. Consumed by `crate::audit::verify::fold::check_runs`
+    /// (#13 V4a).
     pub(crate) runs: Vec<RunReport>,
 }
 
@@ -966,21 +963,28 @@ pub(crate) struct SegmentReport {
     pub(crate) final_state: Option<RunState>,
 }
 
-/// #197 ruling addendum 25.5: one entry per closed run. Spans the
-/// range `first_segment..=last_segment` of
-/// [`ClassifyOutput::segments`]. Every field is only read by the
-/// V4a walk at this head (the run-grouping loop in `classify` uses
-/// local `usize` variables, not these fields).
+/// #197 ruling addendum 25.5: one entry per closed run. Membership
+/// spans the inclusive range `first_segment..=last_segment` of
+/// [`ClassifyOutput::segments`]: `last_segment` is the closer, whose
+/// opening checkpoint ends the run. Ruling 13-V4-d9: the run's
+/// `spans` (and run digest) are collected from the run's own
+/// segments only, `first_segment..last_segment` (exclusive); the
+/// closer's spans belong to the next run if one begins on it.
+/// `first_segment`, `loss_points` and `spans` are consumed by
+/// `crate::audit::verify::fold::check_runs` (#13 V4a); `last_segment`
+/// and `closing_opening` wait for #13 V4b's MMR fold and
+/// opening-vs-rule-2 check.
 #[derive(Clone)]
 pub(crate) struct RunReport {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
-    )]
+    /// Base index of the run's first segment in
+    /// [`ClassifyOutput::segments`]. V4a reads it to recover the
+    /// segment's path and first record (ruling 13-V4-d5 (a),
+    /// 13-V4-d8 point 5) through `Collection::native_segments()`,
+    /// whose parallel order is guaranteed by construction.
     pub(crate) first_segment: usize,
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
+        expect(dead_code, reason = "read by #13 V4b's opening/rule-2 compare")
     )]
     pub(crate) last_segment: usize,
     /// `Some(head)` of the closer's opening checkpoint (ADR (i));
@@ -988,24 +992,17 @@ pub(crate) struct RunReport {
     /// [`Reaction::Collect`] when the trail never reached a closer.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
+        expect(dead_code, reason = "read by #13 V4b's opening/rule-2 compare")
     )]
     pub(crate) closing_opening: Option<Head>,
     /// Loss points in run-walk order. Each `(first, count)` pair feeds
-    /// `verify::lines::run_digest`'s ranges. V4a pins equality against
-    /// the digest at this head.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
-    )]
+    /// `verify::lines::run_digest`'s ranges. Consumed by
+    /// `crate::audit::verify::fold::check_runs` (#13 V4a).
     pub(crate) loss_points: Vec<LossPoint>,
     /// Spans concatenated per segment with each span's `seg`
     /// rewritten to the run-local segment index (ruling 13-V4-d2
-    /// point 2).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the V4a walk in this crate's tests")
-    )]
+    /// point 2). Consumed by
+    /// `crate::audit::verify::fold::check_runs` (#13 V4a).
     pub(crate) spans: Vec<super::verify::lines::Span>,
 }
 
@@ -1483,12 +1480,20 @@ pub(crate) fn classify(
                     continue;
                 }
                 SegmentClass::Closer => {
-                    // A closer ends any open run. Its `first_segment`
-                    // is either the in-progress start (an earlier
-                    // run-active segment) OR -- if no prior run was
-                    // open -- the closer itself (a single-segment
-                    // run covering just this closer; used by p09/A8).
-                    let first_segment = open_run_start.unwrap_or(i);
+                    // Ruling 13-V4-d9: a closer ends an open run. The
+                    // closer segment (`last_segment`) begins the next
+                    // run's segment range, never this run's. The
+                    // walker reaches `SegmentClass::Closer` only after
+                    // the loop opened a run on an earlier Base/InRun
+                    // segment, so `open_run_start` is `Some` here;
+                    // a closer with no prior in-progress run is
+                    // unreachable (there is nothing to close).
+                    let first_segment = open_run_start.expect(
+                        "SegmentClass::Closer implies an earlier in-progress run \
+                         (ruling 13-V4-d9): `open_run_start` is set by the \
+                         InRun/Damaged arm above before any Closer can fire \
+                         (the Base arm resets it to None)",
+                    );
                     let last_segment = i;
                     let run_idx = runs_out.len();
                     // Addendum 25.5: compute spans by concatenating
@@ -1496,16 +1501,23 @@ pub(crate) fn classify(
                     // u64::MAX` iff it starts at the segment's first
                     // byte) and rewriting `seg` to the run-local
                     // segment index (0, 1, ...). 13-V4-d2 point 2.
+                    //
+                    // Ruling 13-V4-d9: spans come from the run's own
+                    // segments only, `first_segment..last_segment`
+                    // (exclusive). The closer sits outside the run,
+                    // so its bytes never enter this run's spans or
+                    // digest.
                     let mut spans: Vec<super::verify::lines::Span> = Vec::new();
                     for (local_idx, seg_spans_k) in seg_spans
                         .iter()
                         .enumerate()
-                        .take(last_segment + 1)
+                        .take(last_segment)
                         .skip(first_segment)
                         .map(|(k, s)| (k - first_segment, s))
                     {
                         // `local_idx = k - first_segment` with k in
-                        // `[first_segment, last_segment]`, so
+                        // `[first_segment, last_segment)` (closer
+                        // excluded, ruling 13-V4-d9), so
                         // `local_idx <= seg_spans.len() - 1`.
                         // `seg_spans` is only pushed to after the
                         // checked `u32::try_from(segment_index)` in

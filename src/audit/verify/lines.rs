@@ -147,10 +147,8 @@ fn append_span(spans: &mut Vec<Span>, bytes: &[u8], seg: u32, after: u64, range:
 }
 
 /// Callers supply ranges in ascending sequence order and spans in segment/byte order.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by run verification, #13 V4")
-)]
+/// Consumed by `verify::fold::check_runs` (#13 V4a) for the ADR-0005 decision 11
+/// `accept-run` run digest.
 pub(crate) fn run_digest(ranges: &[(u64, u64)], spans: &[Span]) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
     hash.update(b"vigil.audit.v1.run-ranges\0");
