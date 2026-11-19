@@ -2002,3 +2002,154 @@ fn r19_m11_a3_torn_live_no_run_finding() {
          M11 flips this to one run finding by treating live as sealed.",
     );
 }
+
+// ============================================================
+// R20 — ruling 13-V4-d8 point 2 (one classify over the merged
+// `Collection`): an A3-layout trail split into an archive directory
+// (the sealed segments S0, S1, S2 — including the run's first
+// segment S1) and a trail directory (the live file), verified in
+// ONE `Verifier::verify_files` call with both directories. The run
+// spans both directories, so the single classify pass must see them
+// together; its one run finding falls at the archived first segment
+// S1 with A3's pinned digest `78d50888…`.
+//
+// Second killer for the per-directory classification mutant (call
+// `classify` once per `path.parent()` group of `natives` instead of
+// once over all of them): neither the archive group (no live-file
+// closer) nor the trail group (no run opener) emits the run finding
+// under the mutant, so the literal list flips. R10 kills the same
+// mutant with a different layout (archive-plus-trail split of the
+// R7 archive, A1's digest `79d8cb1c…`); R20 is the distinct second
+// killer. Regression row for the mutant: this row passes on base
+// `origin/dev` because the classify pass at that head already runs
+// once over the merged Collection.
+// ============================================================
+
+#[test]
+fn r20_227_cross_dir_a3_archive_plus_trail_dir_one_classify() {
+    /// Rebase each finding's file path onto `base_dir`, keeping only
+    /// its basename (every A3 segment lives at its dir root).
+    fn relative(got: Vec<Row>, base_dir: &Path) -> Vec<Row> {
+        got.into_iter()
+            .map(|r| {
+                let rebased = r.1.map(|p| {
+                    let name = p.file_name().expect("row file path has a basename");
+                    base_dir.join(name)
+                });
+                (r.0, rebased, r.2, r.3, r.4, r.5)
+            })
+            .collect()
+    }
+    let common = Path::new("base");
+    let a = build_a3();
+    // Split A3: sealed S0, S1, S2 land in `archive_dir`; the live
+    // `audit.jsonl` lands in `trail_dir`. Both directories pass
+    // through the same `verify_files` call so the merged
+    // `Collection` is classified once (ruling 13-V4-d8 point 2),
+    // producing exactly one run finding at S1 with A3's digest.
+    let s0_name = "audit-20260101T000000.000000000Z_000000.jsonl";
+    let s1_name = "audit-20260101T000000.000000000Z_000001.jsonl";
+    let s2_name = "audit-20260101T000000.000000000Z_000002.jsonl";
+    let archive_dir = Temp::new();
+    let trail_dir = Temp::new();
+    for name in [s0_name, s1_name, s2_name] {
+        fs::copy(a.dir_path.join(name), archive_dir.0.join(name)).unwrap();
+    }
+    fs::copy(
+        a.dir_path.join("audit.jsonl"),
+        trail_dir.0.join("audit.jsonl"),
+    )
+    .unwrap();
+    let s1 = Path::new(s1_name);
+    let s2 = Path::new(s2_name);
+    let live = Path::new("audit.jsonl");
+    let a3_digest = parse_digest(A3_DIGEST);
+    // A3's two loss points and the full A3 digest: ruling 13-V4-d8
+    // point 1 grammar; ADR-0005 decision 11 digest pin.
+    let run_detail = make_run_detail(&[(4, 3, 1), (7, 6, 1)], &[], &a3_digest);
+    let per_seg_detail = "expected first complete record to be a checkpoint".to_owned();
+    // A3's `Resumed` head citation is `cp8.hash`, captured here as
+    // a literal (same as R2's A3 row).
+    let resume_detail = "operator=operator reason=incident \
+         head=8:blake3:436c1a38d9dd40b9880233500e5c4c97783f180fcc0eb9c8376bee20e791d2ce \
+         gap=9..=9 lost_records=0 structural=valid"
+        .to_owned();
+    let expected = vec![
+        (
+            K::SegmentStructure,
+            Some(common.join(s1)),
+            Some(1),
+            Some(4),
+            per_seg_detail.clone(),
+            None,
+        ),
+        (
+            K::SegmentStructure,
+            Some(common.join(s1)),
+            Some(1),
+            Some(4),
+            run_detail,
+            Some(digest_string(&a3_digest)),
+        ),
+        (
+            K::SeqGap,
+            Some(common.join(s1)),
+            Some(1),
+            Some(4),
+            "missing seq 3..=3".to_owned(),
+            None,
+        ),
+        (
+            K::SegmentStructure,
+            Some(common.join(s2)),
+            Some(1),
+            Some(7),
+            per_seg_detail,
+            None,
+        ),
+        (
+            K::SeqGap,
+            Some(common.join(s2)),
+            Some(1),
+            Some(7),
+            "missing seq 6..=6".to_owned(),
+            None,
+        ),
+        (
+            K::SeqGap,
+            Some(common.join(live)),
+            Some(1),
+            Some(10),
+            "missing seq 9..=9".to_owned(),
+            None,
+        ),
+        (
+            K::Resumed,
+            Some(common.join(live)),
+            Some(2),
+            Some(11),
+            resume_detail,
+            None,
+        ),
+        (
+            K::UncoveredTail,
+            None,
+            None,
+            None,
+            "records seq 0..=11, no trusted coverage yet (signatures are checked in #13 V5)"
+                .to_owned(),
+            None,
+        ),
+    ];
+    let split_rows = relative(
+        rows(&verify_files([archive_dir.0.clone(), trail_dir.0.clone()])),
+        common,
+    );
+    assert_eq!(
+        split_rows, expected,
+        "R20 (ruling 13-V4-d8 point 2): verify_files([archive_dir, trail_dir]) \
+         on an A3 split (sealed S0/S1/S2 in archive_dir, live in trail_dir) \
+         emits one run finding at the archived first segment S1 with A3's \
+         pinned digest `78d50888…` (the full literal finding list, rebased)",
+    );
+}
