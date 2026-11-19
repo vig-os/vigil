@@ -251,15 +251,17 @@ pub(crate) struct CollectorOutcome {
     /// (ruling 197-d1 addendum 28, 13-V4-d3 point 1) without
     /// heuristics.
     pub(crate) closed_run: bool,
-    /// #13 V4b (ruling 13-V4-d10 points 2-4): per-checkpoint fold
-    /// outcomes recorded by the tolerant classifier during this
-    /// segment's walk (including both arms of the fold-(iii) salvage
-    /// callsite). Pos indices are segment-local; `classify` rewrites
-    /// them. The outer [`classify`] loop drops the per-segment
-    /// entries under outer [`Reaction::Stop`] (`build_reports ==
-    /// false`), so Stop's `ClassifyOutput::fold_entries` stays
-    /// empty and reader behaviour is byte-for-byte the same (ruling
-    /// 13-V4-d10 point 1). See [`ScanSegmentOutcome::fold_entries`].
+    /// #13 V4b (ruling 13-V4-d10 points 1, 4, 6): per-checkpoint
+    /// fold outcomes recorded by the tolerant classifier during
+    /// this segment's walk. Each push is gated by two
+    /// Classifier-level flags: the outer-reaction
+    /// `record_fold_entries` flag (point 1: reader paths leave it
+    /// `false` so no per-checkpoint blake3 hash is done) and the
+    /// per-segment `segment_has_collected_violation` latch (point
+    /// 6: once a violation lands in `collected` the rest of the
+    /// segment stops recording). Pos indices are segment-local;
+    /// `classify` rewrites them. See
+    /// [`ScanSegmentOutcome::fold_entries`].
     pub(crate) fold_entries: Vec<CheckpointFoldEntry>,
 }
 
@@ -380,9 +382,10 @@ pub(crate) fn apply_checked(
             // one outcome at the one fold-compare site. The caller
             // records a [`CheckpointFoldEntry`] whose outcome is read
             // directly from here, so two fields cannot contradict
-            // each other (addendum: a differing self-base is
-            // [`CheckpointFoldOutcome::Differs`], not
-            // [`CheckpointFoldOutcome::Base`]). Reader paths pass
+            // each other: a differing self-base (declared fields do
+            // not agree with the fold loaded from its own peaks)
+            // is [`CheckpointFoldOutcome::Differs`], not
+            // [`CheckpointFoldOutcome::Base`]. Reader paths pass
             // `&mut None` and nothing reads it. No second fold.
             //
             // Outcome derivation from what the fold actually did at
@@ -620,6 +623,16 @@ pub(crate) struct ScanSegmentArgs {
     /// (ctx.run || predecessor-not-sealed). Set by the shim and owned
     /// by the classifier thereafter.
     pub(crate) initial_boundary_resume: bool,
+    /// #13 V4b (ruling 13-V4-d10 point 1): whether the outer caller
+    /// consumes `ClassifyOutput::fold_entries`. Threaded into
+    /// [`Classifier::set_record_fold_entries`]. Set `true` on
+    /// verifier paths; set `false` on every reader-only path so no
+    /// per-checkpoint blake3 hash is computed for entries the outer
+    /// classify loop would drop. Independent of `reaction` because
+    /// the strict closure inside `storage::history_segment` uses
+    /// inner [`Reaction::Stop`] even when the outer verifier is
+    /// Collect.
+    pub(crate) record_fold_entries: bool,
 }
 
 /// Ruling 197-d1 addendum 24.1: terminal outcome of the strict single-
@@ -653,14 +666,15 @@ pub(crate) struct ScanSegmentOutcome {
     /// segment's walk. Pos indices are segment-local (segment_index
     /// = 0, record_index_in_segment per feed); `classify` rewrites
     /// them to its own segment enumeration before placing the
-    /// entries in [`ClassifyOutput::fold_entries`]. Recorded
-    /// regardless of the inner reaction, so the hardcoded Stop
-    /// strict closure inside `storage::history_segment` also feeds
-    /// matched entries for honest sealed segments into the outer
-    /// classification. The outer [`classify`] loop drops them
-    /// under outer [`Reaction::Stop`] (`build_reports == false`),
-    /// keeping reader behaviour byte-for-byte the same (ruling
-    /// 13-V4-d10 point 1).
+    /// entries in [`ClassifyOutput::fold_entries`]. The push is
+    /// gated by the Classifier's outer-reaction
+    /// `record_fold_entries` flag (ruling 13-V4-d10 point 1): the
+    /// verifier's one classification sets it `true` (including for
+    /// the strict-Stop closure inside `storage::history_segment`
+    /// on that outer Collect path, so matched entries from honest
+    /// sealed segments feed the fail-closed filter), and reader
+    /// paths leave it `false` so no per-checkpoint blake3 hash is
+    /// done.
     pub(crate) fold_entries: Vec<CheckpointFoldEntry>,
 }
 
@@ -718,6 +732,12 @@ where
         Reaction::Stop => Classifier::new_tolerant(args.prior_run, ctx, inherited),
         Reaction::Collect => Classifier::new_collect(args.prior_run, ctx, inherited),
     };
+    // #13 V4b (ruling 13-V4-d10 point 1): the tolerant fallback's
+    // reaction already matches the outer caller's reaction, so the
+    // inner Collect case is also the outer Collect case. The reader
+    // paths set this `false` so no per-checkpoint blake3 hashing
+    // happens for entries the outer classify loop would drop.
+    classifier.set_record_fold_entries(matches!(reaction, Reaction::Collect));
     let mut record_index: usize = 0;
     while let Some(line) = events()? {
         // Ruling 197-d1 addendum 24.3: the per-line mapping lives in the
@@ -795,6 +815,7 @@ where
         trail,
         prior_run,
         initial_boundary_resume,
+        record_fold_entries,
     } = args;
     let mut classifier = match reaction {
         Reaction::Stop => Classifier::new(prior_run, ctx, Mode::Strict, initial_boundary_resume),
@@ -802,6 +823,7 @@ where
             Classifier::new_collect_strict(prior_run, ctx, initial_boundary_resume)
         }
     };
+    classifier.set_record_fold_entries(record_fold_entries);
     let mut record_index: usize = 0;
     while let Some(line) = events()? {
         // Ruling 197-d1 addendum 24.3: shared per-line dispatch.
@@ -955,18 +977,27 @@ pub(crate) struct ClassifyOutput {
     /// closed run. Consumed by `crate::audit::verify::fold::check_runs`
     /// (#13 V4a).
     pub(crate) runs: Vec<RunReport>,
-    /// #13 V4b (ruling 13-V4-d10 points 2-3): one entry per checkpoint
-    /// the classifier's fold met in the walk. Populated only under
-    /// [`Reaction::Collect`]; empty under [`Reaction::Stop`]. Consumed
-    /// by `crate::audit::verify::fold::check_runs` to emit one
-    /// `MmrMismatch` per [`CheckpointFoldOutcome::Differs`] and per
-    /// [`CheckpointFoldOutcome::DiffersAfterLoss`] entry, and by
-    /// `crate::audit::verify::engine::check` for the resume-candidate
-    /// filter.
+    /// #13 V4b (ruling 13-V4-d10 points 1-4, 6): one entry per
+    /// checkpoint the classifier's fold met and recorded. Each
+    /// per-segment walk's Classifier receives
+    /// `record_fold_entries = true` on the verifier's single
+    /// classification call (outer [`Reaction::Collect`]) and
+    /// `false` on every reader-only path, so under outer Stop
+    /// this `Vec` is empty by construction -- no per-checkpoint
+    /// blake3 hash runs on the reader's hot path. Consumed by
+    /// `crate::audit::verify::fold::check_runs` to emit one
+    /// `MmrMismatch` per [`CheckpointFoldOutcome::Differs`] and
+    /// per [`CheckpointFoldOutcome::DiffersAfterLoss`] entry,
+    /// and by `crate::audit::verify::engine::check` for the
+    /// resume-candidate filter.
     ///
-    /// **Known limits (ruling 13-V4-d10 points 5-6):** shipped-only
-    /// openings are not checked (spike #224); after a violation the
-    /// classifier stops checking the rest of that segment.
+    /// **Known limits (ruling 13-V4-d10 points 5-6):** shipped-
+    /// only openings are not checked (spike #224); once a
+    /// segment records a violation the classifier stops pushing
+    /// per-checkpoint fold entries for the rest of that segment
+    /// (the walk itself continues so violations and reader
+    /// results are unchanged, but no second mismatch there is
+    /// reported).
     pub(crate) fold_entries: Vec<CheckpointFoldEntry>,
 }
 
@@ -1054,7 +1085,9 @@ pub(crate) enum CheckpointFoldOutcome {
     /// self-base whose declared `(size, root, peaks)` do NOT agree
     /// with the fold loaded from its own peaks is a compare that
     /// FAILED and is recorded as [`Differs`], not here: one enum
-    /// value for one compare outcome (blocker 1). Shipped-copy rule
+    /// value for one compare outcome, so no caller can read a
+    /// self-base flag that disagrees with the compare's own
+    /// result (ruling 13-V4-d10 point 2). Shipped-copy rule
     /// 2 for this case is spike #224. The genesis base of amendment
     /// 9 part 1 is NOT a self-base: its 1-leaf fold is a real
     /// compare, so the opening lands under
@@ -1075,10 +1108,12 @@ pub(crate) enum CheckpointFoldOutcome {
 ///
 /// **Known limits (ruling 13-V4-d10 points 5-6):** (i) shipped-only
 /// openings are not checked here; spike #224 decides whether run
-/// boundaries can be recovered from a Collector record stream; (ii)
-/// once a segment records a violation the classifier stops checking
-/// the rest of that segment, so a second mismatch in the same
-/// segment is not reported.
+/// boundaries can be recovered from a Collector record stream;
+/// (ii) once a segment records a violation the classifier stops
+/// pushing per-checkpoint entries for the rest of that segment
+/// (the salvage walk itself continues under Collect so violations
+/// and reader decisions stay unchanged), so a second mismatch in
+/// the same segment is not reported.
 #[derive(Clone, Debug)]
 pub(crate) struct CheckpointFoldEntry {
     pub(crate) pos: SegmentViolationPos,
@@ -1681,19 +1716,20 @@ pub(crate) fn classify(
                 v,
             ));
         }
-        // #13 V4b (ruling 13-V4-d10 point 2): rewrite the per-segment
-        // local index to classify's own segment enumeration (parallel
-        // to `segments`, and to `Collection::native_segments()` in
-        // the verifier -- ruling 13-V4-d5 (a)) before storing. Under
-        // Reaction::Stop (reader) the entries exist in
-        // `seg_fold_entries` but we drop them here: the reader never
-        // reads this field, and ClassifyOutput::fold_entries stays
-        // empty.
-        if build_reports {
-            for mut e in seg_fold_entries {
-                e.pos.segment_index = segment_index;
-                fold_entries.push(e);
-            }
+        // #13 V4b (ruling 13-V4-d10 points 1-2): rewrite the per-
+        // segment local index to classify's own segment enumeration
+        // (parallel to `segments`, and to
+        // `Collection::native_segments()` in the verifier -- ruling
+        // 13-V4-d5 (a)) before storing. `seg_fold_entries` is empty
+        // under outer [`Reaction::Stop`] by construction: the
+        // per-walk Classifier threads `record_fold_entries =
+        // matches!(outer_reaction, Reaction::Collect)` into
+        // `set_record_fold_entries`, so no `record_fold_entry` push
+        // fires on a reader path and no CPU is spent for entries
+        // the outer loop would drop.
+        for mut e in seg_fold_entries {
+            e.pos.segment_index = segment_index;
+            fold_entries.push(e);
         }
         segment_index += 1;
     }
@@ -2275,15 +2311,35 @@ pub(crate) struct Classifier {
     /// outcomes the classifier recorded in this segment's walk.
     /// Pushed from the record-apply call sites in `feed_record`
     /// (strict) and `feed_record_apply_tolerant` (tolerant) when
-    /// `apply_checked` populated its [`CheckpointFoldReport`] out-
-    /// slot. Recorded regardless of this classifier's reaction;
-    /// classify threads each segment's entries into
-    /// [`ClassifyOutput::fold_entries`] only under outer
-    /// [`Reaction::Collect`] (`build_reports == true`), so under
-    /// outer Stop the trail-level `fold_entries` stays empty and
-    /// reader behaviour is byte-for-byte the same (ruling 13-V4-d10
-    /// point 1).
+    /// [`Classifier::record_fold_entries`] is `true` AND
+    /// [`Classifier::segment_has_collected_violation`] is `false`
+    /// (ruling 13-V4-d10 point 6: a segment stops checking after
+    /// its first violation). Classify threads each segment's entries
+    /// into [`ClassifyOutput::fold_entries`] only under outer
+    /// [`Reaction::Collect`]; under outer Stop the trail-level
+    /// `fold_entries` stays empty and reader behaviour is byte-for-
+    /// byte the same (ruling 13-V4-d10 point 1).
     fold_entries: Vec<CheckpointFoldEntry>,
+    /// #13 V4b (ruling 13-V4-d10 point 1): outer-reaction gate on
+    /// [`Classifier::record_fold_entry`]. The reader's Stop paths
+    /// set this `false` so the classifier does no blake3-hash work
+    /// per checkpoint for entries the outer classify loop would
+    /// then drop. Set `true` only when the outer caller consumes
+    /// `ClassifyOutput::fold_entries`, i.e. the verifier's single
+    /// [`runs::classify`] call under outer [`Reaction::Collect`]
+    /// (including the hardcoded Stop strict closure inside
+    /// `storage::history_segment` when that outer caller is the
+    /// verifier). Threaded via the constructors.
+    record_fold_entries: bool,
+    /// #13 V4b (ruling 13-V4-d10 point 6): per-segment latch set
+    /// once any violation lands in [`Classifier::collected`] for
+    /// the current segment. While set, [`Classifier::record_fold_entry`]
+    /// no-ops so no further `CheckpointFoldEntry` is pushed from
+    /// this segment; the walk itself continues unchanged so the
+    /// reader's accept/reject decisions and the recorded
+    /// `Violation` list stay byte-for-byte the same. Cleared at
+    /// each segment boundary by [`Classifier::reset_at_boundary`].
+    segment_has_collected_violation: bool,
 }
 
 /// The run state and gap hasher produced by [`Classifier::finish`] on success.
@@ -2347,6 +2403,8 @@ impl Classifier {
             recovery_pending: false,
             closed_run: false,
             fold_entries: Vec::new(),
+            record_fold_entries: false,
+            segment_has_collected_violation: false,
         }
     }
 
@@ -2389,7 +2447,22 @@ impl Classifier {
             recovery_pending: false,
             closed_run: false,
             fold_entries: Vec::new(),
+            record_fold_entries: false,
+            segment_has_collected_violation: false,
         }
+    }
+
+    /// #13 V4b (ruling 13-V4-d10 point 1): enable per-checkpoint
+    /// fold recording. Callers set this `true` only when the outer
+    /// caller consumes `ClassifyOutput::fold_entries` -- the
+    /// verifier's one [`classify`] call under outer
+    /// [`Reaction::Collect`], including the inner strict-Stop
+    /// closure inside `storage::history_segment` on that outer
+    /// Collect path. Every reader-only path leaves it `false`, so
+    /// no blake3 hashing happens per checkpoint for entries the
+    /// outer loop would drop.
+    pub(crate) fn set_record_fold_entries(&mut self, record: bool) {
+        self.record_fold_entries = record;
     }
 
     /// Builds a tolerant-mode classifier in Collect reaction (addendum 16
@@ -2443,30 +2516,34 @@ impl Classifier {
         self.state.as_ref()
     }
 
-    /// #13 V4b (ruling 13-V4-d10 points 2-4): push one
+    /// #13 V4b (ruling 13-V4-d10 points 2-4, 6): push one
     /// [`CheckpointFoldEntry`] for the checkpoint-apply call whose
     /// `apply_checked` populated `report`. No-op when `report` is
-    /// `None` (non-checkpoint path). Records regardless of
-    /// `self.reaction`: the outer [`classify`] loop drops the
-    /// per-segment entries when `build_reports == false` (that is,
-    /// under outer [`Reaction::Stop`]), so the Stop output's
-    /// `ClassifyOutput::fold_entries` stays empty and reader
-    /// behaviour remains byte-for-byte the same (ruling 13-V4-d10
-    /// point 1). Recording here under Mode::Strict with inner
-    /// reaction Stop (the hardcoded strict closure inside
-    /// `storage::history_segment`) is how an honest-and-strict
-    /// sealed segment contributes its matched entries to the
-    /// verifier's one classification, so a resume whose opening
-    /// is in that segment passes the fail-closed filter (blocker 3).
+    /// `None` (non-checkpoint path). Two gates skip the push, and
+    /// both skip the blake3 record-hash work the entry would need:
     ///
-    /// The outcome comes straight from
-    /// [`CheckpointFoldReport::outcome`], which `apply_checked`
-    /// derives at the one compare site (one enum, not two separate
-    /// flags). A differing self-base is `Differs`, not `Base`.
+    ///   - [`Classifier::record_fold_entries`] is `false` (the
+    ///     outer-reaction gate: reader-only paths set it false so
+    ///     no CPU is spent for entries the outer `classify` would
+    ///     drop; ruling 13-V4-d10 point 1);
+    ///   - [`Classifier::segment_has_collected_violation`] is
+    ///     `true` (a prior violation in this segment has latched
+    ///     it, ruling 13-V4-d10 point 6: once a segment has a
+    ///     violation the classifier stops checking the rest of
+    ///     that segment, so no second mismatch there is reported).
+    ///
+    /// When the gate lets the push through, the outcome comes
+    /// straight from [`CheckpointFoldReport::outcome`], which
+    /// `apply_checked` derives at the one compare site (one enum,
+    /// not two separate flags). A differing self-base is `Differs`,
+    /// not `Base`.
     fn record_fold_entry(&mut self, record: &Record, report: Option<CheckpointFoldReport>) {
         let Some(rep) = report else {
             return;
         };
+        if !self.record_fold_entries || self.segment_has_collected_violation {
+            return;
+        }
         self.fold_entries.push(CheckpointFoldEntry {
             pos: SegmentViolationPos {
                 segment_index: self.current_pos.segment_index,
@@ -2505,6 +2582,12 @@ impl Classifier {
         if matches!(self.reaction, Reaction::Collect) {
             self.collected.push((self.current_pos, v));
             self.recovery_pending = true;
+            // Ruling 13-V4-d10 point 6: once a segment has a violation
+            // the classifier stops recording per-checkpoint fold
+            // entries for the rest of that segment. The walk itself
+            // continues (so violations and reader results are
+            // unchanged), but no second mismatch there is reported.
+            self.segment_has_collected_violation = true;
         }
         AuditError::from(v)
     }
@@ -2599,19 +2682,21 @@ impl Classifier {
             matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume");
         let closer_candidate =
             self.ctx.run && self.boundary_resume && !self.first && is_resume_record;
-        // #13 V4b (ruling 13-V4-d10 points 2-4): record one
-        // `CheckpointFoldEntry` per checkpoint the fold meets in the
-        // walk. The out-slot is populated inside `apply_checked`
-        // BEFORE any `Violation::CheckpointMmrDiffers` return, so
-        // `fold_report` is `Some` whether the compare matched,
-        // differed or loaded a self-base. `record_fold_entry`
-        // records regardless of this classifier's reaction: the
-        // outer [`classify`] loop drops the per-segment entries
-        // under outer [`Reaction::Stop`] (`build_reports == false`),
-        // which keeps reader behaviour byte-for-byte the same while
-        // letting an honest-and-strict sealed segment contribute
-        // matched entries into the verifier's single classification
-        // (blocker 3; ruling 13-V4-d10 points 1-4).
+        // #13 V4b (ruling 13-V4-d10 points 1-4, 6): record one
+        // `CheckpointFoldEntry` per checkpoint the fold meets in
+        // the walk. The out-slot is populated inside
+        // `apply_checked` BEFORE any `Violation::CheckpointMmrDiffers`
+        // return, so `fold_report` is `Some` whether the compare
+        // matched, differed or loaded a self-base. The record only
+        // lands when the outer caller requested fold recording
+        // (point 1: reader paths leave `record_fold_entries`
+        // false, so no per-checkpoint blake3 hash runs on them)
+        // AND the current segment has not yet latched a collected
+        // violation (point 6). On the verifier's one classification
+        // these two gates let an honest-and-strict sealed segment
+        // contribute its matched entries, so a resume whose
+        // opening sits in that segment passes the fail-closed
+        // candidate filter.
         let mut fold_report: Option<CheckpointFoldReport> = None;
         let result = apply_checked(
             self.state.as_ref(),
@@ -2953,10 +3038,15 @@ impl Classifier {
         // walk always threads a prior `RunState` into
         // `apply_checked`, so the self-base `Mmr::from_peaks`
         // branch (and hence `CheckpointFoldOutcome::Base`) is
-        // unreachable here. `record_fold_entry` records regardless
-        // of this classifier's reaction; the outer [`classify`]
-        // loop drops entries under outer [`Reaction::Stop`]
-        // (ruling 13-V4-d10 point 1).
+        // unreachable here. The salvage arm pushes a violation
+        // directly (no `on_violation`), so it latches
+        // `segment_has_collected_violation` itself (ruling
+        // 13-V4-d10 point 6): subsequent checkpoints in this
+        // segment get `apply_checked` calls as before -- the walk
+        // itself is unchanged, so the reader's accept/reject
+        // decisions and the recorded `Violation` list stay
+        // byte-for-byte the same -- but `record_fold_entry`
+        // no-ops for them.
         let mut fold_report: Option<CheckpointFoldReport> = None;
         let primary = apply_checked(
             self.state.as_ref(),
@@ -2973,6 +3063,15 @@ impl Classifier {
                 // Record-only (no `on_violation`, no latch); splice-in.
                 self.collected
                     .push((self.current_pos, Violation::CheckpointMmrDiffers));
+                // Ruling 13-V4-d10 point 6: a segment stops
+                // recording fold entries after its first violation.
+                // The salvage arm records directly, bypassing
+                // `on_violation`, so it latches the segment flag
+                // here. Subsequent `apply_checked` calls still run,
+                // so the reader's decisions and the violations
+                // list stay byte-for-byte the same; only
+                // `record_fold_entry` is gated by the latch.
+                self.segment_has_collected_violation = true;
                 // Addendum 19.2: a recorded fold-(iii) mismatch marks its
                 // segment damaged for the end-of-segment checks, so no
                 // derived `InvalidUndamagedSegment` follows.
@@ -3206,6 +3305,11 @@ impl Classifier {
         self.outside_run_from_prepare = false;
         self.recovery_pending = false;
         self.closed_run = false;
+        // Ruling 13-V4-d10 point 6: the "segment has a collected
+        // violation" latch is per-segment; clear it at the next
+        // segment boundary so `record_fold_entry` resumes recording
+        // for the new segment's checkpoints.
+        self.segment_has_collected_violation = false;
         self.current_pos = CollectorPos {
             segment_index: next_segment_index,
             record_index_in_segment: 0,
@@ -4366,6 +4470,7 @@ mod collector_tests {
                 trail: TRAIL,
                 prior_run,
                 initial_boundary_resume,
+                record_fold_entries: false,
             },
             events,
             |_, _, _| {},
@@ -4468,6 +4573,7 @@ mod collector_tests {
                 trail: TRAIL,
                 prior_run: None,
                 initial_boundary_resume: false,
+                record_fold_entries: false,
             },
             events,
             |_, _, _| {},
@@ -4842,6 +4948,7 @@ mod collector_tests {
                 trail: TRAIL,
                 prior_run: None,
                 initial_boundary_resume: false,
+                record_fold_entries: false,
             },
             events,
             |_, _, _| {},

@@ -44,14 +44,16 @@
 //! is spike #224). A self-base whose declared `(size, root,
 //! peaks)` disagree with the fold loaded from its own peaks is a
 //! failed compare and lands under
-//! `CheckpointFoldOutcome::Differs`, not `Base` (blocker 1).
+//! `CheckpointFoldOutcome::Differs`, not `Base`, so one enum
+//! value represents one compare outcome (ruling 13-V4-d10
+//! point 2).
 //!
 //! `check_runs` returns the matched openings as
 //! `(seq, hash)` pairs; the engine's fail-closed filter keeps a
 //! candidate only when `(opening_seq, opening_hash)` is present,
 //! so a forged opening whose hash collides on `seq` with an
-//! honest Matched opening on the same trail is dropped (blocker
-//! 2).
+//! honest Matched opening on the same trail is dropped (ruling
+//! 13-V4-d10 point 4).
 //!
 //! **Shipped-copy limit (owner decision 13-V4-d7; spike #224):** the
 //! classifier runs over native inputs only; a shipped (Collector)
@@ -94,7 +96,8 @@ use crate::audit::{
 /// `(opening_seq, opening_hash)` is in this set (ruling 13-V4-d10
 /// point 4, fail-closed). Matching on the pair -- not on `seq`
 /// alone -- drops a forged opening whose hash collides on `seq`
-/// with an honest Matched opening on the same trail (blocker 2).
+/// with an honest Matched opening on the same trail (ruling
+/// 13-V4-d10 point 4).
 ///
 /// Native inputs only; a shipped (Collector) input gets no run
 /// finding and no fold compare at this head (owner decision
@@ -193,9 +196,10 @@ fn emit_fold_findings(
             CheckpointFoldOutcome::Matched => {
                 // Ruling 13-V4-d10 point 4: a positive, compare-and-
                 // matched record of the opening, keyed by the
-                // checked record's own `(seq, hash)` (blocker 2).
-                // The filter in `verify::engine::check` consumes
-                // this set.
+                // checked record's own `(seq, hash)` (ruling
+                // 13-V4-d10 point 4: match on the full pair, not
+                // on `seq` alone). The filter in
+                // `verify::engine::check` consumes this set.
                 matched_openings.insert((entry.seq, entry.hash));
             }
             CheckpointFoldOutcome::Differs | CheckpointFoldOutcome::DiffersAfterLoss => {
@@ -217,8 +221,9 @@ fn emit_fold_findings(
                 // branch ensures a self-based opening is never
                 // confirmed. A self-base whose declared fields
                 // disagree with the fold loaded from its own peaks
-                // lands under `Differs`, not here (blocker 1), so
-                // an `MmrMismatch` is emitted at that record.
+                // lands under `Differs`, not here (one enum value
+                // per compare outcome, ruling 13-V4-d10 point 2),
+                // so an `MmrMismatch` is emitted at that record.
             }
         }
     }
