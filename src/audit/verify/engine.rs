@@ -457,8 +457,8 @@ pub(super) fn check(collection: Collection, trail: [u8; 16]) -> Report {
     let declarations = resume::declarations(&collection, trail);
     emit_resumed(&declarations, &mut findings);
     // Validated structural-resume tuples (ruling 13-V3-d5 points 1, 5, 10);
-    // consumed by #13 V4 (rule 2 fold) in `pending_resumes` below, and by
-    // V6 (start) and V7 (confirmation) in later slices.
+    // consumed by #13 V4 (rule 2 fold) in `pending_resumes` below, and
+    // by #13 V6 (start) and #13 V7 (confirmation).
     let candidates = resume::candidates(&declarations);
     // #13 V4a (rulings 13-V4-d3, 13-V4-d4, 13-V4-d5, 13-V4-d6, 13-V4-d8)
     // emits one `SegmentStructure` run finding per closed run; #13 V4b
@@ -476,12 +476,14 @@ pub(super) fn check(collection: Collection, trail: [u8; 16]) -> Report {
     // #13 V4b (ruling 13-V4-d10 point 4): fail-closed candidate
     // filter. Keep only candidates whose opening the fold positively
     // recorded as matched; drop anything else -- a differing opening,
-    // a shipped-only opening (no fold compare at this head), and an
-    // opening the walk did not reach after an earlier violation.
-    // V4b's later slices therefore cannot confirm or excuse a gap
-    // whose opening rule 2 has not passed. Consumed by #13 V6 / V7;
-    // the `#[cfg(test)]` seam below returns this list for row B6
-    // without widening visibility otherwise.
+    // a self-based opening (ADR amendment 6 "Base"; never compared),
+    // a shipped-only opening (no fold compare at this head, spike
+    // #224), and an opening the walk did not reach after an earlier
+    // violation. Consumed by the gap confirmation of #13 (V6 start,
+    // V7 confirmation), so a gap whose opening rule 2 has not
+    // passed can never be confirmed or excused there. The
+    // `#[cfg(test)]` seam below returns this list for row B6 without
+    // widening visibility otherwise.
     let pending_resumes = filter_candidates(candidates, &matched_openings);
     let _ = &pending_resumes;
     let first_seq = groups.first_key_value().map(|(&s, _)| s);

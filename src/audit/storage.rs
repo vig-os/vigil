@@ -37,14 +37,19 @@ pub(crate) struct SegmentOutcome {
     pub(crate) state: Option<State>,
     pub(crate) violations: Vec<(CollectorPos, Violation)>,
     pub(crate) closed_run: bool,
-    /// #13 V4b (ruling 13-V4-d10 points 2-3): per-checkpoint fold
+    /// #13 V4b (ruling 13-V4-d10 points 2-4): per-checkpoint fold
     /// outcomes this segment's walk recorded. Pos indices are
     /// segment-local; `runs::classify` rewrites them to its own
     /// segment enumeration before placing the entries in
-    /// `ClassifyOutput::fold_entries`. Threaded up under BOTH
-    /// reactions (see [`runs::Classifier::record_fold_entry`])
-    /// because `storage::history_segment`'s strict pass is hardcoded
-    /// to `Reaction::Stop`; the reader paths never read this field.
+    /// `ClassifyOutput::fold_entries`. **Only populated under
+    /// [`Reaction::Collect`]** -- `record_fold_entry` short-circuits
+    /// in the Stop reaction so reader behaviour is byte-for-byte the
+    /// same (ruling 13-V4-d10 point 1). Honest sealed segments
+    /// therefore contribute entries to `ClassifyOutput::fold_entries`
+    /// only through the tolerant-fallback branch inside
+    /// `history_segment` (which runs under the outer reaction); an
+    /// honest-and-strict sealed segment contributes nothing. The
+    /// reader paths never read this field.
     pub(crate) fold_entries: Vec<runs::CheckpointFoldEntry>,
 }
 use crate::rotate::Directory;
@@ -1205,13 +1210,18 @@ pub(crate) fn history_segment(
     // The strict pass takes one clone, the lazy tolerant byte source
     // takes the original.
     let strict_source = source.try_clone().map_err(io_error)?;
-    // #13 V4b (ruling 13-V4-d10 points 2-3): the strict pass's
-    // `fold_entries` are threaded up alongside the final State so an
-    // honest sealed segment under outer `Reaction::Collect` contributes
-    // its matched fold entries to `ClassifyOutput::fold_entries`
-    // (the strict closure stays Reaction::Stop per addendum 27.1; the
-    // Classifier populates fold_entries under both reactions, see
-    // `runs::Classifier::record_fold_entry`).
+    // #13 V4b (ruling 13-V4-d10 points 2-4): the strict pass's
+    // `fold_entries` are threaded up alongside the final State; the
+    // strict closure stays `Reaction::Stop` per addendum 27.1 and
+    // `record_fold_entry` short-circuits in the Stop reaction, so an
+    // honest-and-strict sealed segment contributes nothing to
+    // `ClassifyOutput::fold_entries`. The tolerant fallback below
+    // runs under the outer reaction, so under outer
+    // `Reaction::Collect` a sealed segment that fell back records
+    // its fold entries normally. Rule 2 for an honest-and-strict
+    // sealed segment's opening is not reachable through a
+    // resume-candidate opening (which sits in the live segment
+    // walked by `scan_closing` under the outer reaction).
     #[rustfmt::skip]
     let strict = move || scan_inner(Reaction::Stop, strict_source, trail, strict_state, expected, &mut fc.borrow_mut(), ctx)
         .map(|out| (

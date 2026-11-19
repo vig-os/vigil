@@ -34,7 +34,14 @@
 //! `CheckpointMmrDiffers` violation (which empties every run per
 //! 13-V4-d8 point 3); a `DiffersAfterLoss` entry is never a
 //! violation and never empties a run (amendment 6 (iii) refined by
-//! decision 11 `accept-run` item 3; ruling 13-V4-d10 point 3).
+//! decision 11 `accept-run` item 3; ruling 13-V4-d10 point 3). A
+//! `CheckpointFoldOutcome::Base` entry (ADR amendment 6 "Base":
+//! the opening IS the fold's base, `Mmr::from_peaks`) is never
+//! compared and therefore never a finding; it is also never in the
+//! matched-openings set, which keeps the fail-closed
+//! resume-candidate filter correct for a self-based opening
+//! (ruling 13-V4-d10 point 4; shipped-copy rule 2 for this case
+//! is spike #224).
 //!
 //! **Shipped-copy limit (owner decision 13-V4-d7; spike #224):** the
 //! classifier runs over native inputs only; a shipped (Collector)
@@ -178,6 +185,20 @@ fn emit_fold_findings(
             }
             CheckpointFoldOutcome::Differs | CheckpointFoldOutcome::DiffersAfterLoss => {
                 emit_mmr_mismatch(natives, collection, trail, entry, findings);
+            }
+            CheckpointFoldOutcome::Base => {
+                // ADR-0005 amendment 6 "Base" / ruling 13-V4-d10
+                // point 4: the fold loaded this opening's declared
+                // `(size, root, peaks)` through `Mmr::from_peaks` and
+                // nothing compared them. The verifier emits no
+                // `MmrMismatch` here (there is no expected-vs-found
+                // to report), and `matched_openings` stays unchanged
+                // so the fail-closed candidate filter drops any
+                // resume candidate whose opening is only self-based.
+                // Shipped-copy rule 2 for a self-based opening is
+                // spike #224; until it decides, this fail-closed
+                // branch ensures a self-based opening is never
+                // confirmed.
             }
         }
     }

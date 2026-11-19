@@ -1,21 +1,25 @@
 //! #13 V4b verifier-level acceptance rows for ADR-0005 decision 5
 //! rule 2 and amendment 6 (iii) refined by decision 11 `accept-run`
 //! item 3 (ruling 13-V4-d10 points 2-4). Each row drives
-//! `Verifier::verify_dir` and asserts the **literal, sorted, full**
-//! finding list on the verified trail; the filter row drives the
-//! `#[cfg(test)]` seam in `verify::engine` to assert the literal
-//! retained candidate `opening_seq` list.
+//! `Verifier::verify_dir` / `Verifier::verify_files` and asserts the
+//! **literal, sorted, full** finding list on the verified trail; the
+//! filter rows drive the `#[cfg(test)]` seam in `verify::engine` and
+//! assert the literal retained candidate `opening_seq` list; the
+//! classifier rows assert the literal per-checkpoint outcome list
+//! from a Collect pass over the same snapshot, and the Stop row
+//! asserts the exact `Reaction::Stop` outcome.
 //!
 //! Row standard (vigil `_traps.md`): the main literal assertion of
 //! each acceptance row fails on base `0xafe9942` through this crate's
-//! single-pass apply + fixture; no precondition companion asserts.
-//! The pinned A1 run digest (`79d8cb1c…`) does not change (the
-//! V4a rows under `runs_tests.rs` still pin it).
+//! single-pass apply + fixture (or by failing to compile, when the
+//! row touches the new [`CheckpointFoldOutcome::Base`] variant or the
+//! new `filter_candidates_for_test` seam -- neither exists on base).
+//! The pinned A1 run digest (`79d8cb1c…`) does not change.
 //!
 //! **Known limits (ruling 13-V4-d10 points 5-6):** openings present
 //! only in a shipped copy and segments the walker never finished
-//! because of an earlier violation are not covered here (shipped-only
-//! is spike #224); a second mismatch in the same segment is not
+//! because of an earlier violation are covered here via the
+//! fail-closed filter; a second mismatch in the same segment is not
 //! reported.
 
 use super::{
@@ -26,9 +30,10 @@ use super::{
 use crate::audit::{
     FindingKind as K, Mmr, Record, TrustPolicy, digest_string,
     runs_v4a_fixtures::{
-        TRAIL, Temp, build_a1, entry_rec, headless, line_bytes, pushed, put_segment, resume_decl,
-        seeded, segment_path, signed_cp, signed_cp_explicit, write_records,
+        A1_DIGEST, TRAIL, Temp, build_a1, entry_rec, headless, line_bytes, pushed, put_segment,
+        resume_decl, seeded, segment_path, signed_cp, signed_cp_explicit, write_records,
     },
+    storage::TrailReader,
 };
 use std::{
     fs,
@@ -42,6 +47,14 @@ fn policy_trail() -> TrustPolicy {
 fn verify_dir(dir: &Path) -> Vec<Finding> {
     Verifier::new(policy_trail())
         .verify_dir(dir)
+        .unwrap()
+        .findings()
+        .to_vec()
+}
+
+fn verify_files(files: impl IntoIterator<Item = PathBuf>) -> Vec<Finding> {
+    Verifier::new(policy_trail())
+        .verify_files(files)
         .unwrap()
         .findings()
         .to_vec()
@@ -92,20 +105,61 @@ fn mmr_mismatch_detail(
     )
 }
 
-// -----------------------------------------------------------------
-// B1: A1 whose CLOSING opening cp6 has a wrong root (then a wrong
-// size). The reader rejects it with `CorruptTrail` (verified in
-// probe at base); the verifier under V4b reports `MmrMismatch` at cp6 and no
-// run finding (13-V4-d10 point 2; 13-V4-d8 point 3: any violation
-// empties every run).
-// -----------------------------------------------------------------
+/// Parse the module's exposed `A1_DIGEST` constant back to bytes so a
+/// row can assert the run finding's `run_digest()` directly.
+fn parse_digest(hex: &str) -> [u8; 32] {
+    let hex = hex.strip_prefix("blake3:").expect("blake3 prefix");
+    assert_eq!(hex.len(), 64, "32-byte digest in hex");
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("hex");
+    }
+    out
+}
 
-/// Build an A1 variant where the live cp6 is signed with
-/// `(size, root, peaks) = (size, bad_root, peaks)`. The rest of the
-/// layout is byte-identical to `build_a1`: S0/S1 remain honest, the
-/// strict pass still reaches cp6, the Classifier records
-/// `CheckpointMmrDiffers` and `DiffersAfterLoss` is NOT the outcome
-/// (compare_mmr is true on an opening).
+/// Builds A1's run detail string (loss points, then spans, then
+/// digest). The honest A1 has one loss point (seq=4 first=3 count=1)
+/// and no spans (S1's `[r4, cp5]` are both records, so the segment
+/// contributes no gap span).
+fn a1_run_detail() -> String {
+    format!("loss seq 4 first 3 count 1; digest {A1_DIGEST}")
+}
+
+/// Formats the honest A1 `Resumed` detail; the writer-honest variant
+/// (Blocker 3) shares this exact text because the resume names the
+/// same head (`seq 5`) and the cp5 hash is derived from the record's
+/// signed bytes -- see each fixture builder for the dependency.
+fn resume_detail_at_seq(head_seq: u64, head_hash: &[u8; 32], gap: &str) -> String {
+    format!(
+        "operator=operator reason=incident head={head_seq}:{hash} \
+         gap={gap} lost_records=0 structural=valid",
+        hash = digest_string(head_hash)
+    )
+}
+
+fn uncovered_tail_row(first: u64, last: u64) -> Row {
+    (
+        K::UncoveredTail,
+        None,
+        None,
+        None,
+        format!(
+            "records seq {first}..={last}, no trusted coverage yet (signatures are checked in #13 V5)"
+        ),
+        None,
+    )
+}
+
+// =======================================================================
+// B1 -- A1 whose CLOSING opening cp6 has a wrong root (then a wrong
+// size). The reader rejects it with `CorruptTrail` (ruling 13-V4-d8
+// probe: "A1 with cp6 wrong root/size: `TrailReader::open` rejects
+// with `CorruptTrail`"); under V4b the verifier reports `MmrMismatch`
+// at cp6 AND no run finding (ruling 13-V4-d10 point 2; ruling
+// 13-V4-d8 point 3: any violation empties every run). Each row
+// asserts the full sorted literal finding list.
+// =======================================================================
+
 fn build_a1_wrong_cp6_root() -> (Temp, PathBuf) {
     let d = Temp::new();
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
@@ -119,11 +173,7 @@ fn build_a1_wrong_cp6_root() -> (Temp, PathBuf) {
     let fold = pushed(&mmr2, &r4);
     let cp5 = signed_cp(5, r4.hash(), &fold);
     put_segment(&d.0, 1, &[&r4, &cp5], &[]);
-    // Walker's fold at cp6 is `fold + cp5` (size, root, peaks).
     let fold6 = pushed(&fold, &cp5);
-    // Keep the correct size and peaks (so `CheckpointFields::new`'s
-    // `peaks.len() == size.count_ones()` invariant holds) but flip
-    // the root; the compare at the opening sees a difference.
     let bad_root = [0xAA; 32];
     let cp6 = signed_cp_explicit(
         6,
@@ -138,10 +188,70 @@ fn build_a1_wrong_cp6_root() -> (Temp, PathBuf) {
     (d, dir_path)
 }
 
-/// Build an A1 variant where the live cp6 is signed with a wrong
-/// SIZE. Wrong size is a distinct arm of the compare (the compare
-/// checks size, root AND peaks); keep root crafted to pass a casual
-/// eye but fail size.
+#[test]
+fn b1_a1_closing_cp6_wrong_root_full_literal_list() {
+    let (_temp, dir) = build_a1_wrong_cp6_root();
+    let s1 = dir.join("audit-20260101T000000.000000000Z_000001.jsonl");
+    let live = dir.join("audit.jsonl");
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let e2 = entry_rec(2, e1.hash());
+    let mmr2 = pushed(&mmr1, &e2);
+    let r4 = headless(&e2, 4);
+    let fold = pushed(&mmr2, &r4);
+    let cp5 = signed_cp(5, r4.hash(), &fold);
+    let fold6 = pushed(&fold, &cp5);
+    let bad_root = [0xAA; 32];
+    let mmr_detail = mmr_mismatch_detail(fold6.size(), &fold6.root(), fold6.size(), &bad_root);
+    let per_seg_detail = "expected first complete record to be a checkpoint".to_owned();
+    let resume_detail = resume_detail_at_seq(5, &cp5.hash(), "none");
+    let got = rows(&verify_dir(&dir));
+    // Any violation empties every run (13-V4-d8 point 3), so NO
+    // `SegmentStructure` with a run digest; the per-segment "expected
+    // first complete record to be a checkpoint" finding on S1 stays.
+    // On base `0xafe9942` no `MmrMismatch` is emitted (the fold compare
+    // is discarded there); this row is red on base through the
+    // `MmrMismatch` at cp6 line.
+    let expected: Vec<Row> = vec![
+        (
+            K::SegmentStructure,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            per_seg_detail,
+            None,
+        ),
+        (
+            K::SeqGap,
+            Some(s1),
+            Some(1),
+            Some(4),
+            "missing seq 3..=3".to_owned(),
+            None,
+        ),
+        (
+            K::MmrMismatch,
+            Some(live.clone()),
+            Some(1),
+            Some(6),
+            mmr_detail,
+            None,
+        ),
+        (
+            K::Resumed,
+            Some(live),
+            Some(2),
+            Some(7),
+            resume_detail,
+            None,
+        ),
+        uncovered_tail_row(0, 7),
+    ];
+    assert_eq!(got, expected, "B1-root full literal list");
+}
+
 fn build_a1_wrong_cp6_size() -> (Temp, PathBuf) {
     let d = Temp::new();
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
@@ -156,11 +266,9 @@ fn build_a1_wrong_cp6_size() -> (Temp, PathBuf) {
     let cp5 = signed_cp(5, r4.hash(), &fold);
     put_segment(&d.0, 1, &[&r4, &cp5], &[]);
     let fold6 = pushed(&fold, &cp5);
-    // Craft a "wrong size" by moving to the next lower power whose
-    // one-count matches the peaks we can supply. Simplest: pick
-    // size=1 (count_ones==1), peaks=[fold6.root()]. The declared
-    // root we leave equal to fold6.root -- this probe focuses the
-    // compare on `size`.
+    // `CheckpointFields::new` requires `peaks.len() == size.count_ones()`.
+    // Pick size=1 (one peak) and declare root=fold6.root(), peaks=[fold6.root()]:
+    // the compare fires on `size` and records a mismatch.
     let bad_size: u64 = 1;
     let fake_peaks: Vec<[u8; 32]> = vec![fold6.root()];
     let cp6 = signed_cp_explicit(6, cp5.hash(), bad_size, fold6.root(), fake_peaks);
@@ -171,53 +279,10 @@ fn build_a1_wrong_cp6_size() -> (Temp, PathBuf) {
 }
 
 #[test]
-fn b1_a1_closing_cp6_wrong_root_mmr_mismatch_no_run() {
-    let (_temp, dir) = build_a1_wrong_cp6_root();
-    let findings = verify_dir(&dir);
-    // The compare at cp6 reports expected = walker's fold (size,
-    // root of `mmr2 + r4 + cp5`), found = declared (size, bad_root).
-    // We rebuild the walker's fold here from the same fixture
-    // helpers so the detail is verified value-for-value.
-    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
-    let mmr0 = seeded(&cp0);
-    let e1 = entry_rec(1, cp0.hash());
-    let mmr1 = pushed(&mmr0, &e1);
-    let e2 = entry_rec(2, e1.hash());
-    let mmr2 = pushed(&mmr1, &e2);
-    let r4 = headless(&e2, 4);
-    let fold = pushed(&mmr2, &r4);
-    let cp5 = signed_cp(5, r4.hash(), &fold);
-    let fold6 = pushed(&fold, &cp5);
-    let bad_root = [0xAA; 32];
-    let detail = mmr_mismatch_detail(fold6.size(), &fold6.root(), fold6.size(), &bad_root);
-    let live = dir.join("audit.jsonl");
-    // Full literal finding list must contain MmrMismatch at cp6 and
-    // NO SegmentStructure run finding (any violation empties runs,
-    // 13-V4-d8 point 3). The honest A1 run finding is absent.
-    // Base 0xafe9942 has NEITHER MmrMismatch NOR the run finding
-    // (the reader rejects the trail with CorruptTrail before
-    // verify's run detection yields anything; base probe).
-    // This row therefore fails on base through the
-    // `MmrMismatch` presence assertion.
-    let got = rows(&findings);
-    assert!(
-        got.iter().any(|r| r.0 == K::MmrMismatch
-            && r.1.as_ref() == Some(&live)
-            && r.3 == Some(6)
-            && r.4 == detail),
-        "B1-root: expected MmrMismatch at cp6 with detail {detail:?}, got {got:#?}",
-    );
-    assert!(
-        !got.iter()
-            .any(|r| r.0 == K::SegmentStructure && r.5.is_some()),
-        "B1-root: expected no run finding (13-V4-d8 point 3 empties runs)",
-    );
-}
-
-#[test]
-fn b1_a1_closing_cp6_wrong_size_mmr_mismatch_no_run() {
+fn b1_a1_closing_cp6_wrong_size_full_literal_list() {
     let (_temp, dir) = build_a1_wrong_cp6_size();
-    let findings = verify_dir(&dir);
+    let s1 = dir.join("audit-20260101T000000.000000000Z_000001.jsonl");
+    let live = dir.join("audit.jsonl");
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
     let mmr0 = seeded(&cp0);
     let e1 = entry_rec(1, cp0.hash());
@@ -228,49 +293,61 @@ fn b1_a1_closing_cp6_wrong_size_mmr_mismatch_no_run() {
     let fold = pushed(&mmr2, &r4);
     let cp5 = signed_cp(5, r4.hash(), &fold);
     let fold6 = pushed(&fold, &cp5);
-    let detail = mmr_mismatch_detail(fold6.size(), &fold6.root(), 1, &fold6.root());
-    let live = dir.join("audit.jsonl");
-    let got = rows(&findings);
-    assert!(
-        got.iter().any(|r| r.0 == K::MmrMismatch
-            && r.1.as_ref() == Some(&live)
-            && r.3 == Some(6)
-            && r.4 == detail),
-        "B1-size: expected MmrMismatch at cp6 with detail {detail:?}, got {got:#?}",
-    );
-    assert!(
-        !got.iter()
-            .any(|r| r.0 == K::SegmentStructure && r.5.is_some()),
-        "B1-size: expected no run finding",
-    );
+    let mmr_detail = mmr_mismatch_detail(fold6.size(), &fold6.root(), 1, &fold6.root());
+    let per_seg_detail = "expected first complete record to be a checkpoint".to_owned();
+    let resume_detail = resume_detail_at_seq(5, &cp5.hash(), "none");
+    let got = rows(&verify_dir(&dir));
+    let expected: Vec<Row> = vec![
+        (
+            K::SegmentStructure,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            per_seg_detail,
+            None,
+        ),
+        (
+            K::SeqGap,
+            Some(s1),
+            Some(1),
+            Some(4),
+            "missing seq 3..=3".to_owned(),
+            None,
+        ),
+        (
+            K::MmrMismatch,
+            Some(live.clone()),
+            Some(1),
+            Some(6),
+            mmr_detail,
+            None,
+        ),
+        (
+            K::Resumed,
+            Some(live),
+            Some(2),
+            Some(7),
+            resume_detail,
+            None,
+        ),
+        uncovered_tail_row(0, 7),
+    ];
+    assert_eq!(got, expected, "B1-size full literal list");
 }
 
-// -----------------------------------------------------------------
-// B2: A plain resume (no run) whose opening checkpoint has a wrong
-// root yields a `MmrMismatch` at the opening. Shape: genesis-linked
-// resume (ADR-0005 amendment 9), which is the simplest plain
-// resume: `cp1 (previous=genesis, size=1, root=genesis leaf)` then
-// `resume2 (head=0:genesis, lost_through=0)`. The walker folds the
-// amendment-9 genesis leaf and compares at cp1.
-// -----------------------------------------------------------------
+// =======================================================================
+// B2 -- A plain genesis-linked resume (ADR-0005 amendment 9) whose
+// opening cp1's root is wrong. The walker folds the computable
+// genesis leaf (amendment 9 branch of `apply_checked`), compares
+// the opening's declared size/root/peaks, and emits one
+// `MmrMismatch` at cp1 (ruling 13-V4-d10 point 2).
+// =======================================================================
 
-/// Builds a genesis-linked resume with a crafted bad cp1 root.
-/// `peaks.len() == size.count_ones()` so `CheckpointFields::new`
-/// accepts the record; the walker's compare is what fails.
 fn build_plain_resume_wrong_root() -> (Temp, PathBuf) {
     let d = Temp::new();
-    // One sealed segment holding a non-genesis "pre-trail" that
-    // the resume does NOT describe would make this a run case.
-    // For a plain resume we need exactly one segment: live =
-    // [cp1, resume2]. The opening cp1 has previous=genesis, size=1,
-    // and declared root is the genesis leaf.
     let genesis_hash = Record::genesis(&TRAIL);
-    // Correct fold: `Mmr::new().push(genesis_hash)`.
     let mut good_fold = Mmr::new();
     good_fold.push(genesis_hash).unwrap();
-    // Craft a cp1 with the correct SIZE/peaks (so
-    // `CheckpointFields::new` passes) but a wrong root; the compare
-    // at the opening fires on root mismatch.
     let bad_root = [0x11; 32];
     let cp1 = signed_cp_explicit(
         1,
@@ -286,40 +363,72 @@ fn build_plain_resume_wrong_root() -> (Temp, PathBuf) {
 }
 
 #[test]
-fn b2_plain_resume_wrong_opening_root_mmr_mismatch() {
+fn b2_plain_resume_wrong_opening_root_full_literal_list() {
     let (_temp, dir) = build_plain_resume_wrong_root();
-    let findings = verify_dir(&dir);
+    let live = dir.join("audit.jsonl");
     let genesis_hash = Record::genesis(&TRAIL);
     let mut good_fold = Mmr::new();
     good_fold.push(genesis_hash).unwrap();
     let bad_root = [0x11; 32];
-    let detail = mmr_mismatch_detail(
+    let mmr_detail = mmr_mismatch_detail(
         good_fold.size(),
         &good_fold.root(),
         good_fold.size(),
         &bad_root,
     );
-    let live = dir.join("audit.jsonl");
-    let got = rows(&findings);
-    assert!(
-        got.iter().any(|r| r.0 == K::MmrMismatch
-            && r.1.as_ref() == Some(&live)
-            && r.3 == Some(1)
-            && r.4 == detail),
-        "B2: expected MmrMismatch at cp1 with detail {detail:?}, got {got:#?}",
+    // Rebuild cp1 so the resume detail references its exact hash.
+    let cp1 = signed_cp_explicit(
+        1,
+        genesis_hash,
+        good_fold.size(),
+        bad_root,
+        good_fold.peaks().to_vec(),
     );
+    let _ = cp1; // referenced for clarity; the resume names head=0:genesis.
+    let got = rows(&verify_dir(&dir));
+    // `gap=0..=0` is the genesis-resume text (ADR l.407; d5 point 3).
+    let resume_detail = resume_detail_at_seq(0, &genesis_hash, "0..=0");
+    // Sort key `(seq, file, line, kind)`: both `MmrMismatch` and
+    // `SeqGap` carry (live, 1, 1); `MmrMismatch` ("M") sorts before
+    // `SeqGap` ("Se"). Base `0xafe9942` has no `MmrMismatch`.
+    let expected: Vec<Row> = vec![
+        (
+            K::MmrMismatch,
+            Some(live.clone()),
+            Some(1),
+            Some(1),
+            mmr_detail,
+            None,
+        ),
+        (
+            K::SeqGap,
+            Some(live.clone()),
+            Some(1),
+            Some(1),
+            "missing seq 0..=0".to_owned(),
+            None,
+        ),
+        (
+            K::Resumed,
+            Some(live),
+            Some(2),
+            Some(2),
+            resume_detail,
+            None,
+        ),
+        uncovered_tail_row(1, 2),
+    ];
+    assert_eq!(got, expected, "B2 full literal list");
 }
 
-// -----------------------------------------------------------------
-// B3: A1 whose in-run cp5 (after loss point seq 4) has a wrong root
-// yields `MmrMismatch` at cp5 AS a `DiffersAfterLoss` entry, AND the
-// run finding is preserved (post-loss differences are NOT
-// violations: ADR amendment 6 (iii), ruling 13-V4-d10 point 3).
-// Base 0xafe9942 (ruling probe): "A1 whose in-run cp5 has a wrong
-// root: identical to honest." -- no MmrMismatch there. This row
-// therefore fails on base through the `MmrMismatch` presence
-// assertion, and under V4b the run finding stays.
-// -----------------------------------------------------------------
+// =======================================================================
+// B3 -- A1 whose in-run cp5 (after the run's first loss point) has a
+// wrong root or a wrong size. The walker does NOT compare at cp5
+// (`compare_mmr = false`, amendment 6 (iii)), so there is no
+// `CheckpointMmrDiffers` violation and the run finding stays
+// (ruling 13-V4-d10 point 3; decision 11 `accept-run` item 3). The
+// verifier emits one `MmrMismatch` as a `DiffersAfterLoss` entry.
+// =======================================================================
 
 fn build_a1_wrong_cp5_root() -> (Temp, PathBuf) {
     let d = Temp::new();
@@ -332,14 +441,9 @@ fn build_a1_wrong_cp5_root() -> (Temp, PathBuf) {
     put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
     let r4 = headless(&e2, 4);
     let fold = pushed(&mmr2, &r4);
-    // Wrong root on cp5 (size and peak count match so the record
-    // builder accepts it).
     let bad_root = [0x55; 32];
     let cp5 = signed_cp_explicit(5, r4.hash(), fold.size(), bad_root, fold.peaks().to_vec());
     put_segment(&d.0, 1, &[&r4, &cp5], &[]);
-    // The closer cp6 must still fold over the walker's reconstruction
-    // mmr2+r4+cp5, i.e. with cp5.hash (NOT the honest cp5 hash). Use
-    // the real cp5's hash for the closer's previous and for its fold.
     let fold6 = pushed(&fold, &cp5);
     let cp6 = signed_cp(6, cp5.hash(), &fold6);
     let resume = resume_decl(&cp6, 5, cp5.hash(), 5);
@@ -349,9 +453,10 @@ fn build_a1_wrong_cp5_root() -> (Temp, PathBuf) {
 }
 
 #[test]
-fn b3_a1_in_run_cp5_wrong_root_differs_after_loss() {
+fn b3_a1_in_run_cp5_wrong_root_full_literal_list() {
     let (_temp, dir) = build_a1_wrong_cp5_root();
-    let findings = verify_dir(&dir);
+    let s1 = dir.join("audit-20260101T000000.000000000Z_000001.jsonl");
+    let live = dir.join("audit.jsonl");
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
     let mmr0 = seeded(&cp0);
     let e1 = entry_rec(1, cp0.hash());
@@ -361,43 +466,56 @@ fn b3_a1_in_run_cp5_wrong_root_differs_after_loss() {
     let r4 = headless(&e2, 4);
     let fold = pushed(&mmr2, &r4);
     let bad_root = [0x55; 32];
-    let detail = mmr_mismatch_detail(fold.size(), &fold.root(), fold.size(), &bad_root);
-    let s1 = dir.join("audit-20260101T000000.000000000Z_000001.jsonl");
-    let got = rows(&findings);
-    // The after-loss compare is NOT a violation (ruling 13-V4-d10
-    // point 3 refines amendment 6 (iii)): the MmrMismatch is
-    // present without a `CheckpointMmrDiffers`.
-    assert!(
-        got.iter().any(|r| r.0 == K::MmrMismatch
-            && r.1.as_ref() == Some(&s1)
-            && r.3 == Some(5)
-            && r.4 == detail),
-        "B3-root: expected MmrMismatch at cp5 with detail {detail:?}, got {got:#?}",
-    );
+    let mmr_detail = mmr_mismatch_detail(fold.size(), &fold.root(), fold.size(), &bad_root);
+    let cp5 = signed_cp_explicit(5, r4.hash(), fold.size(), bad_root, fold.peaks().to_vec());
+    let a1_digest = parse_digest(A1_DIGEST);
+    let run_detail = a1_run_detail();
+    let per_seg_detail = "expected first complete record to be a checkpoint".to_owned();
+    let resume_detail = resume_detail_at_seq(5, &cp5.hash(), "none");
+    let got = rows(&verify_dir(&dir));
+    // Sort key: seq=4 (s1) findings (per-seg, run, SeqGap) sort by
+    // kind-debug (`Seg...` < `Seq...`), then seq=5 MmrMismatch at s1
+    // line=2, then Resumed at live, then UncoveredTail. V4b adds the
+    // MmrMismatch which base `0xafe9942` does not emit.
+    let expected: Vec<Row> = vec![
+        (
+            K::SegmentStructure,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            per_seg_detail,
+            None,
+        ),
+        (
+            K::SegmentStructure,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            run_detail,
+            Some(digest_string(&a1_digest)),
+        ),
+        (
+            K::SeqGap,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            "missing seq 3..=3".to_owned(),
+            None,
+        ),
+        (K::MmrMismatch, Some(s1), Some(2), Some(5), mmr_detail, None),
+        (
+            K::Resumed,
+            Some(live),
+            Some(2),
+            Some(7),
+            resume_detail,
+            None,
+        ),
+        uncovered_tail_row(0, 7),
+    ];
+    assert_eq!(got, expected, "B3-root full literal list");
 }
 
-#[test]
-fn b3_a1_in_run_cp5_wrong_root_run_finding_stays() {
-    // Companion to `b3_a1_in_run_cp5_wrong_root_differs_after_loss`:
-    // pins the "run finding stays" half of ruling 13-V4-d10 point 3.
-    // Named separately so a mutant that records post-loss diffs as
-    // a `Violation` (which would empty the runs list, 13-V4-d8
-    // point 3) fails this row in addition to the MmrMismatch row.
-    let (_temp, dir) = build_a1_wrong_cp5_root();
-    let findings = verify_dir(&dir);
-    let got = rows(&findings);
-    assert!(
-        got.iter()
-            .any(|r| r.0 == K::SegmentStructure && r.5.is_some()),
-        "B3: expected the A1 run finding to remain (not emptied), got {got:#?}",
-    );
-}
-
-/// Builds an A1 variant where in-run cp5 has a WRONG SIZE
-/// (size != mmr2+r4.size). The `CheckpointFields` invariant
-/// `peaks.len() == size.count_ones()` constrains the crafted
-/// value; a declared `size=1` (count_ones==1) with one-peak
-/// vector keeps the fixture valid.
 fn build_a1_wrong_cp5_size() -> (Temp, PathBuf) {
     let d = Temp::new();
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
@@ -409,8 +527,6 @@ fn build_a1_wrong_cp5_size() -> (Temp, PathBuf) {
     put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
     let r4 = headless(&e2, 4);
     let fold = pushed(&mmr2, &r4);
-    // Declared size=1 (walker's fold size is 4); fake one-peak
-    // vector; declared root irrelevant to the size compare.
     let cp5 = signed_cp_explicit(5, r4.hash(), 1, fold.root(), vec![fold.root()]);
     put_segment(&d.0, 1, &[&r4, &cp5], &[]);
     let fold6 = pushed(&fold, &cp5);
@@ -422,9 +538,10 @@ fn build_a1_wrong_cp5_size() -> (Temp, PathBuf) {
 }
 
 #[test]
-fn b3_a1_in_run_cp5_wrong_size_differs_after_loss() {
+fn b3_a1_in_run_cp5_wrong_size_full_literal_list() {
     let (_temp, dir) = build_a1_wrong_cp5_size();
-    let findings = verify_dir(&dir);
+    let s1 = dir.join("audit-20260101T000000.000000000Z_000001.jsonl");
+    let live = dir.join("audit.jsonl");
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
     let mmr0 = seeded(&cp0);
     let e1 = entry_rec(1, cp0.hash());
@@ -433,63 +550,176 @@ fn b3_a1_in_run_cp5_wrong_size_differs_after_loss() {
     let mmr2 = pushed(&mmr1, &e2);
     let r4 = headless(&e2, 4);
     let fold = pushed(&mmr2, &r4);
-    let detail = mmr_mismatch_detail(fold.size(), &fold.root(), 1, &fold.root());
-    let s1 = dir.join("audit-20260101T000000.000000000Z_000001.jsonl");
-    let got = rows(&findings);
-    // Second DiffersAfterLoss row (different craft on the same
-    // path) so the post-loss mapping V2/V3 mutants have two
-    // named rows that fail.
-    assert!(
-        got.iter().any(|r| r.0 == K::MmrMismatch
-            && r.1.as_ref() == Some(&s1)
-            && r.3 == Some(5)
-            && r.4 == detail),
-        "B3-size: expected MmrMismatch at cp5 with detail {detail:?}, got {got:#?}",
-    );
-    assert!(
-        got.iter()
-            .any(|r| r.0 == K::SegmentStructure && r.5.is_some()),
-        "B3-size: expected the A1 run finding to remain, got {got:#?}",
-    );
+    let cp5 = signed_cp_explicit(5, r4.hash(), 1, fold.root(), vec![fold.root()]);
+    let mmr_detail = mmr_mismatch_detail(fold.size(), &fold.root(), 1, &fold.root());
+    let a1_digest = parse_digest(A1_DIGEST);
+    let run_detail = a1_run_detail();
+    let per_seg_detail = "expected first complete record to be a checkpoint".to_owned();
+    let resume_detail = resume_detail_at_seq(5, &cp5.hash(), "none");
+    let got = rows(&verify_dir(&dir));
+    let expected: Vec<Row> = vec![
+        (
+            K::SegmentStructure,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            per_seg_detail,
+            None,
+        ),
+        (
+            K::SegmentStructure,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            run_detail,
+            Some(digest_string(&a1_digest)),
+        ),
+        (
+            K::SeqGap,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            "missing seq 3..=3".to_owned(),
+            None,
+        ),
+        (K::MmrMismatch, Some(s1), Some(2), Some(5), mmr_detail, None),
+        (
+            K::Resumed,
+            Some(live),
+            Some(2),
+            Some(7),
+            resume_detail,
+            None,
+        ),
+        uncovered_tail_row(0, 7),
+    ];
+    assert_eq!(got, expected, "B3-size full literal list");
 }
 
-// -----------------------------------------------------------------
-// B4: A run whose in-run checkpoint sits BEFORE its first loss
-// point with a wrong root. Shape: a layout where the compared
-// in-run checkpoint comes before any loss, so `compare_mmr = true`
-// at that checkpoint; the walker records `CheckpointMmrDiffers`,
-// which empties every run (13-V4-d8 point 3, 13-V4-d10 point 2).
-//
-// Simplest shape (B3d1-d4 / 13-V4-d1 point 3): a run segment opened
-// by a headless boundary where the pre-loss compare fires at the
-// run's FIRST record of its FIRST segment (before any loss point
-// records).
-//
-// We use a reversed variant: a run shape without any loss point
-// (an entirely intact, no-gap in-run segment) where an in-run cp
-// has a wrong root. On base the honest layout with wrong in-run
-// cp emits no `MmrMismatch`; under V4b the violation fires and the
-// run finding is empty.
-// -----------------------------------------------------------------
+/// Blocker 3 (writer-honest A1): `cp5` is signed over the writer's
+/// REAL fold, which counts the lost leaf at seq 3 (ghost record), so
+/// its declared size is 5 while the reader's fold at cp5 time has
+/// size 4. The reader opens successfully (amendment 6 (iii):
+/// post-loss checkpoints are not compared by the reader), and the
+/// verifier emits one `MmrMismatch` at cp5 while the run finding
+/// stays (ruling 13-V4-d10 point 3).
+fn build_a1_writer_honest() -> (Temp, PathBuf) {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let e2 = entry_rec(2, e1.hash());
+    let mmr2 = pushed(&mmr1, &e2);
+    put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
+    let r4 = headless(&e2, 4);
+    // Reader's fold ignoring lost seq 3: size 4.
+    let reader_fold_r4 = pushed(&mmr2, &r4);
+    // Writer's REAL fold counting the lost leaf at seq 3: size 5.
+    let ghost = entry_rec(3, e2.hash());
+    let writer_mmr3 = pushed(&mmr2, &ghost);
+    let writer_mmr4 = pushed(&writer_mmr3, &r4);
+    let cp5_writer = signed_cp(5, r4.hash(), &writer_mmr4);
+    put_segment(&d.0, 1, &[&r4, &cp5_writer], &[]);
+    // Closer cp6 folds on the reader's state after cp5: size 4 then
+    // push cp5 -> size 5.
+    let fold_after_cp5 = pushed(&reader_fold_r4, &cp5_writer);
+    let cp6 = signed_cp(6, cp5_writer.hash(), &fold_after_cp5);
+    let resume = resume_decl(&cp6, 5, cp5_writer.hash(), 5);
+    write_records(&d.0, &[&cp6, &resume]);
+    let dir_path = d.0.clone();
+    (d, dir_path)
+}
 
-/// Builds a layout where S1 is an unsealed boundary-closed segment
-/// with cp2 declared with a wrong root. The walker walks tolerant
-/// and the compare at cp2 fires under `compare_mmr = true` (count
-/// 1 here is not after a broken-boundary record; `before_loss` is
-/// true).
+#[test]
+fn b3_a1_writer_honest_reader_opens_and_verifier_mmr_mismatch() {
+    let (_temp, dir) = build_a1_writer_honest();
+    // (1) Reader opens successfully: amendment 6 (iii) skips the
+    // post-loss cp5 compare in the reader, so a writer-honest cp5
+    // with size 5 is accepted.
+    let _reader = TrailReader::open(&dir, TRAIL, None)
+        .expect("writer-honest A1: TrailReader::open must succeed (amendment 6 (iii))");
+    // (2) Verifier emits `MmrMismatch` at cp5 AND the run finding
+    // stays. Full literal finding list.
+    let s1 = dir.join("audit-20260101T000000.000000000Z_000001.jsonl");
+    let live = dir.join("audit.jsonl");
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let e2 = entry_rec(2, e1.hash());
+    let mmr2 = pushed(&mmr1, &e2);
+    let r4 = headless(&e2, 4);
+    let reader_fold_r4 = pushed(&mmr2, &r4);
+    let ghost = entry_rec(3, e2.hash());
+    let writer_mmr3 = pushed(&mmr2, &ghost);
+    let writer_mmr4 = pushed(&writer_mmr3, &r4);
+    let cp5_writer = signed_cp(5, r4.hash(), &writer_mmr4);
+    let mmr_detail = mmr_mismatch_detail(
+        reader_fold_r4.size(),
+        &reader_fold_r4.root(),
+        writer_mmr4.size(),
+        &writer_mmr4.root(),
+    );
+    let a1_digest = parse_digest(A1_DIGEST);
+    let run_detail = a1_run_detail();
+    let per_seg_detail = "expected first complete record to be a checkpoint".to_owned();
+    let resume_detail = resume_detail_at_seq(5, &cp5_writer.hash(), "none");
+    let got = rows(&verify_dir(&dir));
+    let expected: Vec<Row> = vec![
+        (
+            K::SegmentStructure,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            per_seg_detail,
+            None,
+        ),
+        (
+            K::SegmentStructure,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            run_detail,
+            Some(digest_string(&a1_digest)),
+        ),
+        (
+            K::SeqGap,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            "missing seq 3..=3".to_owned(),
+            None,
+        ),
+        (K::MmrMismatch, Some(s1), Some(2), Some(5), mmr_detail, None),
+        (
+            K::Resumed,
+            Some(live),
+            Some(2),
+            Some(7),
+            resume_detail,
+            None,
+        ),
+        uncovered_tail_row(0, 7),
+    ];
+    assert_eq!(got, expected, "writer-honest A1 full literal list");
+}
+
+// =======================================================================
+// B4 -- A run whose in-run checkpoint sits BEFORE its first loss
+// point (here: no loss point at all, a closer opened by an unsealed
+// boundary with a wrong root). `compare_mmr = true` fires at that
+// opening, the walker records `CheckpointMmrDiffers`, every run is
+// emptied (13-V4-d8 point 3, 13-V4-d10 point 2).
+// =======================================================================
+
 fn build_pre_loss_wrong_root() -> (Temp, PathBuf) {
     let d = Temp::new();
-    // S0 = [cp0, e1] (sealed, unsealed boundary going into S1)
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
     let mmr0 = seeded(&cp0);
     let e1 = entry_rec(1, cp0.hash());
     let mmr1 = pushed(&mmr0, &e1);
     put_segment(&d.0, 0, &[&cp0, &e1], &[]);
-    // S1 = [cp2 (wrong root), resume3] -- cp2 is a closer opening
-    // at seq=2 closing an unsealed-boundary run; the compare at
-    // cp2 under outer Collect is `compare_mmr=true` (first=true,
-    // broken=false, before_loss=true). A wrong root fires
-    // `CheckpointMmrDiffers`.
     let bad_root = [0x77; 32];
     let cp2 = signed_cp_explicit(2, e1.hash(), mmr1.size(), bad_root, mmr1.peaks().to_vec());
     let resume = resume_decl(&cp2, 1, e1.hash(), 1);
@@ -499,64 +729,54 @@ fn build_pre_loss_wrong_root() -> (Temp, PathBuf) {
 }
 
 #[test]
-fn b4_pre_loss_in_run_wrong_root_empties_runs() {
+fn b4_pre_loss_in_run_wrong_root_full_literal_list() {
     let (_temp, dir) = build_pre_loss_wrong_root();
-    let findings = verify_dir(&dir);
-    let got = rows(&findings);
     let live = dir.join("audit.jsonl");
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
     let mmr0 = seeded(&cp0);
     let e1 = entry_rec(1, cp0.hash());
     let mmr1 = pushed(&mmr0, &e1);
     let bad_root = [0x77; 32];
-    let detail = mmr_mismatch_detail(mmr1.size(), &mmr1.root(), mmr1.size(), &bad_root);
-    assert!(
-        got.iter().any(|r| r.0 == K::MmrMismatch
-            && r.1.as_ref() == Some(&live)
-            && r.3 == Some(2)
-            && r.4 == detail),
-        "B4: expected MmrMismatch at cp2 with detail {detail:?}, got {got:#?}",
-    );
-    assert!(
-        !got.iter()
-            .any(|r| r.0 == K::SegmentStructure && r.5.is_some()),
-        "B4: expected no run finding (violation empties runs)",
-    );
+    let mmr_detail = mmr_mismatch_detail(mmr1.size(), &mmr1.root(), mmr1.size(), &bad_root);
+    let resume_detail = resume_detail_at_seq(1, &e1.hash(), "none");
+    let got = rows(&verify_dir(&dir));
+    // The violation at cp2 empties every run (13-V4-d8 point 3), so
+    // no `SegmentStructure` run finding.
+    let expected: Vec<Row> = vec![
+        (
+            K::MmrMismatch,
+            Some(live.clone()),
+            Some(1),
+            Some(2),
+            mmr_detail,
+            None,
+        ),
+        (
+            K::Resumed,
+            Some(live),
+            Some(2),
+            Some(3),
+            resume_detail,
+            None,
+        ),
+        uncovered_tail_row(0, 3),
+    ];
+    assert_eq!(got, expected, "B4 full literal list");
 }
 
-// -----------------------------------------------------------------
-// B5: Genesis-linked resume (ADR amendment 9 part 1).
-//   - Correct: cp1 declares size=1 with the single genesis leaf;
-//     no `MmrMismatch`.
-//   - Wrong: cp1 declares size=0 with peaks=[]; the walker folds
-//     the genesis leaf and compares size/root/peaks, which diverge;
-//     `MmrMismatch`.
+// =======================================================================
+// B5 -- Genesis-linked resume (ADR-0005 amendment 9 part 1) whose
+// cp1's declared root does NOT equal the amendment-9 1-leaf fold.
+// The genesis-fold branch in `apply_checked` is a REAL compare
+// (not a self-base), so a wrong root yields `MmrMismatch`.
 //
-// The amendment-9 branch in `apply_checked`:
-//   `if root_link && head.seq > 0 { fold.push(Record::genesis(...)) }`
-// builds the one-leaf fold that the opening must match.
-// -----------------------------------------------------------------
+// **Known limit:** `Record::checkpoint`'s `validation::checkpoint_count`
+// rejects `size == 0` at `seq > 0` and `size > seq`, so the ruling's
+// `size 0 (peaks=[])` case is unreachable through `CheckpointFields::new`.
+// We test the amendment-9 compare on the root axis, which is the
+// difference the format lets us craft at seq=1.
+// =======================================================================
 
-fn build_genesis_resume_correct() -> (Temp, PathBuf) {
-    let d = Temp::new();
-    let genesis_hash = Record::genesis(&TRAIL);
-    let mut fold = Mmr::new();
-    fold.push(genesis_hash).unwrap();
-    let cp1 = signed_cp(1, genesis_hash, &fold);
-    let resume = resume_decl(&cp1, 0, genesis_hash, 0);
-    write_records(&d.0, &[&cp1, &resume]);
-    let dir_path = d.0.clone();
-    (d, dir_path)
-}
-
-/// Builds a genesis-linked resume where the declared root differs
-/// from the walker's amendment-9 fold's genesis-leaf root.
-/// **Known limit:** `Record::checkpoint`'s `validation::checkpoint_count`
-/// rejects `size == 0` at `seq > 0` and `size > seq` (ADR-0005
-/// decisions 7-8), so the ruling's "size 0 (peaks=[])" case is
-/// unreachable by construction. We test the amendment-9 compare on
-/// the root axis, which is the one difference the format lets us
-/// craft at seq=1.
 fn build_genesis_resume_wrong_root() -> (Temp, PathBuf) {
     let d = Temp::new();
     let genesis_hash = Record::genesis(&TRAIL);
@@ -577,230 +797,314 @@ fn build_genesis_resume_wrong_root() -> (Temp, PathBuf) {
 }
 
 #[test]
-fn b5_genesis_linked_resume_correct_no_mmr_mismatch() {
-    let (_temp, dir) = build_genesis_resume_correct();
-    let findings = verify_dir(&dir);
-    let got = rows(&findings);
-    assert!(
-        !got.iter().any(|r| r.0 == K::MmrMismatch),
-        "B5-correct: no MmrMismatch expected, got {got:#?}",
-    );
+fn b5_genesis_linked_resume_wrong_root_full_literal_list() {
+    let (_temp, dir) = build_genesis_resume_wrong_root();
+    let live = dir.join("audit.jsonl");
+    let genesis_hash = Record::genesis(&TRAIL);
+    let mut fold = Mmr::new();
+    fold.push(genesis_hash).unwrap();
+    let bad_root = [0xBE; 32];
+    let mmr_detail = mmr_mismatch_detail(fold.size(), &fold.root(), fold.size(), &bad_root);
+    let resume_detail = resume_detail_at_seq(0, &genesis_hash, "0..=0");
+    let got = rows(&verify_dir(&dir));
+    // Both `MmrMismatch` and `SeqGap` at (live, line=1, seq=1):
+    // `MmrMismatch` ("M") sorts before `SeqGap` ("Se"). A wrong
+    // opening empties every run (13-V4-d8 point 3), so no
+    // `SegmentStructure` run finding.
+    let expected: Vec<Row> = vec![
+        (
+            K::MmrMismatch,
+            Some(live.clone()),
+            Some(1),
+            Some(1),
+            mmr_detail,
+            None,
+        ),
+        (
+            K::SeqGap,
+            Some(live.clone()),
+            Some(1),
+            Some(1),
+            "missing seq 0..=0".to_owned(),
+            None,
+        ),
+        (
+            K::Resumed,
+            Some(live),
+            Some(2),
+            Some(2),
+            resume_detail,
+            None,
+        ),
+        uncovered_tail_row(1, 2),
+    ];
+    assert_eq!(got, expected, "B5-root full literal list");
+}
+
+// =======================================================================
+// Blocker 1 repro -- the self-based opening fail-open case the
+// reviewer found. The shipped copy `shipped.jsonl = [cp0, e1]` is
+// NOT part of the fold (spike #224); the native `audit.jsonl =
+// [cp2, resume3]` starts from cp2 with no prior native state, so
+// `apply_checked` loads cp2's declared `(size, root, peaks)` through
+// `Mmr::from_peaks` (amendment 6 "Base") -- NO comparison happens.
+// Under V4b this records `CheckpointFoldOutcome::Base` and the
+// fail-closed filter drops the resume candidate; the verifier emits
+// no `MmrMismatch`.
+// =======================================================================
+
+/// Builds the reviewer's repro: a shipped copy holding `[cp0, e1]`,
+/// a native live file holding `[cp2 (self-based opening), resume3]`.
+/// cp2 is signed over the honest `[cp0, e1]` fold so the record
+/// parses, but the walker opens cp2 with no prior native state and
+/// loads its declared fields through `Mmr::from_peaks` (the
+/// amendment-6 self-base branch).
+fn build_self_based_opening_repro() -> (Temp, PathBuf, PathBuf) {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr0 = seeded(&cp0);
+    let mmr1 = pushed(&mmr0, &e1);
+    let cp2 = signed_cp(2, e1.hash(), &mmr1);
+    let resume = resume_decl(&cp2, 1, e1.hash(), 1);
+    write_records(&d.0, &[&cp2, &resume]);
+    let live = d.0.join("audit.jsonl");
+    let shipped = d.0.join("shipped.jsonl");
+    let shipped_bytes: Vec<u8> = [&cp0, &e1].iter().flat_map(|r| line_bytes(r)).collect();
+    fs::write(&shipped, shipped_bytes).unwrap();
+    (d, live, shipped)
 }
 
 #[test]
-fn b5_genesis_linked_resume_wrong_root_mmr_mismatch() {
-    let (_temp, dir) = build_genesis_resume_wrong_root();
-    let findings = verify_dir(&dir);
-    let got = rows(&findings);
-    let live = dir.join("audit.jsonl");
-    // Walker's fold for amendment 9: 1 leaf = genesis leaf; the
-    // compare fires on the bad root while size matches.
-    let mut fold = Mmr::new();
-    fold.push(Record::genesis(&TRAIL)).unwrap();
-    let bad_root = [0xBE; 32];
-    let detail = mmr_mismatch_detail(fold.size(), &fold.root(), fold.size(), &bad_root);
-    assert!(
-        got.iter().any(|r| r.0 == K::MmrMismatch
-            && r.1.as_ref() == Some(&live)
-            && r.3 == Some(1)
-            && r.4 == detail),
-        "B5-root: expected MmrMismatch at cp1 with detail {detail:?}, got {got:#?}",
+fn self_based_opening_fails_closed_full_literal_list() {
+    let (_temp, live, shipped) = build_self_based_opening_repro();
+    // Rebuild cp0, e1 to compute the resume's `head=1:<e1 hash>`.
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let e1 = entry_rec(1, cp0.hash());
+    let got = rows(&verify_files([live.clone(), shipped.clone()]));
+    let resume_detail = resume_detail_at_seq(1, &e1.hash(), "none");
+    // The walker never compares cp2 (`CheckpointFoldOutcome::Base`),
+    // no `MmrMismatch` emitted; no SeqGap/ChainBroken (the shipped
+    // records fill the 0..=1 prefix). The fail-closed filter drops
+    // the resume candidate, so no gap-confirmation leak lands either.
+    // On base the fold compare is discarded and the filter does not
+    // exist; this row's main assertion (retained=[]) fails on base
+    // through a COMPILE failure of `filter_candidates_for_test`, and
+    // the finding-list sub-assertion also fails because base DOES
+    // NOT record cp2 as `Base`.
+    let expected: Vec<Row> = vec![
+        (
+            K::Resumed,
+            Some(live.clone()),
+            Some(2),
+            Some(3),
+            resume_detail,
+            None,
+        ),
+        uncovered_tail_row(0, 3),
+    ];
+    assert_eq!(got, expected, "self-based repro: full literal list");
+    let collection = collect_files(&[live, shipped]);
+    let kept = filter_candidates_for_test(&collection, TRAIL);
+    assert_eq!(
+        kept,
+        Vec::<u64>::new(),
+        "self-based repro: fail-closed filter drops the self-based opening"
     );
 }
 
-// -----------------------------------------------------------------
-// B6: Candidate filter (ruling 13-V4-d10 point 4 fail-closed).
-// Each case asserts the literal retained list of resume candidate
-// opening `seq`s through the `#[cfg(test)]` seam
-// `filter_candidates_for_test`. On base 0xafe9942 the filter is
-// absent (`_pending_resumes` discarded at base), so
-// every "dropped" case would be "kept" at base -- the row fails on
-// base through the length / membership assertions.
-// -----------------------------------------------------------------
+// =======================================================================
+// B6 -- Candidate filter (ruling 13-V4-d10 point 4, fail-closed).
+// Each row asserts the literal retained candidate opening `seq` list
+// through the `#[cfg(test)]` seam `filter_candidates_for_test`. On
+// base `0xafe9942` the seam does not exist, so every B6 row is red on
+// base through a compile failure.
+// =======================================================================
 
-/// Build a `Collection` from a directory the same way the verifier
-/// does, so the filter sees the identical input.
 fn collect_from_dir(dir: &Path) -> Collection {
     input::collect(std::iter::once(dir.to_path_buf())).unwrap()
 }
 
-/// Honest A1: closing resume at seq=7 whose opening cp6 the
-/// classifier compares and matches. The filter keeps it.
+fn collect_files(paths: &[PathBuf]) -> Collection {
+    input::collect(paths.iter().cloned()).unwrap()
+}
+
+/// Honest A1 closing resume: cp6 matches the walker's fold; the
+/// filter keeps the candidate. Regression row (also passes on base
+/// through the seam's absence making it compile-red): kills V4
+/// (fail-open filter still keeps a matched opening -- unchanged)
+/// only trivially, but IS the positive anchor for the negative rows.
 #[test]
-fn b6_honest_a1_closing_resume_kept() {
+fn b6_honest_a1_closing_resume_kept_literal() {
     let a = build_a1();
     let collection = collect_from_dir(&a.dir_path);
     let kept = filter_candidates_for_test(&collection, TRAIL);
-    assert_eq!(kept, vec![6], "B6: A1 honest closing resume kept");
+    assert_eq!(kept, vec![6], "B6 honest A1: closing resume at cp6 kept");
 }
 
-/// B2's wrong-root cp1: the resume candidate's opening `seq=1`
-/// is Differs, not Matched. The filter drops it.
+/// Honest genesis-linked resume: cp1 matches the amendment-9 fold;
+/// the filter keeps the candidate. Same role as above.
 #[test]
-fn b6_wrong_opening_root_dropped() {
-    let (_temp, dir) = build_plain_resume_wrong_root();
-    let collection = collect_from_dir(&dir);
-    let kept = filter_candidates_for_test(&collection, TRAIL);
-    assert_eq!(kept, Vec::<u64>::new(), "B6: wrong-root opening dropped");
-}
-
-/// Honest A1 kept (second instance verifying the filter's inclusion
-/// path is active; in combination with the dropped cases above, this
-/// row anchors the kept-vs-dropped binary, ruling 13-V4-d10 point 4).
-#[test]
-fn b6_honest_plain_resume_kept() {
-    let (_temp, dir) = build_genesis_resume_correct();
-    let collection = collect_from_dir(&dir);
+fn b6_honest_plain_resume_kept_literal() {
+    let d = Temp::new();
+    let genesis_hash = Record::genesis(&TRAIL);
+    let mut fold = Mmr::new();
+    fold.push(genesis_hash).unwrap();
+    let cp1 = signed_cp(1, genesis_hash, &fold);
+    let resume = resume_decl(&cp1, 0, genesis_hash, 0);
+    write_records(&d.0, &[&cp1, &resume]);
+    let collection = collect_from_dir(&d.0);
     let kept = filter_candidates_for_test(&collection, TRAIL);
     assert_eq!(kept, vec![1], "B6: honest genesis-linked resume kept");
 }
 
-/// A shipped-only resume (owner decision 13-V4-d7, spike #224):
-/// `input::collect` keeps the Collector-shipped copy with
-/// `native=false`, so the classifier never folds those records.
-/// The opening's seq is not in `matched_openings`; the filter
-/// drops the candidate.
+/// B2's wrong-root cp1: Differs, filter drops. Kills V5 (filter
+/// keeps differing candidates) in combination with
+/// `b6_a1_wrong_closing_cp6_dropped_literal` below.
 #[test]
-fn b6_shipped_only_dropped() {
-    let d = Temp::new();
-    // Build a shipped copy only: the directory contains exactly
-    // one shipped (non-live) file, no native segments. The
-    // Collector shipping-format is modelled through `audit.jsonl.1`
-    // (not the live `audit.jsonl` and not a sealed rotation
-    // segment). Simpler: write only the live file and call it
-    // through `input::collect` with `native = false` -- but the
-    // public API decides `native` via file layout. Fall back to a
-    // minimal fixture: a single shipped-style file naming the trail.
-    //
-    // Fixture simplification: this row is a positive guard against
-    // the fail-closed rule, not a shipped-format pin; use an empty
-    // native snapshot where the opening the resume names is not in
-    // any native segment. Build an A1-like trail but drop S1's
-    // bytes BEFORE running the verifier, so the opening at seq=5
-    // the closer references is not folded natively.
-    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
-    let mmr0 = seeded(&cp0);
-    let e1 = entry_rec(1, cp0.hash());
-    let mmr1 = pushed(&mmr0, &e1);
-    let e2 = entry_rec(2, e1.hash());
-    let mmr2 = pushed(&mmr1, &e2);
-    put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
-    // Skip S1; the live segment references a resume whose opening
-    // sits at seq=5 which has no native segment at all.
-    let r4 = headless(&e2, 4);
-    let fold = pushed(&mmr2, &r4);
-    let cp5 = signed_cp(5, r4.hash(), &fold);
-    // Only a live segment: the cp5 opening is NOT present as a
-    // native record (we omit S1). The resume citation points at
-    // cp5 which is unreachable natively; the classifier records
-    // neither a Matched nor a Differs at seq=5.
-    let fold6 = pushed(&fold, &cp5);
-    let cp6 = signed_cp(6, cp5.hash(), &fold6);
-    let resume = resume_decl(&cp6, 5, cp5.hash(), 5);
-    write_records(&d.0, &[&cp6, &resume]);
-    // The structural-resume gate already drops candidates where
-    // the opening is not a checkpoint-at-k on the trail -- here
-    // the opening at seq=5 is NOT in any native record, so the
-    // structural check fails (NoOpening) and no candidate reaches
-    // the filter. This is still the fail-closed outcome: no
-    // candidate retained.
-    let collection = collect_from_dir(&d.0);
+fn b6_wrong_opening_root_dropped_literal() {
+    let (_temp, dir) = build_plain_resume_wrong_root();
+    let collection = collect_from_dir(&dir);
     let kept = filter_candidates_for_test(&collection, TRAIL);
-    // The closing resume for cp6 IS present (opening_seq=6 would
-    // be checked); its structural outcome is `HeadNotPresent`
-    // (head=5 not in native records), so the candidate never
-    // reaches the filter. The retained list is empty.
     assert_eq!(
         kept,
         Vec::<u64>::new(),
-        "B6: a shipped-only (here: not-native-at-all) opening is never kept",
+        "B6: wrong-root opening dropped by filter"
     );
 }
 
-/// A1 with the wrong-root cp6 closer: the closing resume's
-/// opening is `Differs` (ruling 13-V4-d10 point 2). The filter
-/// drops the candidate. This row AND
-/// `b6_wrong_opening_root_dropped` jointly kill V5 ("filter keeps
-/// differing candidates").
+/// A1 with wrong-root cp6: Differs, filter drops. Second V5 killer.
 #[test]
-fn b6_a1_wrong_closing_cp6_dropped() {
+fn b6_a1_wrong_closing_cp6_dropped_literal() {
     let (_temp, dir) = build_a1_wrong_cp6_root();
     let collection = collect_from_dir(&dir);
     let kept = filter_candidates_for_test(&collection, TRAIL);
     assert_eq!(
         kept,
         Vec::<u64>::new(),
-        "B6: A1 wrong-cp6 closing resume dropped (opening Differs)",
+        "B6: A1 wrong-cp6 closing resume dropped (opening Differs)"
     );
 }
 
-/// A resume whose opening the walk never compared because an
-/// earlier violation stopped the segment (ruling 13-V4-d10 point
-/// 6). Build a layout where an earlier record in the opening
-/// segment is corrupt, so the walker stops before reaching the
-/// opening: no Matched entry at that seq, filter drops.
+/// Shipped-only opening: cp1 in a shipped (non-native) file, cp0
+/// in shipped too; native live carries only the resume. The
+/// structural check passes via `native_then_shipped`, but the
+/// classifier walks native only (cp1 absent), so nothing records a
+/// `Matched` outcome at seq=1 and the fail-closed filter drops the
+/// candidate. Kills V4 (filter keeps never-compared candidates):
+/// V4 would keep the shipped-only opening despite rule 2 having
+/// never validated it. On base `filter_candidates_for_test` is
+/// absent, so this row is red on base through compile failure.
 #[test]
-fn b6_opening_after_earlier_violation_dropped() {
+fn b6_shipped_only_opening_dropped_by_filter_literal() {
     let d = Temp::new();
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
     let mmr0 = seeded(&cp0);
-    // Seal S0 with a line that is valid up to and including cp0,
-    // then an Unparsable line BEFORE the closing cp. The walker
-    // records `Violation::UnparsableBeforeRecord` and stops
-    // checking, so the resume at seq=2 (opening cp1) has its
-    // opening at seq=1 never reached.
+    // Opening at seq=1 lives only in a shipped copy.
+    let cp1 = signed_cp(1, cp0.hash(), &mmr0);
+    let shipped = d.0.join("shipped.jsonl");
+    let bytes: Vec<u8> = [&cp0, &cp1].iter().flat_map(|r| line_bytes(r)).collect();
+    fs::write(&shipped, bytes).unwrap();
+    // Native live: a resume naming the shipped-only cp1 as its
+    // opening. `apply_checked` on the first native record (the
+    // resume, not a checkpoint) fires `MissingInitialCheckpoint` --
+    // the walker never reaches a `Matched` at seq=1 because cp1 is
+    // not native and the native walk opens on a non-checkpoint.
+    let resume = resume_decl(&cp1, 0, cp0.hash(), 0);
+    let live = d.0.join("audit.jsonl");
+    fs::write(&live, line_bytes(&resume)).unwrap();
+    let collection = collect_files(&[live, shipped]);
+    let kept = filter_candidates_for_test(&collection, TRAIL);
+    // The structural check accepts the candidate (opening at seq=1
+    // IS a checkpoint via `native_then_shipped`), but it is never
+    // in the matched-openings set. V4 would keep [1]; V4b drops.
+    assert_eq!(
+        kept,
+        Vec::<u64>::new(),
+        "B6: shipped-only opening dropped by the fail-closed filter"
+    );
+}
+
+/// A sealed segment with an `Unparsable` line BEFORE the next
+/// complete record is a damaged prefix (ruling 13-V4-d10 point 6:
+/// "once a segment records a violation the classifier stops
+/// checking the rest of that segment"). The live-segment opening
+/// cp2 is reached by the live walker with a reduced prior state
+/// (e1 was rejected on `UnparsableBeforeRecord` in S0), so the
+/// compare at cp2 under `compare_mmr=true` sees a declared fold that
+/// does not match the walker's reduced fold -- outcome is
+/// `Differs`. The filter drops it.
+#[test]
+fn b6_opening_after_earlier_violation_dropped_literal() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
     let e1 = entry_rec(1, cp0.hash());
-    let _mmr1 = pushed(&mmr0, &e1);
-    // Craft S0 with a trailing unparsable line BEFORE cp1 so the
-    // walker never reaches cp1 to fold-compare it.
     let mut s0_bytes: Vec<u8> = line_bytes(&cp0);
     s0_bytes.extend(b"not json\n");
     s0_bytes.extend(line_bytes(&e1));
     fs::write(segment_path(&d.0, 0), s0_bytes).unwrap();
-    // Live: cp2 closer + resume3. The opening cp2 would normally
-    // be reached, but any violation in the prior segment empties
-    // every run (13-V4-d8 point 3). The candidate filter only
-    // keeps cp2 if the classifier POSITIVELY recorded it as
-    // matched; even if it was matched, the broken segment's
-    // violation leaves the run-finding empty. The test here
-    // asserts the retained list: for this shape, cp2's opening_seq
-    // is structural-invalid (`HeadNotPresent`) because e1 is not
-    // "the last record below k=2" due to the Unparsable line
-    // interleaving. The filter-dropped behaviour therefore holds.
     let mmr_after_e1 = pushed(&mmr0, &e1);
     let cp2 = signed_cp(2, e1.hash(), &mmr_after_e1);
     let resume = resume_decl(&cp2, 1, e1.hash(), 1);
     write_records(&d.0, &[&cp2, &resume]);
     let collection = collect_from_dir(&d.0);
     let kept = filter_candidates_for_test(&collection, TRAIL);
-    // Even if a structurally-valid candidate exists, the filter
-    // requires the opening to be in `matched_openings` -- which
-    // the classifier does not populate for unreached openings.
-    // The row asserts the fail-closed effect.
-    assert!(
-        !kept.contains(&2),
-        "B6: opening whose walk never reached cp2 must not be kept (got {kept:?})",
+    // The candidate IS structurally valid at base `0xafe9942` (e1 and
+    // cp2 are both on the trail and link); with V4b the filter
+    // drops opening_seq=2 because the earlier violation prevents the
+    // walker from recording a `Matched` outcome at cp2 (`Differs`
+    // against the walker's reduced fold). `kept` is empty.
+    assert_eq!(
+        kept,
+        Vec::<u64>::new(),
+        "B6: opening after an earlier violation is dropped by the filter"
     );
 }
 
-// -----------------------------------------------------------------
-// B7: Classifier rows (`runs.rs` tests). Pin the literal per-
-// checkpoint outcome list for A1 honest and for B1, and that
-// `Reaction::Stop` returns the same result as at base for both
-// (ruling 13-V4-d10 point 1: one classifier, byte-for-byte reader
-// behaviour under Stop).
-// -----------------------------------------------------------------
+// =======================================================================
+// B7 -- Classifier rows (`runs.rs` compiled Collect pass). Each row
+// asserts the literal per-checkpoint outcome list for a layout, plus
+// the `Reaction::Stop` outcome. On base `CheckpointFoldOutcome::Base`
+// does not exist, so the self-based B7 row below is compile-red on
+// base; the honest A1 row changes outcome count (cp0 in S0 is
+// strict-Stop under `storage::history_segment`, so Stop records
+// nothing; the row's expected list of 2 entries becomes 3 on base
+// -- compile green but value-red).
+// =======================================================================
 
 use crate::audit::runs::{self, CheckpointFoldOutcome, ClassifyArgs, Reaction, ReaderPath};
 use crate::audit::storage::SegmentSource;
 
-/// Entries' `(seq, outcome)` from one Collect classify pass over
-/// `dir`. Sorts the list for a stable literal assertion.
 fn fold_outcome_list(dir: &Path) -> Vec<(u64, CheckpointFoldOutcome)> {
-    // Re-collect the native snapshot bytes exactly as the verifier
-    // does, build a snapshot `SegmentSource`, classify once under
-    // Collect, and read `fold_entries`.
     let collection = input::collect(std::iter::once(dir.to_path_buf())).unwrap();
+    let natives = collection.native_segments();
+    let tuples: Vec<(std::rc::Rc<[u8]>, bool)> = natives
+        .iter()
+        .map(|seg| (std::rc::Rc::clone(&seg.bytes), seg.is_live))
+        .collect();
+    let mut source = SegmentSource::for_snapshot(&tuples);
+    let out = runs::classify(
+        ClassifyArgs {
+            trail: TRAIL,
+            prior_state: None,
+        },
+        ReaderPath::LiveOpen { expected: None },
+        &mut source,
+        Reaction::Collect,
+    )
+    .unwrap();
+    let mut list: Vec<(u64, CheckpointFoldOutcome)> = out
+        .fold_entries
+        .iter()
+        .map(|e| (e.seq, e.outcome))
+        .collect();
+    list.sort_by_key(|x| x.0);
+    list
+}
+
+fn fold_outcome_list_files(paths: &[PathBuf]) -> Vec<(u64, CheckpointFoldOutcome)> {
+    let collection = input::collect(paths.iter().cloned()).unwrap();
     let natives = collection.native_segments();
     let tuples: Vec<(std::rc::Rc<[u8]>, bool)> = natives
         .iter()
@@ -830,19 +1134,21 @@ fn fold_outcome_list(dir: &Path) -> Vec<(u64, CheckpointFoldOutcome)> {
 fn b7_a1_honest_fold_entries_literal() {
     let a = build_a1();
     let list = fold_outcome_list(&a.dir_path);
-    // A1 fixture signs cp5 with the walker's reconstruction fold,
-    // so cp5 is `Matched` (ruling 13-V4-d10 point 3: matching
-    // fields after loss are Matched, not DiffersAfterLoss). cp0
-    // is a seq=0 opening (compare is tautological, matches). cp6
-    // opens the closer segment and matches.
+    // S0 is sealed and strict-passes under `storage::history_segment`'s
+    // strict closure (which is hardcoded to `Reaction::Stop`); the
+    // classifier's `record_fold_entry` short-circuits in the Stop
+    // reaction (ruling 13-V4-d10 point 1), so cp0 does NOT appear in
+    // `fold_entries`. S1 falls back to tolerant Collect (r4's broken
+    // boundary trips strict), so cp5 lands as `Matched`. The live
+    // segment walks under strict Collect through `scan_closing`, so
+    // cp6 lands as `Matched` too.
     assert_eq!(
         list,
         vec![
-            (0, CheckpointFoldOutcome::Matched),
             (5, CheckpointFoldOutcome::Matched),
             (6, CheckpointFoldOutcome::Matched),
         ],
-        "B7-honest: per-checkpoint outcome list",
+        "B7-honest: per-checkpoint outcome list"
     );
 }
 
@@ -850,26 +1156,42 @@ fn b7_a1_honest_fold_entries_literal() {
 fn b7_a1_wrong_cp6_root_fold_entries_literal() {
     let (_temp, dir) = build_a1_wrong_cp6_root();
     let list = fold_outcome_list(&dir);
-    // cp6's compare is active (`compare_mmr=true`): Differs.
-    // cp0 and cp5 are unchanged.
+    // Same as honest-A1 shape with cp6 flipping `Matched` -> `Differs`
+    // (compare_mmr=true on a closer opening).
     assert_eq!(
         list,
         vec![
-            (0, CheckpointFoldOutcome::Matched),
             (5, CheckpointFoldOutcome::Matched),
             (6, CheckpointFoldOutcome::Differs),
         ],
-        "B7-wrong-cp6: per-checkpoint outcome list",
+        "B7-wrong-cp6: per-checkpoint outcome list"
     );
 }
 
-/// `Reaction::Stop` returns no fold entries by construction
-/// (ruling 13-V4-d10 point 1: the Stop reader path stays byte-for-
-/// byte the same; `ClassifyOutput::fold_entries` is empty).
 #[test]
-fn b7_reaction_stop_returns_no_fold_entries() {
-    // Use a reader-safe layout (A1 with wrong cp6 trips the reader
-    // with `CorruptTrail`; the honest A1 opens cleanly at this head).
+fn b7_self_based_opening_fold_entry_literal() {
+    let (_temp, live, shipped) = build_self_based_opening_repro();
+    let list = fold_outcome_list_files(&[live, shipped]);
+    // The native live segment opens on cp2 with no prior state, so
+    // `apply_checked` loads cp2's declared `(size, root, peaks)`
+    // through `Mmr::from_peaks` and records
+    // `CheckpointFoldOutcome::Base`. This variant does NOT exist on
+    // base `0xafe9942`, so this row is compile-red there.
+    assert_eq!(
+        list,
+        vec![(2, CheckpointFoldOutcome::Base)],
+        "B7-self-based: single Base entry at the self-based opening"
+    );
+}
+
+#[test]
+fn b7_reaction_stop_a1_honest_literal_outcome() {
+    // `Reaction::Stop` must stay byte-for-byte the same as the
+    // reader (ruling 13-V4-d10 point 1). On A1 honest, the reader
+    // opens `Ok`, so classify under Stop also returns `Ok`; the
+    // Ok value's `fold_entries` is empty, as are `runs`, `segments`,
+    // `violations`, and `head_mismatch` is false. No `Err(_) => {}`
+    // arm (brief blocker 2).
     let a = build_a1();
     let collection = input::collect(std::iter::once(a.dir_path.to_path_buf())).unwrap();
     let natives = collection.native_segments();
@@ -878,13 +1200,7 @@ fn b7_reaction_stop_returns_no_fold_entries() {
         .map(|seg| (std::rc::Rc::clone(&seg.bytes), seg.is_live))
         .collect();
     let mut source = SegmentSource::for_snapshot(&tuples);
-    // A `LiveOpen` + `expected = None` + Reaction::Stop pass may
-    // or may not accept the trail (LiveOpen with Some expected
-    // triggers HeadMismatch guard; here expected is None, which
-    // mirrors the reader `initial_record` entry). The point is
-    // that under Stop `fold_entries` stays empty regardless of
-    // walker success.
-    let result = runs::classify(
+    let out = runs::classify(
         ClassifyArgs {
             trail: TRAIL,
             prior_state: None,
@@ -892,15 +1208,36 @@ fn b7_reaction_stop_returns_no_fold_entries() {
         ReaderPath::LiveOpen { expected: None },
         &mut source,
         Reaction::Stop,
+    )
+    .expect("A1 honest classify under Reaction::Stop must succeed");
+    assert!(
+        out.fold_entries.is_empty(),
+        "Stop records no fold entries: got {:?}",
+        out.fold_entries
+            .iter()
+            .map(|e| (e.seq, e.outcome))
+            .collect::<Vec<_>>()
     );
-    match result {
-        Ok(out) => assert!(
-            out.fold_entries.is_empty(),
-            "Stop must not expose fold entries",
-        ),
-        Err(_) => {
-            // A walker error under Stop also surfaces no
-            // `ClassifyOutput`; the invariant trivially holds.
-        }
-    }
+    assert!(
+        out.runs.is_empty(),
+        "Stop produces no run reports: got {} runs",
+        out.runs.len()
+    );
+    assert!(
+        out.segments.is_empty(),
+        "Stop produces no segment reports: got {} segments",
+        out.segments.len()
+    );
+    assert!(
+        out.violations.is_empty(),
+        "Stop produces no violations on honest A1"
+    );
+    assert!(
+        !out.head_mismatch,
+        "Stop head_mismatch false on A1 honest with expected=None"
+    );
+    assert!(
+        out.final_state.is_some(),
+        "Stop's final_state is Some on A1 honest"
+    );
 }
