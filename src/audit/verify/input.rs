@@ -21,6 +21,17 @@ use std::{
 type Inode = (u64, u64);
 type Operator = (String, String, Option<String>, Option<String>);
 
+/// A checkpoint record's signed body as the verifier retains it: the
+/// checkpoint fields plus `checkpoint_message(unsigned_fields)`,
+/// pre-computed from the one snapshot so `verify::signatures` never
+/// re-reads or re-parses the trail bytes (ruling 13-V4-d5). Carrying
+/// both in one struct makes the invariant structural: the signing
+/// message is present iff the summary is for a checkpoint.
+pub(super) struct SignedCheckpoint {
+    pub(super) fields: CheckpointFields,
+    pub(super) signing_message: Vec<u8>,
+}
+
 /// Authenticated identity and bounded context, never the full entry payload.
 pub(super) struct Summary {
     pub(super) trail: [u8; 16],
@@ -29,7 +40,7 @@ pub(super) struct Summary {
     pub(super) previous: [u8; 32],
     pub(super) time: u64,
     pub(super) repaired: Option<[u8; 32]>,
-    pub(super) checkpoint: Option<CheckpointFields>,
+    pub(super) checkpoint: Option<SignedCheckpoint>,
     // Only reserved records need text for #13 V3b resume/fragment context.
     pub(super) operator: Option<Operator>,
     pub(super) line: u64,
@@ -37,8 +48,16 @@ pub(super) struct Summary {
 impl Summary {
     fn new(record: Record, line: u64) -> Self {
         let hash = record.hash();
+        let signing_message = record.signing_message();
         let (checkpoint, operator) = match record.kind {
-            Kind::Checkpoint(fields) => (Some(fields), None),
+            Kind::Checkpoint(fields) => (
+                Some(SignedCheckpoint {
+                    fields,
+                    signing_message: signing_message
+                        .expect("checkpoint record exposes its signing message"),
+                }),
+                None,
+            ),
             Kind::Entry(entry) => (
                 None,
                 entry.action.starts_with("vigil.audit.").then_some((

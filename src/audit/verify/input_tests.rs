@@ -379,7 +379,7 @@ fn checkpoint_operator_and_native_span_context_survives_compaction() {
         assert_eq!(input.data.spans[0].after, 0);
         let first = &input.data.records[0];
         assert_eq!(first.hash, checkpoint.hash());
-        assert_eq!(first.checkpoint.as_ref().unwrap().key, [7; 32]);
+        assert_eq!(first.checkpoint.as_ref().unwrap().fields.key, [7; 32]);
         assert_eq!(
             input.data.records[1].operator.as_ref().unwrap(),
             &(

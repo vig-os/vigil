@@ -1,7 +1,29 @@
 use super::*;
-use crate::audit::verify::input::{Data, Input, LineItem};
+use crate::audit::{
+    Signer as _,
+    verify::input::{Data, Input, LineItem},
+};
 use std::{path::PathBuf, rc::Rc};
 const TRAIL: [u8; 16] = [1; 16];
+/// Trail-pinned trust policy listing the shared fixture signing key. The
+/// fabricated checkpoints in `ctx::checkpoint` sign with that key, so a
+/// policy listing it means the signature pass never emits findings for
+/// the structural-engine rows. Rows that specifically care about
+/// `BadSignature` / `UntrustedKey` live in `signature_tests`.
+fn trust_trail() -> crate::audit::TrustPolicy {
+    crate::audit::TrustPolicy::builder()
+        .trail(TRAIL)
+        .key(
+            crate::audit::KeyFileSigner::from_hex(&"27".repeat(32))
+                .unwrap()
+                .public_key(),
+        )
+        .build()
+        .unwrap()
+}
+fn check(collection: Collection, trail: [u8; 16]) -> Report {
+    super::check(collection, trail, &trust_trail())
+}
 fn record(seq: u64, hash: u8, previous: [u8; 32], time: u64) -> Summary {
     Summary {
         trail: TRAIL,
@@ -195,10 +217,38 @@ fn ordering_is_seq_then_path_line_kind_with_unlocated_seq_last() {
 mod ctx {
     use super::*;
     use crate::audit::verify::input::{LineContent, Summary};
-    use crate::audit::{CheckpointFields, Record};
+    use crate::audit::{CheckpointFields, KeyFileSigner, Record, RecordContext, Signer};
     use std::ops::Range;
+    /// Fabricated checkpoint summary with a real `signing_message` and a
+    /// real signature by the shared fixture key `0x27`, so the engine's
+    /// signature pass sees a valid, trusted checkpoint when
+    /// `trust_trail()` lists that key. The `hash` and `previous` are the
+    /// test's crafted values (the engine's chain checks compare them
+    /// directly) and may diverge from `Record::hash()`, which is fine:
+    /// the signature pass only consumes `checkpoint` + `signing_message`.
     pub(super) fn checkpoint(seq: u64, hash: u8, previous: [u8; 32]) -> Summary {
-        let fields = CheckpointFields::new(0, [0; 32], vec![], [1; 32], [0; 64]).unwrap();
+        let signer = KeyFileSigner::from_hex(&"27".repeat(32)).unwrap();
+        // Zero size is permitted only at seq 0 (`validation::checkpoint_count`);
+        // every later seq uses a minimal one-leaf MMR.
+        let (size, peaks) = if seq == 0 {
+            (0u64, Vec::<[u8; 32]>::new())
+        } else {
+            (1u64, vec![[0xaa; 32]])
+        };
+        let fields = |sig| {
+            CheckpointFields::new(size, [0; 32], peaks.clone(), signer.public_key(), sig).unwrap()
+        };
+        let ctx = RecordContext::new(TRAIL, seq, seq, "test", previous);
+        let unsigned = Record::checkpoint(ctx.clone(), fields([0; 64])).unwrap();
+        let sig = signer.sign(&unsigned.signing_message().unwrap()).unwrap();
+        let signed = Record::checkpoint(ctx, fields(sig)).unwrap();
+        let signing_message = signed
+            .signing_message()
+            .expect("fabricated checkpoint exposes its signing message");
+        let fields = match signed.kind {
+            crate::audit::format::Kind::Checkpoint(cp) => cp,
+            _ => unreachable!(),
+        };
         Summary {
             trail: TRAIL,
             seq,
@@ -206,7 +256,10 @@ mod ctx {
             previous,
             time: seq,
             repaired: None,
-            checkpoint: Some(fields),
+            checkpoint: Some(crate::audit::verify::input::SignedCheckpoint {
+                fields,
+                signing_message,
+            }),
             operator: None,
             line: seq + 1,
         }

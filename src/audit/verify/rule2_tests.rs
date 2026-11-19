@@ -31,8 +31,9 @@ use super::{
 use crate::audit::{
     FindingKind as K, Mmr, Record, TrustPolicy, digest_string,
     runs_v4a_fixtures::{
-        A1_DIGEST, TRAIL, Temp, build_a1, entry_rec, headless, line_bytes, pushed, put_segment,
-        resume_decl, seeded, segment_path, signed_cp, signed_cp_explicit, write_records,
+        A1_DIGEST, TRAIL, Temp, build_a1, entry_rec, fixture_pubkey, headless, line_bytes, pushed,
+        put_segment, resume_decl, seeded, segment_path, signed_cp, signed_cp_explicit,
+        write_records,
     },
     storage::{Head, TrailReader},
 };
@@ -42,7 +43,11 @@ use std::{
 };
 
 fn policy_trail() -> TrustPolicy {
-    TrustPolicy::builder().trail(TRAIL).build().unwrap()
+    TrustPolicy::builder()
+        .trail(TRAIL)
+        .key(fixture_pubkey())
+        .build()
+        .unwrap()
 }
 
 fn verify_dir(dir: &Path) -> Vec<Finding> {

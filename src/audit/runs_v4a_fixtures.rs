@@ -32,6 +32,16 @@ use std::{
 pub(crate) const TRAIL: [u8; 16] = [17; 16];
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
+/// Public key of the shared fixture signing key (seed `0x27` repeated).
+/// Consumed by every verifier test that lists the fixture key on a
+/// `TrustPolicy` so a signed fixture checkpoint is trusted at verify time
+/// (ruling 13-V5-d1 points 1-2).
+pub(crate) fn fixture_pubkey() -> [u8; 32] {
+    KeyFileSigner::from_hex(&"27".repeat(32))
+        .unwrap()
+        .public_key()
+}
+
 /// Per-process temporary directory for a V4a trail. Deleted on drop.
 pub(crate) struct Temp(pub(crate) PathBuf);
 impl Temp {

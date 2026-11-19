@@ -235,7 +235,11 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
         inputs: vec![input],
         shipped: vec![(0, 0)],
     };
-    let report = super::engine::check(collection, TRAIL);
+    let trust = crate::audit::TrustPolicy::builder()
+        .trail(TRAIL)
+        .build()
+        .unwrap();
+    let report = super::engine::check(collection, TRAIL, &trust);
     // Confirm both error findings are present before asserting the order.
     let errors: Vec<_> = report
         .findings()

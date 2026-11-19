@@ -10,8 +10,8 @@ use std::{
     },
 };
 use vigil::audit::{
-    AuditConfig, AuditErrorKind, Entry, FindingKind as K, KeyFileSigner, Report, TrustPolicy,
-    Verifier, keygen, verify,
+    AuditConfig, AuditErrorKind, Entry, FindingKind as K, KeyFileSigner, Report, Signer,
+    TrustPolicy, Verifier, keygen, verify,
 };
 const GOLDEN: &str = include_str!("fixtures/audit/codec.jsonl");
 const TRAIL: [u8; 16] = [0x11; 16];
@@ -268,7 +268,13 @@ impl Written {
         }
         let head = writer.close().unwrap();
         seqs.push(head.seq());
-        let trust = TrustPolicy::builder().trail(trail_id).build().unwrap();
+        // List the writer's signing key so its checkpoints are trusted at verify time
+        // (ADR-0005 decision 9; ruling 13-V5-d1 point 2).
+        let trust = TrustPolicy::builder()
+            .trail(trail_id)
+            .key(KeyFileSigner::load(&key).unwrap().public_key())
+            .build()
+            .unwrap();
         Self {
             dir,
             trail: trail_dir,
@@ -805,7 +811,11 @@ fn no_crash_mark_absent_when_only_successor_is_a_shipped_copy() {
     writer.record(&Entry::new("a", "change", "o1")).unwrap();
     writer.record(&Entry::new("a", "change", "o2")).unwrap();
     writer.close().unwrap();
-    let trust = TrustPolicy::builder().trail(trail_id).build().unwrap();
+    let trust = TrustPolicy::builder()
+        .trail(trail_id)
+        .key(signer.public_key())
+        .build()
+        .unwrap();
     // Pick the LATEST sealed archive: its closing checkpoint links
     // forward to the live file's opening checkpoint, which is what the
     // shipped copy will hold. The sealed-segment timestamp in the
