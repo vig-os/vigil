@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-09T13:22:04Z
-updated: 2026-11-03T10:18:00Z
+updated: 2026-11-19T08:46:56Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/13
-comments: 29
+comments: 34
 labels: feature, security, priority:medium, area:testing, effort:medium
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-04T08:43:08.630Z
+synced: 2026-11-19T09:58:15.306Z
 ---
 
 # [Issue 13]: [feat(audit): verify API/CLI and tamper tests](https://github.com/vig-os/vigil/issues/13)
@@ -697,5 +697,132 @@ Four V4a brief revisions restated the reader's run rule from the ADR prose, and 
 2. **V4a then calls that module.** A run finding is emitted exactly for the runs the classifier accepts. The fold condition (iii) stays V4b's: V4b uses the same module, or the shared fold, for the MMR comparison. The agreement table (13-V4-d3 point 1) remains as a regression test.
 3. **The trap is narrowed.** The verifier still never calls `history_segment`, `scan_inner` or `apply_checked`. It may call the shared pure classifier.
 4. The open point from the last check (which rejected trails may show a run) is settled by the classifier's typed violations. V4a emits no run for a run the classifier rejects, except for a fold-only violation (iii), which is V4b's `MmrMismatch`.
+
+
+---
+
+# [Comment #30]() by [gerchowl]()
+
+_Posted on November 18, 2026 at 01:27 PM_
+
+## Ruling 13-V4-d5 (architect): V4a classifies the confirmed snapshot, never a second read
+
+Context: the V4a plan drafted on `dc2daaa` fed `runs::classify` from `storage::SegmentSource::for_live_open(dir)`, that is, a fresh listing and fresh opens of the trail directory after `input::collect` had already taken the verifier's snapshot. That shape is rejected for three reasons, each checked against the code at `dc2daaa`:
+
+1. **One snapshot (ruling 13-V3-d2; ADR-0005 decision 11, "Locking and offline use").** A successful verification reflects exactly one confirmed snapshot. A second listing can differ from it (rotation, retention, a writer appending), so run findings and every other finding would describe two different trails, and the parallel index between `ClassifyOutput::segments` and the collected inputs would hold only by luck. No reconciliation (skip on out-of-range, compare and drop) makes this sound; the rule is that there is only one read.
+2. **The verifier never writes and takes no lock.** `PlanStep::ClosingLive` opens `audit.jsonl` with `existing(dir, "audit.jsonl", true)`, writable. The verifier must not open trail files for writing, must work on read-only media, and must not need permissions the reader needs.
+3. **Archives and Collector copies.** `verify <archive>` and `verify_files` over shipped copies are where run findings and `accept-run` matter most (decision 2 steps 1 and 6; decision 11). An archive has no live file: the live-open plan fails on `ClosingLive` and V4a would silently emit nothing. Explicit files given to `verify_files` must be exactly what is classified, not whatever else sits in their directory.
+
+Ruling:
+- **(a)** V4a runs the one shared classifier (owner decision 13-V4-d4) over the segments of the confirmed snapshot, from the bytes `input::collect` already holds, in the collection's native order. The parallel array between the classifier's segment index and the collected native inputs then holds **by construction**, not by a probe.
+- **(b)** This needs a crate-private segment source over snapshot bytes (opening nothing, writing nothing), alongside the existing file-backed sources whose reader behaviour stays byte-identical (a reader differential against the base head is the proof). Where the walkers need a reader generic over `Read` instead of `File`, that is part of the prerequisite.
+- **(c)** How a snapshot whose last native segment is a sealed rotated file (an archive, no live file) closes its final run is a design question the plan must state with options and their ADR citations; it is not decided by a fallback. Until it is decided, nothing in V4a may special-case it.
+- **(d)** No silent arms: an index the construction guarantees is not "skipped if out of range"; a classifier `Err` on in-memory bytes is either impossible by type or surfaced, never swallowed.
+
+
+---
+
+# [Comment #31]() by [gerchowl]()
+
+_Posted on November 18, 2026 at 01:50 PM_
+
+## Ruling 13-V4-d6 (architect): the snapshot source is portable, and a snapshot without a live file walks every segment as sealed
+
+Follows ruling 13-V4-d5.
+
+1. **No OS-specific backing for snapshot bytes.** A snapshot source that copies the collected bytes into an anonymous memory file (`memfd_create`) so the walkers keep their `&File` signatures is rejected. `memfd_create` does not exist on macOS, a supported 1.0 platform (#46), and it is a workaround that avoids the refactor 13-V4-d5 (b) asks for. The walkers the classifier drives read from a byte reader that both the file-backed sources and the snapshot source provide. On the reader paths this changes the types and not the behaviour. The proof is the reader differential against the base head, with 0 differences.
+2. **Archive snapshots (closes 13-V4-d5 (c)).** When the confirmed snapshot holds no live file (`audit.jsonl`), every native segment in it is sealed and is walked as a sealed history segment. No segment is treated as live and nothing is opened. A run closes only as amendment 6 (i)+(ii) and ruling 13-V4-d3 point 1 define, by a closer inside the snapshot. A run still open at the end of the snapshot is not closed and yields **no run finding** (ruling 13-V4-d2 point 1). Its loss is reported when the archive is verified together with the part that follows, as decision 2 step 6 does with `verify <archive dir> <trail dir>`. Per-segment findings for damaged segments are unchanged. A snapshot that holds a live file classifies exactly as the live-open reader path does.
+3. **Rejected:** treating the last sealed segment as if it were live. It is sealed, and walking it with the live closing walk would apply rules for a file the writer still owns. Also rejected: emitting a finding for a run that is not closed at the end of the snapshot (13-V4-d2 point 1: a reviewer could `accept-run` a run the classifier never closed).
+
+
+---
+
+# [Comment #32]() by [gerchowl]()
+
+_Posted on November 18, 2026 at 09:03 PM_
+
+**Owner decision 13-V4-d7 and architect ruling 13-V4-d8 (#13 V4a, at `0a4aaaf`)**
+
+**13-V4-d7 (owner): shipped copies.** V4a runs the shared classifier over native inputs only. Whether the verifier can recover run boundaries from a shipped (Collector) record stream is a spike, #224, decided before 1.0. Until then, the V4a rustdoc names the limit and cites #224: shipped inputs get no run finding.
+
+**13-V4-d8: rules for V4a.**
+
+1. **Run finding detail.** ADR-0005 decision 11 says a run's "spans are listed after the ranges, with the digest", so the detail lists them. The grammar is:
+   - for each loss point, in `seq` order: `loss seq <s> first <f> count <c>; `
+   - then for each span, in segment order and then byte order: `span seg <seg> after <after> len <len> blake3:<hex>; `. Here `<after>` is the decimal `seq`, or `start` when the span begins at its segment's first byte (`u64::MAX` in the digest input, 13-V4-d2 point 2), and `blake3:<hex>` is the span's `D`.
+   - finally `digest blake3:<hex>`.
+
+   The run digest is unchanged: it is frozen by ADR-0005 decision 11.
+2. **One classification per verify call.**
+   - `verify_files` and `verify_dir` build one `Collection` and classify its native segments once, in collection order.
+   - An archive directory verified together with the trail directory is that single classification (13-V4-d6 point 2; ADR-0005 decision 2 step 6). It is never split per directory.
+   - Explicit files and their directory give the same report (13-V3-d2).
+3. **Rejection empties every run.** Any classifier violation empties `runs` (197-d1 addendum 28 point 2). V4a adds no filter of its own on a run.
+4. **No silent arm (13-V4-d5 (d)).** A classifier error on the snapshot source is never mapped to "no finding":
+   - If the error is reachable on crafted input, verification fails closed with that error.
+   - If it is unreachable by construction, the code says why at the one `expect`, and a row exercises the path.
+5. **First record.** A run finding's `line` and `seq` are those of the first complete record on the verified trail in the run's first segment. If that segment holds none, both are absent.
+
+
+---
+
+# [Comment #33]() by [gerchowl]()
+
+_Posted on November 18, 2026 at 11:24 PM_
+
+**Ruling 13-V4-d9 (#13 V4a, #226): a run's spans exclude its closer**
+
+1. **Span range.** A run's spans, and so its run digest, come only from the run's segments, `first_segment..last_segment`. The closer (`last_segment`, the segment that begins with the resume's opening checkpoint) is never part of run k's spans.
+   - This follows ADR-0005 decision 11 ("the consecutive segments right before", "inside a segment of the run") and decision 8 (the closer "may itself be the first segment of the next run").
+   - 13-V4-d3 point 2 and 13-V4-d4 set run *membership*. They do not set span attribution.
+2. **Unchanged:**
+   - `loss_points`, `closing_opening` and `run_membership`;
+   - the pinned A1/A3/A8/A9 digests.
+
+   V4b reads spans only from `RunReport::spans` and does not use the closer's membership to widen any exemption.
+3. **Rows:**
+   - A torn tail appended to the closer leaves the run digest equal to the pinned value (A1 plus a fragment stays `79d8cb1c…`).
+   - In the p01 shape, the closer's span appears only in run 2.
+   - The two tests that pinned the old behaviour are rewritten to assert the exclusion.
+4. **The `first_segment` fallback.** The fallback `open_run_start.unwrap_or(i)` in `classify` is unreachable: no test reaches it, and a closer needs a run before it. Remove it, or give it one `expect` that states why (13-V4-d8 point 4). Also correct the comment that names p09/A8 as a "single-segment run covering just this closer": that run is S1.
+
+
+---
+
+# [Comment #34]() by [gerchowl]()
+
+_Posted on November 19, 2026 at 08:46 AM_
+
+**Ruling 13-V4-d10 (#13 V4b): rule 2 comes from the shared classifier's fold**
+
+1. **One fold.** The shared classifier (13-V4-d4) already folds the MMR:
+   - from the base, including the genesis base of amendment 9 part 1;
+   - one leaf per distinct `seq`;
+   - comparing size, root and peaks.
+
+   The reader enforces rule 2 through that same fold. The verifier must not walk or fold the records a second time. V4b reports what the classifier's fold decides on the verifier's confirmed snapshot (13-V4-d5), with one classification per verify call (13-V4-d8 point 2).
+2. **Openings and other compared checkpoints.** The classifier's `CheckpointMmrDiffers` violation becomes a `MmrMismatch` error at that record:
+   - its file and line come from the record's segment, through the native segment index;
+   - its detail names the expected and found size and root.
+
+   13-V4-d8 point 3 still holds: any violation empties every run. A mismatched closing opening therefore yields `MmrMismatch` and no run finding. That is decision 11's "the closing checkpoint reports `MmrMismatch`, and the exit code is 1 again". The opening that closes a run is always compared (amendment 6 (iii)). The closer's membership never widens anything (13-V4-d9).
+3. **In-run checkpoints at or after the first loss point.**
+   - **Reader (amendment 6 (iii)):** these are not compared, and they never make the trail corrupt. That stays exactly as it is.
+   - **Verifier (decision 11 `accept-run` item 3):** each one whose fields differ from the fold is reported as `MmrMismatch`. A matching `accept-run` line will later turn it into `Accepted`. Honest checkpoints there count lost leaves, so they do differ.
+   - This refines 13-V4-d1 point 3's word "exempt": the exemption is from the reader's acceptance test, not from the verifier's report.
+   - The classifier records these as a separate output, not as a `Violation`, so they never empty the runs and never change `Reaction::Stop`. Each one is a positive record from the compare point (segment, record index, `seq`, expected and found fields). It is never inferred from a missing violation.
+4. **The candidate filter is fail-closed.** V4b keeps a resume candidate for later slices only when the classifier positively records that its opening was compared and matched the fold. The classifier records that verdict where it compares; nothing infers it later.
+   - Dropped: a candidate whose opening differs.
+   - Dropped: a candidate whose opening was never compared, which covers a shipped-only opening and an opening the walk did not reach after an earlier violation.
+   - V4b's later slices therefore can never confirm or excuse a gap whose opening rule 2 has not passed.
+   - The `structural=` suffix stays as 13-V3-d5 defines it.
+5. **Shipped copies.** Rule 2 over records that exist only in shipped copies has the same open question as 13-V4-d7: the classifier sees native segments, and a shipped copy has no file boundaries. Spike #224 takes this question too.
+   - Until #224 decides, the fail-closed filter in point 4 means a shipped-only resume is never confirmed.
+   - The rustdoc and the ADR's §19.9 sentence state this as a known limit that cites #224.
+   - #13 does not close while #224 leaves this open.
+6. **Known limit, Collect.** Once a segment has a violation, the classifier stops checking the rest of that segment. A second mismatch there is not reported. The trail is already rejected and the first error is reported. State this in rustdoc.
+7. **Proof.** The classifier is shared with the reader, so V4b proves:
+   - `Reaction::Stop` and the reader's accept/reject decisions are unchanged: reader differential 0 differences, fe_full/fe_snap 0 mismatches, syn gate 49;
+   - every new verifier finding comes from rows that follow the row standard.
 
 

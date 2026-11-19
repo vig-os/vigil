@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-10-09T14:07:47Z
-updated: 2026-11-17T18:10:53Z
+updated: 2026-11-18T16:25:45Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/vigil/issues/20
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-11-18T09:48:49.729Z
+synced: 2026-11-19T09:58:14.718Z
 ---
 
 # [Issue 20]: [Dependency Dashboard](https://github.com/vig-os/vigil/issues/20)
@@ -32,7 +32,7 @@ The following updates are currently rate-limited. To force their creation now, c
 
 The following updates have all been created. To force a retry/rebase of any, click on a checkbox below.
 
- - [ ] <!-- rebase-branch=renovate/actions-create-github-app-token-digest -->[chore(deps): update actions/create-github-app-token digest to 64ab729](../pull/162)
+ - [ ] <!-- rebase-branch=renovate/actions-create-github-app-token-digest -->[chore(deps): update actions/create-github-app-token digest to f418cff](../pull/162)
  - [ ] <!-- rebase-branch=renovate/opentelemetry-rust-monorepo -->[build(cargo): update opentelemetry-rust monorepo to v0.33.1](../pull/94) (`opentelemetry`, `opentelemetry-appender-tracing`, `opentelemetry-proto`, `opentelemetry_sdk`)
  - [ ] <!-- rebase-branch=renovate/flate2-1.x-lockfile -->[build(cargo): update rust crate flate2 to v1.1.11](../pull/217)
  - [ ] <!-- rebase-branch=renovate/log-0.x-lockfile -->[build(cargo): update rust crate log to v0.4.35](../pull/170)

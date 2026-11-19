@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-11-03T10:18:01Z
-updated: 2026-11-15T19:43:26Z
+updated: 2026-11-18T13:08:11Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/197
-comments: 30
+comments: 31
 labels: priority:medium
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-16T09:05:45.304Z
+synced: 2026-11-19T09:58:14.142Z
 ---
 
 # [Issue 197]: [refactor(audit): extract the reader's run classification into one shared pure module (#13 V4 prerequisite)](https://github.com/vig-os/vigil/issues/197)
@@ -592,5 +592,26 @@ _Posted on November 15, 2026 at 07:43 PM_
     3. **Source checks read the source, not a subprocess.** The module-doc wording check reads `runs.rs` with `include_str!`, scans only `//!` lines, and has no skip switch. No unit test spawns `git`.
     4. **No proof without a mechanism.** A row whose mechanism cannot be built as described (a counting wrapper around the concrete `SegmentSource`) is dropped rather than approximated. That `classify` holds one segment at a time follows from its signature and is checked by review.
     5. **Addendum 27.2 applies to report mutants.** Each mutant that changes a report needs two distinct killer rows, each actually run (exit 101, then 0 after revert). A module-doc mutant needs only its one source-check row.
+
+
+---
+
+# [Comment #31]() by [gerchowl]()
+
+_Posted on November 18, 2026 at 01:08 PM_
+
+**S3b2 merged as #216 (dc2daaa): `classify` now produces the V4a-facing reports.**
+
+- `ClassifyOutput` gains `segments: Vec<SegmentReport>` and `runs: Vec<RunReport>`, with `LossPoint`, spans and `closing_opening`. They are built only under `Reaction::Collect`, so the reader does no extra work.
+- Run membership is exactly the reader's run flag: a segment is a member iff `run_in || run_out`. A segment closes a run only when a run is open and the walk accepts the closing check, on both the strict and the tolerant pass. `damage` comes only from that segment's violations. `runs` is empty whenever the reader rejects the trail (ruling 13-V4-d3 point 1; ruling 197-d1 addendum 28).
+- The `runs.rs` module doc now states the single first-violation oracle (addendum 13 point 3).
+- Proofs at the final code:
+  - the reader differential vs `ba7ef3e` has 0 differences over 163,968 rows;
+  - the multi-segment first-equality sweeps show 0 mismatches over 137,610 and 276,990 rows;
+  - a membership sweep over about 543k generated layouts (accepted and rejected trails, including closers that reopen a run) found 0 disagreements with the reader;
+  - every report mutant is killed by two distinct rows;
+  - the syn gate stays at 49, and the PR adds +315 net non-test lines.
+
+Next: V4a (the verifier fold) is re-briefed on top of these reports.
 
 
