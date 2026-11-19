@@ -218,13 +218,14 @@ pub enum FindingKind {
     Unreconciled,
     /// Info: An operator waived a receipt or supplied a receipt prefix.
     ReceiptWaived,
-    /// Info: A fragment gap attested by a record at or below
-    /// `covered_through` (ruling 13-V5-d1 point 6). Detail grammar is
-    /// the same as `TornWrite`'s attested form:
+    /// Info: A fragment gap attested by a record of the verified
+    /// trail at or below `covered_through`, with no other record at
+    /// its `seq` (rulings 13-V5-d1 point 6 and 13-V5-d2). Detail
+    /// grammar is the same as `TornWrite`'s attested form:
     /// `lines {first}..={last} ({N} bytes), attested at line {L} seq {S}`.
-    /// A fragment is reported by length and digest, never by text; a
-    /// shipped-file `audit.repaired` with no gap present keeps the
-    /// `fragment not present` detail.
+    /// A fragment is reported by length and digest, never by text. A
+    /// native or shipped `audit.repaired` record with no preceding
+    /// fragment carries the `fragment not present` detail.
     TornWriteRepaired,
     /// Info: A reviewer accepted a warning or a run finding.
     Accepted,

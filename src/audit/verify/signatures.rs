@@ -13,8 +13,8 @@
 //! a checkpoint can carry both; neither suppresses the other. "Trusted"
 //! per ruling 13-V5-d1 point 3 requires both to hold.
 //!
-//! Revocation pin consistency, `end=`, coverage and `max_age` belong to
-//! later work in #13.
+//! Revocation pin consistency, `end=` and `max_age` belong to later
+//! work in #13.
 
 use super::{Finding, input::Summary};
 use crate::audit::{FindingKind as K, TrustPolicy, hex, verify_signature};

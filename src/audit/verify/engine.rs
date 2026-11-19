@@ -1,7 +1,9 @@
 //! Collecting chain and gap checks (ruling 13-V3-d3). A native gap
 //! attested by a record whose `seq <= covered_through` is reported as
-//! `TornWriteRepaired`; otherwise it stays `TornWrite` (ruling
-//! 13-V5-d1 point 6).
+//! `TornWriteRepaired`, but only when that attesting record is itself a
+//! record of the verified trail AND is the only record at its `seq`
+//! (not one side of a `SeqConflict` fork); otherwise it stays
+//! `TornWrite` (rulings 13-V5-d1 point 6 and 13-V5-d2).
 //!
 //! Fragment context: a fragment run (consecutive `Fragment` lines) that fails
 //! condition 3 (ruling 13-V3-d4, addendum 10) yields `Unparsable` "fragment
@@ -76,13 +78,18 @@ fn failed_fragment_lines(input: &Input) -> BTreeSet<u64> {
 }
 
 /// Pessimistic gap and shipped-fragment findings (ruling 13-V3-d3,
-/// 13-V5-d1 point 6): an attested gap whose attesting record's
-/// `seq <= covered_through` is `TornWriteRepaired`; a trailing gap
-/// with no attesting record and `RepairMismatch` are never promoted.
+/// 13-V5-d1 point 6 and 13-V5-d2): an attested gap is promoted to
+/// `TornWriteRepaired` only when all of (a) the attesting record is a
+/// record of the verified `trail`, (b) its `seq <= covered_through`,
+/// and (c) its `seq` has no other record (not one side of a
+/// `SeqConflict` fork) hold. A trailing gap with no attesting record
+/// and `RepairMismatch` are never promoted.
 fn file_findings(
     input: &Input,
     no_crash: bool,
     covered_through: Option<u64>,
+    trail: [u8; 16],
+    conflicting_seqs: &BTreeSet<u64>,
     findings: &mut Vec<Finding>,
 ) {
     let data = &input.data;
@@ -140,7 +147,14 @@ fn file_findings(
                     s.len, r.line, r.seq
                 );
                 let (kind, detail) = if r.repaired == Some(s.digest) {
-                    let covered = covered_through.is_some_and(|c| r.seq <= c);
+                    // Ruling 13-V5-d2: a covered checkpoint protects
+                    // the records of the verified trail at or below
+                    // its `seq` through the hash chain. Promote only
+                    // when the attester is a record of the verified
+                    // trail AND the only record at its `seq`.
+                    let covered = covered_through.is_some_and(|c| r.seq <= c)
+                        && r.trail == trail
+                        && !conflicting_seqs.contains(&r.seq);
                     let kind = if covered {
                         K::TornWriteRepaired
                     } else {
@@ -354,9 +368,27 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy
     // of a candidate (every distinct `(seq, hash)` checkpoint, native
     // or shipped-only) for which the crate-private predicate holds.
     let covered_through = coverage(&groups, trail, trust);
+    // Ruling 13-V5-d2: a `SeqConflict` fork blocks promotion at its
+    // `seq` -- the attester must be the only record on the verified
+    // trail at that `seq`. A seq with two or more distinct hashes
+    // reports `SeqConflict` below; we pre-compute the set here once.
+    let conflicting_seqs: BTreeSet<u64> = groups
+        .iter()
+        .filter_map(|(&seq, copies)| {
+            let hashes: BTreeSet<[u8; 32]> = copies.iter().map(|(_, r)| r.hash).collect();
+            (hashes.len() > 1).then_some(seq)
+        })
+        .collect();
     for (idx, input) in collection.inputs.iter().enumerate() {
         let no_crash = mark_no_crash(&collection, idx);
-        file_findings(input, no_crash, covered_through, &mut findings);
+        file_findings(
+            input,
+            no_crash,
+            covered_through,
+            trail,
+            &conflicting_seqs,
+            &mut findings,
+        );
         if input.native
             && input
                 .data

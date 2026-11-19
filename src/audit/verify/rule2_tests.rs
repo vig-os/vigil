@@ -1828,10 +1828,13 @@ fn sealed_two_mismatch_single_mmr_mismatch_and_kept_empty_literal() {
     let got = rows(&verify_dir(&dir));
     // The sealed S0 opens with cp0; it includes r5 which is a
     // valid resume for cp4→cp3-head (structural=valid). The
-    // live cp6 is honest. Expected literal finding list:
+    // live cp6 is honest. Every checkpoint carries a signature
+    // valid for its own declared fields (even cp2, cp3 whose
+    // declared roots are crafted), so the trusted-coverage head
+    // is cp6 and no `UncoveredTail` is emitted. Expected literal
+    // finding list:
     //   - `MmrMismatch` at cp2 in S0 (the first violation);
-    //   - `Resumed` for r5 at S0 with its structural-valid suffix;
-    //   - `UncoveredTail` spanning 0..=6.
+    //   - `Resumed` for r5 at S0 with its structural-valid suffix.
     // Any violation empties every run (13-V4-d8 point 3), so
     // there is no `SegmentStructure` run finding.
     // The resume's gap is "none" because head_seq == lost_through.
