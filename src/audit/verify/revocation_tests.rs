@@ -189,17 +189,8 @@ fn trust_fixture_unbounded() -> TrustPolicy {
 // `AuditConfig::rotate`: the bound names the old key's close checkpoint,
 // the new key is listed unbounded, every checkpoint is trusted, and the
 // bound is both pinned and confirmed, so the expected list is empty.
-// Base stubs `revocation::check` to a no-op; this row does not fail on
-// base through its main assertion. Killers (two measured, matching the
-// mutant table in the PR body):
-//   - **Q4** (pin skips the checkpoint-kind check): with Q4 active a
-//     bound at a non-checkpoint would still pin. Here the bound names
-//     a real close checkpoint, so Q4 does not add a false positive; V1
-//     does NOT kill Q4. Kept here for documentation; the row is
-//     deliberately a clean regression against the honest d11 procedure.
-//   - (No direct mutant kills.) Kept per the brief's row list; if the
-//     mutant table in the PR body shows fewer than 2 kills here, the
-//     row stays as an d11 clean-stop sanity row only.
+// This row is a sanity pin against the honest d11 procedure (no direct
+// mutant kill is expected here).
 // =====================================================================
 #[test]
 fn v1_clean_stop_rotation_has_no_revocation_finding_and_empty_list() {
@@ -959,6 +950,180 @@ fn v12_bound_only_on_another_trail_is_scoped_out() {
     // itself covered → no UncoveredTail.
     assert_findings(&findings, &[], "V12");
     let _keep = fx.dir;
+}
+
+// =====================================================================
+// V3b — ACCEPTANCE companion. Hash mismatch at a different `seq` to
+// give Q6 ("pin compares seq only, not the hash") a second named kill:
+// the bound names seq=2 with the cp0-shape hash, but the actual record
+// at seq=2 (the honest cp2) has a different hash, so pin fails.
+// =====================================================================
+#[test]
+fn v3b_hash_mismatch_at_seq_two() {
+    let fx = two_checkpoints();
+    // Bound at seq=2 names a wrong hash ([0x5a;32]). cp2's actual hash
+    // differs → pin fails with "has hash".
+    let bound_hash: [u8; 32] = [0x5a; 32];
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key_through(fixture_pubkey(), 2, bound_hash)
+        .build()
+        .unwrap();
+    let findings = verify_files_with(vec![fx.path.clone()], trust);
+    let bound_hex = digest_string(&bound_hash);
+    let mut expected = vec![
+        located(
+            K::RevocationMismatch,
+            fx.path.clone(),
+            3,
+            2,
+            format!(
+                "key {FIXTURE_KEY_HEX} through=2:{bound_hex}: record at seq 2 has hash {CP2_HONEST_DIGEST}"
+            ),
+        ),
+        located(
+            K::RevocationUnconfirmed,
+            fx.path.clone(),
+            3,
+            2,
+            format!(
+                "key {FIXTURE_KEY_HEX} through=2: no trusted checkpoint by another key above the bound"
+            ),
+        ),
+    ];
+    expected.sort_by_key(|f| {
+        (
+            f.seq().is_none(),
+            f.seq(),
+            f.file().map(std::path::Path::to_path_buf),
+            f.line(),
+            format!("{:?}", f.kind()),
+        )
+    });
+    assert_findings(&findings, &expected, "V3b");
+    let _keep = fx.dir;
+}
+
+// =====================================================================
+// V4b — ACCEPTANCE companion. Bound names an entry seq at a different
+// position to give Q4 ("pin skips the checkpoint-kind check") a second
+// named kill: the trail has an entry at seq=1 and cp0 only. A bound
+// pointing at that entry's hash at seq=1 fails pin with "is not a
+// checkpoint" under production; under Q4 the kind check would be
+// skipped and pin would wrongly pass.
+// =====================================================================
+#[test]
+fn v4b_bound_at_entry_only_segment() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let e1 = entry_rec(1, cp0.hash());
+    put_segment(&d.0, 0, &[&cp0, &e1], &[]);
+    let path = segment_path(&d.0, 0);
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key_through(fixture_pubkey(), 1, e1.hash())
+        .build()
+        .unwrap();
+    let findings = verify_files_with(vec![path.clone()], trust);
+    let e1_hex = digest_string(&e1.hash());
+    assert_eq!(e1_hex, E1_HONEST_DIGEST);
+    let mut expected = vec![
+        located(
+            K::RevocationMismatch,
+            path.clone(),
+            2,
+            1,
+            format!(
+                "key {FIXTURE_KEY_HEX} through=1:{E1_HONEST_DIGEST}: record at seq 1 is not a checkpoint"
+            ),
+        ),
+        located(
+            K::RevocationUnconfirmed,
+            path,
+            2,
+            1,
+            format!(
+                "key {FIXTURE_KEY_HEX} through=1: no trusted checkpoint by another key above the bound"
+            ),
+        ),
+        uncovered(1, 1),
+    ];
+    expected.sort_by_key(|f| {
+        (
+            f.seq().is_none(),
+            f.seq(),
+            f.file().map(std::path::Path::to_path_buf),
+            f.line(),
+            format!("{:?}", f.kind()),
+        )
+    });
+    assert_findings(&findings, &expected, "V4b");
+}
+
+// =====================================================================
+// V6b — ACCEPTANCE companion. Fork at a DIFFERENT seq to give Q5 ("pin
+// ignores forks: the first record wins") a second named kill. Honest
+// cp0 plus a shipped twin cp0 forking seq=0; the bound names cp0's
+// honest hash at seq=0. Pin fails with "forked".
+// =====================================================================
+#[test]
+fn v6b_bound_at_forked_seq_zero() {
+    let d = Temp::new();
+    let honest_cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    put_segment(&d.0, 0, &[&honest_cp0], &[]);
+    let native = segment_path(&d.0, 0);
+    // Ship a twin cp0 with a different signed body → different hash.
+    let twin_cp0 = signed_cp_explicit(0, Record::genesis(&TRAIL), 0, [0xde; 32], vec![]);
+    let twin_path = d.0.join("cp0.twin");
+    fs::write(&twin_path, line_bytes(&twin_cp0)).unwrap();
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key_through(fixture_pubkey(), 0, honest_cp0.hash())
+        .build()
+        .unwrap();
+    let findings = verify_files_with(vec![native.clone(), twin_path], trust);
+    let (first, second) = if honest_cp0.hash() < twin_cp0.hash() {
+        (
+            digest_string(&honest_cp0.hash()),
+            digest_string(&twin_cp0.hash()),
+        )
+    } else {
+        (
+            digest_string(&twin_cp0.hash()),
+            digest_string(&honest_cp0.hash()),
+        )
+    };
+    let mut expected = vec![
+        located(
+            K::SeqConflict,
+            native,
+            1,
+            0,
+            format!("conflicting hashes: {first}, {second}"),
+        ),
+        unlocated(
+            K::RevocationMismatch,
+            Some(0),
+            format!("key {FIXTURE_KEY_HEX} through=0:{CP0_HONEST_DIGEST}: seq 0 is forked"),
+        ),
+        unlocated(
+            K::RevocationUnconfirmed,
+            Some(0),
+            format!(
+                "key {FIXTURE_KEY_HEX} through=0: no trusted checkpoint by another key above the bound"
+            ),
+        ),
+    ];
+    expected.sort_by_key(|f| {
+        (
+            f.seq().is_none(),
+            f.seq(),
+            f.file().map(std::path::Path::to_path_buf),
+            f.line(),
+            format!("{:?}", f.kind()),
+        )
+    });
+    assert_findings(&findings, &expected, "V6b");
 }
 
 // =====================================================================
