@@ -296,8 +296,9 @@ mod schema_writer_tests;
 /// and captured run-digest literals, shared by both V4a readers --
 /// `runs::classify_v4a_walk` (classify-level pins) and
 /// `verify::runs_tests` (V4a verifier rows through `Verifier::verify_*`).
-/// Duplicating this fixture code across the two consumers is a
-/// review blocker.
+/// Invariant: both readers import the builders and `A*_DIGEST`
+/// constants from here, so the pinned digests and layout code live in
+/// exactly one place.
 #[cfg(test)]
 pub(crate) mod runs_v4a_fixtures;
 

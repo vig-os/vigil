@@ -1592,12 +1592,13 @@ fn closer_spans_excluded_torn_live_tail_p10() {
     );
 }
 
-/// A9 (multi-segment record-free) run spans with the closer's spans
-/// as the trailing pair. Note: A9's closer segment itself carries
-/// no spans (its live is `[cp_opening, resume]` with no fragments);
-/// the spans here come from the two record-free sealed segments
-/// inside the run. Any mutant that truncates the per-segment span
-/// concatenation flips the `[(0, MAX, 9), (1, MAX, 14)]` pair.
+/// A9 (multi-segment record-free) run spans. Ruling 13-V4-d9 excludes
+/// the closer segment from a run's spans, so the two entries here
+/// come from the two record-free sealed segments inside the run
+/// (`first_segment..last_segment`, exclusive); A9's closer segment
+/// itself carries no spans anyway (its live is `[cp_opening, resume]`
+/// with no fragments). Any mutant that truncates the per-segment
+/// span concatenation flips the `[(0, MAX, 9), (1, MAX, 14)]` pair.
 #[test]
 fn span_shapes_record_free_a9_literal() {
     let a = build_a9();

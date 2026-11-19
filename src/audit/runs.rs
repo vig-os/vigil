@@ -1490,8 +1490,9 @@ pub(crate) fn classify(
                     // unreachable (there is nothing to close).
                     let first_segment = open_run_start.expect(
                         "SegmentClass::Closer implies an earlier in-progress run \
-                         (ruling 13-V4-d9): `open_run_start` is set by the Base \
-                         (or InRun) arm above before any Closer can fire",
+                         (ruling 13-V4-d9): `open_run_start` is set by the \
+                         InRun/Damaged arm above before any Closer can fire \
+                         (the Base arm resets it to None)",
                     );
                     let last_segment = i;
                     let run_idx = runs_out.len();
@@ -1515,7 +1516,8 @@ pub(crate) fn classify(
                         .map(|(k, s)| (k - first_segment, s))
                     {
                         // `local_idx = k - first_segment` with k in
-                        // `[first_segment, last_segment]`, so
+                        // `[first_segment, last_segment)` (closer
+                        // excluded, ruling 13-V4-d9), so
                         // `local_idx <= seg_spans.len() - 1`.
                         // `seg_spans` is only pushed to after the
                         // checked `u32::try_from(segment_index)` in

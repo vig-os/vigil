@@ -121,7 +121,22 @@ fn parse_digest(hex: &str) -> [u8; 32] {
 // point 2 one-pass classify).
 // ============================================================
 
-fn classify_run_bundles(dir: &Path) -> Vec<(PathBuf, [u8; 32], String)> {
+/// Bundle every field the verifier emits for a run finding, so a
+/// mutant that drops any one is caught (ruling 13-V4-d8 point 1,
+/// point 5; ADR-0005 decision 11). Filtering on `run_digest.is_some()`
+/// here is a kind filter (run findings carry a digest; others never
+/// do), not a value filter: every field below is still asserted.
+type RunBundle = (
+    K,           // always `SegmentStructure` for a run finding
+    PathBuf,     // first-segment path
+    Option<u64>, // line of the first record on trail in first segment
+    Option<u64>, // seq of the same
+    String,      // detail (ruling 13-V4-d8 point 1 grammar)
+    [u8; 32],    // run digest (ADR-0005 decision 11)
+);
+
+fn classify_run_bundles(dir: &Path) -> Vec<RunBundle> {
+    use crate::audit::Record;
     use crate::audit::runs::{self, ClassifyArgs, Reaction, ReaderPath};
     // The row's trail directory is static in these tests (no writer
     // in flight), so we read the directory once instead of going
@@ -212,18 +227,53 @@ fn classify_run_bundles(dir: &Path) -> Vec<(PathBuf, [u8; 32], String)> {
                 })
                 .collect();
             let detail = make_run_detail(&lps, &sps, &digest);
-            (natives[run.first_segment].0.clone(), digest, detail)
+            // Compute (line, seq) directly from the first segment's
+            // bytes by parsing each line and filtering by trail. The
+            // oracle therefore does not share `verify::input`'s code
+            // path with the verifier side -- it is independent in
+            // every field (ruling 13-V4-d8 point 5).
+            let (path, bytes, _is_live) = &natives[run.first_segment];
+            let mut line_seq: (Option<u64>, Option<u64>) = (None, None);
+            for (idx, line) in bytes.split(|b| *b == b'\n').enumerate() {
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(records) = Record::parse_line(line) else {
+                    continue;
+                };
+                if let Some(r) = records.into_iter().find(|r| r.context.trail == TRAIL) {
+                    // 1-based line number, matching `Finding::line`.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let ln = (idx + 1) as u64;
+                    line_seq = (Some(ln), Some(r.context.seq));
+                    break;
+                }
+            }
+            (
+                K::SegmentStructure,
+                path.clone(),
+                line_seq.0,
+                line_seq.1,
+                detail,
+                digest,
+            )
         })
         .collect()
 }
 
-fn run_bundles_from_findings(findings: &[Finding]) -> Vec<(PathBuf, [u8; 32], String)> {
+fn run_bundles_from_findings(findings: &[Finding]) -> Vec<RunBundle> {
     findings
         .iter()
         .filter_map(|f| {
-            f.run_digest().and_then(|d| {
-                f.file()
-                    .map(|p| (p.to_path_buf(), d, f.detail().to_owned()))
+            f.run_digest().map(|d| {
+                (
+                    f.kind(),
+                    f.file().map_or_else(PathBuf::new, Path::to_path_buf),
+                    f.line(),
+                    f.seq(),
+                    f.detail().to_owned(),
+                    d,
+                )
             })
         })
         .collect()
@@ -570,78 +620,31 @@ fn r4_a9_two_spans_after_start_literal() {
     assert_eq!(rows(&findings), expected, "A9 full literal finding list");
 }
 
-// ============================================================
-// R5 — p07: rejected layout, no run finding; the per-segment
-// `SegmentStructure` finding (and the rest of the engine's findings)
-// list literally (ruling 13-V4-d3 point 2, 13-V4-d8 point 3).
-//
-// Regression row: "no run finding" is trivially true on base (no
-// V4a code), so R5's main assertion is not red on base. Pins the
-// shape so a future regression that re-admits p07 as a run does not
-// pass silently; killed by M5/M15/M16 at head.
-// ============================================================
-
-#[test]
-fn r5_p07_rejected_no_run_finding() {
-    let d = Temp::new();
-    // An entry with seq=0 pointing at genesis -- not a checkpoint.
-    let e0 = entry_rec(0, crate::audit::Record::genesis(&TRAIL));
-    let fold = seeded(&e0);
-    let close = signed_cp(1, e0.hash(), &fold);
-    let resume = resume_decl(&close, 0, e0.hash(), 0);
-    let s0 = d.0.join("audit-20260101T000000.000000000Z_000000.jsonl");
-    fs::write(&s0, line_bytes(&e0)).unwrap();
-    write_records(&d.0, &[&close, &resume]);
-    let live = d.0.join("audit.jsonl");
-    let per_seg_detail = "expected first complete record to be a checkpoint".to_owned();
-    // The close's hash determines the `Resumed` head citation.
-    let resume_detail = "operator=operator reason=incident \
-         head=0:blake3:575d1f7bfd75218c181f31204b5a4682b410123d47a1e644879246a4f0124119 \
-         gap=none lost_records=0 structural=valid"
-        .to_owned();
-    let expected = vec![
-        (
-            K::SegmentStructure,
-            Some(s0),
-            Some(1),
-            Some(0),
-            per_seg_detail,
-            None,
-        ),
-        (
-            K::Resumed,
-            Some(live),
-            Some(2),
-            Some(2),
-            resume_detail,
-            None,
-        ),
-        (
-            K::UncoveredTail,
-            None,
-            None,
-            None,
-            "records seq 0..=2, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
-            None,
-        ),
-    ];
-    assert_eq!(
-        rows(&verify_dir(&d.0)),
-        expected,
-        "p07 full literal finding list (no run finding; per-segment \
-         SegmentStructure listed; engine's Resumed/UncoveredTail unchanged)",
-    );
-}
+// R5 was removed: the only mutant it killed in practice was M16.
+// A MissingInitialCheckpoint / non-CP-first-record layout classifies
+// its leading segment as `SegmentClass::Base` with `member=false`,
+// so dropping the violation-suppression rule (MS) never opens a run
+// at `open_run_start`, and R5 survived MS. The "rejection empties
+// every run" rule is still pinned by R6 (RecordRolledBack inside an
+// InRun segment, where the walker keeps the run open; killed by
+// both MS and M16) and by R18 / R19 (InvalidLineOrOpeningCheckpoint
+// at the live closer; killed by both MS and M11).
 
 // ============================================================
 // R6 — non-increasing `seq` inside a would-be run: no run finding
 // (addendum 28 point 2: any classifier violation empties `runs`);
 // the engine's violation and record-level findings list literally.
 //
-// Regression row: "no run finding" is trivially true on base. Pins
-// the full-list shape so a mutant that admits the would-be run in
-// the presence of violations (M16) flips it at head.
+// Regression row: "no run finding" is already true on base. Measured
+// killers at head, each exit 101:
+//   * M16 (emit a run finding when `out.runs` is empty and
+//     violations are present) — this layout has classifier
+//     violations (SeqConflict, ChainBroken, SegmentStructure), so
+//     M16 would add a spurious run finding.
+//   * MS (drop the "any violation empties `runs`" rule in
+//     `runs::classify`) — without the drop, the Base/InRun/Closer
+//     walk produces a run finding; the expected literal list has
+//     none.
 // ============================================================
 
 #[test]
@@ -830,34 +833,36 @@ fn r7_archive_run_closed_inside_single_run_finding() {
     );
 }
 
+// R8 was removed: an open-run archive (no closer) has no classifier
+// violations, so no mutant in the final table flips its literal list
+// — it killed zero mutants. The open-run archive case is still
+// pinned by R13's agreement row, which classifies the same layout
+// directly and asserts verifier-side equality with the empty
+// classifier runs output.
+
 // ============================================================
-// R8 — archive with a run left open at the end: no run finding
-// (ruling 13-V4-d6 point 2: a run still open at the end of the
-// snapshot yields no run finding).
-//
-// Regression row: "no run finding" is trivially true on base.
-// Pins the full-list shape so a mutant that admits an open run
-// (M16) flips the main assertion at head.
+// R9 — SS-7: `verify_dir(dir)` and `verify_files([each file])` emit
+// identical reports (ruling 13-V3-d2: one confirmed snapshot).
 // ============================================================
 
 #[test]
-fn r8_archive_run_open_at_end_no_run_finding() {
-    let d = Temp::new();
-    let cp0 = signed_cp(
-        0,
-        crate::audit::Record::genesis(&TRAIL),
-        &crate::audit::Mmr::new(),
-    );
-    let mmr0 = seeded(&cp0);
-    let e1 = entry_rec(1, cp0.hash());
-    let mmr1 = pushed(&mmr0, &e1);
-    let e2 = entry_rec(2, e1.hash());
-    let _mmr2 = pushed(&mmr1, &e2);
-    crate::audit::runs_v4a_fixtures::put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
-    let r4 = headless(&e2, 4);
-    crate::audit::runs_v4a_fixtures::put_segment(&d.0, 1, &[&r4], &[]);
-    let s1 = d.0.join("audit-20260101T000000.000000000Z_000001.jsonl");
+fn r9_ss7_verify_dir_equals_verify_files_each_file() {
+    let a = build_a1();
+    let s1 = a
+        .dir_path
+        .join("audit-20260101T000000.000000000Z_000001.jsonl");
+    let live = a.dir_path.join("audit.jsonl");
+    let a1_digest = parse_digest(A1_DIGEST);
+    let run_detail = make_run_detail(&[(4, 3, 1)], &[], &a1_digest);
     let per_seg_detail = "expected first complete record to be a checkpoint".to_owned();
+    let resume_detail = "operator=operator reason=incident \
+         head=5:blake3:4181d394847e4274645a1b39a8366b0217c32abc5ab45e4dbee9f064c25361aa \
+         gap=none lost_records=0 structural=valid"
+        .to_owned();
+    // The ruling 13-V3-d2 pin: the literal full finding list carries
+    // the one A1 run finding on both sides. On base this list differs
+    // from both sides (the run finding is absent), so the main
+    // assertion flips red on base.
     let expected = vec![
         (
             K::SegmentStructure,
@@ -868,11 +873,27 @@ fn r8_archive_run_open_at_end_no_run_finding() {
             None,
         ),
         (
+            K::SegmentStructure,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            run_detail,
+            Some(digest_string(&a1_digest)),
+        ),
+        (
             K::SeqGap,
-            Some(s1),
+            Some(s1.clone()),
             Some(1),
             Some(4),
             "missing seq 3..=3".to_owned(),
+            None,
+        ),
+        (
+            K::Resumed,
+            Some(live),
+            Some(2),
+            Some(7),
+            resume_detail,
             None,
         ),
         (
@@ -880,41 +901,22 @@ fn r8_archive_run_open_at_end_no_run_finding() {
             None,
             None,
             None,
-            "records seq 0..=4, no trusted coverage yet (signatures are checked in #13 V5)"
+            "records seq 0..=7, no trusted coverage yet (signatures are checked in #13 V5)"
                 .to_owned(),
             None,
         ),
     ];
-    assert_eq!(
-        rows(&verify_dir(&d.0)),
-        expected,
-        "R8 archive-open-at-end full literal finding list (no run finding)",
-    );
-}
-
-// ============================================================
-// R9 — SS-7: `verify_dir(dir)` and `verify_files([each file])` emit
-// identical reports (ruling 13-V3-d2: one confirmed snapshot).
-// ============================================================
-
-#[test]
-fn r9_ss7_verify_dir_equals_verify_files_each_file() {
-    let a = build_a1();
     let dir_rows = rows(&verify_dir(&a.dir_path));
+    assert_eq!(dir_rows, expected, "SS-7: verify_dir == expected literal");
     let files: Vec<PathBuf> = fs::read_dir(&a.dir_path)
         .unwrap()
         .map(|e| e.unwrap().path())
         .collect();
     let files_rows = rows(&verify_files(files));
-    // A1 produces one run finding -- both forms must see it, and
-    // the full literal lists must match (ruling 13-V3-d2).
-    let dir_runs: Vec<_> = dir_rows.iter().filter(|r| r.5.is_some()).collect();
     assert_eq!(
-        dir_runs.len(),
-        1,
-        "SS-7 precondition: A1 verify_dir emits one run finding",
+        files_rows, expected,
+        "SS-7: verify_files([each file]) == expected literal (ruling 13-V3-d2)",
     );
-    assert_eq!(dir_rows, files_rows, "SS-7: dir == files([each file])");
 }
 
 // ============================================================
@@ -943,7 +945,67 @@ fn r10_ss8_archive_plus_trail_dir_vs_full_dir_same_run_finding() {
     // Build the full trail in `full_dir` (archive + trail together).
     let (_full_d, s0_full, _s1_full, _s2_full) = build_archive_closed_inside();
     let full_dir = s0_full.parent().unwrap().to_owned();
+    // Expected literal finding list (paths rebased to `common`). The
+    // run finding files to S1's basename, so on base (no V4a) this
+    // list differs from both sides through the SegmentStructure run
+    // finding row — the main assertion flips red on base.
+    let s1_name = Path::new("audit-20260101T000000.000000000Z_000001.jsonl");
+    let s2_name = Path::new("audit-20260101T000000.000000000Z_000002.jsonl");
+    let a1_digest = parse_digest(A1_DIGEST);
+    let run_detail = make_run_detail(&[(4, 3, 1)], &[], &a1_digest);
+    let per_seg_detail = "expected first complete record to be a checkpoint".to_owned();
+    let resume_detail = "operator=operator reason=incident \
+         head=5:blake3:4181d394847e4274645a1b39a8366b0217c32abc5ab45e4dbee9f064c25361aa \
+         gap=none lost_records=0 structural=valid"
+        .to_owned();
+    let expected = vec![
+        (
+            K::SegmentStructure,
+            Some(common.join(s1_name)),
+            Some(1),
+            Some(4),
+            per_seg_detail,
+            None,
+        ),
+        (
+            K::SegmentStructure,
+            Some(common.join(s1_name)),
+            Some(1),
+            Some(4),
+            run_detail,
+            Some(digest_string(&a1_digest)),
+        ),
+        (
+            K::SeqGap,
+            Some(common.join(s1_name)),
+            Some(1),
+            Some(4),
+            "missing seq 3..=3".to_owned(),
+            None,
+        ),
+        (
+            K::Resumed,
+            Some(common.join(s2_name)),
+            Some(2),
+            Some(7),
+            resume_detail,
+            None,
+        ),
+        (
+            K::UncoveredTail,
+            None,
+            None,
+            None,
+            "records seq 0..=7, no trusted coverage yet (signatures are checked in #13 V5)"
+                .to_owned(),
+            None,
+        ),
+    ];
     let full_rows = relative(rows(&verify_dir(&full_dir)), common);
+    assert_eq!(
+        full_rows, expected,
+        "SS-8: verify_dir(full_trail) == expected literal (rebased)",
+    );
     // Split: `archive_dir` holds S0+S1; `trail_dir` holds S2 under
     // a later-timestamped rotated name so the merged order matches
     // the single-dir order (ruling 13-V4-d8 point 2: one classify
@@ -971,25 +1033,16 @@ fn r10_ss8_archive_plus_trail_dir_vs_full_dir_same_run_finding() {
             .join("audit-20260101T000001.000000000Z_000000.jsonl"),
     )
     .unwrap();
+    // The split form renames S2 to a different timestamped sealed
+    // segment, so rebase S2's rotated basename back to the single-dir
+    // basename, then rebase every finding's directory to `common` and
+    // assert literal equality with the same `expected` list.
     let split_rows = {
-        // The split form renames S2 to a different timestamped
-        // sealed segment, so rebase both sides onto the same shared
-        // segment basenames for literal equality. The run finding
-        // files to a basename that exists in both forms (S1); the
-        // Resumed binds to S2's basename, which differs between
-        // forms. Keep the comparison literal where names agree and
-        // assert explicitly on the Resumed row's rebased basename.
         let mut v = rows(&verify_files([archive_dir.0.clone(), trail_dir.0.clone()]));
-        // Rebase S2's rotated name (`...20260101T000001...000000.jsonl`)
-        // back to the single-dir name (`...20260101T000000...000002.jsonl`)
-        // so the two side-by-side lists match literally.
         let split_s2 = trail_dir
             .0
             .join("audit-20260101T000001.000000000Z_000000.jsonl");
-        let full_s2_name = Path::new("audit-20260101T000000.000000000Z_000002.jsonl")
-            .file_name()
-            .unwrap()
-            .to_owned();
+        let full_s2_name = s2_name.file_name().unwrap().to_owned();
         for r in &mut v {
             if r.1.as_deref() == Some(split_s2.as_path()) {
                 r.1 = Some(common.join(&full_s2_name));
@@ -997,28 +1050,10 @@ fn r10_ss8_archive_plus_trail_dir_vs_full_dir_same_run_finding() {
         }
         relative(v, common)
     };
-    // Ruling 13-V3-d2 and 13-V4-d8 point 2: the merged Collection
-    // produces the same full literal list as the single-dir trail,
-    // once each finding's file name is rebased to a shared dir.
     assert_eq!(
-        split_rows, full_rows,
-        "SS-8: archive_dir + trail_dir yields the same full literal \
-         finding list as the single-dir trail (names rebased to a shared \
-         dir); ruling 13-V3-d2, 13-V4-d8 point 2",
-    );
-    // Belt-and-braces: pin the run finding's file to S1's basename
-    // in both forms; a shipped-input mutation that reroutes the run
-    // finding to a different file would survive the rebase match
-    // otherwise.
-    let s1_name = Path::new("audit-20260101T000000.000000000Z_000001.jsonl");
-    let run_files: Vec<_> = full_rows
-        .iter()
-        .filter_map(|r| r.5.as_ref().map(|_| r.1.clone()))
-        .collect();
-    assert_eq!(
-        run_files,
-        vec![Some(common.join(s1_name))],
-        "SS-8: the run finding files to S1 (ruling 13-V4-d8 point 5)",
+        split_rows, expected,
+        "SS-8: verify_files([archive_dir, trail_dir]) == expected literal \
+         (rebased); ruling 13-V3-d2, 13-V4-d8 point 2",
     );
 }
 
@@ -1041,148 +1076,114 @@ fn r11_shipped_only_and_native_plus_shipped_no_shipped_run_finding() {
     let shipped_only_dir = Temp::new();
     let shipped_only_path = shipped_only_dir.0.join("copy-live");
     fs::copy(a.dir_path.join("audit.jsonl"), &shipped_only_path).unwrap();
-    let shipped_only_rows = rows(&verify_files([shipped_only_path.clone()]));
-    let shipped_only_runs: Vec<_> = shipped_only_rows.iter().filter(|r| r.5.is_some()).collect();
-    assert!(
-        shipped_only_runs.is_empty(),
-        "shipped-only verify_files emits no run finding (#224); got {shipped_only_rows:?}",
+    // Literal expected list for the shipped-only form: a shipped
+    // input sees only the resume checkpoint in isolation (no native
+    // segments before it), so the engine emits a leading `SeqGap`
+    // for the invisible prior seqs, a `Resumed` with
+    // `structural=invalid(head-not-present)` (the resume's head
+    // record is not on this input), and a trailing `UncoveredTail`.
+    // No run finding — owner decision 13-V4-d7 / spike #224.
+    let shipped_only_expected = vec![
+        (
+            K::SeqGap,
+            Some(shipped_only_path.clone()),
+            Some(1),
+            Some(6),
+            "missing seq 0..=5".to_owned(),
+            None,
+        ),
+        (
+            K::Resumed,
+            Some(shipped_only_path.clone()),
+            Some(2),
+            Some(7),
+            "operator=operator reason=incident \
+             head=5:blake3:4181d394847e4274645a1b39a8366b0217c32abc5ab45e4dbee9f064c25361aa \
+             gap=none lost_records=0 structural=invalid(head-not-present)"
+                .to_owned(),
+            None,
+        ),
+        (
+            K::UncoveredTail,
+            None,
+            None,
+            None,
+            "records seq 6..=7, no trusted coverage yet (signatures are checked in #13 V5)"
+                .to_owned(),
+            None,
+        ),
+    ];
+    assert_eq!(
+        rows(&verify_files([shipped_only_path.clone()])),
+        shipped_only_expected,
+        "R11 (a): verify_files([shipped_copy]) == expected literal \
+         (SeqGap + Resumed + UncoveredTail; no run finding, #224)",
     );
     // (b) Native + shipped: pass both the native trail directory
     // AND an explicit shipped copy of the live file through
-    // `verify_files`. The native run finding list (the first pass)
-    // stays the same; adding the shipped copy must not introduce a
-    // second run finding and must not alter the native one.
-    let native_only_rows = rows(&verify_files([a.dir_path.clone()]));
-    let native_only_runs: Vec<_> = native_only_rows
-        .iter()
-        .filter(|r| r.5.is_some())
-        .cloned()
-        .collect();
-    assert_eq!(
-        native_only_runs.len(),
-        1,
-        "R11 (b) precondition: native A1 emits one run finding via verify_files",
-    );
+    // `verify_files`. The shipped records duplicate the native
+    // records on the live file, so the engine emits `DuplicateRecord`
+    // findings on that live file; exactly one run finding still
+    // appears, at the native S1, with A1's digest — the shipped
+    // input adds no run finding.
     let shipped_mix = Temp::new();
     let shipped_mix_path = shipped_mix.0.join("copy-live-2");
     fs::copy(a.dir_path.join("audit.jsonl"), &shipped_mix_path).unwrap();
-    let mixed_rows = rows(&verify_files([
-        a.dir_path.clone(),
-        shipped_mix_path.clone(),
-    ]));
-    let mixed_runs: Vec<_> = mixed_rows
-        .iter()
-        .filter(|r| r.5.is_some())
-        .cloned()
-        .collect();
-    assert_eq!(
-        mixed_runs, native_only_runs,
-        "R11 (b): the native run finding list is unchanged when a shipped \
-         copy of the same trail is added through verify_files",
-    );
-    // Belt-and-braces: exactly one run finding across the mixed call;
-    // no run finding comes from the shipped path.
-    assert_eq!(
-        mixed_runs.len(),
-        1,
-        "R11 (b): exactly one run finding (the native's) in native+shipped",
-    );
-    assert!(
-        mixed_runs[0]
-            .1
-            .as_ref()
-            .is_some_and(|p| p != &shipped_mix_path),
-        "R11 (b): run finding's file is the native segment, not the shipped copy",
-    );
-}
-
-// ============================================================
-// R12 — a foreign-trail record inside a would-be run segment:
-// 0 run findings plus the literal `TrailMismatch` violation.
-// Ruling 13-V4-d8 point 3 and 197-d1 addendum 28.2: any classifier
-// violation empties `runs`. The trail check runs first, so a
-// foreign-trail record in a candidate run segment turns into a
-// violation that zeroes every run. (M13's trail-filter mutant is
-// equivalent on this head — see the PR body.)
-//
-// Regression row: "no run finding" is trivially true on base, so
-// R12's main assertion stands as a regression pin. Killed at head
-// by M16 (which would try to emit a run finding under violations).
-// ============================================================
-
-#[test]
-fn r12_foreign_trail_record_in_run_segment_empties_runs() {
-    let d = Temp::new();
-    let cp0 = signed_cp(
-        0,
-        crate::audit::Record::genesis(&TRAIL),
-        &crate::audit::Mmr::new(),
-    );
-    let mmr0 = seeded(&cp0);
-    let e1 = entry_rec(1, cp0.hash());
-    let mmr1 = pushed(&mmr0, &e1);
-    let e2 = entry_rec(2, e1.hash());
-    let mmr2 = pushed(&mmr1, &e2);
-    crate::audit::runs_v4a_fixtures::put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
-    // A foreign-trail record sits at the head of S1 (would-be run);
-    // the tolerant walker's broken-boundary arm accepts it, raising
-    // `TrailMismatch`.
-    let foreign_trail = [0xAA; 16];
-    let ctx_b = crate::audit::RecordContext::new(foreign_trail, 3, 123, "f", [0x55; 32]);
-    let extra_b =
-        crate::audit::Record::new(ctx_b, crate::audit::Entry::new("actor", "change", "object"))
-            .unwrap();
-    let e4 = entry_rec(4, extra_b.hash());
-    let mmr_bextra = {
-        let mut m = mmr2.clone();
-        m.push(extra_b.hash()).unwrap();
-        m
-    };
-    let mmr4 = pushed(&mmr_bextra, &e4);
-    let cp5 = signed_cp(5, e4.hash(), &mmr4);
-    crate::audit::runs_v4a_fixtures::put_segment(&d.0, 1, &[&extra_b, &e4, &cp5], &[]);
-    let mmr5 = pushed(&mmr4, &cp5);
-    let cp6 = signed_cp(6, cp5.hash(), &mmr5);
-    let resume = resume_decl(&cp6, 5, cp5.hash(), 5);
-    write_records(&d.0, &[&cp6, &resume]);
-    let s1 = d.0.join("audit-20260101T000000.000000000Z_000001.jsonl");
-    let live = d.0.join("audit.jsonl");
+    let s1 = a
+        .dir_path
+        .join("audit-20260101T000000.000000000Z_000001.jsonl");
+    let live = a.dir_path.join("audit.jsonl");
+    let a1_digest = parse_digest(A1_DIGEST);
+    let run_detail = make_run_detail(&[(4, 3, 1)], &[], &a1_digest);
     let per_seg_detail = "expected first complete record to be a checkpoint".to_owned();
-    let trail_mismatch_detail = "expected trail 11111111111111111111111111111111, \
-         found aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        .to_owned();
     let resume_detail = "operator=operator reason=incident \
-         head=5:blake3:c3a1dc5dcd7d799f3d337332ae1c836378ef2948d549bd674ad51007023d0487 \
+         head=5:blake3:4181d394847e4274645a1b39a8366b0217c32abc5ab45e4dbee9f064c25361aa \
          gap=none lost_records=0 structural=valid"
         .to_owned();
-    let expected = vec![
+    let mixed_expected = vec![
         (
             K::SegmentStructure,
             Some(s1.clone()),
             Some(1),
-            Some(3),
+            Some(4),
             per_seg_detail,
             None,
         ),
         (
-            K::TrailMismatch,
+            K::SegmentStructure,
             Some(s1.clone()),
             Some(1),
-            Some(3),
-            trail_mismatch_detail,
-            None,
+            Some(4),
+            run_detail,
+            Some(digest_string(&a1_digest)),
         ),
         (
             K::SeqGap,
-            Some(s1),
-            Some(2),
+            Some(s1.clone()),
+            Some(1),
             Some(4),
             "missing seq 3..=3".to_owned(),
             None,
         ),
         (
+            K::DuplicateRecord,
+            Some(live.clone()),
+            Some(1),
+            Some(6),
+            "2 copies of 1 distinct records".to_owned(),
+            None,
+        ),
+        (
+            K::DuplicateRecord,
+            Some(live.clone()),
+            Some(2),
+            Some(7),
+            "2 copies of 1 distinct records".to_owned(),
+            None,
+        ),
+        (
             K::Resumed,
-            Some(live),
+            Some(live.clone()),
             Some(2),
             Some(7),
             resume_detail,
@@ -1199,12 +1200,26 @@ fn r12_foreign_trail_record_in_run_segment_empties_runs() {
         ),
     ];
     assert_eq!(
-        rows(&verify_dir(&d.0)),
-        expected,
-        "R12: foreign-trail record in a run segment → 0 run findings + literal \
-         TrailMismatch violation (ruling 13-V4-d8 point 3; 197-d1 addendum 28.2)",
+        rows(&verify_files([
+            a.dir_path.clone(),
+            shipped_mix_path.clone(),
+        ])),
+        mixed_expected,
+        "R11 (b): verify_files([native_dir, shipped_copy]) == expected literal \
+         (DuplicateRecord on the live file; the one run finding is the native's, \
+         at S1 with A1's digest; owner decision 13-V4-d7 / spike #224)",
     );
 }
+
+// R12 was removed: like R5, the only mutant it killed in practice
+// was M16. A foreign-trail record as the leading record of a
+// would-be run segment makes the classifier record a TrailMismatch
+// violation AND stops opening a run at that segment (the walker's
+// tolerant arm reclassifies the segment away from a run opener), so
+// dropping the violation-suppression rule (MS) still produces no
+// run. The trail check runs before any first-record lookup, which
+// is the equivalence argument for M13 (see the PR body); this
+// property is now documented, not pinned by a row.
 
 // ============================================================
 // R13 — agreement over A1, A3, A8, A9 and R5-R8: the set of run
@@ -1336,26 +1351,29 @@ fn r13_agreement_verifier_run_findings_equal_classify_output_runs() {
             .join("audit-20260101T000001.000000000Z_000000.jsonl"),
     )
     .unwrap();
+    // Split form: compare every run-bundle field between split and
+    // single-dir forms. Dropping the precondition `.len()` check --
+    // the field-wise equality itself is red on base (both sides are
+    // empty on base, so they trivially match there; but on a mutant
+    // that drops either side's run finding, the two literal lists
+    // diverge).
     let split_verify_runs: Vec<_> =
         rows(&verify_files([archive_dir.0.clone(), trail_dir.0.clone()]))
             .into_iter()
             .filter(|r| r.5.is_some())
-            .map(|r| (r.3, r.4, r.5))
+            .map(|r| (r.0, r.2, r.3, r.4, r.5))
             .collect();
     let full_verify_runs: Vec<_> = rows(&verify_dir(&full_dir_for_split))
         .into_iter()
         .filter(|r| r.5.is_some())
-        .map(|r| (r.3, r.4, r.5))
+        .map(|r| (r.0, r.2, r.3, r.4, r.5))
         .collect();
-    assert_eq!(
-        split_verify_runs.len(),
-        1,
-        "R13 split-form agreement precondition: one run finding",
-    );
     assert_eq!(
         split_verify_runs, full_verify_runs,
         "R13 split-form agreement: archive_dir + trail_dir == full_dir \
-         (ruling 13-V4-d8 point 2: one classify over the merged Collection)",
+         (ruling 13-V4-d8 point 2: one classify over the merged Collection); \
+         compares (kind, line, seq, detail, digest) -- file names differ by \
+         rotated basename between split and full forms",
     );
 }
 
@@ -1369,37 +1387,92 @@ fn r13_agreement_verifier_run_findings_equal_classify_output_runs() {
 #[test]
 fn r14_d9_a1_torn_live_tail_run_digest_unchanged() {
     let a = build_a1();
-    // Append a torn JSON fragment to the live closer. Ruling 13-V4-d9:
-    // this fragment lands in the closer segment (last_segment), so it
-    // is excluded from the run's spans and its run digest.
+    // Append a torn JSON fragment (6 bytes, no trailing newline) to
+    // the live closer. Ruling 13-V4-d9: this fragment lands in the
+    // closer segment (last_segment) and is excluded from the run's
+    // spans and its run digest.
     fs::OpenOptions::new()
         .append(true)
         .open(a.dir_path.join("audit.jsonl"))
         .unwrap()
         .write_all(b"{\"half")
         .unwrap();
-    let findings = verify_dir(&a.dir_path);
+    let s1 = a
+        .dir_path
+        .join("audit-20260101T000000.000000000Z_000001.jsonl");
+    let live = a.dir_path.join("audit.jsonl");
     let a1_digest = parse_digest(A1_DIGEST);
     // Detail: A1's one loss range, no span entries, A1's pinned digest.
     let run_detail = make_run_detail(&[(4, 3, 1)], &[], &a1_digest);
-    let run_rows: Vec<_> = rows(&findings)
-        .into_iter()
-        .filter(|r| r.5.is_some())
-        .collect();
-    assert_eq!(run_rows.len(), 1, "A1+torn: one run finding");
+    let per_seg_detail = "expected first complete record to be a checkpoint".to_owned();
+    let resume_detail = "operator=operator reason=incident \
+         head=5:blake3:4181d394847e4274645a1b39a8366b0217c32abc5ab45e4dbee9f064c25361aa \
+         gap=none lost_records=0 structural=valid"
+        .to_owned();
+    // The 6-byte `{"half` fragment hashes to this blake3 digest; a
+    // mutant that admits the fragment into the run's spans would
+    // make this digest appear in the run detail (flipping R14).
+    let torn_gap_detail = "trailing gap lines 3..=3 (6 bytes), \
+         digest blake3:d9a5b587318eff723676e5ae0e4f95bc2b2617255722fea8409d547b4cb020cc"
+        .to_owned();
+    let expected = vec![
+        (
+            K::SegmentStructure,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            per_seg_detail,
+            None,
+        ),
+        (
+            K::SegmentStructure,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            run_detail,
+            Some(digest_string(&a1_digest)),
+        ),
+        (
+            K::SeqGap,
+            Some(s1),
+            Some(1),
+            Some(4),
+            "missing seq 3..=3".to_owned(),
+            None,
+        ),
+        (
+            K::Resumed,
+            Some(live.clone()),
+            Some(2),
+            Some(7),
+            resume_detail,
+            None,
+        ),
+        (
+            K::UncoveredTail,
+            None,
+            None,
+            None,
+            "records seq 0..=7, no trusted coverage yet (signatures are checked in #13 V5)"
+                .to_owned(),
+            None,
+        ),
+        (
+            K::TornWrite,
+            Some(live),
+            Some(3),
+            None,
+            torn_gap_detail,
+            None,
+        ),
+    ];
     assert_eq!(
-        run_rows[0].4, run_detail,
-        "A1+torn: detail excludes closer span"
-    );
-    assert_eq!(
-        run_rows[0].5,
-        Some(digest_string(&a1_digest)),
-        "A1+torn: run digest unchanged (`79d8cb1c…`) per ruling 13-V4-d9",
-    );
-    // Belt-and-braces: no `span ` segment appears in the detail.
-    assert!(
-        !run_rows[0].4.contains("span "),
-        "A1+torn: detail must not carry any `span` entry (closer excluded)",
+        rows(&verify_dir(&a.dir_path)),
+        expected,
+        "R14 (ruling 13-V4-d9): A1+torn live emits one run finding with A1's \
+         pinned digest `79d8cb1c…` and NO `span` entry in the detail (closer \
+         fragment excluded); TornWrite records the torn trailing bytes with \
+         their own gap digest, distinct from A1's pinned run digest",
     );
 }
 
@@ -1425,35 +1498,148 @@ fn r15_d9_p01_closer_span_in_second_run_only() {
     fold.push(checkpoint.hash()).unwrap();
     fold.push(resume.hash()).unwrap();
     let _ = st_runs::close_run(&d, &resume, &fold);
-    let findings = Verifier::new(policy_trail())
-        .verify_dir(&d.0)
-        .unwrap()
-        .findings()
-        .to_vec();
-    let run_rows: Vec<_> = rows(&findings)
-        .into_iter()
-        .filter(|r| r.5.is_some())
-        .collect();
-    assert_eq!(run_rows.len(), 2, "p01: two run findings");
-    // Run 0's detail has no `span` entry (closer S2 excluded; S1
-    // carries no fragments → zero spans).
-    assert!(
-        !run_rows[0].4.contains("span "),
-        "p01 run 0: no span entry (ruling 13-V4-d9 excludes closer S2)",
+    let s1 = d.0.join("audit-20260101T000000.000000000Z_000001.jsonl");
+    let s2 = d.0.join("audit-20260101T000000.000000000Z_000002.jsonl");
+    let live = d.0.join("audit.jsonl");
+    // Run 1 lives over S1 only (closer S2 excluded per ruling
+    // 13-V4-d9), so it has no `span` entry; its single loss point
+    // is `seq 3 first 1 count 2` (missing seqs 1..=2 before `kept`).
+    let run1_digest =
+        parse_digest("blake3:704ee3cfabb1bc4a578dfa0f678084188f7ccb8fede0f6077d0c2a621a479656");
+    let run1_detail = make_run_detail(&[(3, 1, 2)], &[], &run1_digest);
+    // Run 2 lives over S2 only (its own first segment, closer is the
+    // live file). S2's trailing `broken\n` is a 7-byte span sitting
+    // after `resume.context.seq` (ruling 13-V4-d8 point 1).
+    let broken_span_digest =
+        parse_digest("blake3:8b09328c8766397df3eadace558cdd4ef653e8df4e7526bc3dce37e6dfd62116");
+    let run2_digest =
+        parse_digest("blake3:6bfc835246e5c5bed97d27e155faf709a50bf972f1ccdadcf6ea1545c0039b46");
+    let run2_detail = make_run_detail(
+        &[],
+        &[(0, Some(resume.context.seq), 7, broken_span_digest)],
+        &run2_digest,
     );
-    // Run 1 (index 1 here is the SECOND run; `engine::check`'s stable
-    // sort keeps run findings ordered). Its detail must carry exactly
-    // one `span seg 0 after <resume.seq> len 7` for S2's `broken\n`.
+    let per_seg_detail = "expected first complete record to be a checkpoint".to_owned();
+    // Pin the two `Resumed` details literally; both are deterministic
+    // from the fixture inputs. First `Resumed` cites `kept`'s hash;
+    // the second cites `resume`'s hash. Their `gap=` suffix carries
+    // the loss range `kept` opened (seqs 4..=6) and the final closer
+    // opened (seqs 9..=11).
+    let resume1_detail = "operator=operator reason=incident \
+         head=3:blake3:e8a61e83396580ddf71275b181d0fe95bb922083544ae6767d001cb35fdf2cd4 \
+         gap=4..=6 lost_records=0 structural=valid"
+        .to_owned();
+    let resume2_detail = "operator=operator reason=incident \
+         head=8:blake3:3fe635742eb540ce2a878ab83bdf08ac4b41667c8afb405e94f5810a5e05324a \
+         gap=9..=11 lost_records=0 structural=valid"
+        .to_owned();
+    let torn_gap_detail = "trailing gap lines 3..=3 (7 bytes), \
+         digest blake3:8b09328c8766397df3eadace558cdd4ef653e8df4e7526bc3dce37e6dfd62116"
+        .to_owned();
+    let expected = vec![
+        (
+            K::SegmentStructure,
+            Some(s1.clone()),
+            Some(1),
+            Some(3),
+            per_seg_detail,
+            None,
+        ),
+        (
+            K::SegmentStructure,
+            Some(s1.clone()),
+            Some(1),
+            Some(3),
+            run1_detail,
+            Some(digest_string(&run1_digest)),
+        ),
+        (
+            K::SeqGap,
+            Some(s1),
+            Some(1),
+            Some(3),
+            "missing seq 1..=2".to_owned(),
+            None,
+        ),
+        (
+            K::SegmentStructure,
+            Some(s2.clone()),
+            Some(1),
+            Some(7),
+            run2_detail,
+            Some(digest_string(&run2_digest)),
+        ),
+        (
+            K::SeqGap,
+            Some(s2.clone()),
+            Some(1),
+            Some(7),
+            "missing seq 4..=6".to_owned(),
+            None,
+        ),
+        (
+            K::Resumed,
+            Some(s2.clone()),
+            Some(2),
+            Some(8),
+            resume1_detail,
+            None,
+        ),
+        (
+            K::SeqGap,
+            Some(live.clone()),
+            Some(1),
+            Some(12),
+            "missing seq 9..=11".to_owned(),
+            None,
+        ),
+        (
+            K::Resumed,
+            Some(live),
+            Some(2),
+            Some(13),
+            resume2_detail,
+            None,
+        ),
+        (
+            K::UncoveredTail,
+            None,
+            None,
+            None,
+            "records seq 0..=13, no trusted coverage yet (signatures are checked in #13 V5)"
+                .to_owned(),
+            None,
+        ),
+        (
+            K::TornWrite,
+            Some(s2.clone()),
+            Some(3),
+            None,
+            torn_gap_detail,
+            None,
+        ),
+        (
+            K::Unparsable,
+            Some(s2),
+            Some(3),
+            None,
+            "CorruptTrail: Unparsable: invalid audit v1 OTLP line".to_owned(),
+            None,
+        ),
+    ];
     assert_eq!(
-        run_rows[1].4.matches("span ").count(),
-        1,
-        "p01 run 2: exactly one span (S2's trailing `broken\\n`)",
-    );
-    let expected_fragment = format!("span seg 0 after {} len 7 ", resume.context.seq);
-    assert!(
-        run_rows[1].4.contains(&expected_fragment),
-        "p01 run 2: detail carries `{expected_fragment}…`; got `{}`",
-        run_rows[1].4,
+        rows(
+            Verifier::new(policy_trail())
+                .verify_dir(&d.0)
+                .unwrap()
+                .findings(),
+        ),
+        expected,
+        "R15 (ruling 13-V4-d9) p01 full literal finding list: run 1 at S1 \
+         with NO `span` entry (closer S2 excluded); run 2 at S2 with exactly \
+         one `span seg 0 after {} len 7` for S2's trailing `broken\\n`; \
+         run 1 and run 2 digests pinned literally",
+        resume.context.seq,
     );
 }
 
@@ -1659,12 +1845,25 @@ fn r17_m10_a8_as_archive_torn_closer_run_finding_unchanged() {
 }
 
 // ============================================================
-// R18 / R19 — M11 killers (every `is_live` forced `false`). M11
-// perturbs only layouts with a native live file; each killer is a
-// trail whose live file carries a torn tail that prevents the
-// closer from firing. At head: zero run findings. Under M11 the
-// live becomes sealed, the walker accepts its closer, and the
-// count flips to one run finding.
+// R18 / R19 — regression rows for M11 and MS. Each row's main
+// assertion ("zero run findings" on an A1/A3 layout plus a torn
+// tail appended to the live file) is already true on base, since
+// on base there is no V4a code and no run findings exist for any
+// layout. The regression is against the V4a code at head, where
+// two distinct mutants flip the row:
+//   * M11 (every `is_live` forced `false`): the live tuple is
+//     treated as sealed, the walker accepts its closer, and one
+//     run finding is emitted; the literal row count flips.
+//   * MS (drop the "any violation empties `runs`" rule in
+//     `runs::classify`): torn tail on the live closer fires
+//     `Violation::InvalidLineOrOpeningCheckpoint` on segment 2 at
+//     head and the walker still classifies Base/InRun/Closer; the
+//     suppression rule is the only reason `runs` is empty here,
+//     so MS flips the row to one run finding.
+// Head behaviour: torn tail on the live file prevents the closer
+// from firing (the walker's violation suppresses `runs`), so zero
+// run findings are emitted. Each row is therefore a measured
+// killer for both M11 and MS (exit 101).
 // ============================================================
 
 #[test]
