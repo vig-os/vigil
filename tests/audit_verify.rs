@@ -237,6 +237,7 @@ fn reversed_shipped_files_and_batches_have_same_findings_and_physical_lines() {
 struct Written {
     dir: PathBuf,
     trail: PathBuf,
+    trail_id: [u8; 16],
     key: PathBuf,
     trust: TrustPolicy,
     seqs: Vec<u64>,
@@ -278,6 +279,7 @@ impl Written {
         Self {
             dir,
             trail: trail_dir,
+            trail_id,
             key,
             trust,
             seqs,
@@ -437,14 +439,22 @@ fn honest_crash_writer_attests_gap_and_mutating_a_byte_turns_it_into_repair_mism
         .unwrap();
     drop(reopened);
     let report = verify(&fx.trail, &fx.trust).unwrap();
-    let tw = kinds(&report, K::TornWrite);
-    assert_eq!(tw.len(), 1, "{:?}", report.findings());
+    // Ruling 13-V5-d1 point 6: with the writer's key trusted and the
+    // attesting record at or below `covered_through`, the attested
+    // gap is `TornWriteRepaired` (info), not `TornWrite` (warning).
+    let twr = kinds(&report, K::TornWriteRepaired);
+    assert_eq!(twr.len(), 1, "{:?}", report.findings());
+    assert!(kinds(&report, K::TornWrite).is_empty());
     assert!(kinds(&report, K::RepairMismatch).is_empty());
-    assert!(kinds(&report, K::TornWriteRepaired).is_empty());
+    assert!(
+        report.covered_through().is_some_and(|c| c >= resumed.seq()),
+        "attesting record must be covered: {:?}",
+        report.covered_through(),
+    );
     // The attested gap points at the gap line itself and names its exact byte
     // length (#193 / 191-d1 tightening: previously only `"bytes)"` was checked).
-    assert_eq!(tw[0].line(), Some(4));
-    let d = tw[0].detail();
+    assert_eq!(twr[0].line(), Some(4));
+    let d = twr[0].detail();
     assert!(d.contains("lines 4..=4"), "{d}");
     assert!(d.contains(&format!("({gap_bytes} bytes)")), "{d}");
     assert!(
@@ -452,6 +462,7 @@ fn honest_crash_writer_attests_gap_and_mutating_a_byte_turns_it_into_repair_mism
         "{d}"
     );
     // Now flip one gap byte and re-verify: attestation no longer matches.
+    // `RepairMismatch` is never promoted even under coverage.
     let mut mutated = fs::read(fx.live()).unwrap();
     mutated[cut - 1] ^= 1; // flip a bit inside the torn fragment
     fx.write(&mutated);
@@ -460,6 +471,11 @@ fn honest_crash_writer_attests_gap_and_mutating_a_byte_turns_it_into_repair_mism
         kinds(&report, K::TornWrite).is_empty(),
         "{:?}",
         report.findings()
+    );
+    assert!(
+        kinds(&report, K::TornWriteRepaired).is_empty(),
+        "{:?}",
+        report.findings(),
     );
     let rm = kinds(&report, K::RepairMismatch);
     assert_eq!(rm.len(), 1);
@@ -603,21 +619,39 @@ fn hash_mismatch_carries_seq_and_sorts_before_seqless_findings() {
     assert!(hash_pos < unp_pos, "ordering: {order:?}");
 }
 
-/// V3b-1: uncovered tail (addendum 7).
+/// Clean writer trail with trusted key covers every record: no
+/// `UncoveredTail`, strict valid (ruling 13-V5-d1 point 6). Pairs
+/// with [`unlisted_writer_key_leaves_full_uncovered_tail`].
 #[test]
-fn clean_writer_trail_emits_uncovered_tail_and_strict_is_false() {
+fn clean_writer_trail_with_trusted_key_is_strict_valid() {
     let fx = Written::new(2);
     let report = verify(&fx.trail, &fx.trust).unwrap();
     assert!(report.is_valid(), "{:?}", report.findings());
-    assert!(!report.is_strict_valid());
+    assert!(
+        kinds(&report, K::UncoveredTail).is_empty(),
+        "{:?}",
+        report.findings(),
+    );
+    assert_eq!(report.covered_through(), fx.seqs.last().copied());
+    assert!(report.is_strict_valid(), "{:?}", report.findings());
+}
+
+/// The same writer trail verified under a trust policy that does not
+/// list the writer's key: `covered_through` is `None` and the single
+/// `UncoveredTail` spans every verified `seq` (ruling 13-V5-d1 points 3
+/// and 6).
+#[test]
+fn unlisted_writer_key_leaves_full_uncovered_tail() {
+    let fx = Written::new(2);
+    let trust = TrustPolicy::builder().trail(fx.trail_id).build().unwrap();
+    let report = verify(&fx.trail, &trust).unwrap();
+    assert_eq!(report.covered_through(), None);
     let tails = kinds(&report, K::UncoveredTail);
     assert_eq!(tails.len(), 1, "{:?}", report.findings());
-    assert!(tails[0].detail().contains("records seq"));
-    assert!(
-        tails[0]
-            .detail()
-            .contains("signatures are checked in #13 V5")
-    );
+    let first = report.first_seq().unwrap();
+    let last = report.last_seq().unwrap();
+    assert_eq!(tails[0].detail(), format!("records seq {first}..={last}"));
+    assert!(!report.is_strict_valid());
 }
 
 #[test]
@@ -650,8 +684,11 @@ fn consecutive_crashes_from_honest_writer_give_one_gap_no_unparsable() {
         .unwrap();
     drop(reopened);
     let report = verify(&fx.trail, &fx.trust).unwrap();
-    let tw = kinds(&report, K::TornWrite);
-    assert_eq!(tw.len(), 1, "{:?}", report.findings());
+    // Coverage promotes the attested gap to `TornWriteRepaired`
+    // (ruling 13-V5-d1 point 6): one info finding, no `TornWrite`.
+    let twr = kinds(&report, K::TornWriteRepaired);
+    assert_eq!(twr.len(), 1, "{:?}", report.findings());
+    assert!(kinds(&report, K::TornWrite).is_empty());
     // No Unparsable "fragment line failed context": the run links.
     for u in kinds(&report, K::Unparsable) {
         assert!(

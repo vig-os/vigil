@@ -13,8 +13,8 @@
 //! a checkpoint can carry both; neither suppresses the other. "Trusted"
 //! per ruling 13-V5-d1 point 3 requires both to hold.
 //!
-//! Revocation pin consistency, `end=`, coverage and `max_age` belong to
-//! later work in #13.
+//! Revocation pin consistency, `end=` and `max_age` belong to later
+//! work in #13.
 
 use super::{Finding, input::Summary};
 use crate::audit::{FindingKind as K, TrustPolicy, hex, verify_signature};
@@ -24,15 +24,9 @@ use std::path::Path;
 /// `verify_strict` over its signing message AND whose key is trusted at
 /// its `seq` on `trail` (ruling 13-V5-d1 point 3).
 ///
-/// Crate-private so later `#13 V5` work (coverage, revocation, `end=` and
+/// Crate-private so later `#13 V5` work (revocation, `end=` and
 /// `max_age`) reuses the same predicate rather than copying its logic.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by coverage, revocation, end= and max_age in #13 V5b-V5e"
-    )
-)]
+/// `#13 V5b` consumes it for coverage (ruling 13-V5-d1 point 6).
 pub(crate) fn trusted(trail: [u8; 16], trust: &TrustPolicy, record: &Summary) -> bool {
     let Some(cp) = record.checkpoint.as_ref() else {
         return false;

@@ -1,6 +1,11 @@
-//! Collecting chain and gap checks (ruling 13-V3-d3). Native spans are
-//! reported pessimistically; V5 promotes a covered `TornWrite` to
-//! `TornWriteRepaired` when trusted coverage lands.
+//! Collecting chain and gap checks (ruling 13-V3-d3). A native gap
+//! attested by a record whose `seq <= covered_through` is reported as
+//! `TornWriteRepaired`, but only when that attesting record is itself a
+//! record of the verified trail AND its `seq` carries no `SeqConflict`
+//! (it is the only distinct hash at that `seq`); otherwise it stays
+//! `TornWrite` (rulings 13-V5-d1 point 6 and 13-V5-d2). A byte-
+//! identical copy at the attester's `seq` is `DuplicateRecord`, not a
+//! fork, and does not block promotion.
 //!
 //! Fragment context: a fragment run (consecutive `Fragment` lines) that fails
 //! condition 3 (ruling 13-V3-d4, addendum 10) yields `Unparsable` "fragment
@@ -74,8 +79,21 @@ fn failed_fragment_lines(input: &Input) -> BTreeSet<u64> {
     failed
 }
 
-/// Pessimistic gap and shipped-fragment findings (ruling 13-V3-d3).
-fn file_findings(input: &Input, no_crash: bool, findings: &mut Vec<Finding>) {
+/// Pessimistic gap and shipped-fragment findings (ruling 13-V3-d3,
+/// 13-V5-d1 point 6 and 13-V5-d2): an attested gap is promoted to
+/// `TornWriteRepaired` only when all of (a) the attesting record is a
+/// record of the verified `trail`, (b) its `seq <= covered_through`,
+/// and (c) its `seq` has no other record (not one side of a
+/// `SeqConflict` fork) hold. A trailing gap with no attesting record
+/// and `RepairMismatch` are never promoted.
+fn file_findings(
+    input: &Input,
+    no_crash: bool,
+    covered_through: Option<u64>,
+    trail: [u8; 16],
+    conflicting_seqs: &BTreeSet<u64>,
+    findings: &mut Vec<Finding>,
+) {
     let data = &input.data;
     let path = input.path.as_path();
     let mut spans = data.spans.iter();
@@ -131,7 +149,20 @@ fn file_findings(input: &Input, no_crash: bool, findings: &mut Vec<Finding>) {
                     s.len, r.line, r.seq
                 );
                 let (kind, detail) = if r.repaired == Some(s.digest) {
-                    (K::TornWrite, at)
+                    // Ruling 13-V5-d2: a covered checkpoint protects
+                    // the records of the verified trail at or below
+                    // its `seq` through the hash chain. Promote only
+                    // when the attester is a record of the verified
+                    // trail AND the only record at its `seq`.
+                    let covered = covered_through.is_some_and(|c| r.seq <= c)
+                        && r.trail == trail
+                        && !conflicting_seqs.contains(&r.seq);
+                    let kind = if covered {
+                        K::TornWriteRepaired
+                    } else {
+                        K::TornWrite
+                    };
+                    (kind, at)
                 } else {
                     let got = r
                         .repaired
@@ -307,26 +338,8 @@ fn emit_resumed(declarations: &[resume::Declaration<'_>], findings: &mut Vec<Fin
 pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy) -> Report {
     let mut findings = Vec::new();
     let mut groups: BTreeMap<u64, Vec<Located<'_>>> = BTreeMap::new();
-    for (idx, input) in collection.inputs.iter().enumerate() {
-        let no_crash = mark_no_crash(&collection, idx);
-        file_findings(input, no_crash, &mut findings);
-        if input.native
-            && input
-                .data
-                .records
-                .first()
-                .is_none_or(|r| r.checkpoint.is_none())
-        {
-            let first = input.data.records.first();
-            findings.push(finding(
-                K::SegmentStructure,
-                &input.path,
-                first.map(|r| r.line),
-                first.map(|r| r.seq),
-                "expected first complete record to be a checkpoint".into(),
-            ));
-        }
-    }
+    // Bucket records by seq first so coverage (ruling 13-V5-d1 point 6)
+    // is known before the gap pass can promote an attested torn write.
     let native = collection
         .inputs
         .iter()
@@ -351,6 +364,49 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy
             ));
         } else {
             groups.entry(record.seq).or_default().push((path, record));
+        }
+    }
+    // Ruling 13-V5-d1 point 6: `covered_through` is the highest `seq`
+    // of a candidate (every distinct `(seq, hash)` checkpoint, native
+    // or shipped-only) for which the crate-private predicate holds.
+    let covered_through = coverage(&groups, trail, trust);
+    // Ruling 13-V5-d2: a `SeqConflict` fork blocks promotion at its
+    // `seq` -- the attester must be the only record on the verified
+    // trail at that `seq`. One definition of "forked" (the shared
+    // `forked` helper): both this pre-pass (so `file_findings` can
+    // consult it ahead of the main seq-loop) and the `SeqConflict`
+    // emission inside the main seq-loop read it from the same set,
+    // so a byte-identical duplicate (same hash across copies) is
+    // `DuplicateRecord`, never a fork.
+    let conflicting_seqs: BTreeSet<u64> = groups
+        .iter()
+        .filter_map(|(&seq, copies)| forked(copies).then_some(seq))
+        .collect();
+    for (idx, input) in collection.inputs.iter().enumerate() {
+        let no_crash = mark_no_crash(&collection, idx);
+        file_findings(
+            input,
+            no_crash,
+            covered_through,
+            trail,
+            &conflicting_seqs,
+            &mut findings,
+        );
+        if input.native
+            && input
+                .data
+                .records
+                .first()
+                .is_none_or(|r| r.checkpoint.is_none())
+        {
+            let first = input.data.records.first();
+            findings.push(finding(
+                K::SegmentStructure,
+                &input.path,
+                first.map(|r| r.line),
+                first.map(|r| r.seq),
+                "expected first complete record to be a checkpoint".into(),
+            ));
         }
     }
     let mut count = 0;
@@ -384,7 +440,7 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy
                 ),
             ));
         }
-        if candidates.len() > 1 {
+        if conflicting_seqs.contains(&seq) {
             findings.push(finding(
                 K::SeqConflict,
                 path,
@@ -498,16 +554,19 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy
     let _ = &pending_resumes;
     let first_seq = groups.first_key_value().map(|(&s, _)| s);
     let last_seq = groups.last_key_value().map(|(&s, _)| s);
-    if let (Some(first), Some(last)) = (first_seq, last_seq) {
+    // Ruling 13-V5-d1 point 6: list records above `covered_through`
+    // (or every record when no checkpoint is trusted). When the last
+    // record is itself covered, no `UncoveredTail` is emitted.
+    if let (Some(first), Some(last)) = (first_seq, last_seq)
+        && covered_through.is_none_or(|c| last > c)
+    {
+        let a = covered_through.map_or(first, |c| c + 1);
         findings.push(Finding::new(
             K::UncoveredTail,
             None,
             None,
             None,
-            format!(
-                "records seq {first}..={last}, no trusted coverage yet \
-                 (signatures are checked in #13 V5)"
-            ),
+            format!("records seq {a}..={last}"),
         ));
     }
     findings.sort_by_key(|f| {
@@ -519,7 +578,39 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy
             format!("{:?}", f.kind()),
         )
     });
-    Report::new(trail, count, first_seq, last_seq, None, findings)
+    Report::new(trail, count, first_seq, last_seq, covered_through, findings)
+}
+
+/// Shared fork predicate (ruling 13-V5-d2): `true` iff the records at
+/// one `seq` on the verified trail carry two or more DISTINCT hashes
+/// (not merely two or more copies). One definition for both the pre-
+/// pass `conflicting_seqs` set (which blocks `TornWriteRepaired`
+/// promotion) and the main seq-loop's `SeqConflict` emission, so a
+/// byte-identical duplicate stays `DuplicateRecord` in both places.
+fn forked(copies: &[Located<'_>]) -> bool {
+    let hashes: BTreeSet<[u8; 32]> = copies.iter().map(|(_, r)| r.hash).collect();
+    hashes.len() > 1
+}
+
+/// Highest `seq` whose candidate `(seq, hash)` checkpoint satisfies the
+/// crate-private trusted predicate ([`signatures::trusted`]), or `None`
+/// when no candidate does (ruling 13-V5-d1 points 1, 3 and 6). Native
+/// and shipped-only candidates count equally; a conflict's trusted
+/// candidate covers its `seq`.
+fn coverage(
+    groups: &BTreeMap<u64, Vec<Located<'_>>>,
+    trail: [u8; 16],
+    trust: &TrustPolicy,
+) -> Option<u64> {
+    groups
+        .iter()
+        .rev()
+        .find(|(_, copies)| {
+            copies
+                .iter()
+                .any(|(_, r)| signatures::trusted(trail, trust, r))
+        })
+        .map(|(&s, _)| s)
 }
 
 /// #13 V4b (ruling 13-V4-d10 point 4): fail-closed candidate filter.

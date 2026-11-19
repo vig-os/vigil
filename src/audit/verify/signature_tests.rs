@@ -95,11 +95,9 @@ const A3_RUN_DIGEST_BYTES: [u8; 32] = [
 ];
 
 /// `UncoveredTail` detail for a `first..=last` range (ADR-0005 l.400-407;
-/// the placeholder text is V5a-authoritative and replaced by V5b).
+/// ruling 13-V5-d1 point 6).
 fn uncovered_tail(first: u64, last: u64) -> String {
-    format!(
-        "records seq {first}..={last}, no trusted coverage yet (signatures are checked in #13 V5)"
-    )
+    format!("records seq {first}..={last}")
 }
 
 /// `Resumed` detail (ruling 13-V3-d5; same reason+gap shape for every
@@ -265,7 +263,7 @@ fn a1_listed_key_flipped_signature_is_bad_signature_at_cp2() {
             2,
             format!("key {FIXTURE_KEY_HEX}"),
         ),
-        uncovered(0, 2),
+        uncovered(1, 2),
     ];
     assert_findings(&findings, &expected, "A1");
 }
@@ -294,7 +292,7 @@ fn a2_unlisted_key_valid_signature_is_untrusted_not_listed() {
             2,
             format!("key {ALT_KEY_HEX} not listed for trail {TRAIL_HEX}"),
         ),
-        uncovered(0, 2),
+        uncovered(1, 2),
     ];
     assert_findings(&findings, &expected, "A2");
 }
@@ -321,7 +319,7 @@ fn a3_bound_key_cp2_above_bound_is_untrusted_bounded() {
             2,
             format!("key {FIXTURE_KEY_HEX} bounded through seq 0"),
         ),
-        uncovered(0, 2),
+        uncovered(1, 2),
     ];
     assert_findings(&findings, &expected, "A3");
 }
@@ -361,7 +359,7 @@ fn a4_small_order_key_is_bad_signature_under_strict() {
             2,
             format!("key {IDENTITY_KEY_HEX}"),
         ),
-        uncovered(0, 2),
+        uncovered(1, 2),
     ];
     assert_findings(&findings, &expected, "A4");
 }
@@ -433,7 +431,7 @@ fn a5_non_canonical_signature_is_bad_signature() {
             2,
             format!("key {FIXTURE_KEY_HEX}"),
         ),
-        uncovered(0, 2),
+        uncovered(1, 2),
     ];
     assert_findings(&findings, &expected, "A5");
 }
@@ -470,7 +468,7 @@ fn a6_unlisted_key_with_flipped_signature_emits_both() {
             2,
             format!("key {ALT_KEY_HEX} not listed for trail {TRAIL_HEX}"),
         ),
-        uncovered(0, 2),
+        uncovered(1, 2),
     ];
     assert_findings(&findings, &expected, "A6");
 }
@@ -507,7 +505,7 @@ fn a6b_bounded_key_with_flipped_signature_emits_both() {
             2,
             format!("key {FIXTURE_KEY_HEX} bounded through seq 0"),
         ),
-        uncovered(0, 2),
+        uncovered(1, 2),
     ];
     assert_findings(&findings, &expected, "A6b");
 }
@@ -718,7 +716,7 @@ fn a9_in_run_bad_signature_reports_without_changing_run_findings() {
             7,
             resume_detail(5, CP5_A9_BAD_DIGEST, "none"),
         ),
-        uncovered(0, 7),
+        uncovered(7, 7),
     ];
     assert_findings(&findings, &expected, "A9");
 }
@@ -806,7 +804,7 @@ fn a10_in_run_bad_signature_on_a3_style_closing_checkpoint() {
             11,
             resume_detail(8, CP8_A10_BAD_DIGEST, "9..=9"),
         ),
-        uncovered(0, 11),
+        uncovered(11, 11),
     ];
     assert_findings(&findings, &expected, "A10");
 }
@@ -865,7 +863,6 @@ fn f1_fork_flipped_reports_bad_signature_at_shipped_path() {
             2,
             format!("key {FIXTURE_KEY_HEX}"),
         ),
-        uncovered(0, 2),
     ];
     assert_findings(&findings, &expected, "F1");
 }
@@ -917,7 +914,6 @@ fn f2_fork_unlisted_reports_untrusted_at_shipped_path() {
             2,
             format!("key {ALT_KEY_HEX} not listed for trail {TRAIL_HEX}"),
         ),
-        uncovered(0, 2),
     ];
     assert_findings(&findings, &expected, "F2");
 }
@@ -977,7 +973,7 @@ fn r1_byte_identical_native_and_shipped_yields_one_bad_signature() {
             2,
             "2 copies of 1 distinct records".to_owned(),
         ),
-        uncovered(0, 2),
+        uncovered(1, 2),
     ];
     assert_findings(&findings, &expected, "R1");
 }
@@ -1033,7 +1029,7 @@ fn r1b_triplicate_copies_yield_one_bad_signature() {
             2,
             "3 copies of 1 distinct records".to_owned(),
         ),
-        uncovered(0, 2),
+        uncovered(1, 2),
     ];
     assert_findings(&findings, &expected, "R1b");
 }
@@ -1091,7 +1087,7 @@ fn r2_honest_bounded_at_head_has_no_signature_findings_and_head_is_trusted() {
             7,
             resume_detail(5, CP5_A1_DIGEST, "none"),
         ),
-        uncovered(0, 7),
+        uncovered(7, 7),
     ];
     assert_findings(&findings, &expected, "R2");
     // Predicate M2: cp6 at exactly `through=` must be trusted. Separate

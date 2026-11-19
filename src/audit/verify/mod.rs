@@ -152,7 +152,12 @@ impl Report {
     pub fn last_seq(&self) -> Option<u64> {
         self.last_seq
     }
-    /// Returns the highest sequence covered by a checkpoint signed with a trusted key.
+    /// Returns the highest `seq` of a trusted checkpoint (ruling
+    /// 13-V5-d1 point 6): one whose signature verifies under
+    /// `verify_strict` AND whose key is trusted at that `seq`. Coverage
+    /// is inclusive, so this `seq` is itself covered; `None` means no
+    /// candidate was trusted. Every record above this value (or every
+    /// record when `None`) is reported as `UncoveredTail`.
     pub fn covered_through(&self) -> Option<u64> {
         self.covered_through
     }
@@ -228,6 +233,8 @@ fn severity(kind: FindingKind) -> Severity {
 }
 
 #[cfg(test)]
+mod coverage_tests;
+#[cfg(test)]
 mod mod_tests;
 #[cfg(test)]
 mod rule2_tests;
@@ -239,8 +246,7 @@ mod runs_tests;
 /// **Incomplete (#13):** V3b-1 adds fragment-run context (condition 3 per
 /// run), the "no crash outcome" mark on a trailing `TornWrite`, a plain
 /// `Resumed` warning for every `vigil.audit.resume` record (once per
-/// `(seq, hash)`, attributed to the native copy when present), an
-/// `UncoveredTail` info spanning every record until V5 trusts a checkpoint,
+/// `(seq, hash)`, attributed to the native copy when present),
 /// and the `is_strict_valid` / `first_broken_link` predicates. V3b-2 adds
 /// structural resume validation per ruling 13-V3-d5 (rules 1 and 3): every
 /// parseable `Resumed` detail ends with exactly one suffix,
@@ -253,13 +259,17 @@ mod runs_tests;
 /// detail and gets no suffix. The genesis gap text is `gap=0..=<L>`
 /// (ADR l.407), never `none`. An archived head is indistinguishable from
 /// a deleted one and resolves to `head-not-present`; a start checkpoint
-/// covering an archived head is V6's. V4–V8/R10 supply folds, signatures,
-/// coverage, anchors, receipts, review and archive rules. Native gaps are
-/// reported, never excused, until
-/// V5 supplies trusted coverage: a matching `audit.repaired` is a
-/// `TornWrite`, a missing or different one is `RepairMismatch`, and a
-/// trailing gap is `TornWrite` with the bytes-to-EOF digest. V5 then promotes
-/// a covered `TornWrite` to `TornWriteRepaired`. A line that classifies as a
+/// covering an archived head is V6's. V5b trusts checkpoints (ruling
+/// 13-V5-d1 point 6): `covered_through` is the highest `seq` of a
+/// trusted candidate, `UncoveredTail` lists exactly the records above
+/// it, and an attested native gap is `TornWriteRepaired` only when the
+/// attester is a record of the verified trail whose `seq` has no
+/// `SeqConflict` (ruling 13-V5-d2); otherwise it stays `TornWrite`.
+/// V4/V5c-e/V6-V8/R10 supply folds, revocation,
+/// `end=`, `max_age`, anchors, receipts, review and archive rules.
+/// A matching `audit.repaired` outside coverage is a `TornWrite`, a
+/// missing or different one is `RepairMismatch`, and a trailing gap is
+/// `TornWrite` with the bytes-to-EOF digest. A line that classifies as a
 /// `Fragment` whose enclosing run cannot link to the next complete record
 /// (file-start run, non-`Records` line after, or a mismatched `previous`)
 /// becomes `Unparsable` per line; the gap bytes, lengths and digests stay

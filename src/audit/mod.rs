@@ -189,7 +189,18 @@ pub enum FindingKind {
     RepairMismatch,
     /// Error: A review does not match its record, gap or run digest.
     AcceptMismatch,
-    /// Warning: A fragment gap is trailing or not yet covered by a trusted checkpoint.
+    /// Warning: A fragment gap whose attesting record is not a record
+    /// of the verified trail, is at a `seq` carrying a `SeqConflict`
+    /// (one side of a fork), or has `seq > covered_through`; or a
+    /// trailing gap with no attesting record at all. Promotion to
+    /// `TornWriteRepaired` requires an attester of the verified trail
+    /// whose `seq` has no `SeqConflict` and is at or below
+    /// `covered_through` (rulings 13-V5-d1 point 6 and 13-V5-d2).
+    /// Detail grammar: either
+    /// `lines {first}..={last} ({N} bytes), attested at line {L} seq {S}`
+    /// for an attested-but-uncovered gap, or
+    /// `trailing gap lines {first}..={last} ({N} bytes), digest {D}`
+    /// with an optional `; no crash outcome` suffix for a trailing gap.
     TornWrite,
     /// Warning: An operator resumed the trail after a loss.
     Resumed,
@@ -197,7 +208,14 @@ pub enum FindingKind {
     ClockWentBackwards,
     /// Warning: The same record appears more than once.
     DuplicateRecord,
-    /// Info: Records follow the last trusted checkpoint.
+    /// Info: Records follow the last trusted checkpoint (ruling
+    /// 13-V5-d1 point 6). Coverage is inclusive: a single
+    /// `UncoveredTail` names exactly the records strictly above
+    /// `covered_through`, or every record when no checkpoint is
+    /// trusted. Detail grammar: `records seq {a}..={last}`, where
+    /// `a = covered_through + 1`, or the first verified `seq` when
+    /// `covered_through` is `None`. The last record being itself
+    /// covered yields no `UncoveredTail`.
     UncoveredTail,
     /// Info: An input lies outside anchored verification bounds.
     OutOfRange,
@@ -205,7 +223,14 @@ pub enum FindingKind {
     Unreconciled,
     /// Info: An operator waived a receipt or supplied a receipt prefix.
     ReceiptWaived,
-    /// Info: A fragment gap is attested and covered.
+    /// Info: A fragment gap attested by a record of the verified
+    /// trail at or below `covered_through`, with no other record at
+    /// its `seq` (rulings 13-V5-d1 point 6 and 13-V5-d2). Detail
+    /// grammar is the same as `TornWrite`'s attested form:
+    /// `lines {first}..={last} ({N} bytes), attested at line {L} seq {S}`.
+    /// A fragment is reported by length and digest, never by text. A
+    /// native or shipped `audit.repaired` record with no preceding
+    /// fragment carries the `fragment not present` detail.
     TornWriteRepaired,
     /// Info: A reviewer accepted a warning or a run finding.
     Accepted,
