@@ -2,22 +2,26 @@
 //! crate-private `trusted` predicate (ADR-0005 decisions 8 and 9,
 //! ruling 13-V5-d1 points 1-3).
 //!
-//! Row standard (vigil repo's traps): every acceptance row asserts the
-//! FULL sorted literal finding list as literal values -- every kind,
-//! file, line, seq and detail, including the existing ones such as
-//! `UncoveredTail`, `SeqConflict`, `DuplicateRecord`, run-fold findings
-//! (`SegmentStructure` with `run_digest`), `SeqGap`, and `Resumed`. The
-//! comparison helper `assert_rows` is the only way a row asserts on
-//! findings in this file. Regression rows (R2) are labelled in their
-//! doc comments; predicate tests (A4b, A8b and the direct predicate
-//! rows) are labelled as predicate tests -- they cannot even compile
-//! on base, so they are not acceptance rows.
+//! Row standard (repo-wide): every acceptance row asserts the FULL
+//! sorted literal finding list, compared as whole [`Finding`] values
+//! (every field: kind, file, line, seq, detail, `accepted_kind`,
+//! `run_digest`). The comparison helper [`assert_findings`] is a thin
+//! wrapper around `assert_eq!` on `Vec<Finding>` so a drift in the
+//! dropped-field mutant (for example a run finding losing its
+//! `run_digest`) reddens the row. Regression rows (R2) are labelled
+//! in their doc comments; predicate tests (A4b, A8b, Y1b and the two
+//! `trusted_predicate_...` rows) are labelled as predicate tests.
 //!
 //! Every signed checkpoint carries the shared fixture key `0x27`; its
 //! public key is spelled out literally as [`FIXTURE_KEY_HEX`] so a drift
 //! in the captured bytes fails the row assertion. Keys for crafted
 //! unlisted / small-order / bounded-only scenarios appear in
-//! [`ALT_KEY_HEX`] and [`IDENTITY_KEY_HEX`].
+//! [`ALT_KEY_HEX`] and [`IDENTITY_KEY_HEX`]. Every record-hash digest
+//! that lands in an expected `Finding::detail` is a written-out hex
+//! constant ([`CP2_HONEST_DIGEST`] ...), never computed from the fixture
+//! or from the code under test. A companion test
+//! [`fixture_hashes_match_literals`] pins each literal to the record
+//! the fixtures produce.
 
 use super::{check, trusted};
 use crate::audit::{
@@ -31,9 +35,7 @@ use crate::audit::{
     },
     verify::{Finding, Verifier, input},
 };
-use std::path::{Path, PathBuf};
-
-type Row = (K, Option<PathBuf>, Option<u64>, Option<u64>, String);
+use std::path::PathBuf;
 
 // =====================================================================
 // Literal hex constants (every row's detail uses these directly).
@@ -52,6 +54,46 @@ const IDENTITY_KEY_HEX: &str = "010000000000000000000000000000000000000000000000
 /// Hex of `runs_v4a_fixtures::TRAIL` = `[17; 16]`.
 const TRAIL_HEX: &str = "11111111111111111111111111111111";
 
+/// Record hash (`blake3:<hex>`) of the honest cp2 the shared `two_checkpoints`
+/// / fork fixtures produce (seq=2, `previous=e1.hash()`, fixture-key signed
+/// at honest fold `mmr1`). Appears in F1 and F2's `SeqConflict` detail.
+const CP2_HONEST_DIGEST: &str =
+    "blake3:4164966a12a675e55eb6e133b9e50313907f164fe142d941447defcdfdb25d06";
+/// Record hash of the flipped-signature cp2 that F1 ships beside the honest
+/// one (one byte of the honest signature XORed with `0x01`).
+const CP2_FLIPPED_DIGEST: &str =
+    "blake3:6cd338542f05123f02d86b51c67a880924320e64ef06f9fc1c7aed0ae7c5925d";
+/// Record hash of F2's shipped cp2 copy, validly signed by unlisted key
+/// `0x55` over the same honest fold.
+const CP2_UNLISTED_DIGEST: &str =
+    "blake3:8f71deebb1a2b11df8703bc9210730f478d3f5f0688e042b9469a5bf4eaaba33";
+/// Record hash of the honest cp5 opening checkpoint in `runs_v4a_fixtures::build_a1`.
+/// Appears in R2's `Resumed` detail (`head=5:<this>`).
+const CP5_A1_DIGEST: &str =
+    "blake3:4181d394847e4274645a1b39a8366b0217c32abc5ab45e4dbee9f064c25361aa";
+/// Record hash of A9's cp5 after flipping its signature (sealed-run opening
+/// cp5 under A1-style layout). Appears in A9's `Resumed` detail.
+const CP5_A9_BAD_DIGEST: &str =
+    "blake3:5aaa6866c59ceff7c8150206e7c244e5ae23af426a531b937ec8469cdf2e96cd";
+/// Record hash of A10's cp8 after flipping its signature (sealed-run opening
+/// cp8 under A3-style two-range layout). Appears in A10's `Resumed` detail.
+const CP8_A10_BAD_DIGEST: &str =
+    "blake3:0f853869e6f11781afe571f046d324ac56f1a8d4e3a8edf9b5e5450cca601d2f";
+
+/// Raw bytes of `A1_DIGEST` (fold-level run digest for A9's single-range run
+/// and for the honest A1 trail reused by R2). Written out so the dropped
+/// `run_digest` mutant reddens the row through the whole-`Finding` equality.
+const A1_RUN_DIGEST_BYTES: [u8; 32] = [
+    0x79, 0xd8, 0xcb, 0x1c, 0x4d, 0xfc, 0x89, 0xa8, 0x0a, 0x49, 0x11, 0x12, 0x02, 0x80, 0xe6, 0x3e,
+    0xd3, 0x83, 0x10, 0x8f, 0x31, 0x99, 0xf0, 0x52, 0x91, 0xbc, 0xb5, 0x1f, 0x62, 0x5f, 0x39, 0x31,
+];
+/// Raw bytes of the A3-style two-range run digest used by A10's fold finding
+/// (`78d50…c63d`).
+const A3_RUN_DIGEST_BYTES: [u8; 32] = [
+    0x78, 0xd5, 0x08, 0x88, 0x83, 0xd5, 0x4f, 0xaa, 0x6a, 0xef, 0xe3, 0x50, 0x94, 0x8c, 0x21, 0x7b,
+    0xb5, 0xef, 0x3c, 0x32, 0xa4, 0x68, 0xf2, 0x21, 0x84, 0xbc, 0x07, 0xe5, 0x6d, 0x84, 0xc6, 0x3d,
+];
+
 /// `UncoveredTail` detail for a `first..=last` range (ADR-0005 l.400-407;
 /// the placeholder text is V5a-authoritative and replaced by V5b).
 fn uncovered_tail(first: u64, last: u64) -> String {
@@ -61,35 +103,40 @@ fn uncovered_tail(first: u64, last: u64) -> String {
 }
 
 /// `Resumed` detail (ruling 13-V3-d5; same reason+gap shape for every
-/// resume this test module builds via `resume_decl`).
-fn resume_detail(head_seq: u64, head_hash: [u8; 32], gap: &str) -> String {
+/// resume this test module builds via `resume_decl`). `head_hash` is a
+/// pre-formatted `blake3:<hex>` literal so the Resumed detail carries no
+/// hash computed from the record under test.
+fn resume_detail(head_seq: u64, head_hash: &str, gap: &str) -> String {
     format!(
-        "operator=operator reason=incident head={head_seq}:{} gap={gap} lost_records=0 structural=valid",
-        digest_string(&head_hash)
+        "operator=operator reason=incident head={head_seq}:{head_hash} gap={gap} lost_records=0 structural=valid"
     )
 }
 
-fn rows(findings: &[Finding]) -> Vec<Row> {
-    findings
-        .iter()
-        .map(|f| {
-            (
-                f.kind(),
-                f.file().map(Path::to_path_buf),
-                f.line(),
-                f.seq(),
-                f.detail().to_owned(),
-            )
-        })
-        .collect()
+/// Finding constructor for a located row (one `(kind, file, line, seq,
+/// detail)` tuple). All located findings in this file go through here so
+/// the whole-value equality in [`assert_findings`] is the sole assertion
+/// surface on `check`'s output.
+fn located(kind: K, file: PathBuf, line: u64, seq: u64, detail: String) -> Finding {
+    Finding::new(kind, Some(file), Some(line), Some(seq), detail)
 }
 
-/// Asserts that the full sorted literal finding list (every field of
-/// every finding) is exactly `expected`. This is the only way a row
-/// in this file asserts on `check`'s output.
+/// `UncoveredTail` finding (unlocated info).
+fn uncovered(first: u64, last: u64) -> Finding {
+    Finding::new(
+        K::UncoveredTail,
+        None,
+        None,
+        None,
+        uncovered_tail(first, last),
+    )
+}
+
+/// Asserts the full sorted literal finding list is exactly `expected`,
+/// comparing whole [`Finding`] values (so a dropped `run_digest` or
+/// `accepted_kind` reddens the row). This is the only way a row in this
+/// file asserts on `check`'s output.
 #[track_caller]
-fn assert_rows(findings: &[Finding], expected: &[Row], label: &str) {
-    let actual = rows(findings);
+fn assert_findings(actual: &[Finding], expected: &[Finding], label: &str) {
     assert_eq!(actual, expected, "{label} literal finding list");
 }
 
@@ -198,9 +245,11 @@ fn two_checkpoints() -> TwoCheckpointLayout {
 // A1 — listed key, one byte of cp2's signature flipped → BadSignature@2.
 // Acceptance row. Base emits only `UncoveredTail`; this row asserts the
 // `BadSignature` as part of the literal list so base fails on the equality.
-// Kills M1. Does NOT kill M7 (cp2 lives in a single sealed segment —
-// "member of a run" does not cover this layout); M7's named kills are
-// the two in-run rows A9 and A10.
+// Does NOT kill M1: `verify_strict` → `verify` only separates on the
+// small-order / non-canonical mutants (A4, A4b) — a bit-flipped Ed25519
+// signature still fails legacy `verify`. Does NOT kill M7: cp2 lives in
+// a single sealed segment ("member of a run" does not cover this layout);
+// M7 and M7′'s named kills are the two in-run rows A9 and A10.
 // =====================================================================
 #[test]
 fn a1_listed_key_flipped_signature_is_bad_signature_at_cp2() {
@@ -208,17 +257,17 @@ fn a1_listed_key_flipped_signature_is_bad_signature_at_cp2() {
     let bad = flip_signature_byte(&fx.cp2);
     put_segment(&fx._dir.0, 0, &[&fx.cp0, &fx.e1, &bad], &[]);
     let findings = verify_files_with(vec![fx.path.clone()], trust_with_key(fixture_pubkey()));
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::BadSignature,
-            Some(fx.path.clone()),
-            Some(3),
-            Some(2),
+            fx.path.clone(),
+            3,
+            2,
             format!("key {FIXTURE_KEY_HEX}"),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 2)),
+        uncovered(0, 2),
     ];
-    assert_rows(&findings, &expected, "A1");
+    assert_findings(&findings, &expected, "A1");
 }
 
 // =====================================================================
@@ -237,17 +286,17 @@ fn a2_unlisted_key_valid_signature_is_untrusted_not_listed() {
     put_segment(&d.0, 0, &[&cp0, &e1, &cp2], &[]);
     let path = segment_path(&d.0, 0);
     let findings = verify_files_with(vec![path.clone()], trust_with_key(fixture_pubkey()));
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::UntrustedKey,
-            Some(path),
-            Some(3),
-            Some(2),
+            path,
+            3,
+            2,
             format!("key {ALT_KEY_HEX} not listed for trail {TRAIL_HEX}"),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 2)),
+        uncovered(0, 2),
     ];
-    assert_rows(&findings, &expected, "A2");
+    assert_findings(&findings, &expected, "A2");
 }
 
 // =====================================================================
@@ -264,17 +313,17 @@ fn a3_bound_key_cp2_above_bound_is_untrusted_bounded() {
         .build()
         .unwrap();
     let findings = verify_files_with(vec![fx.path.clone()], trust);
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::UntrustedKey,
-            Some(fx.path.clone()),
-            Some(3),
-            Some(2),
+            fx.path.clone(),
+            3,
+            2,
             format!("key {FIXTURE_KEY_HEX} bounded through seq 0"),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 2)),
+        uncovered(0, 2),
     ];
-    assert_rows(&findings, &expected, "A3");
+    assert_findings(&findings, &expected, "A3");
 }
 
 // =====================================================================
@@ -304,17 +353,17 @@ fn a4_small_order_key_is_bad_signature_under_strict() {
         .build()
         .unwrap();
     let findings = verify_files_with(vec![fx.path.clone()], trust);
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::BadSignature,
-            Some(fx.path.clone()),
-            Some(3),
-            Some(2),
+            fx.path.clone(),
+            3,
+            2,
             format!("key {IDENTITY_KEY_HEX}"),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 2)),
+        uncovered(0, 2),
     ];
-    assert_rows(&findings, &expected, "A4");
+    assert_findings(&findings, &expected, "A4");
 }
 
 // =====================================================================
@@ -376,17 +425,17 @@ fn a5_non_canonical_signature_is_bad_signature() {
     let bad = with_signature(&fx.cp2, sig);
     put_segment(&fx._dir.0, 0, &[&fx.cp0, &fx.e1, &bad], &[]);
     let findings = verify_files_with(vec![fx.path.clone()], trust_with_key(fixture_pubkey()));
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::BadSignature,
-            Some(fx.path.clone()),
-            Some(3),
-            Some(2),
+            fx.path.clone(),
+            3,
+            2,
             format!("key {FIXTURE_KEY_HEX}"),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 2)),
+        uncovered(0, 2),
     ];
-    assert_rows(&findings, &expected, "A5");
+    assert_findings(&findings, &expected, "A5");
 }
 
 // =====================================================================
@@ -406,24 +455,24 @@ fn a6_unlisted_key_with_flipped_signature_emits_both() {
     put_segment(&d.0, 0, &[&cp0, &e1, &bad], &[]);
     let path = segment_path(&d.0, 0);
     let findings = verify_files_with(vec![path.clone()], trust_with_key(fixture_pubkey()));
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::BadSignature,
-            Some(path.clone()),
-            Some(3),
-            Some(2),
+            path.clone(),
+            3,
+            2,
             format!("key {ALT_KEY_HEX}"),
         ),
-        (
+        located(
             K::UntrustedKey,
-            Some(path),
-            Some(3),
-            Some(2),
+            path,
+            3,
+            2,
             format!("key {ALT_KEY_HEX} not listed for trail {TRAIL_HEX}"),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 2)),
+        uncovered(0, 2),
     ];
-    assert_rows(&findings, &expected, "A6");
+    assert_findings(&findings, &expected, "A6");
 }
 
 // =====================================================================
@@ -443,24 +492,24 @@ fn a6b_bounded_key_with_flipped_signature_emits_both() {
         .build()
         .unwrap();
     let findings = verify_files_with(vec![fx.path.clone()], trust);
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::BadSignature,
-            Some(fx.path.clone()),
-            Some(3),
-            Some(2),
+            fx.path.clone(),
+            3,
+            2,
             format!("key {FIXTURE_KEY_HEX}"),
         ),
-        (
+        located(
             K::UntrustedKey,
-            Some(fx.path.clone()),
-            Some(3),
-            Some(2),
+            fx.path.clone(),
+            3,
+            2,
             format!("key {FIXTURE_KEY_HEX} bounded through seq 0"),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 2)),
+        uncovered(0, 2),
     ];
-    assert_rows(&findings, &expected, "A6b");
+    assert_findings(&findings, &expected, "A6b");
 }
 
 // =====================================================================
@@ -479,24 +528,18 @@ fn a7_shipped_only_checkpoint_bad_signature_uses_shipped_file_and_line() {
     let shipped = d.0.join("cp2.copy");
     std::fs::write(&shipped, line_bytes(&bad)).unwrap();
     let findings = verify_files_with(vec![shipped.clone()], trust_with_key(fixture_pubkey()));
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::BadSignature,
-            Some(shipped.clone()),
-            Some(1),
-            Some(2),
+            shipped.clone(),
+            1,
+            2,
             format!("key {FIXTURE_KEY_HEX}"),
         ),
-        (
-            K::SeqGap,
-            Some(shipped),
-            Some(1),
-            Some(2),
-            "missing seq 0..=1".to_owned(),
-        ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(2, 2)),
+        located(K::SeqGap, shipped, 1, 2, "missing seq 0..=1".to_owned()),
+        uncovered(2, 2),
     ];
-    assert_rows(&findings, &expected, "A7");
+    assert_findings(&findings, &expected, "A7");
 }
 
 // =====================================================================
@@ -516,24 +559,24 @@ fn a7b_shipped_only_unlisted_key_is_untrusted_at_shipped_path() {
     let shipped = d.0.join("cp2.copy");
     std::fs::write(&shipped, line_bytes(&cp2)).unwrap();
     let findings = verify_files_with(vec![shipped.clone()], trust_with_key(fixture_pubkey()));
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::SeqGap,
-            Some(shipped.clone()),
-            Some(1),
-            Some(2),
+            shipped.clone(),
+            1,
+            2,
             "missing seq 0..=1".to_owned(),
         ),
-        (
+        located(
             K::UntrustedKey,
-            Some(shipped),
-            Some(1),
-            Some(2),
+            shipped,
+            1,
+            2,
             format!("key {ALT_KEY_HEX} not listed for trail {TRAIL_HEX}"),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(2, 2)),
+        uncovered(2, 2),
     ];
-    assert_rows(&findings, &expected, "A7b");
+    assert_findings(&findings, &expected, "A7b");
 }
 
 // =====================================================================
@@ -559,24 +602,24 @@ fn a8_key_listed_on_another_trail_is_untrusted_on_this_trail() {
         .unwrap()
         .findings()
         .to_vec();
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::UntrustedKey,
-            Some(fx.path.clone()),
-            Some(1),
-            Some(0),
+            fx.path.clone(),
+            1,
+            0,
             format!("key {FIXTURE_KEY_HEX} not listed for trail {TRAIL_HEX}"),
         ),
-        (
+        located(
             K::UntrustedKey,
-            Some(fx.path.clone()),
-            Some(3),
-            Some(2),
+            fx.path.clone(),
+            3,
+            2,
             format!("key {FIXTURE_KEY_HEX} not listed for trail {TRAIL_HEX}"),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 2)),
+        uncovered(0, 2),
     ];
-    assert_rows(&findings, &expected, "A8");
+    assert_findings(&findings, &expected, "A8");
 }
 
 // =====================================================================
@@ -609,9 +652,12 @@ fn a8b_trusted_predicate_rejects_key_listed_on_another_trail() {
 // =====================================================================
 // A9 — bad signature on an in-run checkpoint after a loss point, in an
 // A1-style sealed run → BadSignature at cp5 reported, with the full
-// literal list. Acceptance row. Together with A10 gives M7 (skip in-run
-// checkpoints) and the new M7′ two named runtime kills; A1-A8, R1, R1b
-// are single-segment layouts WITHOUT a run so they do NOT kill M7.
+// literal list and literal digest constants (the fold's A1 run digest
+// lives in `SegmentStructure::run_digest`; the resume head hash is
+// `CP5_A9_BAD_DIGEST`). Acceptance row. Together with A10 gives M7 (skip
+// in-run checkpoints) and the new M7′ two named runtime kills; A1-A8,
+// R1 and R1b are single-sealed-segment layouts WITHOUT a run so they do
+// NOT kill M7.
 // =====================================================================
 #[test]
 fn a9_in_run_bad_signature_reports_without_changing_run_findings() {
@@ -647,45 +693,34 @@ fn a9_in_run_bad_signature_reports_without_changing_run_findings() {
         .to_vec();
     let s1 = segment_path(&d.0, 1);
     let live = d.0.join("audit.jsonl");
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::SegmentStructure,
-            Some(s1.clone()),
-            Some(1),
-            Some(4),
+            s1.clone(),
+            1,
+            4,
             "expected first complete record to be a checkpoint".to_owned(),
         ),
-        (
+        located(
             K::SegmentStructure,
-            Some(s1.clone()),
-            Some(1),
-            Some(4),
+            s1.clone(),
+            1,
+            4,
             format!("loss seq 4 first 3 count 1; digest {A1_DIGEST}"),
-        ),
-        (
-            K::SeqGap,
-            Some(s1.clone()),
-            Some(1),
-            Some(4),
-            "missing seq 3..=3".to_owned(),
-        ),
-        (
-            K::BadSignature,
-            Some(s1),
-            Some(2),
-            Some(5),
-            format!("key {FIXTURE_KEY_HEX}"),
-        ),
-        (
+        )
+        .with_run_digest(A1_RUN_DIGEST_BYTES),
+        located(K::SeqGap, s1.clone(), 1, 4, "missing seq 3..=3".to_owned()),
+        located(K::BadSignature, s1, 2, 5, format!("key {FIXTURE_KEY_HEX}")),
+        located(
             K::Resumed,
-            Some(live),
-            Some(2),
-            Some(7),
-            resume_detail(5, cp5_bad.hash(), "none"),
+            live,
+            2,
+            7,
+            resume_detail(5, CP5_A9_BAD_DIGEST, "none"),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 7)),
+        uncovered(0, 7),
     ];
-    assert_rows(&findings, &expected, "A9");
+    assert_findings(&findings, &expected, "A9");
 }
 
 // =====================================================================
@@ -693,7 +728,9 @@ fn a9_in_run_bad_signature_reports_without_changing_run_findings() {
 // layout (cp8 is a run member sealed in S2). Acceptance row that pins
 // M7 / M7′ (skip checkpoints that are members of a run) with its second
 // named runtime kill: both A9 and A10 lose their main `BadSignature`
-// finding if the pass drops in-run candidates.
+// finding if the pass drops in-run candidates. The fold's A3 run digest
+// lives in `SegmentStructure::run_digest`; the resume head hash is
+// `CP8_A10_BAD_DIGEST`.
 // =====================================================================
 #[test]
 fn a10_in_run_bad_signature_on_a3_style_closing_checkpoint() {
@@ -732,78 +769,54 @@ fn a10_in_run_bad_signature_on_a3_style_closing_checkpoint() {
     let s1 = segment_path(&d.0, 1);
     let s2 = segment_path(&d.0, 2);
     let live = d.0.join("audit.jsonl");
-    // Dynamic digests are stable across runs because every fixture
-    // field is deterministic; captured literally here so a drift in
-    // `run_digest` or the signing message bytes flips the row.
     let a3_digest_line =
         "loss seq 4 first 3 count 1; loss seq 7 first 6 count 1; digest blake3:78d5088883d54faa6aefe350948c217bb5ef3c32a468f22184bc07e56d84c63d"
             .to_owned();
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::SegmentStructure,
-            Some(s1.clone()),
-            Some(1),
-            Some(4),
+            s1.clone(),
+            1,
+            4,
             "expected first complete record to be a checkpoint".to_owned(),
         ),
-        (
+        located(K::SegmentStructure, s1.clone(), 1, 4, a3_digest_line)
+            .with_run_digest(A3_RUN_DIGEST_BYTES),
+        located(K::SeqGap, s1, 1, 4, "missing seq 3..=3".to_owned()),
+        located(
             K::SegmentStructure,
-            Some(s1.clone()),
-            Some(1),
-            Some(4),
-            a3_digest_line,
-        ),
-        (
-            K::SeqGap,
-            Some(s1),
-            Some(1),
-            Some(4),
-            "missing seq 3..=3".to_owned(),
-        ),
-        (
-            K::SegmentStructure,
-            Some(s2.clone()),
-            Some(1),
-            Some(7),
+            s2.clone(),
+            1,
+            7,
             "expected first complete record to be a checkpoint".to_owned(),
         ),
-        (
+        located(K::SeqGap, s2.clone(), 1, 7, "missing seq 6..=6".to_owned()),
+        located(K::BadSignature, s2, 2, 8, format!("key {FIXTURE_KEY_HEX}")),
+        located(
             K::SeqGap,
-            Some(s2.clone()),
-            Some(1),
-            Some(7),
-            "missing seq 6..=6".to_owned(),
-        ),
-        (
-            K::BadSignature,
-            Some(s2),
-            Some(2),
-            Some(8),
-            format!("key {FIXTURE_KEY_HEX}"),
-        ),
-        (
-            K::SeqGap,
-            Some(live.clone()),
-            Some(1),
-            Some(10),
+            live.clone(),
+            1,
+            10,
             "missing seq 9..=9".to_owned(),
         ),
-        (
+        located(
             K::Resumed,
-            Some(live),
-            Some(2),
-            Some(11),
-            resume_detail(8, cp8_bad.hash(), "9..=9"),
+            live,
+            2,
+            11,
+            resume_detail(8, CP8_A10_BAD_DIGEST, "9..=9"),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 11)),
+        uncovered(0, 11),
     ];
-    assert_rows(&findings, &expected, "A10");
+    assert_findings(&findings, &expected, "A10");
 }
 
 // =====================================================================
 // F1 — fork-flipped: honest native cp2 + shipped cp2 copy holding a
 // DIFFERENT cp2 whose signature is flipped (different record hash).
-// Acceptance row. Together with F2 pins:
+// Acceptance row. Every hash in the `SeqConflict` detail is a literal
+// `blake3:…` constant ([`CP2_HONEST_DIGEST`], [`CP2_FLIPPED_DIGEST`]).
+// Together with F2 pins:
 //   - X1 ("every finding at copies[0].0"): the `BadSignature` here must
 //     land on the shipped file, not the native one that `copies[0]`
 //     sorts to.
@@ -837,34 +850,31 @@ fn f1_fork_flipped_reports_bad_signature_at_shipped_path() {
         vec![native.clone(), shipped.clone()],
         trust_with_key(fixture_pubkey()),
     );
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::SeqConflict,
-            Some(native),
-            Some(3),
-            Some(2),
-            format!(
-                "conflicting hashes: {}, {}",
-                digest_string(&cp2_honest.hash()),
-                digest_string(&cp2_flipped.hash()),
-            ),
+            native,
+            3,
+            2,
+            format!("conflicting hashes: {CP2_HONEST_DIGEST}, {CP2_FLIPPED_DIGEST}"),
         ),
-        (
+        located(
             K::BadSignature,
-            Some(shipped),
-            Some(1),
-            Some(2),
+            shipped,
+            1,
+            2,
             format!("key {FIXTURE_KEY_HEX}"),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 2)),
+        uncovered(0, 2),
     ];
-    assert_rows(&findings, &expected, "F1");
+    assert_findings(&findings, &expected, "F1");
 }
 
 // =====================================================================
 // F2 — fork-unlisted: honest native cp2 + shipped cp2 copy holding a
 // DIFFERENT cp2 validly signed by the unlisted key `0x55`. Acceptance
-// row. Pairs with F1 to pin X1 and X3 (see F1 header) with a second
+// row with literal `blake3:…` digest constants in the `SeqConflict`
+// detail. Pairs with F1 to pin X1 and X3 (see F1 header) with a second
 // kill each via `UntrustedKey` instead of `BadSignature`.
 // =====================================================================
 #[test]
@@ -892,38 +902,34 @@ fn f2_fork_unlisted_reports_untrusted_at_shipped_path() {
         vec![native.clone(), shipped.clone()],
         trust_with_key(fixture_pubkey()),
     );
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::SeqConflict,
-            Some(native),
-            Some(3),
-            Some(2),
-            format!(
-                "conflicting hashes: {}, {}",
-                digest_string(&cp2_honest.hash()),
-                digest_string(&cp2_unlisted.hash()),
-            ),
+            native,
+            3,
+            2,
+            format!("conflicting hashes: {CP2_HONEST_DIGEST}, {CP2_UNLISTED_DIGEST}"),
         ),
-        (
+        located(
             K::UntrustedKey,
-            Some(shipped),
-            Some(1),
-            Some(2),
+            shipped,
+            1,
+            2,
             format!("key {ALT_KEY_HEX} not listed for trail {TRAIL_HEX}"),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 2)),
+        uncovered(0, 2),
     ];
-    assert_rows(&findings, &expected, "F2");
+    assert_findings(&findings, &expected, "F2");
 }
 
 // =====================================================================
-// R1 — acceptance row (reclassified): the same checkpoint byte-identical
-// in a native segment and a shipped copy with a flipped signature yields
-// exactly ONE `BadSignature` at the first-occurrence native path the
-// engine's merge keeps (one `(seq, hash)` candidate). R1 fails on base
-// (base stubs the signature pass to a no-op, so no `BadSignature` is
-// emitted and the literal list below doesn't match); it is the second
-// named kill for M6 (one finding per occurrence) alongside R1b.
+// R1 — acceptance row: the same checkpoint byte-identical in a native
+// segment and a shipped copy with a flipped signature yields exactly
+// ONE `BadSignature` at the first-occurrence native path the engine's
+// merge keeps (one `(seq, hash)` candidate). R1 fails on base (base
+// stubs the signature pass to a no-op, so no `BadSignature` is emitted
+// and the literal list below doesn't match); it is the second named
+// kill for M6 (one finding per occurrence) alongside R1b.
 // =====================================================================
 #[test]
 fn r1_byte_identical_native_and_shipped_yields_one_bad_signature() {
@@ -942,45 +948,45 @@ fn r1_byte_identical_native_and_shipped_yields_one_bad_signature() {
         vec![native.clone(), shipped.clone()],
         trust_with_key(fixture_pubkey()),
     );
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::DuplicateRecord,
-            Some(native.clone()),
-            Some(1),
-            Some(0),
+            native.clone(),
+            1,
+            0,
             "2 copies of 1 distinct records".to_owned(),
         ),
-        (
+        located(
             K::DuplicateRecord,
-            Some(native.clone()),
-            Some(2),
-            Some(1),
+            native.clone(),
+            2,
+            1,
             "2 copies of 1 distinct records".to_owned(),
         ),
-        (
+        located(
             K::BadSignature,
-            Some(native.clone()),
-            Some(3),
-            Some(2),
+            native.clone(),
+            3,
+            2,
             format!("key {FIXTURE_KEY_HEX}"),
         ),
-        (
+        located(
             K::DuplicateRecord,
-            Some(native),
-            Some(3),
-            Some(2),
+            native,
+            3,
+            2,
             "2 copies of 1 distinct records".to_owned(),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 2)),
+        uncovered(0, 2),
     ];
-    assert_rows(&findings, &expected, "R1");
+    assert_findings(&findings, &expected, "R1");
 }
 
 // =====================================================================
-// R1b — acceptance row (reclassified): three byte-identical copies
-// (native + two shipped) of the flipped-signature cp2 still yield
-// exactly ONE `BadSignature`. Pairs with R1 to give M6 (one finding per
-// occurrence) its two named runtime kills.
+// R1b — acceptance row: three byte-identical copies (native + two
+// shipped) of the flipped-signature cp2 still yield exactly ONE
+// `BadSignature`. Pairs with R1 to give M6 (one finding per occurrence)
+// its two named runtime kills.
 // =====================================================================
 #[test]
 fn r1b_triplicate_copies_yield_one_bad_signature() {
@@ -998,49 +1004,52 @@ fn r1b_triplicate_copies_yield_one_bad_signature() {
     std::fs::copy(&native, &a).unwrap();
     std::fs::copy(&native, &b).unwrap();
     let findings = verify_files_with(vec![native.clone(), a, b], trust_with_key(fixture_pubkey()));
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::DuplicateRecord,
-            Some(native.clone()),
-            Some(1),
-            Some(0),
+            native.clone(),
+            1,
+            0,
             "3 copies of 1 distinct records".to_owned(),
         ),
-        (
+        located(
             K::DuplicateRecord,
-            Some(native.clone()),
-            Some(2),
-            Some(1),
+            native.clone(),
+            2,
+            1,
             "3 copies of 1 distinct records".to_owned(),
         ),
-        (
+        located(
             K::BadSignature,
-            Some(native.clone()),
-            Some(3),
-            Some(2),
+            native.clone(),
+            3,
+            2,
             format!("key {FIXTURE_KEY_HEX}"),
         ),
-        (
+        located(
             K::DuplicateRecord,
-            Some(native),
-            Some(3),
-            Some(2),
+            native,
+            3,
+            2,
             "3 copies of 1 distinct records".to_owned(),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 2)),
+        uncovered(0, 2),
     ];
-    assert_rows(&findings, &expected, "R1b");
+    assert_findings(&findings, &expected, "R1b");
 }
 
 // =====================================================================
 // R2 — REGRESSION row. Honest multi-segment A1 trail with a resume,
 // key bounded through the live opening `cp6`. Under production, every
 // checkpoint is trusted and the signature pass emits NO `BadSignature`
-// / `UntrustedKey`. Passes on base (base emits no signature findings
-// anyway). The full literal finding list below is unchanged from the
-// honest A1, and additional predicate assertions pin M2 (bound exactly
-// at `through=`) and M8 (predicate ignores signature) with ≥ 2 named
-// runtime kills.
+// / `UntrustedKey`. Compiles and passes on the stubbed base (`check`
+// is stubbed to a no-op; the honest A1 list below is identical to what
+// base produces). Killed by M2 (`<=` → `<`: cp6 at exactly `through=`
+// becomes untrusted, so coverage moves and the row's coverage changes
+// — the predicate assertion `trusted(cp6) == true` reddens) and by M8
+// (predicate ignores the signature: `!trusted(bad cp2)` flips). All
+// hashes in the expected list are literal constants ([`CP5_A1_DIGEST`]
+// and the A1 run digest bytes).
 // =====================================================================
 #[test]
 fn r2_honest_bounded_at_head_has_no_signature_findings_and_head_is_trusted() {
@@ -1056,52 +1065,39 @@ fn r2_honest_bounded_at_head_has_no_signature_findings_and_head_is_trusted() {
         .unwrap()
         .findings()
         .to_vec();
-    // cp5's hash lives in the confirmed snapshot (cp6.previous = cp5.hash);
-    // read it from the collection so the literal `Resumed` detail below
-    // doesn't need a second accessor on the fixture.
-    let collection = input::collect([a1.dir_path.clone()]).unwrap();
-    let cp5_hash = collection
-        .inputs
-        .iter()
-        .flat_map(|i| i.data.records.iter())
-        .find(|r| r.seq == 5)
-        .expect("cp5 must appear in the A1 confirmed snapshot")
-        .hash;
     let s1 = segment_path(&a1.dir_path, 1);
     let live = a1.dir_path.join("audit.jsonl");
-    let expected: Vec<Row> = vec![
-        (
+    let expected = vec![
+        located(
             K::SegmentStructure,
-            Some(s1.clone()),
-            Some(1),
-            Some(4),
+            s1.clone(),
+            1,
+            4,
             "expected first complete record to be a checkpoint".to_owned(),
         ),
-        (
+        located(
             K::SegmentStructure,
-            Some(s1.clone()),
-            Some(1),
-            Some(4),
+            s1.clone(),
+            1,
+            4,
             format!("loss seq 4 first 3 count 1; digest {A1_DIGEST}"),
-        ),
-        (
-            K::SeqGap,
-            Some(s1),
-            Some(1),
-            Some(4),
-            "missing seq 3..=3".to_owned(),
-        ),
-        (
+        )
+        .with_run_digest(A1_RUN_DIGEST_BYTES),
+        located(K::SeqGap, s1, 1, 4, "missing seq 3..=3".to_owned()),
+        located(
             K::Resumed,
-            Some(live),
-            Some(2),
-            Some(7),
-            resume_detail(5, cp5_hash, "none"),
+            live,
+            2,
+            7,
+            resume_detail(5, CP5_A1_DIGEST, "none"),
         ),
-        (K::UncoveredTail, None, None, None, uncovered_tail(0, 7)),
+        uncovered(0, 7),
     ];
-    assert_rows(&findings, &expected, "R2");
-    // Predicate M2: cp6 at exactly `through=` must be trusted.
+    assert_findings(&findings, &expected, "R2");
+    // Predicate M2: cp6 at exactly `through=` must be trusted. Separate
+    // from the literal finding equality above per the row standard --
+    // this is a predicate pin, not a comparison on `check`'s output.
+    let collection = input::collect([a1.dir_path.clone()]).unwrap();
     let cp6_summary = collection
         .inputs
         .iter()
@@ -1135,7 +1131,10 @@ fn r2_honest_bounded_at_head_has_no_signature_findings_and_head_is_trusted() {
 
 // =====================================================================
 // Direct predicate test (new API; does not compile on base). Pins
-// ruling 13-V5-d1 point 3 directly (kills M8 and M2).
+// ruling 13-V5-d1 point 3 directly (kills M8 and M2) and the Y1 mutant
+// (`trusted` using `listed` instead of `trusted_at`, which ignores
+// `through=`): when cp2 is above the bound, `trusted` must be false
+// though `listed` is true.
 // =====================================================================
 #[test]
 fn trusted_predicate_requires_signature_and_key_trust() {
@@ -1179,6 +1178,8 @@ fn trusted_predicate_requires_signature_and_key_trust() {
     let cp0_summary = records.iter().find(|r| r.seq == 0).unwrap();
     let cp2_summary = records.iter().find(|r| r.seq == 2).unwrap();
     // M2 (`<=` → `<`): cp0 is EXACTLY at the bound and must be trusted.
+    // Y1 (predicate uses `listed` instead of `trusted_at`): cp2 is
+    // listed but above the bound, so `trusted` must be false.
     let bound = TrustPolicy::builder()
         .trail(TRAIL)
         .key_through(fixture_pubkey(), 0, fx.cp0.hash())
@@ -1196,6 +1197,34 @@ fn trusted_predicate_requires_signature_and_key_trust() {
     // `engine::check`; this reference keeps symbol-use parity with
     // the public pass for the test binary.
     let _ = check;
+}
+
+// =====================================================================
+// Y1b — predicate test (new API; does not compile on base). Second
+// named kill for the Y1 mutant: a `through=` bound STRICTLY BELOW the
+// checkpoint's `seq` means `listed(key) == true` while `trusted_at(key,
+// seq) == false`, so a Y1-mutated `trusted` (which would call `listed`
+// instead of `trusted_at`) wrongly reports `true` and this assertion
+// flips.
+// =====================================================================
+#[test]
+fn y1b_trusted_predicate_rejects_key_bounded_below_checkpoint_seq() {
+    let fx = two_checkpoints();
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key_through(fixture_pubkey(), 0, fx.cp0.hash())
+        .build()
+        .unwrap();
+    let collection = input::collect([fx.path.clone()]).unwrap();
+    let cp2_summary = collection
+        .inputs
+        .iter()
+        .flat_map(|i| i.data.records.iter())
+        .find(|r| r.seq == 2)
+        .expect("cp2 in the honest two-checkpoint fixture");
+    // cp2 is honestly signed by the listed fixture key but its `seq`
+    // exceeds the key's `through=0` bound: the predicate is false.
+    assert!(!trusted(TRAIL, &trust, cp2_summary));
 }
 
 // =====================================================================
@@ -1241,14 +1270,81 @@ fn unpinned_trail_errors_before_signature_pass_runs() {
 }
 
 // =====================================================================
-// Consistency check on the key and trail literals every row's detail
-// uses: if these drift from the fixture bytes, every A1-A10 / F1-F2 row
-// would fail confusingly on the hex substring. Spelling them both ways
-// lands any such drift here instead.
+// Consistency check on the key, trail and record-hash literals every
+// row's detail uses. A drift in the captured bytes lands here instead
+// of in a confusing per-row digest mismatch. The record-hash constants
+// (`CP2_*_DIGEST`, `CP5_*_DIGEST`, `CP8_A10_BAD_DIGEST`) stay OUT of
+// the row literals' expected values and are pinned here to the
+// fixture-produced records.
 // =====================================================================
 #[test]
-fn fixture_pubkey_matches_the_literal_hex_in_details() {
+fn fixture_hashes_match_literals() {
     assert_eq!(hex(&fixture_pubkey()), FIXTURE_KEY_HEX);
     assert_eq!(hex(&alt_signer().public_key()), ALT_KEY_HEX);
     assert_eq!(hex(&TRAIL), TRAIL_HEX);
+    // Two-checkpoint / fork fixtures.
+    let fx = two_checkpoints();
+    let cp2_flipped = flip_signature_byte(&fx.cp2);
+    let signer = alt_signer();
+    let mmr0 = seeded(&fx.cp0);
+    let mmr1 = pushed(&mmr0, &fx.e1);
+    let cp2_unlisted = sign_as(&signer, 2, fx.e1.hash(), &mmr1);
+    assert_eq!(digest_string(&fx.cp2.hash()), CP2_HONEST_DIGEST);
+    assert_eq!(digest_string(&cp2_flipped.hash()), CP2_FLIPPED_DIGEST);
+    assert_eq!(digest_string(&cp2_unlisted.hash()), CP2_UNLISTED_DIGEST);
+    // A1-style honest cp5 (reused by R2) and A9's flipped cp5.
+    let a1 = build_a1();
+    let collection = input::collect([a1.dir_path.clone()]).unwrap();
+    let cp5_hash = collection
+        .inputs
+        .iter()
+        .flat_map(|i| i.data.records.iter())
+        .find(|r| r.seq == 5)
+        .expect("cp5 in the A1 confirmed snapshot")
+        .hash;
+    assert_eq!(digest_string(&cp5_hash), CP5_A1_DIGEST);
+    // A9's cp5_bad has the honest A1 layout with a flipped cp5 signature.
+    {
+        let d = Temp::new();
+        let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        let mmr0 = seeded(&cp0);
+        let e1 = entry_rec(1, cp0.hash());
+        let mmr1 = pushed(&mmr0, &e1);
+        let e2 = entry_rec(2, e1.hash());
+        let mmr2 = pushed(&mmr1, &e2);
+        put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
+        let r4 = headless(&e2, 4);
+        let fold = pushed(&mmr2, &r4);
+        let cp5 = signed_cp(5, r4.hash(), &fold);
+        let cp5_bad = flip_signature_byte(&cp5);
+        assert_eq!(digest_string(&cp5_bad.hash()), CP5_A9_BAD_DIGEST);
+    }
+    // A10's cp8_bad has the A3-style two-range layout with a flipped cp8.
+    {
+        let d = Temp::new();
+        let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        let mmr0 = seeded(&cp0);
+        let e1 = entry_rec(1, cp0.hash());
+        let mmr1 = pushed(&mmr0, &e1);
+        let cp2 = signed_cp(2, e1.hash(), &mmr1);
+        put_segment(&d.0, 0, &[&cp0, &e1, &cp2], &[]);
+        let mmr2 = pushed(&mmr1, &cp2);
+        let r4 = headless(&cp2, 4);
+        let mmr4 = pushed(&mmr2, &r4);
+        let cp5 = signed_cp(5, r4.hash(), &mmr4);
+        put_segment(&d.0, 1, &[&r4, &cp5], &[]);
+        let mmr5 = pushed(&mmr4, &cp5);
+        let r7 = headless(&cp5, 7);
+        let mmr7 = pushed(&mmr5, &r7);
+        let cp8 = signed_cp(8, r7.hash(), &mmr7);
+        let cp8_bad = flip_signature_byte(&cp8);
+        assert_eq!(digest_string(&cp8_bad.hash()), CP8_A10_BAD_DIGEST);
+    }
+    // Run-digest constants (byte form) decode to the published `blake3:…`
+    // strings used in the detail text.
+    assert_eq!(digest_string(&A1_RUN_DIGEST_BYTES), A1_DIGEST);
+    assert_eq!(
+        digest_string(&A3_RUN_DIGEST_BYTES),
+        "blake3:78d5088883d54faa6aefe350948c217bb5ef3c32a468f22184bc07e56d84c63d",
+    );
 }
