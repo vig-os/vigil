@@ -10,12 +10,12 @@
 //! any constant drifts from the fixture). Fragments are reported by
 //! length and digest, never by text (ruling 13-V5-d1 point 6).
 //!
-//! Acceptance rows (C1-C9, R1-R3b, P6b, P6b2, P6c, P6c2). Each
-//! acceptance row's first assertion is the full literal finding list
-//! (`assert_findings`), and that assertion is what reddens on base:
-//! base is the head with `covered_through` forced to `None`, so
-//! either the list itself or `covered_through()` differs; the list
-//! is asserted first in every row.
+//! Acceptance rows (C1-C9, R1-R3b, P6b, P6b2, P6c, P6c2, D1, D2).
+//! Each acceptance row's first assertion is the full literal finding
+//! list (`assert_findings`), and that assertion is what reddens on
+//! base: base is the head with `covered_through` forced to `None`,
+//! so either the list itself or `covered_through()` differs; the
+//! list is asserted first in every row.
 //!
 //! The honest-crash d11 bullet shape `[cp0, frag, e1(repaired), cp2]`
 //! drives C6, C7 and C9 and their `is_strict_valid` assertion: the
@@ -62,6 +62,24 @@ const REPAIR_DIGEST_CRASH: &str =
 /// C7 and C8b.
 const REPAIR_DIGEST_AB: &str =
     "blake3:8fd91a67a35221ff17201ecc251195ffcaac90af4bb002a52cc73d48fad10ac6";
+/// Native-side `e1` entry hash in P6c's `[cp0, frag, e1(repaired),
+/// cp2]` layout -- `digest_string(&e1.hash())`, bytewise greater than
+/// [`P6C_E1_ALT_HASH`] so it is the `h_hi` side of the `SeqConflict`.
+const P6C_E1_HASH: &str = "blake3:6fe4128226d928b7f2c266bb9e8b02f2e1bce617c2105a2d9008f3beb09157f6";
+/// Shipped-side `e1_alt` hash in P6c -- same `previous` and `repaired`
+/// but `time = 999` instead of `101`, so a distinct record hash. The
+/// bytewise smaller of the two, hence the `h_lo` side.
+const P6C_E1_ALT_HASH: &str =
+    "blake3:1d16d488c7d5aa0a0f66a5081dc2f80a874779fa326a622afbcba18cca61f52f";
+/// Native-side `cp1` sealing-checkpoint hash in P6c2 -- bytewise
+/// smaller, hence the `h_lo` side of the `SeqConflict`.
+const P6C2_CP1_HASH: &str =
+    "blake3:34d94409a29798731d290d81488429798f7df8f11f491d74685a04a54f1f60bd";
+/// Shipped-side `cp1_alt` hash in P6c2 -- same signed fields except
+/// `time = 999`, so a distinct signature and a distinct record hash.
+/// Bytewise greater, hence the `h_hi` side.
+const P6C2_CP1_ALT_HASH: &str =
+    "blake3:e604b6f8e5e88d42daa5b3768a73ee8eff5eac5c6696cc4d4fb1476179ff95a6";
 
 // =====================================================================
 // Shared helpers.
@@ -950,12 +968,8 @@ fn p6c_acceptance_forked_attester_native_vs_shipped_stays_torn_write() {
     write_bytes(&shipped, &line_bytes(&e1_alt));
     let report = report_of(vec![native.clone(), shipped.clone()], trust_fixture());
     // The engine's `SeqConflict` detail lists the two distinct hashes
-    // in `BTreeMap<[u8; 32], _>` iteration order (bytewise ascending).
-    let (h_lo, h_hi) = if e1.hash() < e1_alt.hash() {
-        (e1.hash(), e1_alt.hash())
-    } else {
-        (e1_alt.hash(), e1.hash())
-    };
+    // in `BTreeMap<[u8; 32], _>` iteration order (bytewise ascending):
+    // `h_lo` = `P6C_E1_ALT_HASH`, `h_hi` = `P6C_E1_HASH`.
     let expected = vec![
         located(
             K::TornWrite,
@@ -972,11 +986,7 @@ fn p6c_acceptance_forked_attester_native_vs_shipped_stays_torn_write() {
             native,
             3,
             1,
-            format!(
-                "conflicting hashes: {}, {}",
-                digest_string(&h_lo),
-                digest_string(&h_hi),
-            ),
+            format!("conflicting hashes: {P6C_E1_ALT_HASH}, {P6C_E1_HASH}"),
         ),
         located(
             K::TornWriteRepaired,
@@ -1021,11 +1031,8 @@ fn p6c2_acceptance_forked_sealing_checkpoint_stays_torn_write() {
     let shipped = d.0.join("cp1-alt.copy");
     write_bytes(&shipped, &line_bytes(&cp1_alt));
     let report = report_of(vec![native.clone(), shipped.clone()], trust_fixture());
-    let (h_lo, h_hi) = if cp1.hash() < cp1_alt.hash() {
-        (cp1.hash(), cp1_alt.hash())
-    } else {
-        (cp1_alt.hash(), cp1.hash())
-    };
+    // Bytewise ascending (`BTreeMap<[u8; 32], _>` order):
+    // `h_lo` = `P6C2_CP1_HASH`, `h_hi` = `P6C2_CP1_ALT_HASH`.
     let expected = vec![
         located(
             K::TornWrite,
@@ -1042,11 +1049,7 @@ fn p6c2_acceptance_forked_sealing_checkpoint_stays_torn_write() {
             native,
             3,
             1,
-            format!(
-                "conflicting hashes: {}, {}",
-                digest_string(&h_lo),
-                digest_string(&h_hi),
-            ),
+            format!("conflicting hashes: {P6C2_CP1_HASH}, {P6C2_CP1_ALT_HASH}"),
         ),
         located(
             K::TornWriteRepaired,
@@ -1058,6 +1061,133 @@ fn p6c2_acceptance_forked_sealing_checkpoint_stays_torn_write() {
     ];
     assert_findings(report.findings(), &expected, "P6c2");
     assert_eq!(report.covered_through(), Some(1));
+}
+
+// =====================================================================
+// D1 -- ACCEPTANCE row for ruling 13-V5-d2: a byte-identical duplicate
+// of the attester (same hash, two copies) is `DuplicateRecord`, NOT a
+// `SeqConflict` fork, so it must NOT block promotion. Honest-crash
+// shape `[cp0, frag, e1(repaired), cp2]` plus a shipped copy of `e1`
+// (same bytes). HEAD: one `DuplicateRecord` at seq 1 and the attested
+// gap is still `TornWriteRepaired`; `--strict` remains false because
+// `DuplicateRecord` carries `Severity::Warning`. On the coverage-
+// forced-to-`None` base, the gap falls back to `TornWrite` and an
+// `UncoveredTail` appears, so the `assert_findings` list reddens.
+// Named runtime killer: X1 (`hashes.len() > 1` -> `copies.len() > 1`
+// in the `conflicting_seqs` pre-pass: with X1, seq 1 counts as a
+// fork and the promotion is blocked).
+// First failing line on base: the `assert_findings` call below.
+// =====================================================================
+#[test]
+fn d1_acceptance_duplicate_entry_attester_does_not_block_promotion() {
+    let fx = honest_crash();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let gap_digest = repair_digest(fx.frag);
+    let e1 = entry_rec_with_repaired(1, cp0.hash(), gap_digest);
+    let shipped = fx.path.parent().unwrap().join("e1.copy");
+    write_bytes(&shipped, &line_bytes(&e1));
+    let report = report_of(vec![fx.path.clone(), shipped.clone()], trust_fixture());
+    // Sorted by `(seq_none, seq, file, line, kind)`: the native
+    // segment filename sorts before `e1.copy`, so the native line-2
+    // TornWriteRepaired lands first, then the main seq-loop's
+    // `DuplicateRecord` at the first-occurrence copy (native line 3),
+    // then the shipped `fragment not present`.
+    let expected = vec![
+        located(
+            K::TornWriteRepaired,
+            fx.path.clone(),
+            2,
+            1,
+            format!(
+                "lines 2..=2 ({len} bytes), attested at line 3 seq 1",
+                len = fx.frag.len(),
+            ),
+        ),
+        located(
+            K::DuplicateRecord,
+            fx.path.clone(),
+            3,
+            1,
+            "2 copies of 1 distinct records".to_owned(),
+        ),
+        located(
+            K::TornWriteRepaired,
+            shipped,
+            1,
+            1,
+            "fragment not present".to_owned(),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "D1");
+    assert_eq!(report.covered_through(), Some(2));
+    assert!(
+        !report.is_strict_valid(),
+        "D1 --strict fails on the DuplicateRecord warning",
+    );
+}
+
+// =====================================================================
+// D2 -- ACCEPTANCE row paired with D1: byte-identical duplicate of the
+// SEALING attester (checkpoint variant). Native: `[cp0, frag,
+// cp1(repaired)]` (C8-style sealing checkpoint attests its own repaired
+// tail); shipped: byte-identical copy of `cp1` (same bytes, so
+// `hashes.len() == 1` at seq 1 and `copies.len() == 2`). Named runtime
+// killer: X1 (would flip seq 1 to "forked" and block promotion).
+// First failing line on base: the `assert_findings` call below.
+// =====================================================================
+#[test]
+fn d2_acceptance_duplicate_sealing_attester_does_not_block_promotion() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let fragment = b"{\"crash\":\n";
+    let gap_digest = repair_digest(fragment);
+    let cp1 = signed_cp_with_ctx(context(1, cp0.hash()).repaired(gap_digest), &mmr0);
+    let mut bytes = line_bytes(&cp0);
+    bytes.extend_from_slice(fragment);
+    bytes.extend_from_slice(&line_bytes(&cp1));
+    let native = segment_path(&d.0, 0);
+    write_bytes(&native, &bytes);
+    let shipped = d.0.join("cp1.copy");
+    write_bytes(&shipped, &line_bytes(&cp1));
+    let report = report_of(vec![native.clone(), shipped.clone()], trust_fixture());
+    // Sorted by `(seq_none, seq, file, line, kind)`: the native segment
+    // filename sorts before `cp1.copy`, so the native line-2
+    // TornWriteRepaired lands first, then `DuplicateRecord` at the
+    // first-occurrence copy (native line 3), then the shipped
+    // `fragment not present`.
+    let expected = vec![
+        located(
+            K::TornWriteRepaired,
+            native.clone(),
+            2,
+            1,
+            format!(
+                "lines 2..=2 ({len} bytes), attested at line 3 seq 1",
+                len = fragment.len(),
+            ),
+        ),
+        located(
+            K::DuplicateRecord,
+            native,
+            3,
+            1,
+            "2 copies of 1 distinct records".to_owned(),
+        ),
+        located(
+            K::TornWriteRepaired,
+            shipped,
+            1,
+            1,
+            "fragment not present".to_owned(),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "D2");
+    assert_eq!(report.covered_through(), Some(1));
+    assert!(
+        !report.is_strict_valid(),
+        "D2 --strict fails on the DuplicateRecord warning",
+    );
 }
 
 // =====================================================================
@@ -1084,6 +1214,23 @@ fn fixture_hashes_match_literals() {
     ab.extend_from_slice(b"{\"a\":\n");
     ab.extend_from_slice(b"{\"b\":\n");
     assert_eq!(digest_string(&repair_digest(&ab)), REPAIR_DIGEST_AB);
+    // P6c -- native e1 vs shipped e1_alt (same previous and repaired,
+    // `time = 101` vs `999`).
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let gap_digest = repair_digest(FRAG_TORN);
+    let e1 = entry_rec_with_repaired(1, cp0.hash(), gap_digest);
+    let alt_ctx = RecordContext::new(TRAIL, 1, 999, "test", cp0.hash()).repaired(gap_digest);
+    let e1_alt = Record::new(alt_ctx, Entry::new("a", "change", "c")).unwrap();
+    assert_eq!(digest_string(&e1.hash()), P6C_E1_HASH);
+    assert_eq!(digest_string(&e1_alt.hash()), P6C_E1_ALT_HASH);
+    // P6c2 -- native cp1 vs shipped cp1_alt (same signed fields except
+    // `time`), so a distinct signature and distinct record hash.
+    let mmr0 = seeded(&cp0);
+    let cp1 = signed_cp_with_ctx(context(1, cp0.hash()).repaired(gap_digest), &mmr0);
+    let cp1_alt_ctx = RecordContext::new(TRAIL, 1, 999, "test", cp0.hash()).repaired(gap_digest);
+    let cp1_alt = signed_cp_with_ctx(cp1_alt_ctx, &mmr0);
+    assert_eq!(digest_string(&cp1.hash()), P6C2_CP1_HASH);
+    assert_eq!(digest_string(&cp1_alt.hash()), P6C2_CP1_ALT_HASH);
 }
 
 // =====================================================================

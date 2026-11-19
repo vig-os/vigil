@@ -262,8 +262,10 @@ mod runs_tests;
 /// covering an archived head is V6's. V5b trusts checkpoints (ruling
 /// 13-V5-d1 point 6): `covered_through` is the highest `seq` of a
 /// trusted candidate, `UncoveredTail` lists exactly the records above
-/// it, and an attested native gap whose attesting record is covered is
-/// `TornWriteRepaired`. V4/V5c-e/V6-V8/R10 supply folds, revocation,
+/// it, and an attested native gap is `TornWriteRepaired` only when the
+/// attester is a record of the verified trail whose `seq` has no
+/// `SeqConflict` (ruling 13-V5-d2); otherwise it stays `TornWrite`.
+/// V4/V5c-e/V6-V8/R10 supply folds, revocation,
 /// `end=`, `max_age`, anchors, receipts, review and archive rules.
 /// A matching `audit.repaired` outside coverage is a `TornWrite`, a
 /// missing or different one is `RepairMismatch`, and a trailing gap is

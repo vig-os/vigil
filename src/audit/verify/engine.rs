@@ -1,9 +1,11 @@
 //! Collecting chain and gap checks (ruling 13-V3-d3). A native gap
 //! attested by a record whose `seq <= covered_through` is reported as
 //! `TornWriteRepaired`, but only when that attesting record is itself a
-//! record of the verified trail AND is the only record at its `seq`
-//! (not one side of a `SeqConflict` fork); otherwise it stays
-//! `TornWrite` (rulings 13-V5-d1 point 6 and 13-V5-d2).
+//! record of the verified trail AND its `seq` carries no `SeqConflict`
+//! (it is the only distinct hash at that `seq`); otherwise it stays
+//! `TornWrite` (rulings 13-V5-d1 point 6 and 13-V5-d2). A byte-
+//! identical copy at the attester's `seq` is `DuplicateRecord`, not a
+//! fork, and does not block promotion.
 //!
 //! Fragment context: a fragment run (consecutive `Fragment` lines) that fails
 //! condition 3 (ruling 13-V3-d4, addendum 10) yields `Unparsable` "fragment
@@ -370,14 +372,15 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy
     let covered_through = coverage(&groups, trail, trust);
     // Ruling 13-V5-d2: a `SeqConflict` fork blocks promotion at its
     // `seq` -- the attester must be the only record on the verified
-    // trail at that `seq`. A seq with two or more distinct hashes
-    // reports `SeqConflict` below; we pre-compute the set here once.
+    // trail at that `seq`. One definition of "forked" (the shared
+    // `forked` helper): both this pre-pass (so `file_findings` can
+    // consult it ahead of the main seq-loop) and the `SeqConflict`
+    // emission inside the main seq-loop read it from the same set,
+    // so a byte-identical duplicate (same hash across copies) is
+    // `DuplicateRecord`, never a fork.
     let conflicting_seqs: BTreeSet<u64> = groups
         .iter()
-        .filter_map(|(&seq, copies)| {
-            let hashes: BTreeSet<[u8; 32]> = copies.iter().map(|(_, r)| r.hash).collect();
-            (hashes.len() > 1).then_some(seq)
-        })
+        .filter_map(|(&seq, copies)| forked(copies).then_some(seq))
         .collect();
     for (idx, input) in collection.inputs.iter().enumerate() {
         let no_crash = mark_no_crash(&collection, idx);
@@ -437,7 +440,7 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy
                 ),
             ));
         }
-        if candidates.len() > 1 {
+        if conflicting_seqs.contains(&seq) {
             findings.push(finding(
                 K::SeqConflict,
                 path,
@@ -576,6 +579,17 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy
         )
     });
     Report::new(trail, count, first_seq, last_seq, covered_through, findings)
+}
+
+/// Shared fork predicate (ruling 13-V5-d2): `true` iff the records at
+/// one `seq` on the verified trail carry two or more DISTINCT hashes
+/// (not merely two or more copies). One definition for both the pre-
+/// pass `conflicting_seqs` set (which blocks `TornWriteRepaired`
+/// promotion) and the main seq-loop's `SeqConflict` emission, so a
+/// byte-identical duplicate stays `DuplicateRecord` in both places.
+fn forked(copies: &[Located<'_>]) -> bool {
+    let hashes: BTreeSet<[u8; 32]> = copies.iter().map(|(_, r)| r.hash).collect();
+    hashes.len() > 1
 }
 
 /// Highest `seq` whose candidate `(seq, hash)` checkpoint satisfies the

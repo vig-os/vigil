@@ -189,9 +189,14 @@ pub enum FindingKind {
     RepairMismatch,
     /// Error: A review does not match its record, gap or run digest.
     AcceptMismatch,
-    /// Warning: A fragment gap whose attesting record is not covered by
-    /// a trusted checkpoint, or a trailing gap with no attesting record
-    /// at all. Detail grammar (ruling 13-V5-d1 point 6): either
+    /// Warning: A fragment gap whose attesting record is not a record
+    /// of the verified trail, is at a `seq` carrying a `SeqConflict`
+    /// (one side of a fork), or has `seq > covered_through`; or a
+    /// trailing gap with no attesting record at all. Promotion to
+    /// `TornWriteRepaired` requires an attester of the verified trail
+    /// whose `seq` has no `SeqConflict` and is at or below
+    /// `covered_through` (rulings 13-V5-d1 point 6 and 13-V5-d2).
+    /// Detail grammar: either
     /// `lines {first}..={last} ({N} bytes), attested at line {L} seq {S}`
     /// for an attested-but-uncovered gap, or
     /// `trailing gap lines {first}..={last} ({N} bytes), digest {D}`
