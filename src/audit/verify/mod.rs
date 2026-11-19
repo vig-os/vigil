@@ -1,6 +1,7 @@
 //! Offline collecting verifier and results (ADR-0005).
 use super::{AuditError, AuditErrorKind, FindingKind, TrustPolicy};
 use std::path::{Path, PathBuf};
+mod end;
 mod engine;
 mod fold;
 mod input;
@@ -107,8 +108,9 @@ pub struct Report {
     last_seq: Option<u64>,
     covered_through: Option<u64>,
     findings: Vec<Finding>,
-    // `--strict` exempts `UncoveredTail` under a validated `end=` (#13 V5);
-    // every V3b-1 report leaves this `false`.
+    // `--strict` exempts `UncoveredTail` under a matching `end=`
+    // (ruling 13-V5-d5 point 2.1); a mismatched or absent `end=`
+    // leaves this `false`.
     tail_exempt: bool,
 }
 impl Report {
@@ -130,9 +132,11 @@ impl Report {
             tail_exempt: false,
         }
     }
-    /// Marks the uncovered tail as exempt (consumed by `is_strict_valid`).
-    /// `end=` validation sets this; V3b-1 reports always leave it `false`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "end= exemption, #13 V5"))]
+    /// Marks the uncovered tail as exempt from `--strict` (consumed
+    /// by `is_strict_valid`). Set by [`super::engine::check`] to
+    /// `true` exactly when the verified trail's section carries an
+    /// `end=` that matches (ruling 13-V5-d5 point 2.1); every other
+    /// report leaves it `false`.
     pub(crate) fn with_tail_exempt(mut self, exempt: bool) -> Self {
         self.tail_exempt = exempt;
         self
@@ -174,10 +178,14 @@ impl Report {
     }
     /// Returns true when `--strict` would exit 0 for this report.
     ///
-    /// No `Error`, no `Warning`, no `UncoveredTail` without `tail_exempt`,
-    /// no `Unreconciled`. V3b-1 never sets `tail_exempt`; V5 does under
-    /// `end=`. An `Accepted` info does not suppress a separate warning of
-    /// the same kind.
+    /// No `Error`, no `Warning`, no `UncoveredTail` without
+    /// `tail_exempt`, no `Unreconciled`. `tail_exempt` is set by the
+    /// verifier exactly when the verified trail's section carries an
+    /// `end=` that matches (both the "at `s`" and "above `s`"
+    /// conditions of ruling 13-V5-d5 pass), so `UncoveredTail`
+    /// stays an info but does not fail `--strict`. A mismatched or
+    /// absent `end=` leaves it `false`. An `Accepted` info does not
+    /// suppress a separate warning of the same kind.
     pub fn is_strict_valid(&self) -> bool {
         self.findings.iter().all(|f| match f.severity() {
             Severity::Error | Severity::Warning => false,
@@ -235,6 +243,8 @@ fn severity(kind: FindingKind) -> Severity {
 
 #[cfg(test)]
 mod coverage_tests;
+#[cfg(test)]
+mod end_tests;
 #[cfg(test)]
 mod mod_tests;
 #[cfg(test)]

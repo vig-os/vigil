@@ -137,10 +137,7 @@ impl TrustPolicy {
         bounded.into_iter().collect()
     }
     /// Returns the trail's pinned retirement head, if present.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the verifier, #13 V3/V5")
-    )]
+    /// Consumed by the verifier's `end=` check (ruling 13-V5-d5).
     pub(crate) fn end(&self, id: &[u8; 16]) -> Option<Bound> {
         self.sections.get(id)?.ends.first().copied()
     }

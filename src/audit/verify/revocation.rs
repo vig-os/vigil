@@ -35,9 +35,12 @@
 //! `SeqConflict` set, and the crate-private trusted predicate from
 //! [`super::signatures::trusted`]. Never a second pass over files.
 //!
-//! The `end=` exemption of ruling 13-V5-d1 point 4 arrives with
-//! `end=` itself in V5d: until then, a retired trail without a
-//! confirming checkpoint reports `RevocationUnconfirmed` (#13).
+//! Ruling 13-V5-d5 point 2.2: a matching `end=` confirms every
+//! `through=` bound in the section whose `seq` is at or below the
+//! matched end `seq`, so no `RevocationUnconfirmed` fires there. The
+//! pin itself still runs (rulings 13-V5-d3 and 13-V5-d4). Threaded
+//! as `matched_end` from [`super::end::check`], whose single call
+//! `super::engine::check` owns.
 
 use super::{Finding, input::Summary, signatures};
 use crate::audit::{FindingKind as K, TrustPolicy, digest_string, hex};
@@ -54,6 +57,7 @@ struct Ctx<'a> {
     trust: &'a TrustPolicy,
     groups: &'a BTreeMap<u64, Vec<Located<'a>>>,
     conflicting_seqs: &'a BTreeSet<u64>,
+    matched_end: Option<u64>,
 }
 
 pub(super) fn check(
@@ -61,6 +65,7 @@ pub(super) fn check(
     trust: &TrustPolicy,
     groups: &BTreeMap<u64, Vec<Located<'_>>>,
     conflicting_seqs: &BTreeSet<u64>,
+    matched_end: Option<u64>,
     findings: &mut Vec<Finding>,
 ) {
     let ctx = Ctx {
@@ -68,6 +73,7 @@ pub(super) fn check(
         trust,
         groups,
         conflicting_seqs,
+        matched_end,
     };
     for (key, (s, h)) in trust.bounds_in(&trail) {
         let key_hex = hex(&key);
@@ -150,7 +156,9 @@ fn pin(
 /// above `s` is signed by a key other than the bounded one
 /// (ruling 13-V5-d1 point 3; ruling 13-V5-d3 point 2). Runs whether
 /// the pin passed or failed: ruling 13-V5-d1 point 4 makes the two
-/// checks independent so one bound can carry both findings.
+/// checks independent so one bound can carry both findings. A
+/// matching `end=` whose `seq` is at or above `s` also confirms the
+/// bound (ruling 13-V5-d5 point 2.2).
 fn confirmation(
     ctx: &Ctx<'_>,
     s: u64,
@@ -159,6 +167,9 @@ fn confirmation(
     location: Option<(PathBuf, u64)>,
     findings: &mut Vec<Finding>,
 ) {
+    if ctx.matched_end.is_some_and(|e| s <= e) {
+        return;
+    }
     let confirmed = s.checked_add(1).is_some_and(|next| {
         ctx.groups.range(next..).any(|(_, copies)| {
             copies.iter().any(|(_, r)| {
