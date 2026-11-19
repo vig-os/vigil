@@ -163,9 +163,48 @@ pub enum FindingKind {
     /// Each distinct `(seq, hash)` checkpoint is checked once. Revocation pin
     /// mismatch and bound confirmation belong to later work.
     UntrustedKey,
-    /// Error: A revoked key conflicts with its trusted bound.
+    /// Error: A `through=<s>:<h>` revocation bound is not pinned by
+    /// the verified set (ADR-0005 decision 9 and amendment 8; rulings
+    /// 13-V5-d1 point 4 and 13-V5-d3 point 1). Emitted at `seq` `s`
+    /// for each such bound on a key of the verified trail's section
+    /// (scope: ruling 13-V5-d3 point 3; one finding per bound). A
+    /// bound is pinned when exactly one distinct record exists at
+    /// `s`, its hash is `h`, and it is a checkpoint; byte-identical
+    /// duplicates count as one record, a `SeqConflict` fork is not
+    /// pinned (fail-closed, same rule as ruling 13-V5-d2).
+    ///
+    /// Detail is exactly one of:
+    ///
+    /// - `key <64 hex> through=<s>:blake3:<64 hex>: no record at seq <s>`
+    /// - `…: record at seq <s> has hash blake3:<64 hex>`
+    /// - `…: record at seq <s> is not a checkpoint`
+    /// - `…: seq <s> is forked`
+    ///
+    /// The first and fourth carry no location; the second and third
+    /// point to the record's file and line. Independent of
+    /// `RevocationUnconfirmed`: one bound can carry both findings;
+    /// neither suppresses the other.
     RevocationMismatch,
-    /// Error: A revocation bound lacks confirmation.
+    /// Error: A `through=<s>:<h>` revocation bound is not confirmed
+    /// by a trusted checkpoint above `s` signed by another key
+    /// (ADR-0005 decision 9; rulings 13-V5-d1 points 3 and 4 and
+    /// 13-V5-d3 point 2). "Trusted" per ruling 13-V5-d1 point 3:
+    /// signature verifies under `verify_strict` AND the key is
+    /// trusted at that `seq` for the verified trail. Emitted at
+    /// `seq` `s`, located like the pin finding above (ruling
+    /// 13-V5-d3 point 2).
+    ///
+    /// Detail is exactly
+    /// `key <64 hex> through=<s>: no trusted checkpoint by another
+    /// key above the bound`.
+    ///
+    /// `end=` interim (ruling 13-V5-d1 point 4): a matching `end=`
+    /// will also confirm a bound; until then a retired trail
+    /// without a confirming checkpoint reports
+    /// `RevocationUnconfirmed` (#13).
+    ///
+    /// Independent of `RevocationMismatch`: one bound can carry both
+    /// findings; neither suppresses the other.
     RevocationUnconfirmed,
     /// Error: A segment or run violates the required structure.
     SegmentStructure,

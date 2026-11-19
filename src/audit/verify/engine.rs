@@ -20,7 +20,7 @@
 use super::{
     Finding, Report, fold,
     input::{Collection, Input, LineContent, Summary},
-    resume, signatures,
+    resume, revocation, signatures,
 };
 use crate::audit::{FindingKind as K, Record, TrustPolicy, digest_string, hex};
 use std::{
@@ -514,6 +514,11 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy
         }
         previous = Some((seq, candidates));
     }
+    // Ruling 13-V5-d1 point 4 and 13-V5-d3: pin and confirm every
+    // `through=` bound on a key of the verified trail's section, in
+    // key-byte order. Reads the same merged `groups` and fork set the
+    // main seq-loop just filled, so no second file pass.
+    revocation::check(trail, trust, &groups, &conflicting_seqs, &mut findings);
     // Compute the per-declaration structural outcome once (ruling
     // 13-V3-d5 point 10, #195): both the `Resumed` detail suffix and the
     // candidate list derive from the same declarations.

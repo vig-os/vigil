@@ -308,7 +308,19 @@ fn c4_untrusted_key_at_head_falls_back_coverage_to_previous_trusted() {
         .build()
         .unwrap();
     let report = report_of(vec![fx.path.clone()], trust);
+    // V5c (ruling 13-V5-d1 point 4): the bound is pinned at cp0 but no
+    // checkpoint above it is signed by another key, so one
+    // `RevocationUnconfirmed` is added here.
     let expected = vec![
+        Finding::new(
+            K::RevocationUnconfirmed,
+            Some(fx.path.clone()),
+            Some(1),
+            Some(0),
+            format!(
+                "key {FIXTURE_KEY_HEX} through=0: no trusted checkpoint by another key above the bound"
+            ),
+        ),
         located(
             K::UntrustedKey,
             fx.path.clone(),

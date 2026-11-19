@@ -6,6 +6,7 @@ mod fold;
 mod input;
 pub(crate) mod lines;
 mod resume;
+mod revocation;
 mod signatures;
 
 /// Severity of a finding produced by the offline verifier (#13).
@@ -236,6 +237,8 @@ fn severity(kind: FindingKind) -> Severity {
 mod coverage_tests;
 #[cfg(test)]
 mod mod_tests;
+#[cfg(test)]
+mod revocation_tests;
 #[cfg(test)]
 mod rule2_tests;
 #[cfg(test)]

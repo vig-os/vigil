@@ -311,7 +311,19 @@ fn a3_bound_key_cp2_above_bound_is_untrusted_bounded() {
         .build()
         .unwrap();
     let findings = verify_files_with(vec![fx.path.clone()], trust);
+    // V5c (ruling 13-V5-d1 point 4): the bound is pinned at cp0 but
+    // never confirmed (cp2 is signed by the same bounded key), so one
+    // `RevocationUnconfirmed` at the bound's seq is added here.
     let expected = vec![
+        Finding::new(
+            K::RevocationUnconfirmed,
+            Some(fx.path.clone()),
+            Some(1),
+            Some(0),
+            format!(
+                "key {FIXTURE_KEY_HEX} through=0: no trusted checkpoint by another key above the bound"
+            ),
+        ),
         located(
             K::UntrustedKey,
             fx.path.clone(),
@@ -490,7 +502,19 @@ fn a6b_bounded_key_with_flipped_signature_emits_both() {
         .build()
         .unwrap();
     let findings = verify_files_with(vec![fx.path.clone()], trust);
+    // V5c (ruling 13-V5-d1 point 4): the bound is pinned at cp0; cp2's
+    // only candidate has a bad signature so it is not trusted and
+    // cannot confirm the bound. One `RevocationUnconfirmed` is added.
     let expected = vec![
+        Finding::new(
+            K::RevocationUnconfirmed,
+            Some(fx.path.clone()),
+            Some(1),
+            Some(0),
+            format!(
+                "key {FIXTURE_KEY_HEX} through=0: no trusted checkpoint by another key above the bound"
+            ),
+        ),
         located(
             K::BadSignature,
             fx.path.clone(),
@@ -1080,6 +1104,18 @@ fn r2_honest_bounded_at_head_has_no_signature_findings_and_head_is_trusted() {
         )
         .with_run_digest(A1_RUN_DIGEST_BYTES),
         located(K::SeqGap, s1, 1, 4, "missing seq 3..=3".to_owned()),
+        // V5c (ruling 13-V5-d1 point 4): cp6 is bound exactly and
+        // pinned; no checkpoint above the bound is signed by another
+        // key, so the bound is unconfirmed. The live cp6 sits at line 1.
+        Finding::new(
+            K::RevocationUnconfirmed,
+            Some(live.clone()),
+            Some(1),
+            Some(6),
+            format!(
+                "key {FIXTURE_KEY_HEX} through=6: no trusted checkpoint by another key above the bound"
+            ),
+        ),
         located(
             K::Resumed,
             live,
