@@ -37,6 +37,15 @@ pub(crate) struct SegmentOutcome {
     pub(crate) state: Option<State>,
     pub(crate) violations: Vec<(CollectorPos, Violation)>,
     pub(crate) closed_run: bool,
+    /// #13 V4b (ruling 13-V4-d10 points 2-3): per-checkpoint fold
+    /// outcomes this segment's walk recorded. Pos indices are
+    /// segment-local; `runs::classify` rewrites them to its own
+    /// segment enumeration before placing the entries in
+    /// `ClassifyOutput::fold_entries`. Threaded up under BOTH
+    /// reactions (see [`runs::Classifier::record_fold_entry`])
+    /// because `storage::history_segment`'s strict pass is hardcoded
+    /// to `Reaction::Stop`; the reader paths never read this field.
+    pub(crate) fold_entries: Vec<runs::CheckpointFoldEntry>,
 }
 use crate::rotate::Directory;
 use rustix::fs::{self as rfs, Mode, OFlags};
@@ -1196,9 +1205,20 @@ pub(crate) fn history_segment(
     // The strict pass takes one clone, the lazy tolerant byte source
     // takes the original.
     let strict_source = source.try_clone().map_err(io_error)?;
+    // #13 V4b (ruling 13-V4-d10 points 2-3): the strict pass's
+    // `fold_entries` are threaded up alongside the final State so an
+    // honest sealed segment under outer `Reaction::Collect` contributes
+    // its matched fold entries to `ClassifyOutput::fold_entries`
+    // (the strict closure stays Reaction::Stop per addendum 27.1; the
+    // Classifier populates fold_entries under both reactions, see
+    // `runs::Classifier::record_fold_entry`).
     #[rustfmt::skip]
     let strict = move || scan_inner(Reaction::Stop, strict_source, trail, strict_state, expected, &mut fc.borrow_mut(), ctx)
-        .map(|out| (out.state.expect("scan_inner Stop implies state=Some"), out.closed_run));
+        .map(|out| (
+            out.state.expect("scan_inner Stop implies state=Some"),
+            out.closed_run,
+            out.fold_entries,
+        ));
     // Lazy tolerant byte source. The seek, the glued-byte / LF check,
     // `read_line`, `decode_line_kind` AND the tolerant-side byte
     // bookkeeping (`last_offset` / `last_newline` / `offset_cursor`,
@@ -1259,7 +1279,7 @@ pub(crate) fn history_segment(
 
     #[rustfmt::skip]
     let walk_args = HistorySegmentArgs { ctx, prior_run, unsealed_boundary, run_in: *run, trail };
-    let walk = runs::history_segment::<(State, bool), _, _, _>(
+    let walk = runs::history_segment::<(State, bool, Vec<runs::CheckpointFoldEntry>), _, _, _>(
         reaction, walk_args, strict, events, on_feed,
     );
     // Addendum 22.2: writeback `found` BEFORE propagating Err, so the
@@ -1269,7 +1289,7 @@ pub(crate) fn history_segment(
     // caller even when record N+1 broke the fold.
     *found = found_cell.into_inner();
     match walk? {
-        HistorySegmentWalk::Strict((next, strict_closed_run)) => {
+        HistorySegmentWalk::Strict((next, strict_closed_run, fold_entries)) => {
             // Strict completed with no violations. `strict_closed_run`
             // is the inner Classifier's own latch (ruling 197-d1
             // addendum 28, 13-V4-d3 point 1): true iff the walker
@@ -1281,6 +1301,7 @@ pub(crate) fn history_segment(
                 state: Some(next),
                 violations: Vec::new(),
                 closed_run: strict_closed_run,
+                fold_entries,
             })
         }
         HistorySegmentWalk::Tolerant(outcome) => {
@@ -1289,6 +1310,7 @@ pub(crate) fn history_segment(
             let closed_run = outcome.closed_run;
             let bytes = bytes.into_inner();
             let violations = outcome.violations;
+            let fold_entries = outcome.fold_entries;
             // Thread the classifier's own folded state (identical to
             // `running_state` under Stop, authoritative under Collect).
             // Under Collect the tolerant arm's `on_feed` Record branch
@@ -1311,6 +1333,7 @@ pub(crate) fn history_segment(
                 }),
                 violations,
                 closed_run,
+                fold_entries,
             })
         }
     }
@@ -1722,6 +1745,7 @@ fn scan_inner(
         state,
         violations: outcome.violations,
         closed_run: outcome.closed_run,
+        fold_entries: outcome.fold_entries,
     })
 }
 fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<(), AuditError> {
@@ -1742,8 +1766,20 @@ fn apply_checked(
     compare_mmr: bool,
 ) -> Result<(), AuditError> {
     let prior_run = state.as_ref().map(|s| &s.run);
-    let Some(next_run) =
-        runs::apply_checked(prior_run, record, genesis, broken_boundary, compare_mmr)?
+    // The reader never consumes the per-checkpoint fold report
+    // (#13 V4b, ruling 13-V4-d10 point 1: the reader enforces rule 2
+    // through the classifier's compare, not through a separate
+    // report). The discarded slot keeps the one-fold invariant:
+    // storage.rs does not re-fold the records.
+    let mut fold_out: Option<runs::CheckpointFoldReport> = None;
+    let Some(next_run) = runs::apply_checked(
+        prior_run,
+        record,
+        genesis,
+        broken_boundary,
+        compare_mmr,
+        &mut fold_out,
+    )?
     else {
         return Ok(()); // Collector-style identical duplicate: leave state in place.
     };

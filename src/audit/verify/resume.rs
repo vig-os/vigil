@@ -61,7 +61,10 @@ pub(super) struct ResumeCandidate {
     pub(super) resume_seq: u64,
     #[cfg_attr(not(test), expect(dead_code, reason = "consumed by #13 V7"))]
     pub(super) resume_hash: [u8; 32],
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by #13 V6"))]
+    // Consumed in non-test builds by `verify::engine::filter_candidates`
+    // (#13 V4b, ruling 13-V4-d10 point 4): the fail-closed candidate
+    // filter reads this field to drop any opening the classifier did
+    // not positively record as compared and matched.
     pub(super) opening_seq: u64,
     #[cfg_attr(not(test), expect(dead_code, reason = "consumed by #13 V6"))]
     pub(super) opening_hash: [u8; 32],

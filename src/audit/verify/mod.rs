@@ -229,6 +229,8 @@ fn severity(kind: FindingKind) -> Severity {
 #[cfg(test)]
 mod mod_tests;
 #[cfg(test)]
+mod rule2_tests;
+#[cfg(test)]
 mod runs_tests;
 
 /// Verifies a directory using a cloned, validated trust policy.

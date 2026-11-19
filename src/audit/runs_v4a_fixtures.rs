@@ -55,17 +55,25 @@ pub(crate) fn context(seq: u64, previous: [u8; 32]) -> RecordContext {
     RecordContext::new(TRAIL, seq, 100 + seq, "test", previous)
 }
 pub(crate) fn signed_cp(seq: u64, previous: [u8; 32], mmr: &Mmr) -> Record {
+    signed_cp_explicit(seq, previous, mmr.size(), mmr.root(), mmr.peaks().to_vec())
+}
+
+/// Signs a checkpoint with **explicit** `(size, root, peaks)` instead
+/// of taking the honest `Mmr` fold. Used by the #13 V4b rule-2 rows
+/// (ruling 13-V4-d10 point 2) to craft an opening checkpoint whose
+/// declared fields do not match the walker's fold. `peaks.len()` must
+/// equal `size.count_ones()` (a `CheckpointFields::new` invariant);
+/// pass a crafted vector of that length.
+pub(crate) fn signed_cp_explicit(
+    seq: u64,
+    previous: [u8; 32],
+    size: u64,
+    root: [u8; 32],
+    peaks: Vec<[u8; 32]>,
+) -> Record {
     let key = KeyFileSigner::from_hex(&"27".repeat(32)).unwrap();
-    let fields = |sig| {
-        CheckpointFields::new(
-            mmr.size(),
-            mmr.root(),
-            mmr.peaks().to_vec(),
-            key.public_key(),
-            sig,
-        )
-        .unwrap()
-    };
+    let fields =
+        |sig| CheckpointFields::new(size, root, peaks.clone(), key.public_key(), sig).unwrap();
     let unsigned = Record::checkpoint(context(seq, previous), fields([0; 64])).unwrap();
     let signature = key.sign(&unsigned.signing_message().unwrap()).unwrap();
     Record::checkpoint(context(seq, previous), fields(signature)).unwrap()
