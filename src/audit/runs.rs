@@ -254,10 +254,12 @@ pub(crate) struct CollectorOutcome {
     /// #13 V4b (ruling 13-V4-d10 points 2-4): per-checkpoint fold
     /// outcomes recorded by the tolerant classifier during this
     /// segment's walk (including both arms of the fold-(iii) salvage
-    /// callsite). Only populated under [`Reaction::Collect`]; empty
-    /// under Stop (`record_fold_entry` short-circuits). Pos indices
-    /// are segment-local; `classify` rewrites them. See
-    /// [`ScanSegmentOutcome::fold_entries`].
+    /// callsite). Pos indices are segment-local; `classify` rewrites
+    /// them. The outer [`classify`] loop drops the per-segment
+    /// entries under outer [`Reaction::Stop`] (`build_reports ==
+    /// false`), so Stop's `ClassifyOutput::fold_entries` stays
+    /// empty and reader behaviour is byte-for-byte the same (ruling
+    /// 13-V4-d10 point 1). See [`ScanSegmentOutcome::fold_entries`].
     pub(crate) fold_entries: Vec<CheckpointFoldEntry>,
 }
 
@@ -374,31 +376,62 @@ pub(crate) fn apply_checked(
     match &record.kind {
         Kind::Checkpoint(cp) => {
             // #13 V4b (ruling 13-V4-d10 points 1-4): capture the fold's
-            // expected view and the checkpoint's declared view at the
-            // one fold-compare site. The caller records a
-            // [`CheckpointFoldEntry`] under [`Reaction::Collect`]
-            // (and is a no-op under [`Reaction::Stop`]), including
-            // when this function returns
-            // `Err(Violation::CheckpointMmrDiffers)` below (the
-            // report was already written). `is_base` carries the
-            // amendment-6 self-base signal: when true the compare
-            // was tautological (the fold was loaded from `cp.peaks`
-            // through `Mmr::from_peaks`) and the caller records
-            // [`CheckpointFoldOutcome::Base`], which the
-            // resume-candidate filter drops as "never compared"
-            // (ruling 13-V4-d10 point 4). Reader paths pass
+            // expected view, the checkpoint's declared view AND the
+            // one outcome at the one fold-compare site. The caller
+            // records a [`CheckpointFoldEntry`] whose outcome is read
+            // directly from here, so two fields cannot contradict
+            // each other (addendum: a differing self-base is
+            // [`CheckpointFoldOutcome::Differs`], not
+            // [`CheckpointFoldOutcome::Base`]). Reader paths pass
             // `&mut None` and nothing reads it. No second fold.
+            //
+            // Outcome derivation from what the fold actually did at
+            // this record:
+            //   - a mismatch (declared size, root or peaks differ
+            //     from the fold's expected) under `compare_mmr=true`
+            //     returns [`Violation::CheckpointMmrDiffers`] and
+            //     records [`CheckpointFoldOutcome::Differs`];
+            //   - the same mismatch under `compare_mmr=false`
+            //     (amendment 6 (iii): post-loss) returns `Ok` and
+            //     records [`CheckpointFoldOutcome::DiffersAfterLoss`]
+            //     -- not a violation, so runs are never emptied;
+            //   - a self-base that is self-consistent (ADR
+            //     amendment 6 "Base": the fold loaded `cp.peaks`
+            //     through `Mmr::from_peaks` and the declared fields
+            //     agree with that fold) records
+            //     [`CheckpointFoldOutcome::Base`]: no comparison
+            //     fired against predecessor records, so the
+            //     fail-closed resume-candidate filter drops it
+            //     (ruling 13-V4-d10 point 4). Shipped-copy rule 2 for
+            //     this case is spike #224;
+            //   - every other `(cp.size, cp.root, cp.peaks) ==
+            //     (expected_size, expected_root, mmr.peaks())` case
+            //     records [`CheckpointFoldOutcome::Matched`],
+            //     including the amendment 9 part 1 genesis-base
+            //     (`root_link && head.seq > 0`): that branch is a
+            //     real compare against the computable 1-leaf fold
+            //     and `self_base` stays false there.
             let expected_size = mmr.size();
             let expected_root = mmr.root();
             let differs =
                 cp.size != expected_size || cp.root != expected_root || cp.peaks != mmr.peaks();
+            let outcome = if differs {
+                if compare_mmr {
+                    CheckpointFoldOutcome::Differs
+                } else {
+                    CheckpointFoldOutcome::DiffersAfterLoss
+                }
+            } else if self_base {
+                CheckpointFoldOutcome::Base
+            } else {
+                CheckpointFoldOutcome::Matched
+            };
             *fold_out = Some(CheckpointFoldReport {
                 expected_size,
                 expected_root,
                 declared_size: cp.size,
                 declared_root: cp.root,
-                differs,
-                is_base: self_base,
+                outcome,
             });
             if compare_mmr && differs {
                 return Err(Violation::CheckpointMmrDiffers);
@@ -620,11 +653,14 @@ pub(crate) struct ScanSegmentOutcome {
     /// segment's walk. Pos indices are segment-local (segment_index
     /// = 0, record_index_in_segment per feed); `classify` rewrites
     /// them to its own segment enumeration before placing the
-    /// entries in [`ClassifyOutput::fold_entries`]. **Only
-    /// populated under [`Reaction::Collect`]**:
-    /// [`Classifier::record_fold_entry`] short-circuits in the Stop
-    /// reaction (ruling 13-V4-d10 point 1: reader behaviour stays
-    /// byte-for-byte the same).
+    /// entries in [`ClassifyOutput::fold_entries`]. Recorded
+    /// regardless of the inner reaction, so the hardcoded Stop
+    /// strict closure inside `storage::history_segment` also feeds
+    /// matched entries for honest sealed segments into the outer
+    /// classification. The outer [`classify`] loop drops them
+    /// under outer [`Reaction::Stop`] (`build_reports == false`),
+    /// keeping reader behaviour byte-for-byte the same (ruling
+    /// 13-V4-d10 point 1).
     pub(crate) fold_entries: Vec<CheckpointFoldEntry>,
 }
 
@@ -947,33 +983,33 @@ pub(crate) struct SegmentViolationPos {
 }
 
 /// #13 V4b (ruling 13-V4-d10 points 1-3): expected vs declared MMR
-/// summary at a checkpoint's fold-compare point inside
-/// [`apply_checked`]. ADR-0005 decision 5 rule 2 compares `mmr_size`,
-/// root and peaks; this report carries size and root (the root fixes
-/// the peaks) so the verifier's `MmrMismatch` detail can read
-/// `expected size <n> root <digest>, found size <n> root <digest>`.
-/// The fold is the classifier's one fold -- the reader's and
-/// verifier's shared one (ruling 13-V4-d10 point 1); no second fold.
+/// summary AND the one derived outcome at a checkpoint's fold-compare
+/// point inside [`apply_checked`]. ADR-0005 decision 5 rule 2 compares
+/// `mmr_size`, root and peaks; this report carries size and root (the
+/// root fixes the peaks) so the verifier's `MmrMismatch` detail can
+/// read `expected size <n> root <digest>, found size <n> root
+/// <digest>`. The fold is the classifier's one fold -- the reader's
+/// and verifier's shared one (ruling 13-V4-d10 point 1); no second
+/// fold.
+///
+/// The `outcome` is derived here from what the fold did at this
+/// record: a mismatch under `compare_mmr=true` is
+/// [`CheckpointFoldOutcome::Differs`] (paired with
+/// [`Violation::CheckpointMmrDiffers`] below); a mismatch under
+/// `compare_mmr=false` is [`CheckpointFoldOutcome::DiffersAfterLoss`]
+/// (amendment 6 (iii), never a violation); a self-consistent self-base
+/// is [`CheckpointFoldOutcome::Base`] (never compared against
+/// predecessors); everything else is
+/// [`CheckpointFoldOutcome::Matched`]. One enum value, not two
+/// separate booleans, so no caller can read a self-base flag that
+/// disagrees with the compare's own result.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CheckpointFoldReport {
     pub(crate) expected_size: u64,
     pub(crate) expected_root: [u8; 32],
     pub(crate) declared_size: u64,
     pub(crate) declared_root: [u8; 32],
-    pub(crate) differs: bool,
-    /// ADR-0005 amendment 6 "Base": the opening checkpoint IS the
-    /// fold's base, so its declared `(size, root, peaks)` were loaded
-    /// INTO the fold through `Mmr::from_peaks` and no comparison took
-    /// place at this record. `expected_*` equals `declared_*` by
-    /// construction here. The caller records this outcome as
-    /// [`CheckpointFoldOutcome::Base`] (ruling 13-V4-d10 point 4
-    /// "never compared"); it is never [`CheckpointFoldOutcome::Matched`],
-    /// so the fail-closed resume-candidate filter drops it. The
-    /// genesis base of amendment 9 part 1 is NOT a self-base: the
-    /// fold pushes the computable genesis leaf and compares the
-    /// declared fields against the resulting 1-leaf fold, so
-    /// `is_base` stays false on that branch.
-    pub(crate) is_base: bool,
+    pub(crate) outcome: CheckpointFoldOutcome,
 }
 
 /// #13 V4b (ruling 13-V4-d10 points 2-3): per-checkpoint fold outcome
@@ -1007,18 +1043,22 @@ pub(crate) enum CheckpointFoldOutcome {
     /// 11 `accept-run` item 3).
     DiffersAfterLoss,
     /// ADR-0005 amendment 6 "Base": this opening checkpoint is the
-    /// fold's own base -- its declared `(size, root, peaks)` were
-    /// loaded INTO the fold through `Mmr::from_peaks` -- so no
-    /// comparison took place at this record (ruling 13-V4-d10
-    /// point 4 "never compared"). The verifier emits NO
-    /// `MmrMismatch`, and the resume-candidate filter drops any
-    /// candidate whose opening carries this outcome. This is
-    /// distinct from [`CheckpointFoldOutcome::Matched`]: a
-    /// self-based opening never passes rule 2 just by virtue of
-    /// being written. Shipped-copy rule 2 for this case is spike
-    /// #224. The genesis base of amendment 9 part 1 is NOT a
-    /// self-base: its 1-leaf fold is a real compare, so the
-    /// opening lands under [`CheckpointFoldOutcome::Matched`] or
+    /// fold's own base AND is self-consistent -- its declared
+    /// `(size, root, peaks)` were loaded INTO the fold through
+    /// `Mmr::from_peaks` and the compare of `cp.root` against
+    /// `mmr.root()` (computed from those same peaks) matches by
+    /// construction. No comparison fires against predecessor records
+    /// (ruling 13-V4-d10 point 4 "never compared"). The verifier
+    /// emits NO `MmrMismatch`, and the resume-candidate filter drops
+    /// any candidate whose opening carries this outcome. A
+    /// self-base whose declared `(size, root, peaks)` do NOT agree
+    /// with the fold loaded from its own peaks is a compare that
+    /// FAILED and is recorded as [`Differs`], not here: one enum
+    /// value for one compare outcome (blocker 1). Shipped-copy rule
+    /// 2 for this case is spike #224. The genesis base of amendment
+    /// 9 part 1 is NOT a self-base: its 1-leaf fold is a real
+    /// compare, so the opening lands under
+    /// [`CheckpointFoldOutcome::Matched`] or
     /// [`CheckpointFoldOutcome::Differs`].
     Base,
 }
@@ -1043,6 +1083,13 @@ pub(crate) enum CheckpointFoldOutcome {
 pub(crate) struct CheckpointFoldEntry {
     pub(crate) pos: SegmentViolationPos,
     pub(crate) seq: u64,
+    /// The checked record's own hash (ruling 13-V4-d10 point 4).
+    /// The verifier's fail-closed resume-candidate filter matches
+    /// candidates on `(opening_seq, opening_hash)` against the
+    /// matched entries' `(seq, hash)`, so a forged opening whose
+    /// hash collides on `seq` with an honest Matched opening on
+    /// the same trail is dropped.
+    pub(crate) hash: [u8; 32],
     pub(crate) expected_size: u64,
     pub(crate) expected_root: [u8; 32],
     pub(crate) declared_size: u64,
@@ -2225,16 +2272,17 @@ pub(crate) struct Classifier {
     /// [`Classifier::reset_at_boundary`] on every segment boundary.
     closed_run: bool,
     /// #13 V4b (ruling 13-V4-d10 points 2-4): the per-checkpoint fold
-    /// outcomes the classifier recorded in this segment's walk under
-    /// [`Reaction::Collect`]. Pushed from the record-apply call sites
-    /// in `feed_record` (strict) and `feed_record_apply_tolerant`
-    /// (tolerant) when `apply_checked` populated its
-    /// [`CheckpointFoldReport`] out-slot. **Empty under
-    /// [`Reaction::Stop`]**: `record_fold_entry` short-circuits in
-    /// the Stop reaction so the reader's observable behaviour stays
-    /// byte-for-byte the same (ruling 13-V4-d10 point 1). Classify
-    /// threads this per segment into
-    /// [`ClassifyOutput::fold_entries`].
+    /// outcomes the classifier recorded in this segment's walk.
+    /// Pushed from the record-apply call sites in `feed_record`
+    /// (strict) and `feed_record_apply_tolerant` (tolerant) when
+    /// `apply_checked` populated its [`CheckpointFoldReport`] out-
+    /// slot. Recorded regardless of this classifier's reaction;
+    /// classify threads each segment's entries into
+    /// [`ClassifyOutput::fold_entries`] only under outer
+    /// [`Reaction::Collect`] (`build_reports == true`), so under
+    /// outer Stop the trail-level `fold_entries` stays empty and
+    /// reader behaviour is byte-for-byte the same (ruling 13-V4-d10
+    /// point 1).
     fold_entries: Vec<CheckpointFoldEntry>,
 }
 
@@ -2246,19 +2294,18 @@ pub(crate) struct FinishOutcome {
     pub(crate) closed_run: bool,
     /// #13 V4b (ruling 13-V4-d10 points 2-4): per-checkpoint fold
     /// outcomes recorded during this segment's walk (see
-    /// [`Classifier::record_fold_entry`]). Empty under
-    /// [`Reaction::Stop`] (`record_fold_entry` short-circuits
-    /// there), including under `storage::history_segment`'s
-    /// hardcoded-Stop strict closure: an honest sealed segment's
-    /// matched entries land in [`ClassifyOutput::fold_entries`]
-    /// ONLY via the tolerant-fallback path running under the outer
-    /// `Reaction::Collect`, while an honest-and-strict sealed
-    /// segment contributes nothing. In practice this matters only
-    /// for openings inside sealed-and-strict segments, which are
-    /// not a resume-candidate opening the fail-closed filter
-    /// relies on (openings for valid candidates sit in the live
-    /// segment walked under `scan_closing` with the outer
-    /// reaction).
+    /// [`Classifier::record_fold_entry`]). Recorded regardless of
+    /// the classifier's inner reaction, including the hardcoded
+    /// Stop strict closure inside `storage::history_segment`:
+    /// an honest-and-strict sealed segment therefore also
+    /// contributes its matched entries into the one verifier
+    /// classification, so a resume whose opening sits in a sealed
+    /// segment passes the fail-closed candidate filter (ruling
+    /// 13-V4-d10 point 4). The outer [`classify`] loop drops these
+    /// entries when `build_reports == false` (outer
+    /// [`Reaction::Stop`]), keeping Stop's
+    /// `ClassifyOutput::fold_entries` empty and reader behaviour
+    /// byte-for-byte the same (ruling 13-V4-d10 point 1).
     pub(crate) fold_entries: Vec<CheckpointFoldEntry>,
 }
 
@@ -2399,47 +2446,26 @@ impl Classifier {
     /// #13 V4b (ruling 13-V4-d10 points 2-4): push one
     /// [`CheckpointFoldEntry`] for the checkpoint-apply call whose
     /// `apply_checked` populated `report`. No-op when `report` is
-    /// `None` (non-checkpoint path). Populated **only** under
-    /// [`Reaction::Collect`]; a Stop-reaction call returns early so
-    /// the reader's observable output stays byte-for-byte the same
-    /// (ruling 13-V4-d10 point 1). The allocation under Collect is
-    /// bounded by one entry per checkpoint-apply (a few per
-    /// segment); the reader never reads this field.
+    /// `None` (non-checkpoint path). Records regardless of
+    /// `self.reaction`: the outer [`classify`] loop drops the
+    /// per-segment entries when `build_reports == false` (that is,
+    /// under outer [`Reaction::Stop`]), so the Stop output's
+    /// `ClassifyOutput::fold_entries` stays empty and reader
+    /// behaviour remains byte-for-byte the same (ruling 13-V4-d10
+    /// point 1). Recording here under Mode::Strict with inner
+    /// reaction Stop (the hardcoded strict closure inside
+    /// `storage::history_segment`) is how an honest-and-strict
+    /// sealed segment contributes its matched entries to the
+    /// verifier's one classification, so a resume whose opening
+    /// is in that segment passes the fail-closed filter (blocker 3).
     ///
-    /// `compare_mmr` is the flag the caller passed to
-    /// `apply_checked`; it decides whether a differing checkpoint is
-    /// [`CheckpointFoldOutcome::Differs`] (compare was active, also
-    /// recorded as `CheckpointMmrDiffers`) or
-    /// [`CheckpointFoldOutcome::DiffersAfterLoss`] (amendment 6
-    /// (iii): the walker skipped the compare and the reader does
-    /// not reject). A matching checkpoint is
-    /// [`CheckpointFoldOutcome::Matched`], including after the
-    /// first loss point. A self-based opening (ADR-0005 amendment 6
-    /// "Base") is [`CheckpointFoldOutcome::Base`]: the fold loaded
-    /// the checkpoint's declared fields through `Mmr::from_peaks`
-    /// and nothing compared them (ruling 13-V4-d10 point 4). The
-    /// genesis base of amendment 9 part 1 is a real compare against
-    /// the 1-leaf genesis fold and lands under Matched or Differs.
-    fn record_fold_entry(
-        &mut self,
-        record: &Record,
-        report: Option<CheckpointFoldReport>,
-        compare_mmr: bool,
-    ) {
-        if !matches!(self.reaction, Reaction::Collect) {
-            return;
-        }
+    /// The outcome comes straight from
+    /// [`CheckpointFoldReport::outcome`], which `apply_checked`
+    /// derives at the one compare site (one enum, not two separate
+    /// flags). A differing self-base is `Differs`, not `Base`.
+    fn record_fold_entry(&mut self, record: &Record, report: Option<CheckpointFoldReport>) {
         let Some(rep) = report else {
             return;
-        };
-        let outcome = if rep.is_base {
-            CheckpointFoldOutcome::Base
-        } else if !rep.differs {
-            CheckpointFoldOutcome::Matched
-        } else if compare_mmr {
-            CheckpointFoldOutcome::Differs
-        } else {
-            CheckpointFoldOutcome::DiffersAfterLoss
         };
         self.fold_entries.push(CheckpointFoldEntry {
             pos: SegmentViolationPos {
@@ -2447,11 +2473,12 @@ impl Classifier {
                 record_index_in_segment: self.current_pos.record_index_in_segment,
             },
             seq: record.context.seq,
+            hash: Head::of(record).hash,
             expected_size: rep.expected_size,
             expected_root: rep.expected_root,
             declared_size: rep.declared_size,
             declared_root: rep.declared_root,
-            outcome,
+            outcome: rep.outcome,
         });
     }
 
@@ -2577,9 +2604,14 @@ impl Classifier {
         // walk. The out-slot is populated inside `apply_checked`
         // BEFORE any `Violation::CheckpointMmrDiffers` return, so
         // `fold_report` is `Some` whether the compare matched,
-        // differed, or loaded a self-base; `record_fold_entry`
-        // short-circuits under `Reaction::Stop` and pushes only
-        // under `Reaction::Collect`.
+        // differed or loaded a self-base. `record_fold_entry`
+        // records regardless of this classifier's reaction: the
+        // outer [`classify`] loop drops the per-segment entries
+        // under outer [`Reaction::Stop`] (`build_reports == false`),
+        // which keeps reader behaviour byte-for-byte the same while
+        // letting an honest-and-strict sealed segment contribute
+        // matched entries into the verifier's single classification
+        // (blocker 3; ruling 13-V4-d10 points 1-4).
         let mut fold_report: Option<CheckpointFoldReport> = None;
         let result = apply_checked(
             self.state.as_ref(),
@@ -2589,7 +2621,7 @@ impl Classifier {
             true,
             &mut fold_report,
         );
-        self.record_fold_entry(record, fold_report, true);
+        self.record_fold_entry(record, fold_report);
         let next_opt = match result {
             Ok(opt) => opt,
             Err(v) => return Err(self.on_violation(v)),
@@ -2909,21 +2941,22 @@ impl Classifier {
         //
         // #13 V4b (ruling 13-V4-d10 points 2-4): record one
         // `CheckpointFoldEntry` per checkpoint the fold meets in the
-        // walk under `Reaction::Collect` only (the Stop reaction
-        // short-circuits inside `record_fold_entry`). Populated by
-        // `apply_checked` for both the primary call (compare_mmr =
-        // outside_run || before_loss) and the salvage call
-        // (compare_mmr = false). For `compare_mmr = true + differs`,
-        // `fold_report.differs` is true AND `apply_checked` returns
-        // `Err(CheckpointMmrDiffers)`, which this arm handles. For
-        // `compare_mmr = false + differs`, `fold_report.differs` is
-        // true and `apply_checked` returns `Ok` (amendment 6 (iii):
-        // the walker does not compare post-loss). The entry's
-        // outcome then distinguishes `Differs` from
-        // `DiffersAfterLoss`. The tolerant-mode walk always threads
-        // a prior `RunState` into `apply_checked`, so the
-        // self-base `Mmr::from_peaks` branch (and hence
-        // `CheckpointFoldOutcome::Base`) is unreachable here.
+        // walk. Populated by `apply_checked` for both the primary
+        // call (compare_mmr = outside_run || before_loss) and the
+        // salvage call (compare_mmr = false). For `compare_mmr =
+        // true + differs`, `fold_report.outcome` is `Differs` AND
+        // `apply_checked` returns `Err(CheckpointMmrDiffers)`,
+        // which this arm handles. For `compare_mmr = false +
+        // differs`, the outcome is `DiffersAfterLoss` and
+        // `apply_checked` returns `Ok` (amendment 6 (iii): the
+        // walker does not compare post-loss). The tolerant-mode
+        // walk always threads a prior `RunState` into
+        // `apply_checked`, so the self-base `Mmr::from_peaks`
+        // branch (and hence `CheckpointFoldOutcome::Base`) is
+        // unreachable here. `record_fold_entry` records regardless
+        // of this classifier's reaction; the outer [`classify`]
+        // loop drops entries under outer [`Reaction::Stop`]
+        // (ruling 13-V4-d10 point 1).
         let mut fold_report: Option<CheckpointFoldReport> = None;
         let primary = apply_checked(
             self.state.as_ref(),
@@ -2933,7 +2966,7 @@ impl Classifier {
             compare_mmr,
             &mut fold_report,
         );
-        self.record_fold_entry(record, fold_report, compare_mmr);
+        self.record_fold_entry(record, fold_report);
         let next = match primary {
             Ok(opt) => opt,
             Err(Violation::CheckpointMmrDiffers) if matches!(self.reaction, Reaction::Collect) => {

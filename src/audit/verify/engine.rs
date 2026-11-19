@@ -474,16 +474,18 @@ pub(super) fn check(collection: Collection, trail: [u8; 16]) -> Report {
     // (addendum 28 point 2).
     let matched_openings = fold::check_runs(&collection, trail, &mut findings);
     // #13 V4b (ruling 13-V4-d10 point 4): fail-closed candidate
-    // filter. Keep only candidates whose opening the fold positively
-    // recorded as matched; drop anything else -- a differing opening,
-    // a self-based opening (ADR amendment 6 "Base"; never compared),
-    // a shipped-only opening (no fold compare at this head, spike
-    // #224), and an opening the walk did not reach after an earlier
-    // violation. Consumed by the gap confirmation of #13 (V6 start,
-    // V7 confirmation), so a gap whose opening rule 2 has not
-    // passed can never be confirmed or excused there. The
-    // `#[cfg(test)]` seam below returns this list for row B6 without
-    // widening visibility otherwise.
+    // filter. Keep only candidates whose opening `(seq, hash)` the
+    // fold positively recorded as matched; drop anything else --
+    // a differing opening, a self-based opening (ADR amendment 6
+    // "Base"; never compared), a shipped-only opening (no fold
+    // compare at this head, spike #224), an opening the walk did
+    // not reach after an earlier violation, and a forged opening
+    // whose hash collides on `seq` with an honest Matched opening
+    // (blocker 2). Consumed by the gap confirmation of #13 (V6
+    // start, V7 confirmation), so a gap whose opening rule 2 has
+    // not passed can never be confirmed or excused there. The
+    // `#[cfg(test)]` seam below returns this list for row B6
+    // without widening visibility otherwise.
     let pending_resumes = filter_candidates(candidates, &matched_openings);
     let _ = &pending_resumes;
     let first_seq = groups.first_key_value().map(|(&s, _)| s);
@@ -513,21 +515,23 @@ pub(super) fn check(collection: Collection, trail: [u8; 16]) -> Report {
 }
 
 /// #13 V4b (ruling 13-V4-d10 point 4): fail-closed candidate filter.
-/// Keeps a candidate only when its opening `seq` is in
-/// `matched_openings` -- the set
+/// Keeps a candidate only when its `(opening_seq, opening_hash)` is
+/// in `matched_openings` -- the set
 /// [`fold::check_runs`](super::fold::check_runs) collected from the
 /// classifier's positively-compared-and-matched fold entries. Drops
-/// anything else: a differing opening, a shipped-only opening (no
-/// fold compare at this head), and an opening the walk did not
-/// reach after an earlier violation. Shared by `check` (non-test)
-/// and [`filter_candidates_for_test`] (test only).
+/// anything else: a differing opening, a self-based opening, a
+/// shipped-only opening (no fold compare at this head), an opening
+/// the walk did not reach after an earlier violation, and a forged
+/// opening whose hash does not equal the record the fold compared
+/// (blocker 2). Shared by `check` (non-test) and
+/// [`filter_candidates_for_test`] (test only).
 fn filter_candidates(
     candidates: Vec<resume::ResumeCandidate>,
-    matched_openings: &std::collections::BTreeSet<u64>,
+    matched_openings: &std::collections::BTreeSet<(u64, [u8; 32])>,
 ) -> Vec<resume::ResumeCandidate> {
     candidates
         .into_iter()
-        .filter(|c| matched_openings.contains(&c.opening_seq))
+        .filter(|c| matched_openings.contains(&(c.opening_seq, c.opening_hash)))
         .collect()
 }
 

@@ -36,12 +36,22 @@
 //! violation and never empties a run (amendment 6 (iii) refined by
 //! decision 11 `accept-run` item 3; ruling 13-V4-d10 point 3). A
 //! `CheckpointFoldOutcome::Base` entry (ADR amendment 6 "Base":
-//! the opening IS the fold's base, `Mmr::from_peaks`) is never
-//! compared and therefore never a finding; it is also never in the
+//! the opening IS the fold's base AND is self-consistent against
+//! its own peaks) is never a finding; it is also never in the
 //! matched-openings set, which keeps the fail-closed
 //! resume-candidate filter correct for a self-based opening
 //! (ruling 13-V4-d10 point 4; shipped-copy rule 2 for this case
-//! is spike #224).
+//! is spike #224). A self-base whose declared `(size, root,
+//! peaks)` disagree with the fold loaded from its own peaks is a
+//! failed compare and lands under
+//! `CheckpointFoldOutcome::Differs`, not `Base` (blocker 1).
+//!
+//! `check_runs` returns the matched openings as
+//! `(seq, hash)` pairs; the engine's fail-closed filter keeps a
+//! candidate only when `(opening_seq, opening_hash)` is present,
+//! so a forged opening whose hash collides on `seq` with an
+//! honest Matched opening on the same trail is dropped (blocker
+//! 2).
 //!
 //! **Shipped-copy limit (owner decision 13-V4-d7; spike #224):** the
 //! classifier runs over native inputs only; a shipped (Collector)
@@ -78,10 +88,13 @@ use crate::audit::{
 /// `MmrMismatch` per differing fold-compare entry that
 /// `runs::classify` returns under `Reaction::Collect` on the
 /// verifier's confirmed snapshot (rulings 13-V4-d3-d8, 13-V4-d10).
-/// Returns the set of opening `seq`s the classifier positively
-/// recorded as compared and matched; the engine's resume-candidate
-/// filter keeps only candidates whose opening `seq` is in this set
-/// (ruling 13-V4-d10 point 4, fail-closed).
+/// Returns the set of `(opening_seq, opening_hash)` pairs the
+/// classifier positively recorded as compared and matched; the
+/// engine's resume-candidate filter keeps only candidates whose
+/// `(opening_seq, opening_hash)` is in this set (ruling 13-V4-d10
+/// point 4, fail-closed). Matching on the pair -- not on `seq`
+/// alone -- drops a forged opening whose hash collides on `seq`
+/// with an honest Matched opening on the same trail (blocker 2).
 ///
 /// Native inputs only; a shipped (Collector) input gets no run
 /// finding and no fold compare at this head (owner decision
@@ -100,7 +113,7 @@ pub(super) fn check_runs(
     collection: &Collection,
     trail: [u8; 16],
     findings: &mut Vec<Finding>,
-) -> BTreeSet<u64> {
+) -> BTreeSet<(u64, [u8; 32])> {
     let natives = collection.native_segments();
     // Ruling 13-V4-d6 point 1: build a crate-private, portable
     // `(Rc<[u8]>, is_live)` snapshot from the verifier's already-
@@ -173,15 +186,17 @@ fn emit_fold_findings(
     trail: [u8; 16],
     out: &ClassifyOutput,
     findings: &mut Vec<Finding>,
-) -> BTreeSet<u64> {
-    let mut matched_openings: BTreeSet<u64> = BTreeSet::new();
+) -> BTreeSet<(u64, [u8; 32])> {
+    let mut matched_openings: BTreeSet<(u64, [u8; 32])> = BTreeSet::new();
     for entry in &out.fold_entries {
         match entry.outcome {
             CheckpointFoldOutcome::Matched => {
                 // Ruling 13-V4-d10 point 4: a positive, compare-and-
-                // matched record of the opening. The filter in
-                // `verify::engine::check` consumes this set.
-                matched_openings.insert(entry.seq);
+                // matched record of the opening, keyed by the
+                // checked record's own `(seq, hash)` (blocker 2).
+                // The filter in `verify::engine::check` consumes
+                // this set.
+                matched_openings.insert((entry.seq, entry.hash));
             }
             CheckpointFoldOutcome::Differs | CheckpointFoldOutcome::DiffersAfterLoss => {
                 emit_mmr_mismatch(natives, collection, trail, entry, findings);
@@ -189,16 +204,21 @@ fn emit_fold_findings(
             CheckpointFoldOutcome::Base => {
                 // ADR-0005 amendment 6 "Base" / ruling 13-V4-d10
                 // point 4: the fold loaded this opening's declared
-                // `(size, root, peaks)` through `Mmr::from_peaks` and
-                // nothing compared them. The verifier emits no
-                // `MmrMismatch` here (there is no expected-vs-found
-                // to report), and `matched_openings` stays unchanged
-                // so the fail-closed candidate filter drops any
-                // resume candidate whose opening is only self-based.
+                // `(size, root, peaks)` through `Mmr::from_peaks`
+                // AND the declared fields agreed with that fold --
+                // a self-base that is self-consistent. The compare
+                // never fired against predecessor records, so the
+                // verifier emits no `MmrMismatch` here and
+                // `matched_openings` stays unchanged so the
+                // fail-closed candidate filter drops any resume
+                // candidate whose opening is only self-based.
                 // Shipped-copy rule 2 for a self-based opening is
                 // spike #224; until it decides, this fail-closed
                 // branch ensures a self-based opening is never
-                // confirmed.
+                // confirmed. A self-base whose declared fields
+                // disagree with the fold loaded from its own peaks
+                // lands under `Differs`, not here (blocker 1), so
+                // an `MmrMismatch` is emitted at that record.
             }
         }
     }
