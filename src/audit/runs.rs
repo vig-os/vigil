@@ -251,6 +251,18 @@ pub(crate) struct CollectorOutcome {
     /// (ruling 197-d1 addendum 28, 13-V4-d3 point 1) without
     /// heuristics.
     pub(crate) closed_run: bool,
+    /// #13 V4b (ruling 13-V4-d10 points 1, 4, 6): per-checkpoint
+    /// fold outcomes recorded by the tolerant classifier during
+    /// this segment's walk. Each push is gated by two
+    /// Classifier-level flags: the outer-reaction
+    /// `record_fold_entries` flag (point 1: reader paths leave it
+    /// `false` so no per-checkpoint blake3 hash is done) and the
+    /// per-segment `segment_has_collected_violation` latch (point
+    /// 6: once a violation lands in `collected` the rest of the
+    /// segment stops recording). Pos indices are segment-local;
+    /// `classify` rewrites them. See
+    /// [`ScanSegmentOutcome::fold_entries`].
+    pub(crate) fold_entries: Vec<CheckpointFoldEntry>,
 }
 
 impl std::fmt::Debug for CollectorOutcome {
@@ -303,6 +315,7 @@ pub(crate) fn apply_checked(
     genesis: bool,
     broken_boundary: bool,
     compare_mmr: bool,
+    fold_out: &mut Option<CheckpointFoldReport>,
 ) -> Result<Option<RunState>, Violation> {
     let head = Head::of(record);
     let root_link =
@@ -310,6 +323,16 @@ pub(crate) fn apply_checked(
     // A root checkpoint above zero declares loss and needs an immediate resume;
     // an archived prefix instead carries its predecessor hash and MMR (d2/d8).
     let mut pending = prior.is_none() && head.seq > 0 && root_link;
+    // #13 V4b (ruling 13-V4-d10 point 4): true iff this record is the
+    // fold's self-base -- i.e. prior is None AND we take the
+    // `Mmr::from_peaks(cp.size, cp.peaks)` branch below. The compare
+    // that follows is tautological on this branch (the fold just
+    // loaded these fields), so the caller records the outcome as
+    // [`CheckpointFoldOutcome::Base`] and the resume-candidate filter
+    // drops it (never compared). The genesis base of amendment 9
+    // part 1 goes through the `fold.push(genesis)` branch instead
+    // and stays a real compare.
+    let mut self_base = false;
     let mut mmr = if let Some(s) = prior {
         s.mmr.clone()
     } else {
@@ -327,6 +350,7 @@ pub(crate) fn apply_checked(
                 .map_err(|_| Violation::MmrOverflow)?;
             fold
         } else {
+            self_base = true;
             Mmr::from_peaks(cp.size, cp.peaks.clone())
                 .map_err(|_| Violation::InvalidOpeningPeaks)?
         }
@@ -353,9 +377,66 @@ pub(crate) fn apply_checked(
     }
     match &record.kind {
         Kind::Checkpoint(cp) => {
-            if compare_mmr
-                && (cp.size != mmr.size() || cp.root != mmr.root() || cp.peaks != mmr.peaks())
-            {
+            // #13 V4b (ruling 13-V4-d10 points 1-4): capture the fold's
+            // expected view, the checkpoint's declared view AND the
+            // one outcome at the one fold-compare site. The caller
+            // records a [`CheckpointFoldEntry`] whose outcome is read
+            // directly from here, so two fields cannot contradict
+            // each other: a differing self-base (declared fields do
+            // not agree with the fold loaded from its own peaks)
+            // is [`CheckpointFoldOutcome::Differs`], not
+            // [`CheckpointFoldOutcome::Base`]. Reader paths pass
+            // `&mut None` and nothing reads it. No second fold.
+            //
+            // Outcome derivation from what the fold actually did at
+            // this record:
+            //   - a mismatch (declared size, root or peaks differ
+            //     from the fold's expected) under `compare_mmr=true`
+            //     returns [`Violation::CheckpointMmrDiffers`] and
+            //     records [`CheckpointFoldOutcome::Differs`];
+            //   - the same mismatch under `compare_mmr=false`
+            //     (amendment 6 (iii): post-loss) returns `Ok` and
+            //     records [`CheckpointFoldOutcome::DiffersAfterLoss`]
+            //     -- not a violation, so runs are never emptied;
+            //   - a self-base that is self-consistent (ADR
+            //     amendment 6 "Base": the fold loaded `cp.peaks`
+            //     through `Mmr::from_peaks` and the declared fields
+            //     agree with that fold) records
+            //     [`CheckpointFoldOutcome::Base`]: no comparison
+            //     fired against predecessor records, so the
+            //     fail-closed resume-candidate filter drops it
+            //     (ruling 13-V4-d10 point 4). Shipped-copy rule 2 for
+            //     this case is spike #224;
+            //   - every other `(cp.size, cp.root, cp.peaks) ==
+            //     (expected_size, expected_root, mmr.peaks())` case
+            //     records [`CheckpointFoldOutcome::Matched`],
+            //     including the amendment 9 part 1 genesis-base
+            //     (`root_link && head.seq > 0`): that branch is a
+            //     real compare against the computable 1-leaf fold
+            //     and `self_base` stays false there.
+            let expected_size = mmr.size();
+            let expected_root = mmr.root();
+            let differs =
+                cp.size != expected_size || cp.root != expected_root || cp.peaks != mmr.peaks();
+            let outcome = if differs {
+                if compare_mmr {
+                    CheckpointFoldOutcome::Differs
+                } else {
+                    CheckpointFoldOutcome::DiffersAfterLoss
+                }
+            } else if self_base {
+                CheckpointFoldOutcome::Base
+            } else {
+                CheckpointFoldOutcome::Matched
+            };
+            *fold_out = Some(CheckpointFoldReport {
+                expected_size,
+                expected_root,
+                declared_size: cp.size,
+                declared_root: cp.root,
+                outcome,
+            });
+            if compare_mmr && differs {
                 return Err(Violation::CheckpointMmrDiffers);
             }
         }
@@ -542,6 +623,16 @@ pub(crate) struct ScanSegmentArgs {
     /// (ctx.run || predecessor-not-sealed). Set by the shim and owned
     /// by the classifier thereafter.
     pub(crate) initial_boundary_resume: bool,
+    /// #13 V4b (ruling 13-V4-d10 point 1): whether the outer caller
+    /// consumes `ClassifyOutput::fold_entries`. Threaded into
+    /// [`Classifier::set_record_fold_entries`]. Set `true` on
+    /// verifier paths; set `false` on every reader-only path so no
+    /// per-checkpoint blake3 hash is computed for entries the outer
+    /// classify loop would drop. Independent of `reaction` because
+    /// the strict closure inside `storage::history_segment` uses
+    /// inner [`Reaction::Stop`] even when the outer verifier is
+    /// Collect.
+    pub(crate) record_fold_entries: bool,
 }
 
 /// Ruling 197-d1 addendum 24.1: terminal outcome of the strict single-
@@ -570,6 +661,21 @@ pub(crate) struct ScanSegmentOutcome {
     /// addendum 28, 13-V4-d3 point 1). Used by `classify` to derive
     /// `SegmentClass::Closer` from walker signals.
     pub(crate) closed_run: bool,
+    /// #13 V4b (ruling 13-V4-d10 points 2-4): per-checkpoint fold
+    /// outcomes recorded by the strict classifier during this
+    /// segment's walk. Pos indices are segment-local (segment_index
+    /// = 0, record_index_in_segment per feed); `classify` rewrites
+    /// them to its own segment enumeration before placing the
+    /// entries in [`ClassifyOutput::fold_entries`]. The push is
+    /// gated by the Classifier's outer-reaction
+    /// `record_fold_entries` flag (ruling 13-V4-d10 point 1): the
+    /// verifier's one classification sets it `true` (including for
+    /// the strict-Stop closure inside `storage::history_segment`
+    /// on that outer Collect path, so matched entries from honest
+    /// sealed segments feed the fail-closed filter), and reader
+    /// paths leave it `false` so no per-checkpoint blake3 hash is
+    /// done.
+    pub(crate) fold_entries: Vec<CheckpointFoldEntry>,
 }
 
 /// Addendum 22.4 / 20.1: segment-shape inputs to the shared
@@ -626,6 +732,12 @@ where
         Reaction::Stop => Classifier::new_tolerant(args.prior_run, ctx, inherited),
         Reaction::Collect => Classifier::new_collect(args.prior_run, ctx, inherited),
     };
+    // #13 V4b (ruling 13-V4-d10 point 1): the tolerant fallback's
+    // reaction already matches the outer caller's reaction, so the
+    // inner Collect case is also the outer Collect case. The reader
+    // paths set this `false` so no per-checkpoint blake3 hashing
+    // happens for entries the outer classify loop would drop.
+    classifier.set_record_fold_entries(matches!(reaction, Reaction::Collect));
     let mut record_index: usize = 0;
     while let Some(line) = events()? {
         // Ruling 197-d1 addendum 24.3: the per-line mapping lives in the
@@ -660,6 +772,7 @@ where
                 violations: Vec::new(),
                 gap: fin.gap,
                 closed_run: fin.closed_run,
+                fold_entries: fin.fold_entries,
             }
         }
         Reaction::Collect => classifier.finish_collect(),
@@ -702,6 +815,7 @@ where
         trail,
         prior_run,
         initial_boundary_resume,
+        record_fold_entries,
     } = args;
     let mut classifier = match reaction {
         Reaction::Stop => Classifier::new(prior_run, ctx, Mode::Strict, initial_boundary_resume),
@@ -709,6 +823,7 @@ where
             Classifier::new_collect_strict(prior_run, ctx, initial_boundary_resume)
         }
     };
+    classifier.set_record_fold_entries(record_fold_entries);
     let mut record_index: usize = 0;
     while let Some(line) = events()? {
         // Ruling 197-d1 addendum 24.3: shared per-line dispatch.
@@ -734,6 +849,7 @@ where
                 gap: finished.gap,
                 violations: Vec::new(),
                 closed_run: finished.closed_run,
+                fold_entries: finished.fold_entries,
             })
         }
         Reaction::Collect => Ok(classifier.finish_collect_strict()),
@@ -861,6 +977,28 @@ pub(crate) struct ClassifyOutput {
     /// closed run. Consumed by `crate::audit::verify::fold::check_runs`
     /// (#13 V4a).
     pub(crate) runs: Vec<RunReport>,
+    /// #13 V4b (ruling 13-V4-d10 points 1-4, 6): one entry per
+    /// checkpoint the classifier's fold met and recorded. Each
+    /// per-segment walk's Classifier receives
+    /// `record_fold_entries = true` on the verifier's single
+    /// classification call (outer [`Reaction::Collect`]) and
+    /// `false` on every reader-only path, so under outer Stop
+    /// this `Vec` is empty by construction -- no per-checkpoint
+    /// blake3 hash runs on the reader's hot path. Consumed by
+    /// `crate::audit::verify::fold::check_runs` to emit one
+    /// `MmrMismatch` per [`CheckpointFoldOutcome::Differs`] and
+    /// per [`CheckpointFoldOutcome::DiffersAfterLoss`] entry,
+    /// and by `crate::audit::verify::engine::check` for the
+    /// resume-candidate filter.
+    ///
+    /// **Known limits (ruling 13-V4-d10 points 5-6):** shipped-
+    /// only openings are not checked (spike #224); once a
+    /// segment records a violation the classifier stops pushing
+    /// per-checkpoint fold entries for the rest of that segment
+    /// (the walk itself continues so violations and reader
+    /// results are unchanged, but no second mismatch there is
+    /// reported).
+    pub(crate) fold_entries: Vec<CheckpointFoldEntry>,
 }
 
 /// Ruling 197-d1 addendum 25.3: Collect tags a (segment, record-in-
@@ -873,6 +1011,125 @@ pub(crate) struct ClassifyOutput {
 pub(crate) struct SegmentViolationPos {
     pub(crate) segment_index: usize,
     pub(crate) record_index_in_segment: usize,
+}
+
+/// #13 V4b (ruling 13-V4-d10 points 1-3): expected vs declared MMR
+/// summary AND the one derived outcome at a checkpoint's fold-compare
+/// point inside [`apply_checked`]. ADR-0005 decision 5 rule 2 compares
+/// `mmr_size`, root and peaks; this report carries size and root (the
+/// root fixes the peaks) so the verifier's `MmrMismatch` detail can
+/// read `expected size <n> root <digest>, found size <n> root
+/// <digest>`. The fold is the classifier's one fold -- the reader's
+/// and verifier's shared one (ruling 13-V4-d10 point 1); no second
+/// fold.
+///
+/// The `outcome` is derived here from what the fold did at this
+/// record: a mismatch under `compare_mmr=true` is
+/// [`CheckpointFoldOutcome::Differs`] (paired with
+/// [`Violation::CheckpointMmrDiffers`] below); a mismatch under
+/// `compare_mmr=false` is [`CheckpointFoldOutcome::DiffersAfterLoss`]
+/// (amendment 6 (iii), never a violation); a self-consistent self-base
+/// is [`CheckpointFoldOutcome::Base`] (never compared against
+/// predecessors); everything else is
+/// [`CheckpointFoldOutcome::Matched`]. One enum value, not two
+/// separate booleans, so no caller can read a self-base flag that
+/// disagrees with the compare's own result.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CheckpointFoldReport {
+    pub(crate) expected_size: u64,
+    pub(crate) expected_root: [u8; 32],
+    pub(crate) declared_size: u64,
+    pub(crate) declared_root: [u8; 32],
+    pub(crate) outcome: CheckpointFoldOutcome,
+}
+
+/// #13 V4b (ruling 13-V4-d10 points 2-3): per-checkpoint fold outcome
+/// the classifier records at the record-apply call site under
+/// [`Reaction::Collect`]. ADR-0005 decision 5 rule 2 and amendment 6
+/// (iii) together say: before a run's first loss point every
+/// checkpoint's `mmr_size`, root and peaks must equal the fold of the
+/// base and the records present; after the first loss point the
+/// reader does not compare the checkpoint (iii), and a difference
+/// there is **not** a reader violation (no `CorruptTrail`, no run
+/// emptying). Decision 11 `accept-run` item 3 still reports it in
+/// the verifier, which `MmrMismatch` carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointFoldOutcome {
+    /// Declared size, root and peaks all equal the fold's expected.
+    /// A post-loss checkpoint whose fields happen to match lands
+    /// here, not under [`CheckpointFoldOutcome::DiffersAfterLoss`].
+    Matched,
+    /// The walker's fold compare fired (`compare_mmr = true`) and
+    /// the declared fields differ. This outcome pairs with a
+    /// recorded [`Violation::CheckpointMmrDiffers`] at the same
+    /// position; the verifier emits one `MmrMismatch` finding per
+    /// entry (ruling 13-V4-d10 point 2).
+    Differs,
+    /// The classifier's tolerant fold had already seen this run's
+    /// first loss point and the compare was disabled
+    /// (`compare_mmr = false`, amendment 6 (iii)). The declared
+    /// fields differ from the fold. **Not a [`Violation`]** (so the
+    /// run is never emptied); the verifier still emits one
+    /// `MmrMismatch` per entry (ruling 13-V4-d10 point 3; decision
+    /// 11 `accept-run` item 3).
+    DiffersAfterLoss,
+    /// ADR-0005 amendment 6 "Base": this opening checkpoint is the
+    /// fold's own base AND is self-consistent -- its declared
+    /// `(size, root, peaks)` were loaded INTO the fold through
+    /// `Mmr::from_peaks` and the compare of `cp.root` against
+    /// `mmr.root()` (computed from those same peaks) matches by
+    /// construction. No comparison fires against predecessor records
+    /// (ruling 13-V4-d10 point 4 "never compared"). The verifier
+    /// emits NO `MmrMismatch`, and the resume-candidate filter drops
+    /// any candidate whose opening carries this outcome. A
+    /// self-base whose declared `(size, root, peaks)` do NOT agree
+    /// with the fold loaded from its own peaks is a compare that
+    /// FAILED and is recorded as [`Differs`], not here: one enum
+    /// value for one compare outcome, so no caller can read a
+    /// self-base flag that disagrees with the compare's own
+    /// result (ruling 13-V4-d10 point 2). Shipped-copy rule
+    /// 2 for this case is spike #224. The genesis base of amendment
+    /// 9 part 1 is NOT a self-base: its 1-leaf fold is a real
+    /// compare, so the opening lands under
+    /// [`CheckpointFoldOutcome::Matched`] or
+    /// [`CheckpointFoldOutcome::Differs`].
+    Base,
+}
+
+/// #13 V4b (ruling 13-V4-d10 points 2-3): one classifier-recorded
+/// fold compare at a checkpoint, carrying the position, `seq`, the
+/// fold's expected size and root, the checkpoint's declared size and
+/// root, and the outcome. Populated only under [`Reaction::Collect`]
+/// (ruling 13-V4-d10 points 1-2); [`classify`] rewrites `pos.segment_index`
+/// to its own enumeration (parallel to [`ClassifyOutput::segments`]
+/// and [`verify::input::Collection::native_segments`], ruling
+/// 13-V4-d5 (a)) before placing the entry in
+/// [`ClassifyOutput::fold_entries`].
+///
+/// **Known limits (ruling 13-V4-d10 points 5-6):** (i) shipped-only
+/// openings are not checked here; spike #224 decides whether run
+/// boundaries can be recovered from a Collector record stream;
+/// (ii) once a segment records a violation the classifier stops
+/// pushing per-checkpoint entries for the rest of that segment
+/// (the salvage walk itself continues under Collect so violations
+/// and reader decisions stay unchanged), so a second mismatch in
+/// the same segment is not reported.
+#[derive(Clone, Debug)]
+pub(crate) struct CheckpointFoldEntry {
+    pub(crate) pos: SegmentViolationPos,
+    pub(crate) seq: u64,
+    /// The checked record's own hash (ruling 13-V4-d10 point 4).
+    /// The verifier's fail-closed resume-candidate filter matches
+    /// candidates on `(opening_seq, opening_hash)` against the
+    /// matched entries' `(seq, hash)`, so a forged opening whose
+    /// hash collides on `seq` with an honest Matched opening on
+    /// the same trail is dropped.
+    pub(crate) hash: [u8; 32],
+    pub(crate) expected_size: u64,
+    pub(crate) expected_root: [u8; 32],
+    pub(crate) declared_size: u64,
+    pub(crate) declared_root: [u8; 32],
+    pub(crate) outcome: CheckpointFoldOutcome,
 }
 
 /// Ruling 197-d1 addendum 25.5 and addendum 28, 13-V4-d3 point 1:
@@ -1166,6 +1423,12 @@ pub(crate) fn classify(
     // 13-V4-d3 point 1: membership comes from the walker's own run
     // flag and closed-run latch, not a heuristic).
     let mut seg_run_out: Vec<bool> = Vec::new();
+    // #13 V4b (ruling 13-V4-d10 points 2-3): accumulate per-segment
+    // fold entries across the walk. Only under `Reaction::Collect`:
+    // under Stop the reader never reads this field and the per-
+    // segment outcomes are discarded to keep behaviour byte-for-byte
+    // the same (ruling 13-V4-d10 point 1).
+    let mut fold_entries: Vec<CheckpointFoldEntry> = Vec::new();
     let mut segment_index: usize = 0;
     while let Some(seg) = source.next_segment()? {
         let in_state = state.take();
@@ -1227,12 +1490,18 @@ pub(crate) fn classify(
         } else {
             None
         };
-        let (next_state, seg_violations, closed_run, live) = match (path, seg) {
+        let (next_state, seg_violations, closed_run, live, seg_fold_entries) = match (path, seg) {
             (ReaderPath::LiveOpen { expected }, SegmentRead::Sealed { source, .. }) => {
                 let out = storage::history_segment(
                     reaction, source, trail, in_state, true, expected, &mut found, &mut run,
                 )?;
-                (out.state, out.violations, out.closed_run, None)
+                (
+                    out.state,
+                    out.violations,
+                    out.closed_run,
+                    None,
+                    out.fold_entries,
+                )
             }
             (ReaderPath::LiveOpen { expected }, SegmentRead::Live(source)) => {
                 // Preserve a `File` handle for `ClassifyOutput::live_file`
@@ -1253,6 +1522,7 @@ pub(crate) fn classify(
                     out.violations,
                     out.closed_run,
                     source.into_file(),
+                    out.fold_entries,
                 )
             }
             (ReaderPath::RefreshAppend, SegmentRead::Live(source)) => {
@@ -1272,6 +1542,7 @@ pub(crate) fn classify(
                     out.violations,
                     out.closed_run,
                     source.into_file(),
+                    out.fold_entries,
                 )
             }
             (ReaderPath::RefreshAppend, SegmentRead::Sealed { .. }) => {
@@ -1279,7 +1550,7 @@ pub(crate) fn classify(
                 // single Live segment; this arm is unreachable by
                 // construction. Keep it as a no-op so the reader path
                 // has no `unreachable!`.
-                (in_state, Vec::new(), false, None)
+                (in_state, Vec::new(), false, None, Vec::new())
             }
             (
                 ReaderPath::RefreshRotate,
@@ -1291,7 +1562,13 @@ pub(crate) fn classify(
                 let out = storage::history_segment(
                     reaction, source, trail, in_state, false, None, &mut found, &mut run,
                 )?;
-                (out.state, out.violations, out.closed_run, None)
+                (
+                    out.state,
+                    out.violations,
+                    out.closed_run,
+                    None,
+                    out.fold_entries,
+                )
             }
             (
                 ReaderPath::RefreshRotate,
@@ -1303,7 +1580,13 @@ pub(crate) fn classify(
                 let out = storage::history_segment(
                     reaction, source, trail, in_state, true, None, &mut found, &mut run,
                 )?;
-                (out.state, out.violations, out.closed_run, None)
+                (
+                    out.state,
+                    out.violations,
+                    out.closed_run,
+                    None,
+                    out.fold_entries,
+                )
             }
             (ReaderPath::RefreshRotate, SegmentRead::Live(source)) => {
                 let walker_source = source.try_clone().map_err(storage::io_error)?;
@@ -1321,6 +1604,7 @@ pub(crate) fn classify(
                     out.violations,
                     out.closed_run,
                     source.into_file(),
+                    out.fold_entries,
                 )
             }
         };
@@ -1431,6 +1715,21 @@ pub(crate) fn classify(
                 },
                 v,
             ));
+        }
+        // #13 V4b (ruling 13-V4-d10 points 1-2): rewrite the per-
+        // segment local index to classify's own segment enumeration
+        // (parallel to `segments`, and to
+        // `Collection::native_segments()` in the verifier -- ruling
+        // 13-V4-d5 (a)) before storing. `seg_fold_entries` is empty
+        // under outer [`Reaction::Stop`] by construction: the
+        // per-walk Classifier threads `record_fold_entries =
+        // matches!(outer_reaction, Reaction::Collect)` into
+        // `set_record_fold_entries`, so no `record_fold_entry` push
+        // fires on a reader path and no CPU is spent for entries
+        // the outer loop would drop.
+        for mut e in seg_fold_entries {
+            e.pos.segment_index = segment_index;
+            fold_entries.push(e);
         }
         segment_index += 1;
     }
@@ -1646,6 +1945,7 @@ pub(crate) fn classify(
         head_mismatch: head_mismatch_condition,
         segments,
         runs: runs_out,
+        fold_entries,
     })
 }
 
@@ -2007,6 +2307,39 @@ pub(crate) struct Classifier {
     /// `(run_in, run_out, damage)` alone. Cleared by
     /// [`Classifier::reset_at_boundary`] on every segment boundary.
     closed_run: bool,
+    /// #13 V4b (ruling 13-V4-d10 points 2-4): the per-checkpoint fold
+    /// outcomes the classifier recorded in this segment's walk.
+    /// Pushed from the record-apply call sites in `feed_record`
+    /// (strict) and `feed_record_apply_tolerant` (tolerant) when
+    /// [`Classifier::record_fold_entries`] is `true` AND
+    /// [`Classifier::segment_has_collected_violation`] is `false`
+    /// (ruling 13-V4-d10 point 6: a segment stops checking after
+    /// its first violation). Classify threads each segment's entries
+    /// into [`ClassifyOutput::fold_entries`] only under outer
+    /// [`Reaction::Collect`]; under outer Stop the trail-level
+    /// `fold_entries` stays empty and reader behaviour is byte-for-
+    /// byte the same (ruling 13-V4-d10 point 1).
+    fold_entries: Vec<CheckpointFoldEntry>,
+    /// #13 V4b (ruling 13-V4-d10 point 1): outer-reaction gate on
+    /// [`Classifier::record_fold_entry`]. The reader's Stop paths
+    /// set this `false` so the classifier does no blake3-hash work
+    /// per checkpoint for entries the outer classify loop would
+    /// then drop. Set `true` only when the outer caller consumes
+    /// `ClassifyOutput::fold_entries`, i.e. the verifier's single
+    /// [`runs::classify`] call under outer [`Reaction::Collect`]
+    /// (including the hardcoded Stop strict closure inside
+    /// `storage::history_segment` when that outer caller is the
+    /// verifier). Threaded via the constructors.
+    record_fold_entries: bool,
+    /// #13 V4b (ruling 13-V4-d10 point 6): per-segment latch set
+    /// once any violation lands in [`Classifier::collected`] for
+    /// the current segment. While set, [`Classifier::record_fold_entry`]
+    /// no-ops so no further `CheckpointFoldEntry` is pushed from
+    /// this segment; the walk itself continues unchanged so the
+    /// reader's accept/reject decisions and the recorded
+    /// `Violation` list stay byte-for-byte the same. Cleared at
+    /// each segment boundary by [`Classifier::reset_at_boundary`].
+    segment_has_collected_violation: bool,
 }
 
 /// The run state and gap hasher produced by [`Classifier::finish`] on success.
@@ -2015,6 +2348,21 @@ pub(crate) struct FinishOutcome {
     pub(crate) gap: Option<blake3::Hasher>,
     /// Walker's closed-run evidence (see `CollectorOutcome::closed_run`).
     pub(crate) closed_run: bool,
+    /// #13 V4b (ruling 13-V4-d10 points 2-4): per-checkpoint fold
+    /// outcomes recorded during this segment's walk (see
+    /// [`Classifier::record_fold_entry`]). Recorded regardless of
+    /// the classifier's inner reaction, including the hardcoded
+    /// Stop strict closure inside `storage::history_segment`:
+    /// an honest-and-strict sealed segment therefore also
+    /// contributes its matched entries into the one verifier
+    /// classification, so a resume whose opening sits in a sealed
+    /// segment passes the fail-closed candidate filter (ruling
+    /// 13-V4-d10 point 4). The outer [`classify`] loop drops these
+    /// entries when `build_reports == false` (outer
+    /// [`Reaction::Stop`]), keeping Stop's
+    /// `ClassifyOutput::fold_entries` empty and reader behaviour
+    /// byte-for-byte the same (ruling 13-V4-d10 point 1).
+    pub(crate) fold_entries: Vec<CheckpointFoldEntry>,
 }
 
 impl Classifier {
@@ -2054,6 +2402,9 @@ impl Classifier {
             collected: Vec::new(),
             recovery_pending: false,
             closed_run: false,
+            fold_entries: Vec::new(),
+            record_fold_entries: false,
+            segment_has_collected_violation: false,
         }
     }
 
@@ -2095,7 +2446,23 @@ impl Classifier {
             collected: Vec::new(),
             recovery_pending: false,
             closed_run: false,
+            fold_entries: Vec::new(),
+            record_fold_entries: false,
+            segment_has_collected_violation: false,
         }
+    }
+
+    /// #13 V4b (ruling 13-V4-d10 point 1): enable per-checkpoint
+    /// fold recording. Callers set this `true` only when the outer
+    /// caller consumes `ClassifyOutput::fold_entries` -- the
+    /// verifier's one [`classify`] call under outer
+    /// [`Reaction::Collect`], including the inner strict-Stop
+    /// closure inside `storage::history_segment` on that outer
+    /// Collect path. Every reader-only path leaves it `false`, so
+    /// no blake3 hashing happens per checkpoint for entries the
+    /// outer loop would drop.
+    pub(crate) fn set_record_fold_entries(&mut self, record: bool) {
+        self.record_fold_entries = record;
     }
 
     /// Builds a tolerant-mode classifier in Collect reaction (addendum 16
@@ -2149,6 +2516,49 @@ impl Classifier {
         self.state.as_ref()
     }
 
+    /// #13 V4b (ruling 13-V4-d10 points 2-4, 6): push one
+    /// [`CheckpointFoldEntry`] for the checkpoint-apply call whose
+    /// `apply_checked` populated `report`. No-op when `report` is
+    /// `None` (non-checkpoint path). Two gates skip the push, and
+    /// both skip the blake3 record-hash work the entry would need:
+    ///
+    ///   - [`Classifier::record_fold_entries`] is `false` (the
+    ///     outer-reaction gate: reader-only paths set it false so
+    ///     no CPU is spent for entries the outer `classify` would
+    ///     drop; ruling 13-V4-d10 point 1);
+    ///   - [`Classifier::segment_has_collected_violation`] is
+    ///     `true` (a prior violation in this segment has latched
+    ///     it, ruling 13-V4-d10 point 6: once a segment has a
+    ///     violation the classifier stops checking the rest of
+    ///     that segment, so no second mismatch there is reported).
+    ///
+    /// When the gate lets the push through, the outcome comes
+    /// straight from [`CheckpointFoldReport::outcome`], which
+    /// `apply_checked` derives at the one compare site (one enum,
+    /// not two separate flags). A differing self-base is `Differs`,
+    /// not `Base`.
+    fn record_fold_entry(&mut self, record: &Record, report: Option<CheckpointFoldReport>) {
+        let Some(rep) = report else {
+            return;
+        };
+        if !self.record_fold_entries || self.segment_has_collected_violation {
+            return;
+        }
+        self.fold_entries.push(CheckpointFoldEntry {
+            pos: SegmentViolationPos {
+                segment_index: self.current_pos.segment_index,
+                record_index_in_segment: self.current_pos.record_index_in_segment,
+            },
+            seq: record.context.seq,
+            hash: Head::of(record).hash,
+            expected_size: rep.expected_size,
+            expected_root: rep.expected_root,
+            declared_size: rep.declared_size,
+            declared_root: rep.declared_root,
+            outcome: rep.outcome,
+        });
+    }
+
     /// Reader hook: finalize the current gap bytes to a digest and clear it,
     /// so the reader's shim can hand it to [`check_attestation`] before the
     /// next `feed_record` (R2a's per-path position, addendum 12).
@@ -2172,6 +2582,12 @@ impl Classifier {
         if matches!(self.reaction, Reaction::Collect) {
             self.collected.push((self.current_pos, v));
             self.recovery_pending = true;
+            // Ruling 13-V4-d10 point 6: once a segment has a violation
+            // the classifier stops recording per-checkpoint fold
+            // entries for the rest of that segment. The walk itself
+            // continues (so violations and reader results are
+            // unchanged), but no second mismatch there is reported.
+            self.segment_has_collected_violation = true;
         }
         AuditError::from(v)
     }
@@ -2266,7 +2682,32 @@ impl Classifier {
             matches!(&record.kind, Kind::Entry(e) if e.action == "vigil.audit.resume");
         let closer_candidate =
             self.ctx.run && self.boundary_resume && !self.first && is_resume_record;
-        let next_opt = match apply_checked(self.state.as_ref(), record, genesis, false, true) {
+        // #13 V4b (ruling 13-V4-d10 points 1-4, 6): record one
+        // `CheckpointFoldEntry` per checkpoint the fold meets in
+        // the walk. The out-slot is populated inside
+        // `apply_checked` BEFORE any `Violation::CheckpointMmrDiffers`
+        // return, so `fold_report` is `Some` whether the compare
+        // matched, differed or loaded a self-base. The record only
+        // lands when the outer caller requested fold recording
+        // (point 1: reader paths leave `record_fold_entries`
+        // false, so no per-checkpoint blake3 hash runs on them)
+        // AND the current segment has not yet latched a collected
+        // violation (point 6). On the verifier's one classification
+        // these two gates let an honest-and-strict sealed segment
+        // contribute its matched entries, so a resume whose
+        // opening sits in that segment passes the fail-closed
+        // candidate filter.
+        let mut fold_report: Option<CheckpointFoldReport> = None;
+        let result = apply_checked(
+            self.state.as_ref(),
+            record,
+            genesis,
+            false,
+            true,
+            &mut fold_report,
+        );
+        self.record_fold_entry(record, fold_report);
+        let next_opt = match result {
             Ok(opt) => opt,
             Err(v) => return Err(self.on_violation(v)),
         };
@@ -2387,6 +2828,7 @@ impl Classifier {
             state,
             gap: self.gap,
             closed_run: self.closed_run,
+            fold_entries: self.fold_entries,
         })
     }
 
@@ -2413,6 +2855,7 @@ impl Classifier {
             gap: self.gap,
             violations: self.collected,
             closed_run: self.closed_run,
+            fold_entries: self.fold_entries,
         }
     }
 
@@ -2580,17 +3023,71 @@ impl Classifier {
         // UNREACHABLE for the reader-side pin gate (the salvage records
         // without returning an `AuditError`; exercised by
         // `collector_tests::collector_fold_iii_mismatch_on_history_segment_*`).
-        let next = match apply_checked(self.state.as_ref(), record, false, broken, compare_mmr) {
+        //
+        // #13 V4b (ruling 13-V4-d10 points 2-4): record one
+        // `CheckpointFoldEntry` per checkpoint the fold meets in the
+        // walk. Populated by `apply_checked` for both the primary
+        // call (compare_mmr = outside_run || before_loss) and the
+        // salvage call (compare_mmr = false). For `compare_mmr =
+        // true + differs`, `fold_report.outcome` is `Differs` AND
+        // `apply_checked` returns `Err(CheckpointMmrDiffers)`,
+        // which this arm handles. For `compare_mmr = false +
+        // differs`, the outcome is `DiffersAfterLoss` and
+        // `apply_checked` returns `Ok` (amendment 6 (iii): the
+        // walker does not compare post-loss). The tolerant-mode
+        // walk always threads a prior `RunState` into
+        // `apply_checked`, so the self-base `Mmr::from_peaks`
+        // branch (and hence `CheckpointFoldOutcome::Base`) is
+        // unreachable here. The salvage arm pushes a violation
+        // directly (no `on_violation`), so it latches
+        // `segment_has_collected_violation` itself (ruling
+        // 13-V4-d10 point 6): subsequent checkpoints in this
+        // segment get `apply_checked` calls as before -- the walk
+        // itself is unchanged, so the reader's accept/reject
+        // decisions and the recorded `Violation` list stay
+        // byte-for-byte the same -- but `record_fold_entry`
+        // no-ops for them.
+        let mut fold_report: Option<CheckpointFoldReport> = None;
+        let primary = apply_checked(
+            self.state.as_ref(),
+            record,
+            false,
+            broken,
+            compare_mmr,
+            &mut fold_report,
+        );
+        self.record_fold_entry(record, fold_report);
+        let next = match primary {
             Ok(opt) => opt,
             Err(Violation::CheckpointMmrDiffers) if matches!(self.reaction, Reaction::Collect) => {
                 // Record-only (no `on_violation`, no latch); splice-in.
                 self.collected
                     .push((self.current_pos, Violation::CheckpointMmrDiffers));
+                // Ruling 13-V4-d10 point 6: a segment stops
+                // recording fold entries after its first violation.
+                // The salvage arm records directly, bypassing
+                // `on_violation`, so it latches the segment flag
+                // here. Subsequent `apply_checked` calls still run,
+                // so the reader's decisions and the violations
+                // list stay byte-for-byte the same; only
+                // `record_fold_entry` is gated by the latch.
+                self.segment_has_collected_violation = true;
                 // Addendum 19.2: a recorded fold-(iii) mismatch marks its
                 // segment damaged for the end-of-segment checks, so no
                 // derived `InvalidUndamagedSegment` follows.
                 self.damaged = true;
-                match apply_checked(self.state.as_ref(), record, false, broken, false) {
+                // Salvage re-apply with `compare_mmr = false`; the
+                // primary call already recorded the fold entry, so
+                // the salvage passes a discarded slot.
+                let mut _salvage: Option<CheckpointFoldReport> = None;
+                match apply_checked(
+                    self.state.as_ref(),
+                    record,
+                    false,
+                    broken,
+                    false,
+                    &mut _salvage,
+                ) {
                     Ok(opt) => opt,
                     Err(w) => return Err(self.on_violation(w)),
                 }
@@ -2668,6 +3165,7 @@ impl Classifier {
             gap: self.gap,
             run_flag: self.run_flag,
             closed_run: self.closed_run,
+            fold_entries: self.fold_entries,
         })
     }
 
@@ -2807,6 +3305,11 @@ impl Classifier {
         self.outside_run_from_prepare = false;
         self.recovery_pending = false;
         self.closed_run = false;
+        // Ruling 13-V4-d10 point 6: the "segment has a collected
+        // violation" latch is per-segment; clear it at the next
+        // segment boundary so `record_fold_entry` resumes recording
+        // for the new segment's checkpoints.
+        self.segment_has_collected_violation = false;
         self.current_pos = CollectorPos {
             segment_index: next_segment_index,
             record_index_in_segment: 0,
@@ -3041,6 +3544,7 @@ impl Classifier {
             violations: self.collected,
             gap: self.gap,
             closed_run: self.closed_run,
+            fold_entries: self.fold_entries,
         }
     }
 }
@@ -3073,13 +3577,23 @@ pub(crate) struct TolerantFinishOutcome {
     pub(crate) run_flag: bool,
     /// Walker's closed-run evidence (see `CollectorOutcome::closed_run`).
     pub(crate) closed_run: bool,
+    /// #13 V4b (ruling 13-V4-d10 points 2-3): per-checkpoint fold
+    /// outcomes recorded during this segment's walk. See
+    /// [`FinishOutcome::fold_entries`].
+    pub(crate) fold_entries: Vec<CheckpointFoldEntry>,
 }
 
 /// First-record trial apply used by the tolerant-mode classifier. Calls
 /// the pure [`apply_checked`] directly against the saved segment-start
 /// [`RunState`] without allocating a full `State`.
+///
+/// The trial is a pure `is_ok()` probe (no fold-entry recording,
+/// ruling 13-V4-d10 point 2): the discarded `fold_out` slot is
+/// confined to this frame. The real apply on the General branch of
+/// [`Classifier::feed_record_apply_tolerant`] records the entry.
 fn runs_trial_apply(prior: Option<&RunState>, record: &Record, genesis: bool) -> bool {
-    apply_checked(prior, record, genesis, false, true).is_ok()
+    let mut _fold_out: Option<CheckpointFoldReport> = None;
+    apply_checked(prior, record, genesis, false, true, &mut _fold_out).is_ok()
 }
 
 #[cfg(test)]
@@ -3155,12 +3669,14 @@ mod collector_tests {
             violations: vec![(pos, Violation::MissingHead)],
             gap: None,
             closed_run: false,
+            fold_entries: Vec::new(),
         };
         assert!(outcome.state.is_none());
         assert!(!outcome.run_flag);
         assert_eq!(outcome.violations.len(), 1);
         assert!(outcome.gap.is_none());
         assert!(!outcome.closed_run);
+        assert!(outcome.fold_entries.is_empty());
         // Drive the shared `history_segment` orchestration: strict Ok →
         // Strict; strict CorruptTrail with no events → Tolerant with an
         // empty-walk outcome; strict Io → propagates.
@@ -3431,6 +3947,7 @@ mod collector_tests {
                 violations: Vec::new(),
                 gap: None,
                 closed_run: false,
+                fold_entries: Vec::new(),
             },
             HistorySegmentWalk::Tolerant(out) => *out,
         }
@@ -3953,6 +4470,7 @@ mod collector_tests {
                 trail: TRAIL,
                 prior_run,
                 initial_boundary_resume,
+                record_fold_entries: false,
             },
             events,
             |_, _, _| {},
@@ -4055,6 +4573,7 @@ mod collector_tests {
                 trail: TRAIL,
                 prior_run: None,
                 initial_boundary_resume: false,
+                record_fold_entries: false,
             },
             events,
             |_, _, _| {},
@@ -4429,6 +4948,7 @@ mod collector_tests {
                 trail: TRAIL,
                 prior_run: None,
                 initial_boundary_resume: false,
+                record_fold_entries: false,
             },
             events,
             |_, _, _| {},

@@ -120,7 +120,28 @@ pub enum FindingKind {
     SeqConflict,
     /// Error: A record belongs to a trail outside the pinned policy.
     TrailMismatch,
-    /// Error: A checkpoint has an incorrect MMR root.
+    /// Error: A checkpoint's declared `mmr_size`, root or peaks
+    /// differ from the fold of the records present (ADR-0005 decision
+    /// 5 rule 2; emitted by the verifier from the shared classifier's
+    /// one fold, ruling 13-V4-d10 point 2). Two sources:
+    ///
+    /// 1. **Rule 2** -- an opening checkpoint or any in-run
+    ///    checkpoint before the run's first loss point. Paired with
+    ///    a `Violation::CheckpointMmrDiffers` in the classifier (also
+    ///    rejected by the reader); any violation empties every run
+    ///    (13-V4-d8 point 3).
+    /// 2. **Decision 11 `accept-run` item 3** -- an in-run checkpoint
+    ///    at or after the first loss point. The reader does not
+    ///    compare it (amendment 6 (iii)) so the trail stays valid;
+    ///    the verifier still reports it so an `accept-run` line can
+    ///    later promote it to `Accepted`. Not a violation; never
+    ///    empties the run.
+    ///
+    /// **Known limits (ruling 13-V4-d10 points 5-6):** openings
+    /// present only in a shipped (Collector) copy are not checked at
+    /// this head (owner decision 13-V4-d7; spike #224); once a
+    /// segment records a violation, the classifier stops checking
+    /// the rest of that segment.
     MmrMismatch,
     /// Error: A checkpoint signature is invalid.
     BadSignature,

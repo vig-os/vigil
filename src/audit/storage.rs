@@ -37,6 +37,22 @@ pub(crate) struct SegmentOutcome {
     pub(crate) state: Option<State>,
     pub(crate) violations: Vec<(CollectorPos, Violation)>,
     pub(crate) closed_run: bool,
+    /// #13 V4b (ruling 13-V4-d10 points 1, 4): per-checkpoint fold
+    /// outcomes this segment's walk recorded. Pos indices are
+    /// segment-local; `runs::classify` rewrites them to its own
+    /// segment enumeration before placing the entries in
+    /// `ClassifyOutput::fold_entries`. The outer caller's reaction
+    /// is threaded into each walk's Classifier (via
+    /// `ScanSegmentArgs::record_fold_entries` and
+    /// `Classifier::set_record_fold_entries`); only the verifier's
+    /// one `classify` call under outer [`Reaction::Collect`] sets
+    /// the flag `true`, including the strict-Stop closure inside
+    /// `history_segment` on that outer Collect path. Reader-only
+    /// paths leave the flag `false`, so no per-checkpoint blake3
+    /// hash runs on them and this `Vec` stays empty -- byte-for-
+    /// byte identical reader behaviour. Reader paths never read
+    /// this field.
+    pub(crate) fold_entries: Vec<runs::CheckpointFoldEntry>,
 }
 use crate::rotate::Directory;
 use rustix::fs::{self as rfs, Mode, OFlags};
@@ -1196,9 +1212,30 @@ pub(crate) fn history_segment(
     // The strict pass takes one clone, the lazy tolerant byte source
     // takes the original.
     let strict_source = source.try_clone().map_err(io_error)?;
+    // #13 V4b (ruling 13-V4-d10 points 1-4): the strict pass's
+    // `fold_entries` are threaded up alongside the final State.
+    // The strict closure keeps its inner `Reaction::Stop` per
+    // addendum 27.1, but the outer caller's reaction decides
+    // whether the Classifier records fold entries at all. On the
+    // verifier path (outer Collect), `record_fold_entries = true`
+    // so an honest-and-strict sealed segment contributes its
+    // matched entries to the one classification, letting a resume
+    // whose opening sits in that segment pass the fail-closed
+    // candidate filter. On reader paths (outer Stop), the flag is
+    // `false` so no per-checkpoint blake3 hashing is done for
+    // entries the outer loop would drop -- the reader's Stop path
+    // stays byte-for-byte the same and does no extra CPU.
+    let outer_records_fold_entries = matches!(reaction, Reaction::Collect);
     #[rustfmt::skip]
-    let strict = move || scan_inner(Reaction::Stop, strict_source, trail, strict_state, expected, &mut fc.borrow_mut(), ctx)
-        .map(|out| (out.state.expect("scan_inner Stop implies state=Some"), out.closed_run));
+    let strict = move || scan_inner(
+        Reaction::Stop, strict_source, trail, strict_state, expected,
+        &mut fc.borrow_mut(), ctx, outer_records_fold_entries,
+    )
+        .map(|out| (
+            out.state.expect("scan_inner Stop implies state=Some"),
+            out.closed_run,
+            out.fold_entries,
+        ));
     // Lazy tolerant byte source. The seek, the glued-byte / LF check,
     // `read_line`, `decode_line_kind` AND the tolerant-side byte
     // bookkeeping (`last_offset` / `last_newline` / `offset_cursor`,
@@ -1259,7 +1296,7 @@ pub(crate) fn history_segment(
 
     #[rustfmt::skip]
     let walk_args = HistorySegmentArgs { ctx, prior_run, unsealed_boundary, run_in: *run, trail };
-    let walk = runs::history_segment::<(State, bool), _, _, _>(
+    let walk = runs::history_segment::<(State, bool, Vec<runs::CheckpointFoldEntry>), _, _, _>(
         reaction, walk_args, strict, events, on_feed,
     );
     // Addendum 22.2: writeback `found` BEFORE propagating Err, so the
@@ -1269,7 +1306,7 @@ pub(crate) fn history_segment(
     // caller even when record N+1 broke the fold.
     *found = found_cell.into_inner();
     match walk? {
-        HistorySegmentWalk::Strict((next, strict_closed_run)) => {
+        HistorySegmentWalk::Strict((next, strict_closed_run, fold_entries)) => {
             // Strict completed with no violations. `strict_closed_run`
             // is the inner Classifier's own latch (ruling 197-d1
             // addendum 28, 13-V4-d3 point 1): true iff the walker
@@ -1281,6 +1318,7 @@ pub(crate) fn history_segment(
                 state: Some(next),
                 violations: Vec::new(),
                 closed_run: strict_closed_run,
+                fold_entries,
             })
         }
         HistorySegmentWalk::Tolerant(outcome) => {
@@ -1289,6 +1327,7 @@ pub(crate) fn history_segment(
             let closed_run = outcome.closed_run;
             let bytes = bytes.into_inner();
             let violations = outcome.violations;
+            let fold_entries = outcome.fold_entries;
             // Thread the classifier's own folded state (identical to
             // `running_state` under Stop, authoritative under Collect).
             // Under Collect the tolerant arm's `on_feed` Record branch
@@ -1311,6 +1350,7 @@ pub(crate) fn history_segment(
                 }),
                 violations,
                 closed_run,
+                fold_entries,
             })
         }
     }
@@ -1335,6 +1375,9 @@ pub(crate) fn scan_staged(
             genesis: true,
             run,
         },
+        // #13 V4b (ruling 13-V4-d10 point 1): staging settlement is
+        // reader-only; no verifier consumes fold entries from it.
+        false,
     )?;
     Ok(state.expect("scan_staged Stop implies state=Some"))
 }
@@ -1359,6 +1402,11 @@ pub(crate) fn scan_closing(
             genesis: false,
             run,
         },
+        // #13 V4b (ruling 13-V4-d10 point 1): the outer reaction is
+        // the one `scan_closing` was called with. Reader paths pass
+        // Stop → no fold recording; the verifier's classify pass
+        // passes Collect → record for the fail-closed filter.
+        matches!(reaction, Reaction::Collect),
     )
 }
 pub(crate) fn sealed(state: &State) -> bool {
@@ -1604,6 +1652,11 @@ pub(crate) fn scan(
             genesis,
             run: false,
         },
+        // #13 V4b (ruling 13-V4-d10 point 1): the outer reaction is
+        // the one `scan` was called with. Reader paths pass Stop
+        // → no fold recording; the verifier's classify pass passes
+        // Collect → record for the fail-closed filter.
+        matches!(reaction, Reaction::Collect),
     )
 }
 
@@ -1621,6 +1674,17 @@ pub(crate) fn scan(
 /// `history_segment`'s strict pass). The Classifier's own
 /// `closed_run` latch (ruling 197-d1 addendum 28, 13-V4-d3 point 1)
 /// surfaces through the returned [`SegmentOutcome`].
+///
+/// #13 V4b (ruling 13-V4-d10 point 1): `record_fold_entries` is
+/// threaded in from the outer caller (not derived from `reaction`),
+/// because `history_segment`'s strict closure runs with inner
+/// [`Reaction::Stop`] even when the outer verifier call is Collect.
+/// Reader-only paths pass `false`; the verifier's single
+/// [`runs::classify`] call passes `true`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ruling 13-V4-d10 point 1 adds the outer-reaction record_fold_entries flag"
+)]
 fn scan_inner(
     reaction: Reaction,
     source: ByteSource,
@@ -1629,6 +1693,7 @@ fn scan_inner(
     expected: Option<Head>,
     found: &mut Option<Record>,
     context: SegmentContext,
+    record_fold_entries: bool,
 ) -> Result<SegmentOutcome, AuditError> {
     let start = if context.opening {
         0
@@ -1696,6 +1761,7 @@ fn scan_inner(
             trail,
             prior_run,
             initial_boundary_resume,
+            record_fold_entries,
         },
         events,
         on_feed,
@@ -1722,6 +1788,7 @@ fn scan_inner(
         state,
         violations: outcome.violations,
         closed_run: outcome.closed_run,
+        fold_entries: outcome.fold_entries,
     })
 }
 fn apply(record: &Record, state: &mut Option<State>, genesis: bool) -> Result<(), AuditError> {
@@ -1742,8 +1809,20 @@ fn apply_checked(
     compare_mmr: bool,
 ) -> Result<(), AuditError> {
     let prior_run = state.as_ref().map(|s| &s.run);
-    let Some(next_run) =
-        runs::apply_checked(prior_run, record, genesis, broken_boundary, compare_mmr)?
+    // The reader never consumes the per-checkpoint fold report
+    // (#13 V4b, ruling 13-V4-d10 point 1: the reader enforces rule 2
+    // through the classifier's compare, not through a separate
+    // report). The discarded slot keeps the one-fold invariant:
+    // storage.rs does not re-fold the records.
+    let mut fold_out: Option<runs::CheckpointFoldReport> = None;
+    let Some(next_run) = runs::apply_checked(
+        prior_run,
+        record,
+        genesis,
+        broken_boundary,
+        compare_mmr,
+        &mut fold_out,
+    )?
     else {
         return Ok(()); // Collector-style identical duplicate: leave state in place.
     };

@@ -457,19 +457,38 @@ pub(super) fn check(collection: Collection, trail: [u8; 16]) -> Report {
     let declarations = resume::declarations(&collection, trail);
     emit_resumed(&declarations, &mut findings);
     // Validated structural-resume tuples (ruling 13-V3-d5 points 1, 5, 10);
-    // consumed by #13 V4 (rule 2 fold), V6 (start) and V7 (confirmation).
-    let _pending_resumes = resume::candidates(&declarations);
-    // #13 V4a (rulings 13-V4-d3, 13-V4-d4, 13-V4-d5, 13-V4-d6, 13-V4-d8):
-    // one `SegmentStructure` run finding per closed run the shared
-    // classifier returns under `Reaction::Collect` over the
-    // verifier's confirmed snapshot. The classifier runs once, over
-    // the already-retained native bytes (`input::collect` with
+    // consumed by #13 V4 (rule 2 fold) in `pending_resumes` below, and
+    // by #13 V6 (start) and #13 V7 (confirmation).
+    let candidates = resume::candidates(&declarations);
+    // #13 V4a (rulings 13-V4-d3, 13-V4-d4, 13-V4-d5, 13-V4-d6, 13-V4-d8)
+    // emits one `SegmentStructure` run finding per closed run; #13 V4b
+    // (ruling 13-V4-d10) emits one `MmrMismatch` per differing fold-
+    // compare entry AND returns the set of opening `seq`s the fold
+    // positively recorded as compared and matched. One classifier pass
+    // per verify call (13-V4-d8 point 2, 13-V4-d10 point 1) over the
+    // already-retained native bytes (`input::collect` with
     // `keep_bytes = native(path)`) through
     // `storage::SegmentSource::for_snapshot`, which opens nothing.
-    // Shipped-copy runs are out of scope (owner decision 13-V4-d7;
+    // Shipped-copy rule 2 is out of scope (owner decision 13-V4-d7;
     // spike #224); runs that rejection empties keep no finding
     // (addendum 28 point 2).
-    fold::check_runs(&collection, trail, &mut findings);
+    let matched_openings = fold::check_runs(&collection, trail, &mut findings);
+    // #13 V4b (ruling 13-V4-d10 point 4): fail-closed candidate
+    // filter. Keep only candidates whose opening `(seq, hash)` the
+    // fold positively recorded as matched; drop anything else --
+    // a differing opening, a self-based opening (ADR amendment 6
+    // "Base"; never compared), a shipped-only opening (no fold
+    // compare at this head, spike #224), an opening the walk did
+    // not reach after an earlier violation, and a forged opening
+    // whose hash collides on `seq` with an honest Matched opening
+    // (`(seq, hash)` match, not `seq` alone). Consumed by the
+    // gap confirmation of #13 (V6 start, V7 confirmation), so a
+    // gap whose opening rule 2 has not passed can never be
+    // confirmed or excused there. The `#[cfg(test)]` seam below
+    // returns this list for row B6 without widening visibility
+    // otherwise.
+    let pending_resumes = filter_candidates(candidates, &matched_openings);
+    let _ = &pending_resumes;
     let first_seq = groups.first_key_value().map(|(&s, _)| s);
     let last_seq = groups.last_key_value().map(|(&s, _)| s);
     if let (Some(first), Some(last)) = (first_seq, last_seq) {
@@ -494,6 +513,46 @@ pub(super) fn check(collection: Collection, trail: [u8; 16]) -> Report {
         )
     });
     Report::new(trail, count, first_seq, last_seq, None, findings)
+}
+
+/// #13 V4b (ruling 13-V4-d10 point 4): fail-closed candidate filter.
+/// Keeps a candidate only when its `(opening_seq, opening_hash)` is
+/// in `matched_openings` -- the set
+/// [`fold::check_runs`](super::fold::check_runs) collected from the
+/// classifier's positively-compared-and-matched fold entries. Drops
+/// anything else: a differing opening, a self-based opening, a
+/// shipped-only opening (no fold compare at this head), an opening
+/// the walk did not reach after an earlier violation, and a forged
+/// opening whose hash does not equal the record the fold compared
+/// (`(seq, hash)` match, not `seq` alone). Shared by `check`
+/// (non-test) and [`filter_candidates_for_test`] (test only).
+fn filter_candidates(
+    candidates: Vec<resume::ResumeCandidate>,
+    matched_openings: &std::collections::BTreeSet<(u64, [u8; 32])>,
+) -> Vec<resume::ResumeCandidate> {
+    candidates
+        .into_iter()
+        .filter(|c| matched_openings.contains(&(c.opening_seq, c.opening_hash)))
+        .collect()
+}
+
+/// #13 V4b (ruling 13-V4-d10 point 4): `#[cfg(test)]` seam that
+/// returns the retained candidates' opening `seq`s for row B6 (one
+/// kept-list per layout: honest resume kept, wrong opening dropped,
+/// shipped-only dropped, never-compared dropped, honest-A1 closer
+/// kept). The test seam reruns the same filter the non-test path
+/// uses, through the same two helpers -- no second, test-only
+/// filter path -- so the row verifies what production evaluates.
+#[cfg(test)]
+pub(super) fn filter_candidates_for_test(collection: &Collection, trail: [u8; 16]) -> Vec<u64> {
+    let declarations = resume::declarations(collection, trail);
+    let candidates = resume::candidates(&declarations);
+    let mut findings = Vec::new();
+    let matched_openings = fold::check_runs(collection, trail, &mut findings);
+    filter_candidates(candidates, &matched_openings)
+        .into_iter()
+        .map(|c| c.opening_seq)
+        .collect()
 }
 
 #[cfg(test)]
