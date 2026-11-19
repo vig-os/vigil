@@ -187,6 +187,11 @@ impl CheckpointFields {
         fields.extend([(0x23, self.key.to_vec()), (0x24, self.signature.to_vec())]);
         fields
     }
+    /// Returns the raw Ed25519 signature (tag 0x24), the verifier's input to
+    /// `verify_strict` over the checkpoint signing message.
+    pub(super) fn signature(&self) -> &[u8; 64] {
+        &self.signature
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -95,21 +95,21 @@ impl TrustPolicy {
         self.sections.keys()
     }
     /// Whether the listed key is trusted at this sequence, inclusively.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the verifier, #13 V3/V5")
-    )]
     pub(crate) fn trusted_at(&self, id: &[u8; 16], key: &[u8; 32], seq: u64) -> bool {
         self.sections
             .get(id)
             .and_then(|s| s.keys.iter().find(|k| &k.bytes == key))
             .is_some_and(|k| k.bound.is_none_or(|(through, _)| seq <= through))
     }
+    /// Whether this key appears for the trail section at all, independent of
+    /// any `through=` bound. The verifier distinguishes the two `UntrustedKey`
+    /// cases (ADR-0005 decision 9, ruling 13-V5-d1 point 2).
+    pub(crate) fn listed(&self, id: &[u8; 16], key: &[u8; 32]) -> bool {
+        self.sections
+            .get(id)
+            .is_some_and(|s| s.keys.iter().any(|k| &k.bytes == key))
+    }
     /// Returns the key's trail-local revocation bound, if present.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the verifier, #13 V3/V5")
-    )]
     pub(crate) fn bound(&self, id: &[u8; 16], key: &[u8; 32]) -> Option<Bound> {
         self.sections
             .get(id)?

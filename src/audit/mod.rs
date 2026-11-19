@@ -51,9 +51,7 @@ pub use mmr::Mmr;
 #[cfg(not(vigil_unstable))]
 pub(crate) use mmr::Mmr;
 #[cfg(not(vigil_unstable))]
-pub(crate) use signing::checkpoint_message;
-#[cfg(all(test, not(vigil_unstable)))]
-use signing::verify_signature;
+pub(crate) use signing::{checkpoint_message, verify_signature};
 #[cfg(vigil_unstable)]
 #[cfg_attr(docsrs, doc(cfg(vigil_unstable)))]
 pub use signing::{checkpoint_message, verify_signature};
@@ -143,9 +141,27 @@ pub enum FindingKind {
     /// segment records a violation, the classifier stops checking
     /// the rest of that segment.
     MmrMismatch,
-    /// Error: A checkpoint signature is invalid.
+    /// Error: A checkpoint signature does not verify under `verify_strict`
+    /// over the 58-byte checkpoint signing message (ADR-0005 decision 8;
+    /// ruling 13-V5-d1 point 2). An undecodable public key, a small-order
+    /// key and a non-canonical signature are all included. Each distinct
+    /// `(seq, hash)` checkpoint is checked once, native or shipped-only,
+    /// inside a run or outside one; a byte-identical duplicate yields one
+    /// finding at its first occurrence. Detail is `key <64 lowercase hex>`.
+    /// Independent of `UntrustedKey`: a checkpoint can carry both.
     BadSignature,
-    /// Error: A signing key is not trusted for this trail.
+    /// Error: The checkpoint's signing key is not trusted at its `seq` for
+    /// the verified trail (ADR-0005 decision 9; ruling 13-V5-d1 point 2).
+    /// Two cases, independent of `BadSignature`:
+    ///
+    /// - the key is not listed for the trail's section of the policy, detail
+    ///   `key <64 lowercase hex> not listed for trail <32 hex>`;
+    /// - the key is listed with a `through=<n>:<hash>` bound and the
+    ///   checkpoint's `seq` exceeds `n`, detail
+    ///   `key <64 lowercase hex> bounded through seq <n>`.
+    ///
+    /// Each distinct `(seq, hash)` checkpoint is checked once. Revocation pin
+    /// mismatch and bound confirmation belong to later work.
     UntrustedKey,
     /// Error: A revoked key conflicts with its trusted bound.
     RevocationMismatch,

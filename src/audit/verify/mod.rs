@@ -6,6 +6,7 @@ mod fold;
 mod input;
 pub(crate) mod lines;
 mod resume;
+mod signatures;
 
 /// Severity of a finding produced by the offline verifier (#13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -347,6 +348,6 @@ impl Verifier {
             .ok_or_else(|| {
                 AuditError::new(AuditErrorKind::InvalidConfig, "select a pinned trail")
             })?;
-        Ok(engine::check(input::collect(files)?, trail))
+        Ok(engine::check(input::collect(files)?, trail, &self.trust))
     }
 }

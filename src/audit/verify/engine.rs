@@ -15,9 +15,9 @@
 use super::{
     Finding, Report, fold,
     input::{Collection, Input, LineContent, Summary},
-    resume,
+    resume, signatures,
 };
-use crate::audit::{FindingKind as K, Record, digest_string, hex};
+use crate::audit::{FindingKind as K, Record, TrustPolicy, digest_string, hex};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -304,7 +304,7 @@ fn emit_resumed(declarations: &[resume::Declaration<'_>], findings: &mut Vec<Fin
     }
 }
 
-pub(super) fn check(collection: Collection, trail: [u8; 16]) -> Report {
+pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy) -> Report {
     let mut findings = Vec::new();
     let mut groups: BTreeMap<u64, Vec<Located<'_>>> = BTreeMap::new();
     for (idx, input) in collection.inputs.iter().enumerate() {
@@ -363,6 +363,13 @@ pub(super) fn check(collection: Collection, trail: [u8; 16]) -> Report {
         }
         let candidates: Vec<_> = distinct.into_values().collect();
         count += candidates.len() as u64;
+        // Ruling 13-V5-d1 points 1-2: every distinct `(seq, hash)` checkpoint
+        // in the verified set is checked exactly once, at its first
+        // occurrence; shipped-only checkpoints appear as their shipped
+        // `(path, line)`. Run membership does not demote the check.
+        for &(path, record) in &candidates {
+            signatures::check(trail, trust, path, record, &mut findings);
+        }
         let (path, record) = copies[0];
         if copies.len() > candidates.len() {
             findings.push(finding(

@@ -30,6 +30,10 @@ pub(super) struct Summary {
     pub(super) time: u64,
     pub(super) repaired: Option<[u8; 32]>,
     pub(super) checkpoint: Option<CheckpointFields>,
+    /// `checkpoint_message(unsigned_fields)` for a checkpoint record,
+    /// pre-computed from the one snapshot so that `verify::signatures`
+    /// never re-reads or re-parses the trail bytes (ruling 13-V4-d5).
+    pub(super) signing_message: Option<Vec<u8>>,
     // Only reserved records need text for #13 V3b resume/fragment context.
     pub(super) operator: Option<Operator>,
     pub(super) line: u64,
@@ -37,6 +41,7 @@ pub(super) struct Summary {
 impl Summary {
     fn new(record: Record, line: u64) -> Self {
         let hash = record.hash();
+        let signing_message = record.signing_message();
         let (checkpoint, operator) = match record.kind {
             Kind::Checkpoint(fields) => (Some(fields), None),
             Kind::Entry(entry) => (
@@ -57,6 +62,7 @@ impl Summary {
             time: record.context.time,
             repaired: record.context.repaired,
             checkpoint,
+            signing_message,
             operator,
             line,
         }
