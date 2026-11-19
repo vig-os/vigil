@@ -836,9 +836,12 @@ fn r7_archive_run_closed_inside_single_run_finding() {
 // R8 was removed: an open-run archive (no closer) has no classifier
 // violations, so no mutant in the final table flips its literal list
 // — it killed zero mutants. The open-run archive case is still
-// pinned by R13's agreement row, which classifies the same layout
-// directly and asserts verifier-side equality with the empty
-// classifier runs output.
+// pinned by the classifier-level
+// `storage::tests::snapshot_tests::snapshot_archive_unclosed_run_emits_no_run_report`
+// and by the empty-archive row in `tests/audit_verify.rs`
+// (`native_boundaries_cannot_be_repaired_by_shipped_checkpoint`),
+// which asserts exactly one `SegmentStructure` finding on an empty
+// archive segment and never a run finding.
 
 // ============================================================
 // R9 — SS-7: `verify_dir(dir)` and `verify_files([each file])` emit
@@ -1222,11 +1225,11 @@ fn r11_shipped_only_and_native_plus_shipped_no_shipped_run_finding() {
 // property is now documented, not pinned by a row.
 
 // ============================================================
-// R13 — agreement over A1, A3, A8, A9 and R5-R8: the set of run
-// findings equals the set of `ClassifyOutput.runs` computed
-// directly on the same snapshot, with strict equality on
-// `(first_segment.path, digest)` (ruling 13-V4-d5 (a) parallel
-// index by construction).
+// R13 — agreement over A1, A3, A8, A9 and the R5/R6/R7/R8 layouts:
+// the set of verifier run findings equals the set of
+// `ClassifyOutput.runs` computed directly on the same snapshot,
+// with strict equality on `(first_segment.path, digest)`
+// (ruling 13-V4-d5 (a) parallel index by construction).
 // ============================================================
 
 #[test]
@@ -1322,59 +1325,9 @@ fn r13_agreement_verifier_run_findings_equal_classify_output_runs() {
         classify_run_bundles(&r8_dir.0),
         "R8 agreement",
     );
-    // Split archive+trail form: one run finding across the merged
-    // Collection (ruling 13-V4-d8 point 2). The classify-side
-    // computes over a merged (archive + trail) snapshot in base
-    // order, matching `input::collect`'s merge.
-    let (_sd, split_s0, _, _) = build_archive_closed_inside();
-    let full_dir_for_split = split_s0.parent().unwrap().to_owned();
-    let archive_dir = Temp::new();
-    let trail_dir = Temp::new();
-    fs::copy(
-        full_dir_for_split.join("audit-20260101T000000.000000000Z_000000.jsonl"),
-        archive_dir
-            .0
-            .join("audit-20260101T000000.000000000Z_000000.jsonl"),
-    )
-    .unwrap();
-    fs::copy(
-        full_dir_for_split.join("audit-20260101T000000.000000000Z_000001.jsonl"),
-        archive_dir
-            .0
-            .join("audit-20260101T000000.000000000Z_000001.jsonl"),
-    )
-    .unwrap();
-    fs::copy(
-        full_dir_for_split.join("audit-20260101T000000.000000000Z_000002.jsonl"),
-        trail_dir
-            .0
-            .join("audit-20260101T000001.000000000Z_000000.jsonl"),
-    )
-    .unwrap();
-    // Split form: compare every run-bundle field between split and
-    // single-dir forms. Dropping the precondition `.len()` check --
-    // the field-wise equality itself is red on base (both sides are
-    // empty on base, so they trivially match there; but on a mutant
-    // that drops either side's run finding, the two literal lists
-    // diverge).
-    let split_verify_runs: Vec<_> =
-        rows(&verify_files([archive_dir.0.clone(), trail_dir.0.clone()]))
-            .into_iter()
-            .filter(|r| r.5.is_some())
-            .map(|r| (r.0, r.2, r.3, r.4, r.5))
-            .collect();
-    let full_verify_runs: Vec<_> = rows(&verify_dir(&full_dir_for_split))
-        .into_iter()
-        .filter(|r| r.5.is_some())
-        .map(|r| (r.0, r.2, r.3, r.4, r.5))
-        .collect();
-    assert_eq!(
-        split_verify_runs, full_verify_runs,
-        "R13 split-form agreement: archive_dir + trail_dir == full_dir \
-         (ruling 13-V4-d8 point 2: one classify over the merged Collection); \
-         compares (kind, line, seq, detail, digest) -- file names differ by \
-         rotated basename between split and full forms",
-    );
+    // The split archive+trail form is pinned literally by R10
+    // (ruling 13-V4-d8 point 2: one classify over the merged
+    // Collection), not by this agreement row.
 }
 
 // ============================================================
@@ -1509,16 +1462,13 @@ fn r15_d9_p01_closer_span_in_second_run_only() {
     let run1_detail = make_run_detail(&[(3, 1, 2)], &[], &run1_digest);
     // Run 2 lives over S2 only (its own first segment, closer is the
     // live file). S2's trailing `broken\n` is a 7-byte span sitting
-    // after `resume.context.seq` (ruling 13-V4-d8 point 1).
+    // after seq 8 (S2's `resume` record on this fixture; ruling
+    // 13-V4-d8 point 1).
     let broken_span_digest =
         parse_digest("blake3:8b09328c8766397df3eadace558cdd4ef653e8df4e7526bc3dce37e6dfd62116");
     let run2_digest =
         parse_digest("blake3:6bfc835246e5c5bed97d27e155faf709a50bf972f1ccdadcf6ea1545c0039b46");
-    let run2_detail = make_run_detail(
-        &[],
-        &[(0, Some(resume.context.seq), 7, broken_span_digest)],
-        &run2_digest,
-    );
+    let run2_detail = make_run_detail(&[], &[(0, Some(8), 7, broken_span_digest)], &run2_digest);
     let per_seg_detail = "expected first complete record to be a checkpoint".to_owned();
     // Pin the two `Resumed` details literally; both are deterministic
     // from the fixture inputs. First `Resumed` cites `kept`'s hash;
@@ -1637,9 +1587,8 @@ fn r15_d9_p01_closer_span_in_second_run_only() {
         expected,
         "R15 (ruling 13-V4-d9) p01 full literal finding list: run 1 at S1 \
          with NO `span` entry (closer S2 excluded); run 2 at S2 with exactly \
-         one `span seg 0 after {} len 7` for S2's trailing `broken\\n`; \
+         one `span seg 0 after 8 len 7` for S2's trailing `broken\\n`; \
          run 1 and run 2 digests pinned literally",
-        resume.context.seq,
     );
 }
 
