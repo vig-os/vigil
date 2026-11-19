@@ -355,8 +355,7 @@ fn r1_a1_one_run_finding_literal() {
             None,
             None,
             None,
-            "records seq 0..=7, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 7..=7".to_owned(),
             None,
         ),
     ];
@@ -448,8 +447,7 @@ fn r2_a3_two_loss_points_literal() {
             None,
             None,
             None,
-            "records seq 0..=11, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 11..=11".to_owned(),
             None,
         ),
     ];
@@ -493,8 +491,7 @@ fn r3_a8_no_range_line_seq_absent_literal() {
             None,
             None,
             None,
-            "records seq 0..=2, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 2..=2".to_owned(),
             None,
         ),
         (
@@ -560,8 +557,7 @@ fn r4_a9_two_spans_after_start_literal() {
             None,
             None,
             None,
-            "records seq 0..=2, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 2..=2".to_owned(),
             None,
         ),
         (
@@ -733,8 +729,7 @@ fn r6_non_increasing_seq_in_would_be_run_drops_run_finding() {
             None,
             None,
             None,
-            "records seq 0..=6, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 6..=6".to_owned(),
             None,
         ),
     ];
@@ -825,8 +820,7 @@ fn r7_archive_run_closed_inside_single_run_finding() {
             None,
             None,
             None,
-            "records seq 0..=7, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 7..=7".to_owned(),
             None,
         ),
     ];
@@ -908,8 +902,7 @@ fn r9_ss7_verify_dir_equals_verify_files_each_file() {
             None,
             None,
             None,
-            "records seq 0..=7, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 7..=7".to_owned(),
             None,
         ),
     ];
@@ -1003,8 +996,7 @@ fn r10_ss8_archive_plus_trail_dir_vs_full_dir_same_run_finding() {
             None,
             None,
             None,
-            "records seq 0..=7, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 7..=7".to_owned(),
             None,
         ),
     ];
@@ -1115,8 +1107,7 @@ fn r11_shipped_only_and_native_plus_shipped_no_shipped_run_finding() {
             None,
             None,
             None,
-            "records seq 6..=7, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 7..=7".to_owned(),
             None,
         ),
     ];
@@ -1201,8 +1192,7 @@ fn r11_shipped_only_and_native_plus_shipped_no_shipped_run_finding() {
             None,
             None,
             None,
-            "records seq 0..=7, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 7..=7".to_owned(),
             None,
         ),
     ];
@@ -1410,8 +1400,7 @@ fn r14_d9_a1_torn_live_tail_run_digest_unchanged() {
             None,
             None,
             None,
-            "records seq 0..=7, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 7..=7".to_owned(),
             None,
         ),
         (
@@ -1560,8 +1549,7 @@ fn r15_d9_p01_closer_span_in_second_run_only() {
             None,
             None,
             None,
-            "records seq 0..=13, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 13..=13".to_owned(),
             None,
         ),
         (
@@ -1672,8 +1660,7 @@ fn r16_m10_r7_archive_torn_closer_run_finding_unchanged() {
             None,
             None,
             None,
-            "records seq 0..=7, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 7..=7".to_owned(),
             None,
         ),
         (
@@ -1752,8 +1739,7 @@ fn r17_m10_a8_as_archive_torn_closer_run_finding_unchanged() {
             None,
             None,
             None,
-            "records seq 0..=2, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 2..=2".to_owned(),
             None,
         ),
         (
@@ -1870,8 +1856,7 @@ fn r18_m11_a1_torn_live_no_run_finding() {
             None,
             None,
             None,
-            "records seq 0..=7, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 7..=7".to_owned(),
             None,
         ),
         (
@@ -1978,8 +1963,7 @@ fn r19_m11_a3_torn_live_no_run_finding() {
             None,
             None,
             None,
-            "records seq 0..=11, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 11..=11".to_owned(),
             None,
         ),
         (
@@ -2140,8 +2124,7 @@ fn r20_227_cross_dir_a3_archive_plus_trail_dir_one_classify() {
             None,
             None,
             None,
-            "records seq 0..=11, no trusted coverage yet (signatures are checked in #13 V5)"
-                .to_owned(),
+            "records seq 11..=11".to_owned(),
             None,
         ),
     ];

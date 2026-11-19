@@ -571,12 +571,10 @@ fn uncovered_tail_spans_first_through_last_for_non_empty_trail_only() {
     let report = run(vec![record(0, 1, g, 1), record(1, 2, [1; 32], 2)]);
     let tails = kinds(&report, K::UncoveredTail);
     assert_eq!(tails.len(), 1);
-    assert!(tails[0].detail().contains("records seq 0..=1"));
-    assert!(
-        tails[0]
-            .detail()
-            .contains("signatures are checked in #13 V5")
-    );
+    // Plain records (no `checkpoint`) are never trusted, so coverage
+    // is `None` and the tail spans every verified `seq`.
+    assert_eq!(tails[0].detail(), "records seq 0..=1");
+    assert_eq!(report.covered_through(), None);
     assert!(report.is_valid());
     assert!(!report.is_strict_valid());
     // Empty trail: no UncoveredTail.

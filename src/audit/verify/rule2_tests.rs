@@ -149,9 +149,7 @@ fn uncovered_tail_row(first: u64, last: u64) -> Row {
         None,
         None,
         None,
-        format!(
-            "records seq {first}..={last}, no trusted coverage yet (signatures are checked in #13 V5)"
-        ),
+        format!("records seq {first}..={last}"),
         None,
     )
 }
@@ -253,7 +251,7 @@ fn b1_a1_closing_cp6_wrong_root_full_literal_list() {
             resume_detail,
             None,
         ),
-        uncovered_tail_row(0, 7),
+        uncovered_tail_row(7, 7),
     ];
     assert_eq!(got, expected, "B1-root full literal list");
 }
@@ -336,7 +334,7 @@ fn b1_a1_closing_cp6_wrong_size_full_literal_list() {
             resume_detail,
             None,
         ),
-        uncovered_tail_row(0, 7),
+        uncovered_tail_row(7, 7),
     ];
     assert_eq!(got, expected, "B1-size full literal list");
 }
@@ -422,7 +420,7 @@ fn b2_plain_resume_wrong_opening_root_full_literal_list() {
             resume_detail,
             None,
         ),
-        uncovered_tail_row(1, 2),
+        uncovered_tail_row(2, 2),
     ];
     assert_eq!(got, expected, "B2 full literal list");
 }
@@ -517,7 +515,7 @@ fn b3_a1_in_run_cp5_wrong_root_full_literal_list() {
             resume_detail,
             None,
         ),
-        uncovered_tail_row(0, 7),
+        uncovered_tail_row(7, 7),
     ];
     assert_eq!(got, expected, "B3-root full literal list");
 }
@@ -597,7 +595,7 @@ fn b3_a1_in_run_cp5_wrong_size_full_literal_list() {
             resume_detail,
             None,
         ),
-        uncovered_tail_row(0, 7),
+        uncovered_tail_row(7, 7),
     ];
     assert_eq!(got, expected, "B3-size full literal list");
 }
@@ -722,7 +720,7 @@ fn b3_a1_writer_honest_reader_opens_and_verifier_mmr_mismatch() {
             resume_detail,
             None,
         ),
-        uncovered_tail_row(0, 7),
+        uncovered_tail_row(7, 7),
     ];
     assert_eq!(got, expected, "writer-honest A1 full literal list");
     // Literal digest constants are written as full 64-hex blake3
@@ -792,7 +790,7 @@ fn b4_pre_loss_in_run_wrong_root_full_literal_list() {
             resume_detail,
             None,
         ),
-        uncovered_tail_row(0, 3),
+        uncovered_tail_row(3, 3),
     ];
     assert_eq!(got, expected, "B4 full literal list");
 }
@@ -869,7 +867,7 @@ fn b5_genesis_linked_resume_wrong_root_full_literal_list() {
             resume_detail,
             None,
         ),
-        uncovered_tail_row(1, 2),
+        uncovered_tail_row(2, 2),
     ];
     assert_eq!(got, expected, "B5-root full literal list");
 }
@@ -939,7 +937,7 @@ fn self_based_opening_fails_closed_full_literal_list() {
             resume_detail,
             None,
         ),
-        uncovered_tail_row(0, 3),
+        uncovered_tail_row(3, 3),
     ];
     assert_eq!(got, expected, "self-based repro: full literal list");
     let collection = collect_files(&[live, shipped]);
@@ -1013,7 +1011,7 @@ fn self_based_opening_differs_emits_mmr_mismatch_full_literal_list() {
             resume_detail,
             None,
         ),
-        uncovered_tail_row(0, 3),
+        uncovered_tail_row(3, 3),
     ];
     assert_eq!(
         got, expected,
@@ -1325,7 +1323,7 @@ fn hash_forgery_candidate_opening_dropped_full_literal_list() {
             resume_detail,
             None,
         ),
-        uncovered_tail_row(0, 3),
+        uncovered_tail_row(3, 3),
     ];
     assert_eq!(got, expected, "hash forgery: full literal finding list");
     let collection = collect_files(&[live, shipped]);
@@ -1866,7 +1864,6 @@ fn sealed_two_mismatch_single_mmr_mismatch_and_kept_empty_literal() {
             None,
         ),
         (K::Resumed, Some(s0), Some(6), Some(5), resume_detail, None),
-        uncovered_tail_row(0, 6),
     ];
     assert_eq!(
         got, expected,
