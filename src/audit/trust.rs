@@ -118,6 +118,24 @@ impl TrustPolicy {
             .find(|k| &k.bytes == key)?
             .bound
     }
+    /// Returns `(key, (seq, hash))` for every bounded key in this trail's
+    /// section, in key-byte order (rulings 13-V5-d1 point 4 and 13-V5-d3
+    /// point 3). The scope is one section: the parse-time rule that a
+    /// revoked key is revoked on every section listing it already holds
+    /// through [`Self::build`], so another trail's bound on the same key
+    /// stays out of this list.
+    pub(crate) fn bounds_in(&self, id: &[u8; 16]) -> Vec<([u8; 32], Bound)> {
+        let Some(section) = self.sections.get(id) else {
+            return Vec::new();
+        };
+        let mut bounded: BTreeMap<[u8; 32], Bound> = BTreeMap::new();
+        for key in &section.keys {
+            if let Some(bound) = key.bound {
+                bounded.insert(key.bytes, bound);
+            }
+        }
+        bounded.into_iter().collect()
+    }
     /// Returns the trail's pinned retirement head, if present.
     #[cfg_attr(
         not(test),
