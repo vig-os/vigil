@@ -220,6 +220,19 @@ fn b1_a1_closing_cp6_wrong_root_full_literal_list() {
     // `MmrMismatch` at cp6 line.
     let expected: Vec<Row> = vec![
         (
+            // Chain rule at seq 4 (ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&e2.hash()),
+                digest_string(&r4.context.previous),
+            ),
+            None,
+        ),
+        (
             K::SegmentStructure,
             Some(s1.clone()),
             Some(1),
@@ -302,6 +315,19 @@ fn b1_a1_closing_cp6_wrong_size_full_literal_list() {
     let resume_detail = resume_detail_at_seq(5, &cp5.hash(), "none");
     let got = rows(&verify_dir(&dir));
     let expected: Vec<Row> = vec![
+        (
+            // Chain rule at seq 4 (ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&e2.hash()),
+                digest_string(&r4.context.previous),
+            ),
+            None,
+        ),
         (
             K::SegmentStructure,
             Some(s1.clone()),
@@ -483,6 +509,19 @@ fn b3_a1_in_run_cp5_wrong_root_full_literal_list() {
     // MmrMismatch which base `0xafe9942` does not emit.
     let expected: Vec<Row> = vec![
         (
+            // Chain rule at seq 4 (ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&e2.hash()),
+                digest_string(&r4.context.previous),
+            ),
+            None,
+        ),
+        (
             K::SegmentStructure,
             Some(s1.clone()),
             Some(1),
@@ -562,6 +601,19 @@ fn b3_a1_in_run_cp5_wrong_size_full_literal_list() {
     let resume_detail = resume_detail_at_seq(5, &cp5.hash(), "none");
     let got = rows(&verify_dir(&dir));
     let expected: Vec<Row> = vec![
+        (
+            // Chain rule at seq 4 (ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&e2.hash()),
+                digest_string(&r4.context.previous),
+            ),
+            None,
+        ),
         (
             K::SegmentStructure,
             Some(s1.clone()),
@@ -680,6 +732,19 @@ fn b3_a1_writer_honest_reader_opens_and_verifier_mmr_mismatch() {
     let resume_detail = resume_detail_at_seq(5, &cp5_writer.hash(), "none");
     let got = rows(&verify_dir(&dir));
     let expected: Vec<Row> = vec![
+        (
+            // Chain rule at seq 4 (ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&e2.hash()),
+                digest_string(&r4.context.previous),
+            ),
+            None,
+        ),
         (
             K::SegmentStructure,
             Some(s1.clone()),

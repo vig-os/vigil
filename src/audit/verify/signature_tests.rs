@@ -717,6 +717,17 @@ fn a9_in_run_bad_signature_reports_without_changing_run_findings() {
     let live = d.0.join("audit.jsonl");
     let expected = vec![
         located(
+            K::ChainBroken,
+            s1.clone(),
+            1,
+            4,
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&e2.hash()),
+                digest_string(&r4.context.previous),
+            ),
+        ),
+        located(
             K::SegmentStructure,
             s1.clone(),
             1,
@@ -796,6 +807,17 @@ fn a10_in_run_bad_signature_on_a3_style_closing_checkpoint() {
             .to_owned();
     let expected = vec![
         located(
+            K::ChainBroken,
+            s1.clone(),
+            1,
+            4,
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&cp2.hash()),
+                digest_string(&r4.context.previous),
+            ),
+        ),
+        located(
             K::SegmentStructure,
             s1.clone(),
             1,
@@ -805,6 +827,17 @@ fn a10_in_run_bad_signature_on_a3_style_closing_checkpoint() {
         located(K::SegmentStructure, s1.clone(), 1, 4, a3_digest_line)
             .with_run_digest(A3_RUN_DIGEST_BYTES),
         located(K::SeqGap, s1, 1, 4, "missing seq 3..=3".to_owned()),
+        located(
+            K::ChainBroken,
+            s2.clone(),
+            1,
+            7,
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&cp5.hash()),
+                digest_string(&r7.context.previous),
+            ),
+        ),
         located(
             K::SegmentStructure,
             s2.clone(),
@@ -1088,6 +1121,17 @@ fn r2_honest_bounded_at_head_has_no_signature_findings_and_head_is_trusted() {
     let s1 = segment_path(&a1.dir_path, 1);
     let live = a1.dir_path.join("audit.jsonl");
     let expected = vec![
+        located(
+            K::ChainBroken,
+            s1.clone(),
+            1,
+            4,
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&a1.e2_hash),
+                digest_string(&a1.r4_previous),
+            ),
+        ),
         located(
             K::SegmentStructure,
             s1.clone(),

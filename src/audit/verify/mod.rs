@@ -285,6 +285,8 @@ mod coverage_tests;
 #[cfg(test)]
 mod end_before_tests;
 #[cfg(test)]
+mod end_link_tests;
+#[cfg(test)]
 mod end_tests;
 #[cfg(test)]
 mod mod_tests;

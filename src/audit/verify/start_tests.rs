@@ -301,14 +301,24 @@ fn b1c_shipped_first_record_native_above_accepts() {
     let verifier = Verifier::new(trust_with_key(fixture_pubkey())).start_from(parse_start(&fx.cp2));
     let report = report_of(vec![native_path.clone(), shipped], verifier);
     // No prefix `SeqGap` for 0..=1 (start accepted). The `SeqGap` at
-    // cp4 for the missing seq=3 is a non-prefix gap and still fires.
-    let expected = vec![located(
-        K::SeqGap,
-        native_path,
-        1,
-        4,
-        "missing seq 3..=3".into(),
-    )];
+    // cp4 for the missing seq=3 is a non-prefix gap and still fires;
+    // the chain rule also compares cp4 with the record at the highest
+    // `seq` below (`fx.cp2`), so a `ChainBroken` fires alongside the
+    // gap (ruling 13-V6-d6 point 1).
+    let expected = vec![
+        located(
+            K::ChainBroken,
+            native_path.clone(),
+            1,
+            4,
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&fx.cp2.hash()),
+                digest_string(&entry_rec(3, fx.cp2.hash()).hash()),
+            ),
+        ),
+        located(K::SeqGap, native_path, 1, 4, "missing seq 3..=3".into()),
+    ];
     assert_findings(report.findings(), &expected, "B1c");
 }
 
@@ -1120,7 +1130,24 @@ fn b14_batch2_step6_clean_delete_segment_delete_first_segment() {
     let live = d.0.join("audit.jsonl");
     let verifier = Verifier::new(trust_with_key(fixture_pubkey())).start_from(parse_start(&fx.cp2));
     let report = verifier.verify_dir(&d.0).unwrap();
-    let expected = vec![located(K::SeqGap, live, 1, 6, "missing seq 4..=5".into())];
+    // Chain rule at seq 6 compares with the record at the highest
+    // `seq` below (`e3` in segA, since segB was deleted), so a
+    // `ChainBroken` fires together with the `SeqGap` (ruling
+    // 13-V6-d6 point 1).
+    let expected = vec![
+        located(
+            K::ChainBroken,
+            live.clone(),
+            1,
+            6,
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&e3.hash()),
+                digest_string(&e5.hash()),
+            ),
+        ),
+        located(K::SeqGap, live, 1, 6, "missing seq 4..=5".into()),
+    ];
     assert_findings(report.findings(), &expected, "B14 (b) segment deleted");
 
     // (c) Delete segA from archive 2 (the one holding the start):
