@@ -217,11 +217,15 @@ pub enum FindingKind {
     /// Error: A segment or run violates the required structure.
     SegmentStructure,
     /// Error: An anchor does not match the verified history
-    /// (ADR-0005 decision 10; ruling 13-V6-d1 points 1-2). The full
-    /// rule and the four-step detail precedence are on
+    /// (ADR-0005 decision 10; ruling 13-V6-d1 points 1-2, ruling
+    /// 13-V6-d4 point 5). The full rule and the four-step detail
+    /// precedence for an ordinary anchor are on
     /// [`Verifier::anchor`](crate::audit::Verifier::anchor); each
-    /// detail begins `anchor seq <s> hash blake3:<64 hex>: `. An
-    /// end-record form arrives with `end_before` (#13).
+    /// of those details begins `anchor seq <s> hash blake3:<64
+    /// hex>: `. An end-record form with detail exactly `end record
+    /// differs from end anchor` is emitted by
+    /// [`Verifier::end_before`](crate::audit::Verifier::end_before);
+    /// see that method for the rule.
     AnchorMismatch,
     /// Error: The requested start does not match the verified
     /// history (ADR-0005 decision 11 `.start_from`; ruling
@@ -242,13 +246,22 @@ pub enum FindingKind {
     /// [`Verifier::start_from`](crate::audit::Verifier::start_from)
     /// for the rule.
     UnanchoredStart,
-    /// Error: The batch start does not anchor the requested end.
+    /// Error: With
+    /// [`Verifier::end_before`](crate::audit::Verifier::end_before)
+    /// set and no end anchor supplied, one `UnanchoredEnd` fires
+    /// at the end checkpoint's `seq`, unlocated, with detail
+    /// exactly `end_before seq <e>: no end anchor` (ADR-0005
+    /// decision 11 `.end_before`; ruling 13-V6-d4 point 5). See
+    /// [`Verifier::end_before`](crate::audit::Verifier::end_before)
+    /// for the rule.
     UnanchoredEnd,
     /// Error: A record violates the trail's retirement pin
     /// `end=<s>:<h>` (ADR-0005 decision 9; rulings 13-V5-d1 point 5
-    /// and 13-V5-d5). Two independent conditions are evaluated, each
-    /// yielding at most one finding; a batch-end bound (decision 11,
-    /// `--end-before`) is later work.
+    /// and 13-V5-d5), or a file record carries a `seq` at or
+    /// above an
+    /// [`end_before`](crate::audit::Verifier::end_before) record's
+    /// end checkpoint (ADR-0005 decision 11 `.end_before`; ruling
+    /// 13-V6-d4 point 3).
     ///
     /// - **at `s`:** the verified set holds exactly one distinct
     ///   record at `s` and its hash is `h`. One detail is chosen by
@@ -267,6 +280,14 @@ pub enum FindingKind {
     /// (the pin still runs) and promotion of 13-V5-d2 repairs at or
     /// below `s`; a mismatch grants none of them, and no `end=`
     /// checks nothing.
+    ///
+    /// **`end_before` form.** With
+    /// [`Verifier::end_before`](crate::audit::Verifier::end_before)
+    /// set, one further `TrailEnded` with detail exactly
+    /// `end_before seq <e>: records seq <a>..=<b> at or above the
+    /// end` is emitted when any file record of the verified trail
+    /// carries a `seq` at or above the end checkpoint's `seq`;
+    /// see that method for the rule.
     TrailEnded,
     /// Error: With `Verifier::max_age` set, the verified trail is
     /// stale (ADR-0005 decision 5; rulings 13-V5-d1 point 7 and

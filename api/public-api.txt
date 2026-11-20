@@ -199,6 +199,7 @@ pub fn vigil::audit::TrustPolicyBuilder::trail(self, id: [u8; 16]) -> vigil::aud
 pub struct vigil::audit::Verifier
 impl vigil::audit::Verifier
 pub fn vigil::audit::Verifier::anchor(self, anchor: vigil::audit::Checkpoint) -> Self
+pub fn vigil::audit::Verifier::end_before(self, archive_record: &str, end_anchor: core::option::Option<vigil::audit::Checkpoint>) -> core::result::Result<Self, vigil::audit::AuditError>
 pub fn vigil::audit::Verifier::max_age(self, max_age: core::time::Duration) -> core::result::Result<Self, vigil::audit::AuditError>
 pub fn vigil::audit::Verifier::new(trust: vigil::audit::TrustPolicy) -> Self
 pub fn vigil::audit::Verifier::start_from(self, start: vigil::audit::Checkpoint) -> Self

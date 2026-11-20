@@ -198,6 +198,7 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
             checkpoint: None,
             operator: None,
             line: seq + 1,
+            is_end_record: false,
         }
     }
     // The chain loop emits one ChainBroken for the seq-0 record (its
@@ -224,6 +225,7 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
     let input = Input {
         path: PathBuf::from("copy"),
         native: false,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: None,
             records: vec![broken_record],
@@ -242,11 +244,14 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
     let report = super::engine::check(
         collection,
         TRAIL,
-        &trust,
-        None,
-        &[],
-        None,
-        std::time::SystemTime::now(),
+        super::engine::Policy {
+            trust: &trust,
+            max_age: None,
+            anchors: &[],
+            start: None,
+            end_ctx: None,
+            now: std::time::SystemTime::now(),
+        },
     );
     // Confirm both error findings are present before asserting the order.
     let errors: Vec<_> = report
