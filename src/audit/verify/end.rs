@@ -11,8 +11,8 @@
 //! promotion of 13-V5-d2 repairs at or below `s`; a mismatch grants
 //! none of them; no `end=` checks nothing (ruling 13-V5-d5 point 2).
 //!
-//! Ruling 13-V6-d7 point 3 (with clarification 13-V6-d7a point 1):
-//! a trust-file `end=<s>` with `s` strictly above the end record's
+//! Ruling 13-V6-d7 point 3 (with clarification 13-V6-d7a): a
+//! trust-file `end=<s>` with `s` strictly above the end record's
 //! last line's `seq` is routed through
 //! [`super::position::Classifier::set_aside_above_end`] like the
 //! anchors and pins above the end. It replaces both `TrailEnded`
@@ -49,7 +49,7 @@ pub(super) fn check(
 ) -> Option<u64> {
     let (s, h) = trust.end(&trail)?;
     let subject = format!("end={s}:{}", digest_string(&h));
-    // Ruling 13-V6-d7 point 3 (clarification 13-V6-d7a point 1): a
+    // Ruling 13-V6-d7 point 3 (clarification 13-V6-d7a): a
     // trust-file `end=<s>` strictly above the end record's last
     // line's `seq` replaces both conditions and grants nothing. The
     // classifier returns `None` outside an end-bounded verification

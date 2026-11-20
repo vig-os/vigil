@@ -116,8 +116,8 @@ pub(super) struct Context<'a> {
     /// anchor rule (ruling 13-V6-d1 point 2). The result comes from
     /// [`super::anchors::match_only`] once per verify call, so
     /// [`Self::is_anchored`] reuses it rather than reimplementing
-    /// the rule (ruling 13-V6-d7 clarification 13-V6-d7a point 2).
-    /// Left `false` outside [`super::engine::check`].
+    /// the rule (ruling 13-V6-d7 clarification 13-V6-d7a). Left
+    /// `false` outside [`super::engine::check`].
     pub(super) end_anchor_matches: bool,
 }
 
@@ -136,8 +136,8 @@ impl<'a> Context<'a> {
     /// anchor was given, its bytes match the record's first line,
     /// and the shared anchor rule produced no finding for it
     /// (ruling 13-V6-d4 point 5; ruling 13-V6-d7 clarification
-    /// 13-V6-d7a point 2 — a fork at `e` leaves the end unanchored).
-    /// The one place "anchored" is decided for the above-end
+    /// 13-V6-d7a — a fork at `e` leaves the end unanchored). The
+    /// one place "anchored" is decided for the above-end
     /// set-aside; neither the byte-equality nor the anchor rule
     /// is re-checked here.
     pub(super) fn is_anchored(&self) -> bool {

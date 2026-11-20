@@ -430,8 +430,8 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         &conflicting_seqs,
         &mut findings,
     );
-    // Ruling 13-V6-d7 clarification 13-V6-d7a point 2: evaluate the
-    // end anchor through the shared anchor rule once, before the
+    // Ruling 13-V6-d7 clarification 13-V6-d7a: evaluate the end
+    // anchor through the shared anchor rule once, before the
     // classifier is built, so `Context::is_anchored` can reuse the
     // result without re-implementing the rule. The end anchor is
     // never set aside (clarification 13-V6-d7a), so
@@ -664,10 +664,10 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         &conflicting_seqs,
         &mut findings,
     );
-    // Ruling 13-V6-d1 points 1-2 and 13-V6-d7 clarification 13-V6-d7a
-    // point 2: each distinct `(trail, seq, hash)` anchor is checked
-    // once against the already-merged `groups` and the shared fork
-    // set, so no second file pass runs. The end anchor was evaluated
+    // Ruling 13-V6-d1 points 1-2 and 13-V6-d7 clarification 13-V6-d7a:
+    // each distinct `(trail, seq, hash)` anchor is checked once
+    // against the already-merged `groups` and the shared fork set,
+    // so no second file pass runs. The end anchor was evaluated
     // ahead of the classifier (its finding was pushed above), so this
     // call skips it by identity -- the shared anchor rule runs once.
     anchors::check(

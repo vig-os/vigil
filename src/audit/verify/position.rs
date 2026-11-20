@@ -28,9 +28,10 @@ enum Position {
     /// `seq > E` under `Verifier::end_before`. `E` is the `seq` of
     /// the end record's last line (the resume line if there is one,
     /// otherwise the checkpoint, ruling 13-V6-d7 point 1); `anchored`
-    /// is `true` iff the end anchor was given and byte-equals the
-    /// record's first line (ruling 13-V6-d4 point 5; ruling 13-V6-d7
-    /// point 2).
+    /// is `true` iff all three "anchored" conditions hold: the end
+    /// anchor was given, it byte-equals the record's first line, and
+    /// the shared anchor rule matched it (ruling 13-V6-d4 point 5;
+    /// ruling 13-V6-d7 clarification 13-V6-d7a).
     AboveEnd { end_seq: u64, anchored: bool },
 }
 
@@ -129,8 +130,8 @@ impl Classifier {
     /// otherwise. Unlike [`Self::set_aside`], a `seq` below an
     /// accepted start is left untouched: a trust-file `end=<s>` is
     /// set aside only above the end (ruling 13-V6-d7 clarification
-    /// 13-V6-d7a point 1; decision 11 lists the below-start inputs
-    /// without `end=`, so an `end=` below an accepted start keeps its
+    /// 13-V6-d7a; decision 11 lists the below-start inputs without
+    /// `end=`, so an `end=` below an accepted start keeps its
     /// 13-V5-d5 behaviour). Consumed by [`super::end::check`].
     pub(super) fn set_aside_above_end(&self, seq: u64, subject: impl Display) -> Option<Finding> {
         match self.classify(seq) {

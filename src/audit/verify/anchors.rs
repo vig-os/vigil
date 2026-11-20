@@ -1,11 +1,11 @@
 //! Anchor check for the offline verifier (ADR-0005 decision 10;
 //! rulings 13-V6-d1 points 1-2, 13-V6-d3 point 4 and 13-V6-d7
-//! clarification 13-V6-d7a point 2). Each distinct `(trail, seq,
-//! hash)` anchor yields at most one finding, taken from the first
-//! failing step in this order: trail differs, then below the start
-//! (through [`super::position::Classifier::set_aside`]), no record,
-//! seq is forked, hash differs. The end anchor is never set aside:
-//! it skips the position step and always goes through the rule
+//! clarification 13-V6-d7a). Each distinct `(trail, seq, hash)`
+//! anchor yields at most one finding, taken from the first failing
+//! step in this order: trail differs, then below the start (through
+//! [`super::position::Classifier::set_aside`]), no record, seq is
+//! forked, hash differs. The end anchor is never set aside: it
+//! skips the position step and always goes through the rule
 //! (ruling 13-V6-d7a). The rule and the details are on
 //! [`crate::audit::Verifier::anchor`] and the finding kinds
 //! ([`crate::audit::FindingKind::AnchorMismatch`],
@@ -25,9 +25,9 @@ type Located<'a> = (&'a Path, &'a Summary);
 /// [`super::engine::check`] when
 /// [`crate::audit::Verifier::end_before`] was given one. Used to
 /// (1) skip the position set-aside step for the end anchor itself
-/// (ruling 13-V6-d7 clarification 13-V6-d7a point 2: the end anchor
-/// always goes through the anchor rule) and (2) skip the finding
-/// emission in the main loop because
+/// (ruling 13-V6-d7 clarification 13-V6-d7a: the end anchor always
+/// goes through the anchor rule) and (2) skip the finding emission
+/// in the main loop because
 /// [`super::engine::check`] has already pushed it from
 /// [`match_only`]. Emitting it twice would double-count.
 type AnchorIdentity = ([u8; 16], u64, [u8; 32]);
@@ -66,8 +66,8 @@ pub(super) fn check(
 
 /// Evaluates the anchor rule (ruling 13-V6-d1 point 2) without the
 /// position set-aside step, for the end anchor ahead of the
-/// classifier (ruling 13-V6-d7 clarification 13-V6-d7a point 2: the
-/// end anchor is never set aside, so skipping position is equivalent
+/// classifier (ruling 13-V6-d7 clarification 13-V6-d7a: the end
+/// anchor is never set aside, so skipping position is equivalent
 /// to the full rule for it). The result lands in two places with no
 /// re-check: its "matches" flag drives
 /// [`super::end_before::Context::is_anchored`], and its finding (if
@@ -85,8 +85,8 @@ pub(super) fn match_only(
 /// Returns at most one finding per anchor, from the first failing
 /// step in the module's precedence. `position` is `Some` for the
 /// regular anchor path and `None` for the end anchor (ruling
-/// 13-V6-d7 clarification 13-V6-d7a point 2: skip the set-aside step
-/// so the end anchor always goes through the anchor rule).
+/// 13-V6-d7 clarification 13-V6-d7a: skip the set-aside step so the
+/// end anchor always goes through the anchor rule).
 fn evaluate(
     anchor: &Checkpoint,
     trail: [u8; 16],

@@ -735,9 +735,9 @@ impl Verifier {
                 anchor: eb.anchor.as_ref(),
                 // Placeholder: the real value is computed by
                 // `engine::check` (ruling 13-V6-d7 clarification
-                // 13-V6-d7a point 2) once the merged groups and
-                // fork set are available. The classifier reads it
-                // from the rebuilt `Context` there.
+                // 13-V6-d7a) once the merged groups and fork set
+                // are available. The classifier reads it from the
+                // rebuilt `Context` there.
                 end_anchor_matches: false,
             }
         });
