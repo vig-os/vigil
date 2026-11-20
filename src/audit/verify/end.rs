@@ -11,11 +11,17 @@
 //! promotion of 13-V5-d2 repairs at or below `s`; a mismatch grants
 //! none of them; no `end=` checks nothing (ruling 13-V5-d5 point 2).
 //!
-//! Ruling 13-V6-d7 point 3: a trust-file `end=<s>` with `s` strictly
-//! above the end record's last line's `seq` is routed through
-//! [`super::position::Classifier::set_aside`] like the anchors and
-//! pins above the end. It replaces both `TrailEnded` conditions and
-//! grants nothing, because nothing above the end can be checked.
+//! Ruling 13-V6-d7 point 3 (with clarification 13-V6-d7a point 1):
+//! a trust-file `end=<s>` with `s` strictly above the end record's
+//! last line's `seq` is routed through
+//! [`super::position::Classifier::set_aside_above_end`] like the
+//! anchors and pins above the end. It replaces both `TrailEnded`
+//! conditions and grants nothing, because nothing above the end can
+//! be checked. Only the above-end arm sets an `end=` aside: a
+//! trust-file `end=<s>` below an accepted start keeps its 13-V5-d5
+//! behaviour (decision 11 lists the below-start inputs without
+//! `end=`), so [`Classifier::set_aside_above_end`] is used here
+//! rather than the shared [`Classifier::set_aside`].
 //!
 //! Reads only what the engine already has from the one snapshot
 //! (ruling 13-V4-d5): no second file pass.
@@ -43,11 +49,14 @@ pub(super) fn check(
 ) -> Option<u64> {
     let (s, h) = trust.end(&trail)?;
     let subject = format!("end={s}:{}", digest_string(&h));
-    // Ruling 13-V6-d7 point 3: a trust-file `end=<s>` strictly above
-    // the end record's last line's `seq` replaces both conditions and
-    // grants nothing. The classifier returns `None` outside an
-    // end-bounded verification, so the usual check runs.
-    if let Some(finding) = position.set_aside(s, &subject) {
+    // Ruling 13-V6-d7 point 3 (clarification 13-V6-d7a point 1): a
+    // trust-file `end=<s>` strictly above the end record's last
+    // line's `seq` replaces both conditions and grants nothing. The
+    // classifier returns `None` outside an end-bounded verification
+    // and for a `seq` below an accepted start (an `end=` below the
+    // start keeps its 13-V5-d5 behaviour), so the usual check runs
+    // in both cases.
+    if let Some(finding) = position.set_aside_above_end(s, &subject) {
         findings.push(finding);
         return None;
     }

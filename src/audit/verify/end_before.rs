@@ -112,15 +112,36 @@ pub(super) struct Context<'a> {
     pub(super) last_line_seq: u64,
     pub(super) first_line: &'a str,
     pub(super) anchor: Option<&'a Checkpoint>,
+    /// `true` iff the end anchor was given and passed the shared
+    /// anchor rule (ruling 13-V6-d1 point 2). The result comes from
+    /// [`super::anchors::match_only`] once per verify call, so
+    /// [`Self::is_anchored`] reuses it rather than reimplementing
+    /// the rule (ruling 13-V6-d7 clarification 13-V6-d7a point 2).
+    /// Left `false` outside [`super::engine::check`].
+    pub(super) end_anchor_matches: bool,
 }
 
 impl<'a> Context<'a> {
-    /// `true` iff the end anchor was given and byte-equals the end
-    /// record's first line (ruling 13-V6-d4 point 5; ruling 13-V6-d7
-    /// point 2). The one place "anchored" is decided for the above-end
-    /// set-aside.
-    pub(super) fn is_anchored(&self) -> bool {
+    /// `true` iff an end anchor was given and its line byte-equals
+    /// the end record's first line (ruling 13-V6-d4 point 5: each
+    /// side without its LF; whitespace counts). The one place the
+    /// byte-equality check lives; [`Self::is_anchored`] and
+    /// [`check`] both consume it so the comparison runs in exactly
+    /// one place.
+    pub(super) fn bytes_match(&self) -> bool {
         self.anchor.is_some_and(|a| a.line() == self.first_line)
+    }
+
+    /// `true` iff all three "anchored" conditions hold: the end
+    /// anchor was given, its bytes match the record's first line,
+    /// and the shared anchor rule produced no finding for it
+    /// (ruling 13-V6-d4 point 5; ruling 13-V6-d7 clarification
+    /// 13-V6-d7a point 2 — a fork at `e` leaves the end unanchored).
+    /// The one place "anchored" is decided for the above-end
+    /// set-aside; neither the byte-equality nor the anchor rule
+    /// is re-checked here.
+    pub(super) fn is_anchored(&self) -> bool {
+        self.bytes_match() && self.end_anchor_matches
     }
 }
 
@@ -167,7 +188,11 @@ pub(super) fn check(
             Some(ctx.end_seq),
             format!("end_before seq {}: no end anchor", ctx.end_seq),
         )),
-        Some(anchor) if anchor.line() != ctx.first_line => findings.push(Finding::new(
+        // Ruling 13-V6-d4 point 5 (byte equality lives in one place,
+        // `Context::bytes_match`): the end record's first line must
+        // byte-equal the end anchor's line (each side without its LF;
+        // whitespace counts).
+        Some(_) if !ctx.bytes_match() => findings.push(Finding::new(
             K::AnchorMismatch,
             None,
             None,

@@ -118,17 +118,44 @@ impl Classifier {
                 Some(seq),
                 format!("{subject}: below start seq {start_seq}"),
             )),
-            Position::AboveEnd { end_seq, anchored } => Some(Finding::new(
-                if anchored {
-                    K::OutOfRange
-                } else {
-                    K::UnanchoredEnd
-                },
-                None,
-                None,
-                Some(seq),
-                format!("{subject}: above end seq {end_seq}"),
-            )),
+            Position::AboveEnd { end_seq, anchored } => {
+                Some(above_end_finding(seq, end_seq, anchored, subject))
+            }
         }
     }
+
+    /// Returns the one unlocated above-end set-aside finding when
+    /// `seq` is strictly above the end of a bounded batch, or `None`
+    /// otherwise. Unlike [`Self::set_aside`], a `seq` below an
+    /// accepted start is left untouched: a trust-file `end=<s>` is
+    /// set aside only above the end (ruling 13-V6-d7 clarification
+    /// 13-V6-d7a point 1; decision 11 lists the below-start inputs
+    /// without `end=`, so an `end=` below an accepted start keeps its
+    /// 13-V5-d5 behaviour). Consumed by [`super::end::check`].
+    pub(super) fn set_aside_above_end(&self, seq: u64, subject: impl Display) -> Option<Finding> {
+        match self.classify(seq) {
+            Position::AboveEnd { end_seq, anchored } => {
+                Some(above_end_finding(seq, end_seq, anchored, subject))
+            }
+            Position::InRange | Position::BelowStart { .. } => None,
+        }
+    }
+}
+
+/// Builds the one unlocated above-end finding, shared by
+/// [`Classifier::set_aside`] and [`Classifier::set_aside_above_end`]
+/// so the detail grammar and kind choice live in one place (ruling
+/// 13-V6-d7 points 2-3).
+fn above_end_finding(seq: u64, end_seq: u64, anchored: bool, subject: impl Display) -> Finding {
+    Finding::new(
+        if anchored {
+            K::OutOfRange
+        } else {
+            K::UnanchoredEnd
+        },
+        None,
+        None,
+        Some(seq),
+        format!("{subject}: above end seq {end_seq}"),
+    )
 }
