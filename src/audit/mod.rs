@@ -223,7 +223,17 @@ pub enum FindingKind {
     /// detail begins `anchor seq <s> hash blake3:<64 hex>: `. An
     /// end-record form arrives with `end_before` (#13).
     AnchorMismatch,
-    /// Error: The requested start does not match the history.
+    /// Error: The requested start does not match the verified
+    /// history (ADR-0005 decision 11 `.start_from`; ruling
+    /// 13-V6-d2). The full rule and the seven-step detail
+    /// precedence are on
+    /// [`Verifier::start_from`](crate::audit::Verifier::start_from);
+    /// each detail begins `start seq <s> hash blake3:<64 hex>: `.
+    /// Emitted at the start's `seq`, located at the first copy of
+    /// the first record (lowest `seq`) in the engine's merge order,
+    /// or unlocated when the verified set is empty. The record's
+    /// own `BadSignature` and `UntrustedKey` are independent and
+    /// still fire as usual.
     StartMismatch,
     /// Error: An input below the start lacks an anchor.
     UnanchoredStart,
