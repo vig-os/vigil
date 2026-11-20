@@ -58,14 +58,12 @@ const T_S6_CP0: u64 = 2_800_000_000; // highest `time`, lower `seq`.
 const T_S6_E1: u64 = 2_600_000_000;
 const T_S6_CP2: u64 = 1_000_000_000; // lowest `time`, highest `seq`.
 const T_S12_CP0: u64 = 2_999_999_999; // age 1ns, stale at Duration::ZERO.
-// S13 rolls the clock backwards from cp0 to cp2 across the kept cp2
-// (ClockWentBackwards fires at e1 and cp2), so that "latest time" and
-// "highest seq" give different results: cp0 has the latest `time`,
-// cp2 has the highest `seq`.
-const T_S13_CP0: u64 = 2_800_000_000; // age 0.2s if latest-time-wins.
-const T_S13_E1: u64 = 2_600_000_000;
-const T_S13_CP2: u64 = 1_500_000_000; // age 1.5s, stale.
-const T_S13_E3: u64 = 1_000_000_000;
+// S13 — ADR-0005 decision 5 rollback: an old trusted cp0 at `T_OLD_CP0`
+// and plain entries after it at strictly increasing times. Age is 1.5s
+// against `NOW_NS` (stale), and no record carries a backwards `time`,
+// so no `ClockWentBackwards` fires.
+const T_S13_E1: u64 = T_OLD_CP0 + 1; // 1_500_000_001, > T_OLD_CP0.
+const T_S13_E2: u64 = T_OLD_CP0 + 2; // 1_500_000_002, > T_S13_E1.
 const T_S11_CP0: u64 = 1_800_000_000; // age 1.2s.
 
 // Fork hashes for S9: two distinct `(size, root)` cp2s on seq=2.
@@ -73,6 +71,27 @@ const S9_CP2_A_HEX: &str =
     "blake3:033f9437ab0b83a04f4d5a1566ef4fb46277f482ab67d26dddcd01b7f1b5f433";
 const S9_CP2_B_HEX: &str =
     "blake3:24a04e6415ac2c1f7ebd5ac7f6d07bfa09621190d2352aa97dde86e15256166f";
+// Fork hashes for S9b: two cp0s at `T_S1` sharing the same `(seq,
+// previous, time, key)` but differing in `(size, root, peaks)`, so
+// `cp0_b`'s `verify_strict` rejects the record (`cp0_b` is forked but
+// not trusted).
+const S9B_CP0_A_HEX: &str =
+    "blake3:d4665d39b8e3aea6c31eb536ea2007c683a692a3bfca62a26abcc34f5e9d4f83";
+const S9B_CP0_B_HEX: &str =
+    "blake3:b913e2bf34dea145d1d31a5c9b5b76b48f99ad21ff4a3a9537cfe0912b92edd6";
+// Fork hashes for S9c: two cp2s at `T_S9C_CP2` sharing `(seq,
+// previous, time, key)` but differing in `(size, root, peaks)`, so
+// `cp2_b`'s `verify_strict` rejects the record (`cp2_b` is forked but
+// not trusted).
+const S9C_CP2_A_HEX: &str =
+    "blake3:b8ae2cb2cfee3d50faffc6f13146e8a77fa0e2346a014fe5a3ec9edd702a5da4";
+const S9C_CP2_B_HEX: &str =
+    "blake3:3d7083eccf52466fe6954673ec41a241fadaeb3e88733589109a2f09f780e770";
+
+// Times for S9c (fork fallback with a fresh trusted below the fork).
+const T_S9C_CP0: u64 = T_FRESH_CP2; // 2_500_000_000, age 0.5s, fresh.
+const T_S9C_E1: u64 = T_FRESH_CP2 + 1;
+const T_S9C_CP2: u64 = T_FRESH_CP2 + 2;
 
 // =====================================================================
 // Helpers.
@@ -228,6 +247,44 @@ fn fixture_hashes_match_literals() {
     );
     assert_eq!(digest_string(&cp2_a.hash()), S9_CP2_A_HEX);
     assert_eq!(digest_string(&cp2_b.hash()), S9_CP2_B_HEX);
+    // The S9b fork hashes: two cp0s at `T_S1` with the same `(seq,
+    // previous, time, key)` differing only by `(size, root, peaks)`.
+    // Rebuilt here so a fixture change fails this consistency pin, not
+    // S9b's row.
+    let s9b_cp0_a = signed_cp_at(0, Record::genesis(&TRAIL), &Mmr::new(), T_S1);
+    let s9b_cp0_b = signed_cp_explicit_at(
+        &"27".repeat(32),
+        0,
+        Record::genesis(&TRAIL),
+        T_S1,
+        0,
+        [0xff; 32],
+        vec![],
+    );
+    assert_eq!(digest_string(&s9b_cp0_a.hash()), S9B_CP0_A_HEX);
+    assert_eq!(digest_string(&s9b_cp0_b.hash()), S9B_CP0_B_HEX);
+    // The S9c fork hashes: two cp2s at `T_S9C_CP2` above a fresh
+    // trusted cp0, with the same `(seq, previous, time, key)`
+    // differing only by `(size, root, peaks)`. Rebuilt here so a
+    // fixture change fails this consistency pin, not S9c's row.
+    let s9c_cp0 = signed_cp_at(0, Record::genesis(&TRAIL), &Mmr::new(), T_S9C_CP0);
+    let mut s9c_mmr0 = Mmr::new();
+    s9c_mmr0.push(s9c_cp0.hash()).unwrap();
+    let s9c_e1 = entry_at(1, s9c_cp0.hash(), T_S9C_E1);
+    let mut s9c_mmr1 = s9c_mmr0.clone();
+    s9c_mmr1.push(s9c_e1.hash()).unwrap();
+    let s9c_cp2_a = signed_cp_at(2, s9c_e1.hash(), &s9c_mmr1, T_S9C_CP2);
+    let s9c_cp2_b = signed_cp_explicit_at(
+        &"27".repeat(32),
+        2,
+        s9c_e1.hash(),
+        T_S9C_CP2,
+        2,
+        [0xff; 32],
+        vec![[0xff; 32]],
+    );
+    assert_eq!(digest_string(&s9c_cp2_a.hash()), S9C_CP2_A_HEX);
+    assert_eq!(digest_string(&s9c_cp2_b.hash()), S9C_CP2_B_HEX);
     // Nanosecond integers: the row details reference them as literals;
     // re-stating them here anchors the row list against a typo.
     assert_eq!(MAX_AGE.as_nanos(), MAX_AGE_NS);
@@ -432,7 +489,7 @@ fn s6_highest_seq_wins_over_latest_time() {
 }
 
 // =====================================================================
-// S7 — ACCEPTANCE. A trusted checkpoint whose `time` is in the
+// S7 — REGRESSION. A trusted checkpoint whose `time` is in the
 // future relative to `now` saturates to age 0, so no `StaleHead`
 // fires (clock problems are the business of `ClockWentBackwards`).
 // =====================================================================
@@ -449,7 +506,7 @@ fn s7_future_time_saturates_to_zero_age_not_stale() {
 }
 
 // =====================================================================
-// S8 — ACCEPTANCE. The highest-`seq` trusted checkpoint is in a
+// S8 — REGRESSION. The highest-`seq` trusted checkpoint is in a
 // shipped-only copy and is fresh: no `StaleHead`.
 // =====================================================================
 #[test]
@@ -603,52 +660,85 @@ fn s12_zero_max_age_with_one_ns_old_is_stale() {
 
 // =====================================================================
 // S13 — ACCEPTANCE. ADR-0005 decision 5 rollback scenario: a trail
-// rolled back to an old trusted checkpoint, with entries after it
-// but no checkpoint signed since. The clock is set so that cp0 has
-// a later `time` than cp2 (entries record the backwards jump). The
-// newest trusted checkpoint is cp2 (highest `seq`), not cp0 (latest
-// `time`): `StaleHead` names cp2.
+// rolled back to an old trusted checkpoint `cp0`, followed by plain
+// entries at strictly increasing `time`s and no checkpoint signed
+// again. `cp0` exceeds `max_age`, so `StaleHead` names it; the tail
+// above `cp0` is `UncoveredTail`. No `ClockWentBackwards` fires
+// (entries' `time`s increase from `cp0`'s), so the rollback isolates
+// the staleness branch under decision 5.
 // =====================================================================
 #[test]
-fn s13_rollback_newest_trusted_is_highest_seq_not_latest_time() {
+fn s13_rollback_old_trusted_with_no_checkpoint_signed_since_is_stale() {
     let d = Temp::new();
-    let cp0 = signed_cp_at(0, Record::genesis(&TRAIL), &Mmr::new(), T_S13_CP0);
-    let mut mmr0 = Mmr::new();
-    mmr0.push(cp0.hash()).unwrap();
+    let cp0 = signed_cp_at(0, Record::genesis(&TRAIL), &Mmr::new(), T_OLD_CP0);
     let e1 = entry_at(1, cp0.hash(), T_S13_E1);
-    let mut mmr1 = mmr0.clone();
-    mmr1.push(e1.hash()).unwrap();
-    let cp2 = signed_cp_at(2, e1.hash(), &mmr1, T_S13_CP2);
-    let e3 = entry_at(3, cp2.hash(), T_S13_E3);
-    put_segment(&d.0, 0, &[&cp0, &e1, &cp2, &e3], &[]);
+    let e2 = entry_at(2, e1.hash(), T_S13_E2);
+    put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
     let path = segment_path(&d.0, 0);
     let r = report(vec![path.clone()], trusted_policy(), Some(MAX_AGE), now());
-    let expected = vec![
-        located(
-            K::ClockWentBackwards,
-            path.clone(),
-            2,
-            1,
-            format!("expected time >= {T_S13_CP0}, found {T_S13_E1}"),
-        ),
-        located(
-            K::ClockWentBackwards,
-            path.clone(),
-            3,
-            2,
-            format!("expected time >= {T_S13_E1}, found {T_S13_CP2}"),
-        ),
-        stale(path.clone(), 3, 2, T_S13_CP2),
-        located(
-            K::ClockWentBackwards,
-            path,
-            4,
-            3,
-            format!("expected time >= {T_S13_CP2}, found {T_S13_E3}"),
-        ),
-        uncovered(3, 3),
-    ];
+    let expected = vec![stale(path, 1, 0, T_OLD_CP0), uncovered(1, 2)];
     assert_findings(r.findings(), &expected, "S13");
+    assert!(!r.is_strict_valid());
+    assert_eq!(r.covered_through(), Some(0));
+}
+
+// =====================================================================
+// S9c — REGRESSION sibling of S9 (fork fallback with a fresh lower
+// trusted): the highest trusted `seq` is forked AND the trusted
+// checkpoint at the next unforked `seq` below is fresh. The fallback
+// steps down from the forked `seq` to that fresh checkpoint, so only
+// `SeqConflict` fires -- a `newest_trusted` that returned `None` at
+// the forked `seq` (instead of stepping down) would spuriously emit
+// the unlocated `no trusted checkpoint …` finding here. Pairs with S9
+// so the "step down to the highest unforked trusted" rule is pinned
+// on two layouts (stale below the fork; fresh below the fork).
+// =====================================================================
+#[test]
+fn s9c_forked_highest_steps_down_to_fresh_trusted_below() {
+    let d = Temp::new();
+    let cp0 = signed_cp_at(0, Record::genesis(&TRAIL), &Mmr::new(), T_S9C_CP0);
+    let mmr0 = {
+        let mut m = Mmr::new();
+        m.push(cp0.hash()).unwrap();
+        m
+    };
+    let e1 = entry_at(1, cp0.hash(), T_S9C_E1);
+    let mmr1 = {
+        let mut m = mmr0.clone();
+        m.push(e1.hash()).unwrap();
+        m
+    };
+    let cp2_a = signed_cp_at(2, e1.hash(), &mmr1, T_S9C_CP2);
+    let cp2_b = signed_cp_explicit_at(
+        &"27".repeat(32),
+        2,
+        e1.hash(),
+        T_S9C_CP2,
+        2,
+        [0xff; 32],
+        vec![[0xff; 32]],
+    );
+    put_segment(&d.0, 0, &[&cp0, &e1, &cp2_a], &[]);
+    let native = segment_path(&d.0, 0);
+    let shipped = d.0.join("twin.jsonl");
+    write_bytes(&shipped, &line_bytes(&cp2_b));
+    let r = report(
+        vec![native.clone(), shipped],
+        trusted_policy(),
+        Some(MAX_AGE),
+        now(),
+    );
+    // The engine sorts fork candidates by the hash bytes (`BTreeMap`
+    // keyed by `record.hash`), so `conflicting hashes: …` prints the
+    // two pinned literals in hash-byte order (`_B_HEX`, then `_A_HEX`).
+    let expected = vec![located(
+        K::SeqConflict,
+        native,
+        3,
+        2,
+        format!("conflicting hashes: {S9C_CP2_B_HEX}, {S9C_CP2_A_HEX}"),
+    )];
+    assert_findings(r.findings(), &expected, "S9c");
     assert!(!r.is_strict_valid());
     assert_eq!(r.covered_through(), Some(2));
 }
@@ -720,7 +810,7 @@ fn s4b_two_untrusted_checkpoints_still_emit_unlocated_stale_head() {
 }
 
 // =====================================================================
-// S7b — ACCEPTANCE sibling of S7 (shipped-only future): a trusted
+// S7b — REGRESSION sibling of S7 (shipped-only future): a trusted
 // checkpoint in a shipped-only file whose `time` is in the future
 // relative to `now` is not stale, pinning "future `time` saturates
 // to age zero" on a second, independent layout.
@@ -768,18 +858,19 @@ fn s9b_forked_seq_zero_with_no_lower_trusted_emits_no_trusted() {
         Some(MAX_AGE),
         now(),
     );
-    let (lo, hi) = {
-        let a = digest_string(&cp0_a.hash());
-        let b = digest_string(&cp0_b.hash());
-        if a < b { (a, b) } else { (b, a) }
-    };
+    // `S9B_CP0_A_HEX` and `S9B_CP0_B_HEX` are pinned. The engine
+    // sorts fork candidates by the hash bytes (`BTreeMap` keyed by
+    // `record.hash`), so `conflicting hashes: …` prints the two
+    // literals in hash-byte order (`_B_HEX`, then `_A_HEX`); any
+    // fixture drift fails `fixture_hashes_match_literals`, not this
+    // row.
     let expected = vec![
         located(
             K::SeqConflict,
             native,
             1,
             0,
-            format!("conflicting hashes: {lo}, {hi}"),
+            format!("conflicting hashes: {S9B_CP0_B_HEX}, {S9B_CP0_A_HEX}"),
         ),
         stale_untrusted(MAX_AGE_NS),
     ];

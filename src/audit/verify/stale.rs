@@ -41,6 +41,14 @@ pub(super) fn check(
         return;
     };
     let d = max_age.as_nanos();
+    // A "now" before `UNIX_EPOCH` is a value `SystemTime::now()` never
+    // returns in practice, and `Record::time` is a `u64` nanosecond
+    // offset from the epoch (so a record's `time` is always `>= 0`).
+    // Mapping the error to `0` is therefore exact, not a fallback: an
+    // age computed against a pre-epoch "now" would be larger than any
+    // non-negative `record.time`, which the saturating subtraction
+    // clamps to `0` below -- precisely what `map_or(0, …)` produces
+    // here, without a panic path.
     let now_ns = now
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
@@ -80,6 +88,16 @@ pub(super) fn check(
 /// order (`(path, line, hash)`) carries the location, so byte-
 /// identical duplicates report at the same copy `DuplicateRecord`
 /// treats as the original.
+///
+/// This differs on purpose from the engine's `coverage` computation
+/// (ruling 13-V5-d1 point 6): `coverage` keeps a forked `seq` when any
+/// of its candidates is trusted, since the ruling's point 2 still
+/// checks every distinct `(seq, hash)` candidate once; staleness, by
+/// ruling 13-V5-d6 point 3, instead skips every forked `seq` on the
+/// fail-closed rule from 13-V5-d2, so the "newest trusted checkpoint"
+/// has a single `(path, line, hash)` to locate. That is why
+/// `newest_trusted` is a separate computation and cannot share
+/// `coverage`'s result.
 fn newest_trusted<'a>(
     groups: &'a BTreeMap<u64, Vec<Located<'a>>>,
     conflicting_seqs: &BTreeSet<u64>,
