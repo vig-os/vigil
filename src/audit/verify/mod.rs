@@ -1,9 +1,10 @@
 //! Offline collecting verifier and results (ADR-0005).
-use super::{AuditError, AuditErrorKind, FindingKind, TrustPolicy};
+use super::{AuditError, AuditErrorKind, Checkpoint, FindingKind, TrustPolicy};
 use std::{
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
+mod anchors;
 mod end;
 mod engine;
 mod fold;
@@ -246,6 +247,8 @@ fn severity(kind: FindingKind) -> Severity {
 }
 
 #[cfg(test)]
+mod anchors_tests;
+#[cfg(test)]
 mod coverage_tests;
 #[cfg(test)]
 mod end_tests;
@@ -328,6 +331,7 @@ pub struct Verifier {
     trust: TrustPolicy,
     trail: Option<[u8; 16]>,
     max_age: Option<Duration>,
+    anchors: Vec<Checkpoint>,
     #[cfg(test)]
     now_override: Option<SystemTime>,
 }
@@ -338,6 +342,7 @@ impl Verifier {
             trust,
             trail: None,
             max_age: None,
+            anchors: Vec::new(),
             #[cfg(test)]
             now_override: None,
         }
@@ -384,6 +389,55 @@ impl Verifier {
         self.max_age = Some(max_age);
         Ok(self)
     }
+    /// Pins one checkpoint as an anchor, reporting one
+    /// [`AnchorMismatch`](FindingKind::AnchorMismatch) (error) per
+    /// failing anchor at its `seq` (ADR-0005 decision 10; ruling
+    /// 13-V6-d1 points 1-2).
+    ///
+    /// An anchor matches only when its `trail` is the verified trail,
+    /// the verified set holds exactly one distinct record at its
+    /// `seq` (a byte-identical duplicate is still one record), and
+    /// that record carries the anchor's hash. Shipped-only copies
+    /// count as records in the trail (ruling 13-V5-d4). A forked
+    /// `seq` (ruling 13-V5-d2) is never matched, even when one copy
+    /// carries the anchor's hash. Each distinct `(trail, seq, hash)`
+    /// is checked once; duplicate calls collapse.
+    ///
+    /// A failing anchor yields one `AnchorMismatch` at the first
+    /// failing condition, in this order:
+    ///
+    ///   1. `anchor seq <s> hash <hex>: trail differs`
+    ///   2. `anchor seq <s> hash <hex>: no record`
+    ///   3. `anchor seq <s> hash <hex>: seq is forked`
+    ///   4. `anchor seq <s> hash <hex>: hash differs (record <hex>)`
+    ///
+    /// The location is the first copy of the record at `seq` in the
+    /// engine's merge order, or no location when no record exists at
+    /// `seq`.
+    ///
+    /// Anchors must come from a source the attacker cannot write: a
+    /// [`Checkpoint`] returned by [`AuditTrail::checkpoint`],
+    /// [`AuditTrail::close`] or [`AuditConfig::resume`] in process,
+    /// the line printed by `vigil-audit checkpoint`, `rotate` or
+    /// `resume`, or [`checkpoints`] run on a clean verified snapshot
+    /// (ADR-0005 decision 10). Shipped copies are never anchor
+    /// sources (ADR-0005 decision 10, "Shipped copies are not
+    /// anchors").
+    ///
+    /// Anchors are not signature-checked: supplying one is the
+    /// operator's statement that this checkpoint was observed on the
+    /// verified trail at its `seq` (ADR-0005 decision 10). Signature
+    /// and key-trust findings are raised by the ordinary signature
+    /// and trust checks against the verified records.
+    ///
+    /// [`AuditTrail::checkpoint`]: crate::audit::AuditTrail::checkpoint
+    /// [`AuditTrail::close`]: crate::audit::AuditTrail::close
+    /// [`AuditConfig::resume`]: crate::audit::AuditConfig::resume
+    /// [`checkpoints`]: crate::audit::checkpoints
+    pub fn anchor(mut self, anchor: Checkpoint) -> Self {
+        self.anchors.push(anchor);
+        self
+    }
     /// Expands a directory's vigil files and verifies its confirmed snapshot.
     /// See [`verify`] for review limitations and error semantics.
     ///
@@ -419,6 +473,7 @@ impl Verifier {
             trail,
             &self.trust,
             self.max_age,
+            &self.anchors,
             self.now(),
         ))
     }

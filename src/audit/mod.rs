@@ -216,7 +216,39 @@ pub enum FindingKind {
     RevocationUnconfirmed,
     /// Error: A segment or run violates the required structure.
     SegmentStructure,
-    /// Error: An anchor does not match the verified history.
+    /// Error: An anchor does not match the verified history
+    /// (ADR-0005 decision 10; ruling 13-V6-d1 points 1-2).
+    ///
+    /// An anchor passed to [`Verifier::anchor`](crate::audit::Verifier::anchor)
+    /// matches when its `trail` is the verified trail, the verified
+    /// set holds exactly one distinct record at its `seq` (byte-
+    /// identical duplicates count as one record), and that record
+    /// carries the anchor's hash. Shipped-only copies count as
+    /// records in the trail (ruling 13-V5-d4). A forked `seq`
+    /// (ruling 13-V5-d2) is never matched. Each distinct
+    /// `(trail, seq, hash)` is checked once; duplicates collapse.
+    ///
+    /// On failure one `AnchorMismatch` fires at `seq` `s`, with the
+    /// detail taken from the first failing condition in this order:
+    ///
+    ///   1. `anchor seq <s> hash <hex>: trail differs`
+    ///   2. `anchor seq <s> hash <hex>: no record`
+    ///   3. `anchor seq <s> hash <hex>: seq is forked`
+    ///   4. `anchor seq <s> hash <hex>: hash differs (record <hex>)`
+    ///
+    /// The hex values are `blake3:<64 lowercase hex>`; whitespace in
+    /// the detail is significant. The location is the first copy of
+    /// the record at `seq` in the engine's merge order (the same
+    /// copy `DuplicateRecord` reports as the original), or no
+    /// location when no record exists at `seq`.
+    ///
+    /// Anchors are not signature-checked: supplying one is the
+    /// operator's statement that this checkpoint was observed on the
+    /// verified trail at its `seq` (ADR-0005 decision 10).
+    ///
+    /// The `end=<anchor's line>` form of this finding ("the record's
+    /// first line is not byte-equal to the end anchor entry") arrives
+    /// with `end_before` (ruling 13-V6-d1 point 4; #13).
     AnchorMismatch,
     /// Error: The requested start does not match the history.
     StartMismatch,

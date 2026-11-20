@@ -244,6 +244,7 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
         TRAIL,
         &trust,
         None,
+        &[],
         std::time::SystemTime::now(),
     );
     // Confirm both error findings are present before asserting the order.
