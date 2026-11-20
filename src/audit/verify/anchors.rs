@@ -44,10 +44,9 @@ pub(super) fn check(
 /// Applies the four-step precedence and returns the single
 /// `AnchorMismatch` (if any) at the first failing condition.
 ///
-/// Every finding except `no record` locates at the first copy of the
-/// record at `seq` when one exists on the verified trail, and has no
-/// location otherwise (ruling 13-V6-d1 point 2); `no record` is the
-/// one case that has no record to locate against.
+/// Every finding locates at the first copy of the record at `seq`
+/// when the verified trail holds one, and has no location otherwise
+/// (ruling 13-V6-d1 point 2).
 fn evaluate(
     anchor: &Checkpoint,
     trail: [u8; 16],
@@ -67,30 +66,21 @@ fn evaluate(
             format!("{prefix}trail differs"),
         ));
     }
-    let Some((path, record)) = location else {
-        return Some(Finding::new(
-            K::AnchorMismatch,
-            None,
-            None,
-            Some(anchor.seq()),
-            format!("{prefix}no record"),
-        ));
-    };
+    if location.is_none() {
+        return Some(located(None, anchor.seq(), format!("{prefix}no record")));
+    }
     if conflicting_seqs.contains(&anchor.seq()) {
-        return Some(Finding::new(
-            K::AnchorMismatch,
-            Some(path.to_owned()),
-            Some(record.line),
-            Some(anchor.seq()),
+        return Some(located(
+            location,
+            anchor.seq(),
             format!("{prefix}seq is forked"),
         ));
     }
+    let (_, record) = location.expect("checked is_none above");
     if record.hash != anchor.hash() {
-        return Some(Finding::new(
-            K::AnchorMismatch,
-            Some(path.to_owned()),
-            Some(record.line),
-            Some(anchor.seq()),
+        return Some(located(
+            location,
+            anchor.seq(),
             format!(
                 "{prefix}hash differs (record {})",
                 digest_string(&record.hash),
@@ -100,9 +90,9 @@ fn evaluate(
     None
 }
 
-/// Builds the finding at a known location (or with none) on the first
-/// matching precedence step that still runs when the anchor names
-/// another trail.
+/// Builds an `AnchorMismatch` at `seq`, located at the given first
+/// copy when one is passed, and with no location otherwise (ruling
+/// 13-V6-d1 point 2).
 fn located(location: Option<Located<'_>>, seq: u64, detail: String) -> Finding {
     match location {
         Some((path, record)) => Finding::new(

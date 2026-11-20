@@ -5,6 +5,7 @@ use crate::audit::{
     AuditConfig, Checkpoint, Entry, FindingKind as K, KeyFileSigner, Mmr, Record, RecordContext,
     Signer, TrustPolicy, digest_string,
     format::CheckpointFields,
+    hex,
     runs_v4a_fixtures::{
         TRAIL, Temp, entry_rec, fixture_pubkey, line_bytes, pushed, put_segment, seeded,
         segment_path, signed_cp, signed_cp_explicit, write_bytes,
@@ -61,6 +62,11 @@ const GHOST_CP99_DIGEST: &str =
 // `signed_cp_other(50, [0x11; 32], Mmr::push([0xbb; 32]))`.
 const CP50_OTHER_DIGEST: &str =
     "blake3:e7258c673d92c4a5d5a21de38961bcb7316ad57e490e3d7420d3a3f389da4360";
+// `Record::genesis(&TRAIL)` for the shared `TRAIL = [17; 16]` (ruling
+// 13-V6-d1 point 2's "head=<seq>:<hash>" literal; pinned in
+// `fixture_hashes_match_literals`).
+const TRAIL_GENESIS_DIGEST: &str =
+    "blake3:a03c7c40313d5ab5cf449ba187545083161360e5ed3e41e6f9254c3b4c5efaab";
 
 const OTHER_TRAIL: [u8; 16] = [0x01; 16];
 
@@ -238,7 +244,7 @@ fn a3_anchor_above_head_no_record_no_location() {
 }
 
 // =====================================================================
-// A3b — REGRESSION. An anchor whose `seq` falls inside a `SeqGap` of
+// A3b — ACCEPTANCE. An anchor whose `seq` falls inside a `SeqGap` of
 // the verified trail: no record exists below the head at that `seq`,
 // so the `AnchorMismatch` has no location. Pairs with A3 so the "no
 // record" branch is pinned on two independent rows: A3 above the
@@ -555,60 +561,129 @@ fn a10b_in_process_anchor_from_close_matches() {
 // =====================================================================
 // A10c — REGRESSION. Pairs with A10: the opening checkpoint returned
 // by `AuditConfig::resume` is in process and must carry its trail.
-// The full verify report cannot be pinned literally here because
-// `AuditConfig` draws a random trail id per `create` (there is no
-// public seam to pin it), so the `Resumed` detail and the per-call
-// temporary path are not literal across runs; the identity of the
-// returned checkpoint's trail is the load-bearing claim, and the
-// anchor roundtrip under `verify_dir` without an `AnchorMismatch` is
-// what the "parse fills, in-process constructors must too" rule
-// protects.
+// Writes the trail marker directly so the fixture pins the trail id
+// (ruling 13-d1 OQ15; the resume path reads the marker a test can
+// write). The full verify report is literal: `SeqGap` at the opening
+// and the `Resumed` warning for the resume entry, with `head=<genesis
+// of TRAIL>` taken from the fixed TRAIL.
 // =====================================================================
 #[test]
 fn a10c_in_process_anchor_from_resume_opening_matches() {
     let d = Temp::new();
-    let signer: Arc<dyn Signer> = Arc::new(KeyFileSigner::from_hex(&"42".repeat(32)).unwrap());
-    let pubkey = signer.public_key();
-    let trail = AuditConfig::new("svc")
-        .dir(&d.0)
-        .create(signer.clone())
-        .unwrap();
-    let trail_id = trail.trail();
-    drop(trail);
-    std::fs::remove_file(d.0.join("audit.jsonl")).unwrap();
+    // Pre-seed `audit.trail` with the fixed TRAIL so the opening's
+    // trail is literal and the verifier can load the directory.
+    write_bytes(
+        &d.0.join("audit.trail"),
+        format!("{}\n", hex(&TRAIL)).as_bytes(),
+    );
+    let signer: Arc<dyn Signer> = Arc::new(KeyFileSigner::from_hex(&"27".repeat(32)).unwrap());
     let (trail_b, _receipt, opening) = AuditConfig::new("svc")
         .dir(&d.0)
-        .resume(signer, (0, Record::genesis(&trail_id)), 5, "op", "r")
+        .resume(signer, (0, Record::genesis(&TRAIL)), 5, "op", "r")
         .unwrap();
-    drop(trail_b);
     assert_eq!(
         opening.trail(),
-        trail_id,
+        TRAIL,
         "A10c: resume opening carries its trail",
     );
     let round_trip = Checkpoint::parse(opening.line()).unwrap();
     assert_eq!(
         round_trip.trail(),
-        trail_id,
+        TRAIL,
         "A10c: parse of the resume opening's line carries the same trail",
     );
+    drop(trail_b);
+    let verifier = Verifier::new(trust_with_key()).anchor(opening);
+    let report = verifier.verify_dir(&d.0).unwrap();
+    let live = d.0.join("audit.jsonl");
+    let expected = vec![
+        located(K::SeqGap, live.clone(), 1, 6, "missing seq 0..=5".into()),
+        located(
+            K::Resumed,
+            live,
+            2,
+            7,
+            format!(
+                "operator=op reason=r head=0:{TRAIL_GENESIS_DIGEST} gap=0..=5 lost_records=0 structural=valid",
+            ),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "A10c");
+}
+
+// =====================================================================
+// A10d — REGRESSION. Pairs with A10: an anchor taken in process from
+// `AuditTrail::checkpoint()` must carry its trail even when it is the
+// only anchor supplied (no `close()` call). The resulting checkpoint
+// matches the verified trail. Whole-list literal: no finding on the
+// clean trail.
+// =====================================================================
+#[test]
+fn a10d_in_process_anchor_from_checkpoint_only_matches() {
+    let d = Temp::new();
+    let signer: Arc<dyn Signer> = Arc::new(KeyFileSigner::from_hex(&"42".repeat(32)).unwrap());
+    let pubkey = signer.public_key();
+    let trail = AuditConfig::new("svc").dir(&d.0).create(signer).unwrap();
+    let trail_id = trail.trail();
+    trail
+        .record(&Entry::new("actor", "change", "object"))
+        .unwrap();
+    let cp = trail.checkpoint().unwrap();
+    assert_eq!(cp.trail(), trail_id, "A10d: checkpoint() carries its trail");
+    // No `close()`: Drop fires a best-effort checkpoint, which is a
+    // valid signed record and contributes no finding of its own.
+    drop(trail);
     let trust = TrustPolicy::builder()
         .trail(trail_id)
         .key(pubkey)
         .build()
         .unwrap();
-    let verifier = Verifier::new(trust).anchor(opening);
+    let verifier = Verifier::new(trust).anchor(cp);
     let report = verifier.verify_dir(&d.0).unwrap();
-    let anchor_findings: Vec<&Finding> = report
-        .findings()
-        .iter()
-        .filter(|f| f.kind() == K::AnchorMismatch)
-        .collect();
-    assert_eq!(
-        anchor_findings,
-        Vec::<&Finding>::new(),
-        "A10c: in-process resume anchor matches, got {anchor_findings:?}",
+    assert_findings(report.findings(), &[], "A10d");
+}
+
+// =====================================================================
+// A10e — REGRESSION. Second resume row pairing with A10c: an anchor
+// from the opening `Checkpoint` returned by `AuditConfig::resume`
+// still carries the fixed TRAIL under a different operator/reason
+// and `lost_through`. Whole-list literal with a shifted `SeqGap` and
+// `Resumed` detail.
+// =====================================================================
+#[test]
+fn a10e_in_process_anchor_from_resume_opening_shifted() {
+    let d = Temp::new();
+    write_bytes(
+        &d.0.join("audit.trail"),
+        format!("{}\n", hex(&TRAIL)).as_bytes(),
     );
+    let signer: Arc<dyn Signer> = Arc::new(KeyFileSigner::from_hex(&"27".repeat(32)).unwrap());
+    let (trail_b, _receipt, opening) = AuditConfig::new("svc")
+        .dir(&d.0)
+        .resume(signer, (0, Record::genesis(&TRAIL)), 3, "op2", "r2")
+        .unwrap();
+    assert_eq!(
+        opening.trail(),
+        TRAIL,
+        "A10e: resume opening carries its trail",
+    );
+    drop(trail_b);
+    let verifier = Verifier::new(trust_with_key()).anchor(opening);
+    let report = verifier.verify_dir(&d.0).unwrap();
+    let live = d.0.join("audit.jsonl");
+    let expected = vec![
+        located(K::SeqGap, live.clone(), 1, 4, "missing seq 0..=3".into()),
+        located(
+            K::Resumed,
+            live,
+            2,
+            5,
+            format!(
+                "operator=op2 reason=r2 head=0:{TRAIL_GENESIS_DIGEST} gap=0..=3 lost_records=0 structural=valid",
+            ),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "A10e");
 }
 
 // =====================================================================
@@ -710,9 +785,12 @@ fn a13_noncanonical_line_parses_to_same_hash_and_matches() {
 // =====================================================================
 #[test]
 fn fixture_hashes_match_literals() {
-    use crate::audit::hex;
     let fx = two_checkpoints();
     assert_eq!(hex(&OTHER_TRAIL), OTHER_TRAIL_HEX);
+    assert_eq!(
+        digest_string(&Record::genesis(&TRAIL)),
+        TRAIL_GENESIS_DIGEST
+    );
     assert_eq!(digest_string(&fx.cp0.hash()), CP0_HONEST_DIGEST);
     assert_eq!(digest_string(&fx.e1.hash()), E1_HONEST_DIGEST);
     assert_eq!(digest_string(&fx.cp2.hash()), CP2_HONEST_DIGEST);
