@@ -695,44 +695,31 @@ impl Verifier {
     }
     /// Reconciles the application's stored receipts against the
     /// verified history (ADR-0005 decision 5 "Receipt reconciliation";
-    /// ruling 13-V7-d1 points 2-5). Each receipt is `(seq, hash)`
-    /// with the raw blake3 bytes.
+    /// ruling 13-V7-d1 points 2-5 and clarification 13-V7-d1a). Each
+    /// receipt is `(seq, hash)` with the raw blake3 bytes.
     ///
-    /// The call turns reconciliation on, so
-    /// `.receipts([])` still reports every in-range `audit.record`
-    /// as [`NoReceipt`](FindingKind::NoReceipt) (point 2); without a
-    /// call nothing is reconciled. A second call **adds** to the
-    /// receipt set, so several batches can be supplied in sequence;
-    /// identical receipts collapse, and two receipts for one `seq`
-    /// are each evaluated independently (point 4).
-    ///
-    /// The reconciled range runs from `seq 0`, or from the accepted
-    /// [`Self::start_from`] start, through the last record in the
-    /// files. The end record of a [`Self::end_before`] batch is not
-    /// reconciled (no `NoReceipt` for it); a receipt naming an
-    /// end-record line is still matched. A receipt below an
-    /// anchored start or above the end's last line's `seq` is set
+    /// **The rule.** The call turns reconciliation on; without it
+    /// nothing is reconciled. A second call adds to the receipt set,
+    /// so several batches can be supplied in sequence; identical
+    /// receipts collapse, and two receipts for one `seq` are each
+    /// evaluated independently. The reconciled range runs from
+    /// `seq 0`, or from the accepted [`Self::start_from`] start,
+    /// through the last record in the files. The end record of a
+    /// [`Self::end_before`] batch is not reconciled; a receipt naming
+    /// an end-record line is still matched. A receipt below the
+    /// accepted start or above the end's last line's `seq` is set
     /// aside through the shared position classifier as
-    /// [`OutOfRange`](FindingKind::OutOfRange) (info) or
+    /// [`OutOfRange`](FindingKind::OutOfRange) /
     /// [`UnanchoredStart`](FindingKind::UnanchoredStart) /
-    /// [`UnanchoredEnd`](FindingKind::UnanchoredEnd) (error) with
-    /// subject `receipt seq <s> hash blake3:<64 hex>` (point 3).
+    /// [`UnanchoredEnd`](FindingKind::UnanchoredEnd), subject
+    /// `receipt seq <s> hash blake3:<64 hex>`.
     ///
-    /// Receipts protect a deployment against forged appends under an
-    /// honest key: an attacker who has the signing key can still
-    /// mint valid records, but a receipt the application fsynced
-    /// for its own records pins the hash chain from outside the
-    /// trail directory. See
-    /// [`FindingKind::NoReceipt`] and
+    /// See [`FindingKind::NoReceipt`] and
     /// [`FindingKind::ReceiptMismatch`] for the detail grammars.
-    ///
-    /// [`waive`](Verifier), [`receipts_from`](Verifier),
-    /// [`receipts_live`](Verifier) and resume-gap confirmation
-    /// ([`LostRecord`](FindingKind::LostRecord),
+    /// `waive`, `receipts_from`, `receipts_live` and resume-gap
+    /// confirmation ([`LostRecord`](FindingKind::LostRecord),
     /// [`Unreconciled`](FindingKind::Unreconciled)) land in later
-    /// #13 work; a receipt inside an as-yet-unconfirmed resume gap
-    /// takes this method's rule today
-    /// ([`ReceiptMismatch`](FindingKind::ReceiptMismatch) `no record`).
+    /// #13 work.
     pub fn receipts(mut self, receipts: impl IntoIterator<Item = (u64, [u8; 32])>) -> Self {
         let set = self
             .receipts

@@ -1,14 +1,14 @@
 //! Receipt reconciliation (ADR-0005 decision 5 "Receipt
-//! reconciliation"; ruling 13-V7-d1 points 2-5). The rule, the
-//! range, the three `ReceiptMismatch` details with their precedence
-//! and the `NoReceipt` grammar live on
+//! reconciliation"; ruling 13-V7-d1 points 2-5 and its clarification
+//! 13-V7-d1a). The rule, the range, the three `ReceiptMismatch`
+//! details with their precedence and the `NoReceipt` grammar live on
 //! [`crate::audit::Verifier::receipts`],
 //! [`crate::audit::FindingKind::NoReceipt`] and
 //! [`crate::audit::FindingKind::ReceiptMismatch`]; this module owns
 //! none of them twice. The shared merged records per `seq`, fork
 //! set and position classifier come from [`super::engine::check`].
 
-use super::{Finding, input::Summary, position::Classifier};
+use super::{Finding, first_copy, input::Summary, position::Classifier};
 use crate::audit::{FindingKind as K, digest_string};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -49,20 +49,31 @@ pub(super) fn check(
         if !position.is_in_range(seq) {
             continue;
         }
-        // Copies arrive sorted by `(is_end_record, path, line,
-        // hash)` in [`super::engine::check`], so first-per-hash
-        // through this `BTreeMap` is that distinct record's first
-        // copy in the engine's merge order (the same copy
-        // `DuplicateRecord` reports as the original).
-        let mut distinct: BTreeMap<[u8; 32], Located<'_>> = BTreeMap::new();
-        for &pair in copies {
-            distinct.entry(pair.1.hash).or_insert(pair);
+        // Every distinct record at `seq` is `NoReceipt` unless a
+        // receipt names its exact `(seq, hash)` AND the `seq` is not
+        // forked. At a forked `seq` the match rule fails closed, as
+        // anchors do (clarification 13-V7-d1a point 1; ruling
+        // 13-V6-d1 point 2), so a receipt naming one copy there is
+        // `ReceiptMismatch "seq is forked"`, never a match, and
+        // suppresses no `NoReceipt`.
+        let forked = conflicting_seqs.contains(&seq);
+        let mut distinct: BTreeSet<[u8; 32]> = BTreeSet::new();
+        for &(_, record) in copies {
+            distinct.insert(record.hash);
         }
-        for (hash, (path, record)) in distinct {
-            if record.checkpoint.is_some()
-                || record.is_end_record
-                || receipts.contains(&(seq, hash))
-            {
+        for hash in distinct {
+            if !forked && receipts.contains(&(seq, hash)) {
+                continue;
+            }
+            // Shared `first_copy`: the record's first copy in the
+            // engine's merge order (`(is_end_record, path, line,
+            // hash)`), the same copy `DuplicateRecord` reports as
+            // the original (ruling 13-V5-d4).
+            let Some((path, record)) = first_copy(copies.iter().filter(|(_, r)| r.hash == hash))
+            else {
+                continue;
+            };
+            if record.checkpoint.is_some() || record.is_end_record {
                 continue;
             }
             findings.push(Finding::new(
