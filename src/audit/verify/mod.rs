@@ -14,6 +14,7 @@ mod resume;
 mod revocation;
 mod signatures;
 mod stale;
+mod start;
 
 /// The first record copy in the engine's merge order
 /// (`(path, line, hash)`): the same copy [`FindingKind::DuplicateRecord`]
@@ -279,6 +280,8 @@ mod rule2_tests;
 mod runs_tests;
 #[cfg(test)]
 mod stale_tests;
+#[cfg(test)]
+mod start_tests;
 
 /// Verifies a directory using a cloned, validated trust policy.
 ///
@@ -349,6 +352,7 @@ pub struct Verifier {
     trail: Option<[u8; 16]>,
     max_age: Option<Duration>,
     anchors: Vec<Checkpoint>,
+    start: Option<Checkpoint>,
     #[cfg(test)]
     now_override: Option<SystemTime>,
 }
@@ -360,6 +364,7 @@ impl Verifier {
             trail: None,
             max_age: None,
             anchors: Vec::new(),
+            start: None,
             #[cfg(test)]
             now_override: None,
         }
@@ -460,6 +465,67 @@ impl Verifier {
         self.anchors.push(anchor);
         self
     }
+    /// Accepts the first record as an archived trail's start, so the
+    /// prefix [`SeqGap`](FindingKind::SeqGap) for `0..s−1` is not
+    /// reported (ADR-0005 decision 11 `.start_from`; ruling
+    /// 13-V6-d2). A second call replaces the first. Without a call,
+    /// nothing changes.
+    ///
+    /// The start is accepted only when every condition below holds:
+    /// its trail is the verified trail; the verified set has a first
+    /// record whose `seq` equals the start's `seq` (the first record
+    /// is the record with the lowest `seq` across native and shipped
+    /// copies merged by `seq`, a byte-identical duplicate counting
+    /// as one record); that `seq` is not forked (ruling 13-V6-d1
+    /// point 2; the shared `forked()` predicate, so one hash across
+    /// copies stays `DuplicateRecord`); the record is a checkpoint;
+    /// its hash equals the start's hash; and it is trusted at its
+    /// `seq` (ruling 13-V5-d1 point 3: a valid `verify_strict`
+    /// signature by a key trusted for the trail at that `seq`).
+    ///
+    /// If one condition fails, one
+    /// [`StartMismatch`](FindingKind::StartMismatch) (error) is
+    /// reported at the start's `seq`, with the detail of the first
+    /// failing condition, in this order (ruling 13-V6-d2 point 3):
+    ///
+    ///   1. `start seq <s> hash <hex>: trail differs`
+    ///   2. `start seq <s> hash <hex>: no record`
+    ///   3. `start seq <s> hash <hex>: not the first record (first seq <f>)`
+    ///   4. `start seq <s> hash <hex>: seq is forked`
+    ///   5. `start seq <s> hash <hex>: not a checkpoint`
+    ///   6. `start seq <s> hash <hex>: hash differs (record <hex>)`
+    ///   7. `start seq <s> hash <hex>: not trusted at its seq`
+    ///
+    /// The hex values are `blake3:<64 lowercase hex>`; whitespace in
+    /// the detail is significant. The finding locates at the first
+    /// copy of the first record in the engine's merge order (the
+    /// same copy [`FindingKind::DuplicateRecord`] reports as the
+    /// original); with no record, there is no location. The record's
+    /// own [`BadSignature`](FindingKind::BadSignature) and
+    /// [`UntrustedKey`](FindingKind::UntrustedKey) are independent of
+    /// this start check and still fire as usual.
+    ///
+    /// A start that is not accepted is not used (ADR-0005 decision
+    /// 11; ruling 13-V6-d2 point 4): verification runs exactly as if
+    /// no start had been given, including the prefix `SeqGap`. An
+    /// accepted start suppresses only the `SeqGap` for `0..s−1`
+    /// (ruling 13-V6-d2 point 5); the chain, the fold, signatures,
+    /// trust, coverage and revocation run as they do today from the
+    /// first checkpoint, so a forged record later in the file is
+    /// still reported, and the revocation rules above the start
+    /// still apply.
+    ///
+    /// The start must come from the **batch-start anchor entry** of
+    /// the previous batch in the anchor store (ADR-0005 decision 11
+    /// "Where it comes from", amended #123), never the trail
+    /// directory and never the archive record. Inputs below the
+    /// start (anchors, pins) keep their current findings for
+    /// now (ruling 13-V6-d2 point 6); `OutOfRange` and
+    /// `UnanchoredStart` arrive with later work on #13.
+    pub fn start_from(mut self, start: Checkpoint) -> Self {
+        self.start = Some(start);
+        self
+    }
     /// Expands a directory's vigil files and verifies its confirmed snapshot.
     /// See [`verify`] for review limitations and error semantics.
     ///
@@ -496,6 +562,7 @@ impl Verifier {
             &self.trust,
             self.max_age,
             &self.anchors,
+            self.start.as_ref(),
             self.now(),
         ))
     }

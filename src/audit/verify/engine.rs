@@ -20,7 +20,7 @@
 use super::{
     Finding, Report, anchors, end, fold,
     input::{Collection, Input, LineContent, Summary},
-    resume, revocation, signatures, stale,
+    resume, revocation, signatures, stale, start,
 };
 use crate::audit::{Checkpoint, FindingKind as K, Record, TrustPolicy, digest_string, hex};
 use std::{
@@ -348,6 +348,7 @@ pub(super) fn check(
     trust: &TrustPolicy,
     max_age: Option<Duration>,
     anchors: &[Checkpoint],
+    start: Option<&Checkpoint>,
     now: SystemTime,
 ) -> Report {
     let mut findings = Vec::new();
@@ -396,6 +397,20 @@ pub(super) fn check(
         .iter()
         .filter_map(|(&seq, copies)| forked(copies).then_some(seq))
         .collect();
+    // Ruling 13-V6-d2 points 3-5: evaluate the start against the
+    // already-merged `groups` and the shared fork set. `Some(s)`
+    // marks the one `SeqGap` the chain loop would otherwise emit at
+    // the first record (`0..s−1`) for suppression; `None` leaves
+    // every other check running exactly as if no start had been
+    // given, including that prefix `SeqGap` (point 4).
+    let accepted_start = start::check(
+        start,
+        trail,
+        trust,
+        &groups,
+        &conflicting_seqs,
+        &mut findings,
+    );
     // Ruling 13-V5-d5: evaluate the section's `end=` once. A match
     // grants the tail exemption, confirms bounds at or below `s`,
     // and promotes 13-V5-d2 repairs at or below `s`; a mismatch
@@ -480,13 +495,20 @@ pub(super) fn check(
         }
         let next = previous.as_ref().map_or(0, |(s, _)| s + 1);
         if seq > next {
-            findings.push(finding(
-                K::SeqGap,
-                path,
-                Some(record.line),
-                Some(seq),
-                format!("missing seq {next}..={}", seq - 1),
-            ));
+            // Ruling 13-V6-d2 point 5: an accepted start suppresses
+            // only the prefix `SeqGap` for `0..s−1`, i.e. the gap
+            // the first record would otherwise report; every later
+            // gap stays.
+            let suppress_prefix = previous.is_none() && accepted_start == Some(seq);
+            if !suppress_prefix {
+                findings.push(finding(
+                    K::SeqGap,
+                    path,
+                    Some(record.line),
+                    Some(seq),
+                    format!("missing seq {next}..={}", seq - 1),
+                ));
+            }
         }
         for &(path, record) in &candidates {
             let expected = if seq == 0 {

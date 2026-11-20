@@ -28,6 +28,7 @@ fn check(collection: Collection, trail: [u8; 16]) -> Report {
         &trust_trail(),
         None,
         &[],
+        None,
         std::time::SystemTime::now(),
     )
 }
