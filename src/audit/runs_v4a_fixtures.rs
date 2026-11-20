@@ -208,6 +208,14 @@ pub(crate) struct A1 {
     pub(crate) dir_path: PathBuf,
     /// The closer's opening checkpoint (cp6) — for A1 run-structure pin.
     pub(crate) cp6_head: Head,
+    /// Hash of `e2` (seq 2) -- the highest `seq` record below the
+    /// S1 opening `r4`. Exposed so the chain rule's `ChainBroken`
+    /// detail at seq 4 is literal (ruling 13-V6-d6 point 1).
+    pub(crate) e2_hash: [u8; 32],
+    /// `previous` field of `r4` (seq 4) -- the hash of the ghost
+    /// at the hypothetical lost `seq 3`, which is what the chain
+    /// rule's `ChainBroken` finding carries as "found".
+    pub(crate) r4_previous: [u8; 32],
 }
 
 pub(crate) fn build_a1() -> A1 {
@@ -234,10 +242,14 @@ pub(crate) fn build_a1() -> A1 {
     let resume = resume_decl(&cp6, 5, cp5.hash(), 5);
     write_records(&d.0, &[&cp6, &resume]);
     let cp6_head = Head::of(&cp6);
+    let e2_hash = e2.hash();
+    let r4_previous = r4.context.previous;
     A1 {
         dir_path: d.0.clone(),
         _dir: d,
         cp6_head,
+        e2_hash,
+        r4_previous,
     }
 }
 
@@ -301,6 +313,14 @@ pub(crate) fn build_a9() -> A9 {
 pub(crate) struct A3 {
     _dir: Temp,
     pub(crate) dir_path: PathBuf,
+    /// Hash of `cp2` (seq 2) -- the highest `seq` record below `r4`.
+    pub(crate) cp2_hash: [u8; 32],
+    /// `previous` of `r4` -- the hash of the ghost at seq 3.
+    pub(crate) r4_previous: [u8; 32],
+    /// Hash of `cp5` (seq 5) -- the highest `seq` record below `r7`.
+    pub(crate) cp5_hash: [u8; 32],
+    /// `previous` of `r7` -- the hash of the ghost at seq 6.
+    pub(crate) r7_previous: [u8; 32],
 }
 
 pub(crate) fn build_a3() -> A3 {
@@ -328,6 +348,10 @@ pub(crate) fn build_a3() -> A3 {
     A3 {
         dir_path: d.0.clone(),
         _dir: d,
+        cp2_hash: cp2.hash(),
+        r4_previous: r4.context.previous,
+        cp5_hash: cp5.hash(),
+        r7_previous: r7.context.previous,
     }
 }
 

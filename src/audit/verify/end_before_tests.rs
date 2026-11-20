@@ -54,28 +54,29 @@ const FIXTURE_KEY_HEX: &str = "ee45ecb9aca01a0abd83ef56dd985c8c874e6e7f4aebcedf2
 /// trust policy, so the verifier reports `UntrustedKey`.
 const UNTRUSTED_KEY_HEX: &str = "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12";
 /// Record hash of `signed_cp(0, Record::genesis(&TRAIL), &Mmr::new())`.
-const CP0_HONEST_DIGEST: &str =
+pub(super) const CP0_HONEST_DIGEST: &str =
     "blake3:fc26c6f2bb830592aaaca5413da1599489d86ac6e240a4a7a010681e0d4c8e77";
 /// Record hash of `entry_rec(1, cp0.hash())` on the honest chain.
-const E1_HONEST_DIGEST: &str =
+pub(super) const E1_HONEST_DIGEST: &str =
     "blake3:c121282b5135adfe7a17142cae6bfc4c9040c4aed26d74bddc923b8dafcdb6e8";
 /// Record hash of `signed_cp(2, e1.hash(), &fold(cp0, e1))` on the
 /// honest hand-built chain (used by E5-family, E6-family, E7-family
 /// and E11).
-const CP2_HONEST_DIGEST: &str =
+pub(super) const CP2_HONEST_DIGEST: &str =
     "blake3:4164966a12a675e55eb6e133b9e50313907f164fe142d941447defcdfdb25d06";
 /// Record hash of `entry_rec(2, e1.hash())`, the forged record at
-/// the end `seq` in E7.
-const FORGED_E2_DIGEST: &str =
+/// the end `seq` in E7. Also reused as the honest `e2` hash in the
+/// end-link rows' `ChainBroken` details.
+pub(super) const FORGED_E2_DIGEST: &str =
     "blake3:8a5ea9c989aad7e89033b58ad6f59a6384af43dfe6df5bada042420c0040c306";
 /// Record hash of `Record::new(context(2, e1.hash()), Entry::new(
 /// "actor", "change", "alt"))`, the alternate forged record at the
 /// end `seq` in E7c2.
-const FORGED_E2_ALT_DIGEST: &str =
+pub(super) const FORGED_E2_ALT_DIGEST: &str =
     "blake3:b0a0082469a0a510874383b5c46630665a6952dd3e0ee8a05ed3eb3704f77287";
 /// Record hash of `entry_rec(3, cp2.hash())` on the honest chain
 /// past the end, used by E7b.
-const E3_HONEST_DIGEST: &str =
+pub(super) const E3_HONEST_DIGEST: &str =
     "blake3:6dd21c1a65b14cff0eecfb0679a9da4a45cc6d5007071d250295342d454fb9b5";
 /// Record hash of a second entry at seq 3 (`Entry::new("actor",
 /// "change", "alt")` chaining the same `previous`) so E7b's two
@@ -1405,7 +1406,15 @@ fn e10_step6_and_step7_report_the_same_findings() {
 
     let s0_7 = segment_path(&fx.archive_dir, 0);
     let s1_7 = fx.s1_path.clone();
+    // Ruling 13-V6-d6 point 3: with no file record below `e = 1`,
+    // the end checkpoint is the lowest record and the chain rule
+    // does not check it, so the end-specific `ChainBroken` fires.
     let expected7 = vec![
+        unlocated(
+            K::ChainBroken,
+            Some(1),
+            "end_before seq 1: no record precedes the end".into(),
+        ),
         unlocated(K::SeqGap, Some(1), "missing seq 0..=0".into()),
         unlocated(K::Resumed, Some(2), resumed_detail),
         unlocated(K::UncoveredTail, None, "records seq 2..=2".into()),
@@ -1473,7 +1482,13 @@ fn e10b_second_step7_row_different_operator_reason() {
     let s0 = segment_path(&fx.archive_dir, 0);
     let s1 = fx.s1_path.clone();
     let resumed = resumed_detail_e10_with("admin", "dry-run");
+    // Ruling 13-V6-d6 point 3: no file record below `e = 1`.
     let expected = vec![
+        unlocated(
+            K::ChainBroken,
+            Some(1),
+            "end_before seq 1: no record precedes the end".into(),
+        ),
         unlocated(K::SeqGap, Some(1), "missing seq 0..=0".into()),
         unlocated(K::Resumed, Some(2), resumed),
         unlocated(K::UncoveredTail, None, "records seq 2..=2".into()),

@@ -111,6 +111,30 @@ pub enum FindingKind {
     /// The declared record hash differs from the canonical hash.
     HashMismatch,
     /// Error: A record does not link to its predecessor.
+    ///
+    /// Two detail grammars:
+    ///
+    /// - The chain-rule form (ruling 13-V6-d6 point 1), emitted by
+    ///   the chain loop over the verified set: every record except
+    ///   the one at the lowest `seq` is compared with the record at
+    ///   the **highest `seq` below it** that is present in the set,
+    ///   not only `seq - 1`. When the record's `prev_hash` is not
+    ///   among those hashes, the finding is `expected previous
+    ///   blake3:<64 hex>[ or blake3:<64 hex>]*, found blake3:<64
+    ///   hex>`. Where `seq`s are missing, the `SeqGap` for the
+    ///   named range is reported as well. The end record
+    ///   (`Verifier::end_before`) is checked by the same rule; its
+    ///   finding is unlocated (no file, no line, ruling 13-V6-d4
+    ///   point 6).
+    /// - The end-specific form, emitted by
+    ///   [`Verifier::end_before`](crate::audit::Verifier::end_before)
+    ///   per ruling 13-V6-d6 point 3 when the files hold no record
+    ///   below `e` and `e > 0`: the end checkpoint is the lowest
+    ///   record in the set, so the chain loop does not check it.
+    ///   One `ChainBroken` at `e`, unlocated, with the fixed detail
+    ///   `end_before seq <e>: no record precedes the end`. At
+    ///   `e = 0` nothing is checked. See
+    ///   [`end_before`](crate::audit::Verifier::end_before).
     ChainBroken,
     /// Error: A required sequence number is absent.
     SeqGap,

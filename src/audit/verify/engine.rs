@@ -1,11 +1,17 @@
-//! Collecting chain and gap checks (ruling 13-V3-d3). A native gap
-//! attested by a record whose `seq <= covered_through` is reported as
-//! `TornWriteRepaired`, but only when that attesting record is itself a
-//! record of the verified trail AND its `seq` carries no `SeqConflict`
-//! (it is the only distinct hash at that `seq`); otherwise it stays
+//! Collecting chain and gap checks (ruling 13-V3-d3). The chain
+//! loop compares every record with the record at the **highest
+//! `seq` below it** that is present in the verified set, not only
+//! `seq - 1` (ruling 13-V6-d6 point 1), so `ChainBroken` fires
+//! together with `SeqGap` wherever records are missing between the
+//! two. The record at the lowest `seq` keeps the existing genesis
+//! and prefix rules. A native gap attested by a record whose
+//! `seq <= covered_through` is reported as `TornWriteRepaired`,
+//! but only when that attesting record is itself a record of the
+//! verified trail AND its `seq` carries no `SeqConflict` (it is the
+//! only distinct hash at that `seq`); otherwise it stays
 //! `TornWrite` (rulings 13-V5-d1 point 6 and 13-V5-d2). A byte-
-//! identical copy at the attester's `seq` is `DuplicateRecord`, not a
-//! fork, and does not block promotion.
+//! identical copy at the attester's `seq` is `DuplicateRecord`, not
+//! a fork, and does not block promotion.
 //!
 //! Fragment context: a fragment run (consecutive `Fragment` lines) that fails
 //! condition 3 (ruling 13-V3-d4, addendum 10) yields `Unparsable` "fragment
@@ -537,14 +543,23 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
             }
         }
         for &(path, record) in &candidates {
-            let expected = if seq == 0 {
+            // Ruling 13-V6-d6 point 1: every record except the record
+            // at the lowest `seq` is compared with the record at the
+            // highest `seq` below it in the verified set, not only
+            // `seq - 1`. The `previous` variable tracks exactly that
+            // record because iteration is in ascending `seq` order.
+            // The lowest-`seq` record keeps the existing genesis /
+            // prefix rules (`seq 0` genesis, `seq > 0` prefix
+            // `SeqGap`, accepted-start suppression above). An end
+            // record is checked like any other; the strip-location
+            // pass below unlocates the finding (ruling 13-V6-d4
+            // point 6). No special case for resume openings
+            // (point 2): the resume rules (`Resumed structural=...`,
+            // `SeqGap`) layer on top of the chain rule.
+            let expected = if let Some((_, records)) = &previous {
+                records.iter().map(|(_, r)| r.hash).collect::<Vec<_>>()
+            } else if seq == 0 {
                 vec![Record::genesis(&trail)]
-            } else if let Some((last, records)) = &previous {
-                if last.checked_add(1) == Some(seq) {
-                    records.iter().map(|(_, r)| r.hash).collect()
-                } else {
-                    Vec::new()
-                }
             } else {
                 Vec::new()
             };
@@ -685,6 +700,13 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // happens inside the seq loop; these three are the rest.
     if let Some(ctx) = end_ctx {
         end_before::check(ctx, &groups, &mut findings);
+        // Ruling 13-V6-d6 point 3: the only end-specific link
+        // finding -- when the files hold no record below `e` and
+        // `e > 0`, the end checkpoint is the lowest record and the
+        // chain loop above does not check it. One ChainBroken at
+        // `e`, unlocated, with the fixed detail. At `e = 0`
+        // nothing is checked.
+        end_before::no_record_precedes(ctx, &groups, &mut findings);
         // Identify the end-record inputs by their
         // `Input::is_end_record` flag (not by path value), then
         // unlocate every finding whose file is one of their paths.

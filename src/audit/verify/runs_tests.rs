@@ -319,6 +319,18 @@ fn r1_a1_one_run_finding_literal() {
         .to_owned();
     let expected = vec![
         (
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&a.e2_hash),
+                digest_string(&a.r4_previous),
+            ),
+            None,
+        ),
+        (
             K::SegmentStructure,
             Some(s1.clone()),
             Some(1),
@@ -387,6 +399,18 @@ fn r2_a3_two_loss_points_literal() {
         .to_owned();
     let expected = vec![
         (
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&a.cp2_hash),
+                digest_string(&a.r4_previous),
+            ),
+            None,
+        ),
+        (
             K::SegmentStructure,
             Some(s1.clone()),
             Some(1),
@@ -408,6 +432,18 @@ fn r2_a3_two_loss_points_literal() {
             Some(1),
             Some(4),
             "missing seq 3..=3".to_owned(),
+            None,
+        ),
+        (
+            K::ChainBroken,
+            Some(s2.clone()),
+            Some(1),
+            Some(7),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&a.cp5_hash),
+                digest_string(&a.r7_previous),
+            ),
             None,
         ),
         (
@@ -701,6 +737,22 @@ fn r6_non_increasing_seq_in_would_be_run_drops_run_finding() {
             None,
         ),
         (
+            // Chain rule at seq 4 compares with the records at the
+            // highest present `seq` below (the fork at seq 1); the
+            // expected set lists BOTH forked hashes (ruling
+            // 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            "expected previous \
+             blake3:1c2f696ee6e90bc1e2256617e993dfed53fcc292ea34bb5b52bffd45b9dbceb5 or \
+             blake3:c121282b5135adfe7a17142cae6bfc4c9040c4aed26d74bddc923b8dafcdb6e8, found \
+             blake3:8a5ea9c989aad7e89033b58ad6f59a6384af43dfe6df5bada042420c0040c306"
+                .to_owned(),
+            None,
+        ),
+        (
             K::SegmentStructure,
             Some(s1.clone()),
             Some(1),
@@ -791,6 +843,19 @@ fn r7_archive_run_closed_inside_single_run_finding() {
         .to_owned();
     let expected = vec![
         (
+            // Chain rule at seq 4: `r4.previous` does not link to
+            // `e2.hash` (the highest `seq` below).
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            "expected previous \
+             blake3:8a5ea9c989aad7e89033b58ad6f59a6384af43dfe6df5bada042420c0040c306, found \
+             blake3:b378374409602bc24aa87765b3cc3361e3b647368f57d9a06816f9b2bd0696c9"
+                .to_owned(),
+            None,
+        ),
+        (
             K::SegmentStructure,
             Some(s1.clone()),
             Some(1),
@@ -865,6 +930,20 @@ fn r9_ss7_verify_dir_equals_verify_files_each_file() {
     // from both sides (the run finding is absent), so the main
     // assertion flips red on base.
     let expected = vec![
+        (
+            // Chain rule at seq 4: `r4.previous` does not link to
+            // `e2.hash` (the highest `seq` below, ruling 13-V6-d6).
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&a.e2_hash),
+                digest_string(&a.r4_previous),
+            ),
+            None,
+        ),
         (
             K::SegmentStructure,
             Some(s1.clone()),
@@ -959,6 +1038,18 @@ fn r10_ss8_archive_plus_trail_dir_vs_full_dir_same_run_finding() {
          gap=none lost_records=0 structural=valid"
         .to_owned();
     let expected = vec![
+        (
+            // Chain rule at seq 4 (ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(common.join(s1_name)),
+            Some(1),
+            Some(4),
+            "expected previous \
+             blake3:8a5ea9c989aad7e89033b58ad6f59a6384af43dfe6df5bada042420c0040c306, found \
+             blake3:b378374409602bc24aa87765b3cc3361e3b647368f57d9a06816f9b2bd0696c9"
+                .to_owned(),
+            None,
+        ),
         (
             K::SegmentStructure,
             Some(common.join(s1_name)),
@@ -1139,6 +1230,19 @@ fn r11_shipped_only_and_native_plus_shipped_no_shipped_run_finding() {
          gap=none lost_records=0 structural=valid"
         .to_owned();
     let mixed_expected = vec![
+        (
+            // Chain rule at seq 4 (ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&a.e2_hash),
+                digest_string(&a.r4_previous),
+            ),
+            None,
+        ),
         (
             K::SegmentStructure,
             Some(s1.clone()),
@@ -1364,6 +1468,19 @@ fn r14_d9_a1_torn_live_tail_run_digest_unchanged() {
         .to_owned();
     let expected = vec![
         (
+            // Chain rule at seq 4 (ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&a.e2_hash),
+                digest_string(&a.r4_previous),
+            ),
+            None,
+        ),
+        (
             K::SegmentStructure,
             Some(s1.clone()),
             Some(1),
@@ -1480,6 +1597,20 @@ fn r15_d9_p01_closer_span_in_second_run_only() {
          digest blake3:8b09328c8766397df3eadace558cdd4ef653e8df4e7526bc3dce37e6dfd62116"
         .to_owned();
     let expected = vec![
+        (
+            // Chain rule at seq 3: `kept.previous` does not link
+            // to `first.hash` (the lowest-seq record below;
+            // ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(3),
+            "expected previous \
+             blake3:fc26c6f2bb830592aaaca5413da1599489d86ac6e240a4a7a010681e0d4c8e77, found \
+             blake3:c121282b5135adfe7a17142cae6bfc4c9040c4aed26d74bddc923b8dafcdb6e8"
+                .to_owned(),
+            None,
+        ),
         (
             K::SegmentStructure,
             Some(s1.clone()),
@@ -1623,6 +1754,18 @@ fn r16_m10_r7_archive_torn_closer_run_finding_unchanged() {
          digest blake3:8b78e71ce40a5c8ed68f53d8601ac823e803eb9366d24f963163e8524438ce8a"
         .to_owned();
     let expected = vec![
+        (
+            // Chain rule at seq 4 (ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            "expected previous \
+             blake3:8a5ea9c989aad7e89033b58ad6f59a6384af43dfe6df5bada042420c0040c306, found \
+             blake3:b378374409602bc24aa87765b3cc3361e3b647368f57d9a06816f9b2bd0696c9"
+                .to_owned(),
+            None,
+        ),
         (
             K::SegmentStructure,
             Some(s1.clone()),
@@ -1828,6 +1971,19 @@ fn r18_m11_a1_torn_live_no_run_finding() {
         .to_owned();
     let expected = vec![
         (
+            // Chain rule at seq 4 (ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&a.e2_hash),
+                digest_string(&a.r4_previous),
+            ),
+            None,
+        ),
+        (
             K::SegmentStructure,
             Some(s1.clone()),
             Some(1),
@@ -1911,6 +2067,19 @@ fn r19_m11_a3_torn_live_no_run_finding() {
         .to_owned();
     let expected = vec![
         (
+            // Chain rule at seq 4 (ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(s1.clone()),
+            Some(1),
+            Some(4),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&a.cp2_hash),
+                digest_string(&a.r4_previous),
+            ),
+            None,
+        ),
+        (
             K::SegmentStructure,
             Some(s1.clone()),
             Some(1),
@@ -1924,6 +2093,19 @@ fn r19_m11_a3_torn_live_no_run_finding() {
             Some(1),
             Some(4),
             "missing seq 3..=3".to_owned(),
+            None,
+        ),
+        (
+            // Chain rule at seq 7 (ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(s2.clone()),
+            Some(1),
+            Some(7),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&a.cp5_hash),
+                digest_string(&a.r7_previous),
+            ),
             None,
         ),
         (
@@ -2064,6 +2246,19 @@ fn r20_227_cross_dir_a3_archive_plus_trail_dir_one_classify() {
         .to_owned();
     let expected = vec![
         (
+            // Chain rule at seq 4 (ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(common.join(s1)),
+            Some(1),
+            Some(4),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&a.cp2_hash),
+                digest_string(&a.r4_previous),
+            ),
+            None,
+        ),
+        (
             K::SegmentStructure,
             Some(common.join(s1)),
             Some(1),
@@ -2085,6 +2280,19 @@ fn r20_227_cross_dir_a3_archive_plus_trail_dir_one_classify() {
             Some(1),
             Some(4),
             "missing seq 3..=3".to_owned(),
+            None,
+        ),
+        (
+            // Chain rule at seq 7 (ruling 13-V6-d6 point 1).
+            K::ChainBroken,
+            Some(common.join(s2)),
+            Some(1),
+            Some(7),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&a.cp5_hash),
+                digest_string(&a.r7_previous),
+            ),
             None,
         ),
         (

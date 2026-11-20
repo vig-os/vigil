@@ -167,3 +167,34 @@ fn first_file_copy<'a>(copies: &[Located<'a>]) -> Option<Located<'a>> {
         .min_by_key(|(path, r)| (*path, r.line, r.hash))
         .copied()
 }
+
+/// Emits one `ChainBroken` at `e` when the files hold no record
+/// below the end checkpoint's `seq` and `e > 0` (ruling 13-V6-d6
+/// point 3). In every other shape the chain loop in
+/// [`super::engine::check`] checks the end record like any other,
+/// so this is the only end-specific link finding. The finding has
+/// no file and no line (end-record findings are unlocated, ruling
+/// 13-V6-d4 point 6).
+pub(super) fn no_record_precedes(
+    ctx: &Context<'_>,
+    groups: &BTreeMap<u64, Vec<Located<'_>>>,
+    findings: &mut Vec<Finding>,
+) {
+    let e = ctx.end_seq;
+    if e == 0 {
+        return;
+    }
+    let has_file_record_below = groups
+        .range(..e)
+        .any(|(_, copies)| copies.iter().any(|(_, r)| !r.is_end_record));
+    if has_file_record_below {
+        return;
+    }
+    findings.push(Finding::new(
+        K::ChainBroken,
+        None,
+        None,
+        Some(e),
+        format!("end_before seq {e}: no record precedes the end"),
+    ));
+}
