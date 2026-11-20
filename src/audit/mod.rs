@@ -206,10 +206,10 @@ pub enum FindingKind {
     /// `key <64 hex> through=<s>: no trusted checkpoint by another
     /// key above the bound`.
     ///
-    /// `end=` interim (ruling 13-V5-d1 point 4): a matching `end=`
-    /// will also confirm a bound; until then a retired trail
-    /// without a confirming checkpoint reports
-    /// `RevocationUnconfirmed` (#13).
+    /// A matching `end=` whose `seq` is at or above `s` also
+    /// confirms the bound, so no `RevocationUnconfirmed` fires there
+    /// (ruling 13-V5-d5 point 2.2). A mismatched or absent `end=`
+    /// leaves the bound subject to the trusted-checkpoint rule above.
     ///
     /// Independent of `RevocationMismatch`: one bound can carry both
     /// findings; neither suppresses the other.
@@ -224,7 +224,29 @@ pub enum FindingKind {
     UnanchoredStart,
     /// Error: The batch start does not anchor the requested end.
     UnanchoredEnd,
-    /// Error: A record violates the trail retirement or batch end bound.
+    /// Error: A record violates the trail's retirement pin
+    /// `end=<s>:<h>` (ADR-0005 decision 9; rulings 13-V5-d1 point 5
+    /// and 13-V5-d5). Two independent conditions are evaluated, each
+    /// yielding at most one finding; a batch-end bound (decision 11,
+    /// `--end-before`) is later work.
+    ///
+    /// - **at `s`:** the verified set holds exactly one distinct
+    ///   record at `s` and its hash is `h`. One detail is chosen by
+    ///   the first failing check in this order: `seq <s> is forked`
+    ///   (no location), `no record at seq <s>` (no location), or
+    ///   `record at seq <s> has hash blake3:<64 hex>` (at the first
+    ///   copy in the engine's merge order).
+    /// - **above `s`:** no record of the verified trail has `seq`
+    ///   strictly above `s`. The detail `records seq <a>..=<b>
+    ///   above the end` fires at the first such record in merge
+    ///   order, with `a` and `b` the lowest and highest such `seq`.
+    ///
+    /// Every detail starts with `end=<s>:blake3:<64 hex>: `. A
+    /// matching `end=` (neither condition fails) grants the tail
+    /// exemption, confirmation of `through=` bounds at or below `s`
+    /// (the pin still runs) and promotion of 13-V5-d2 repairs at or
+    /// below `s`; a mismatch grants none of them, and no `end=`
+    /// checks nothing.
     TrailEnded,
     /// Error: The head exceeds the permitted age.
     StaleHead,
@@ -238,11 +260,13 @@ pub enum FindingKind {
     AcceptMismatch,
     /// Warning: A fragment gap whose attesting record is not a record
     /// of the verified trail, is at a `seq` carrying a `SeqConflict`
-    /// (one side of a fork), or has `seq > covered_through`; or a
-    /// trailing gap with no attesting record at all. Promotion to
-    /// `TornWriteRepaired` requires an attester of the verified trail
-    /// whose `seq` has no `SeqConflict` and is at or below
-    /// `covered_through` (rulings 13-V5-d1 point 6 and 13-V5-d2).
+    /// (one side of a fork), or neither covered by a trusted
+    /// checkpoint (`seq > covered_through`) nor pinned by a matching
+    /// `end=` (`seq > matched_end`); or a trailing gap with no
+    /// attesting record at all. Promotion to `TornWriteRepaired`
+    /// requires an attester of the verified trail whose `seq` has no
+    /// `SeqConflict` and is reached by either rule (rulings 13-V5-d1
+    /// points 5-6, 13-V5-d2 and 13-V5-d5 point 2.3).
     /// Detail grammar: either
     /// `lines {first}..={last} ({N} bytes), attested at line {L} seq {S}`
     /// for an attested-but-uncovered gap, or
@@ -271,9 +295,11 @@ pub enum FindingKind {
     /// Info: An operator waived a receipt or supplied a receipt prefix.
     ReceiptWaived,
     /// Info: A fragment gap attested by a record of the verified
-    /// trail at or below `covered_through`, with no other record at
-    /// its `seq` (rulings 13-V5-d1 point 6 and 13-V5-d2). Detail
-    /// grammar is the same as `TornWrite`'s attested form:
+    /// trail with no other record at its `seq` whose `seq` is at or
+    /// below `covered_through` or at or below a matching `end=`
+    /// (rulings 13-V5-d1 points 5-6, 13-V5-d2 and 13-V5-d5
+    /// point 2.3). Detail grammar is the same as `TornWrite`'s
+    /// attested form:
     /// `lines {first}..={last} ({N} bytes), attested at line {L} seq {S}`.
     /// A fragment is reported by length and digest, never by text. A
     /// native or shipped `audit.repaired` record with no preceding

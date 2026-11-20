@@ -18,7 +18,7 @@
 //! attributed to the native copy when present; a malformed declaration leaves
 //! any `SeqGap` the chain loop emitted.
 use super::{
-    Finding, Report, fold,
+    Finding, Report, end, fold,
     input::{Collection, Input, LineContent, Summary},
     resume, revocation, signatures,
 };
@@ -80,16 +80,18 @@ fn failed_fragment_lines(input: &Input) -> BTreeSet<u64> {
 }
 
 /// Pessimistic gap and shipped-fragment findings (ruling 13-V3-d3,
-/// 13-V5-d1 point 6 and 13-V5-d2): an attested gap is promoted to
-/// `TornWriteRepaired` only when all of (a) the attesting record is a
-/// record of the verified `trail`, (b) its `seq <= covered_through`,
-/// and (c) its `seq` has no other record (not one side of a
-/// `SeqConflict` fork) hold. A trailing gap with no attesting record
-/// and `RepairMismatch` are never promoted.
+/// 13-V5-d1 points 5-6, 13-V5-d2 and 13-V5-d5): an attested gap is
+/// promoted to `TornWriteRepaired` only when the attester is a record
+/// of the verified `trail`, its `seq` has no other record (not one
+/// side of a `SeqConflict` fork), and either its `seq <=
+/// covered_through` or a matching `end=` covers it (its `seq <=
+/// matched_end`). A trailing gap with no attesting record and
+/// `RepairMismatch` are never promoted.
 fn file_findings(
     input: &Input,
     no_crash: bool,
     covered_through: Option<u64>,
+    matched_end: Option<u64>,
     trail: [u8; 16],
     conflicting_seqs: &BTreeSet<u64>,
     findings: &mut Vec<Finding>,
@@ -149,15 +151,19 @@ fn file_findings(
                     s.len, r.line, r.seq
                 );
                 let (kind, detail) = if r.repaired == Some(s.digest) {
-                    // Ruling 13-V5-d2: a covered checkpoint protects
-                    // the records of the verified trail at or below
-                    // its `seq` through the hash chain. Promote only
-                    // when the attester is a record of the verified
-                    // trail AND the only record at its `seq`.
-                    let covered = covered_through.is_some_and(|c| r.seq <= c)
-                        && r.trail == trail
-                        && !conflicting_seqs.contains(&r.seq);
-                    let kind = if covered {
+                    // Rulings 13-V5-d2 and 13-V5-d5 point 2.3: a
+                    // covered checkpoint protects the records of the
+                    // verified trail at or below its `seq` through
+                    // the hash chain; a matching `end=` pins every
+                    // record at or below its `seq` from outside the
+                    // trail directory. Promote when the attester is
+                    // a record of the verified trail AND the only
+                    // record at its `seq` AND either reaches it.
+                    let pinned_tail = covered_through.is_some_and(|c| r.seq <= c)
+                        || matched_end.is_some_and(|e| r.seq <= e);
+                    let promotable =
+                        pinned_tail && r.trail == trail && !conflicting_seqs.contains(&r.seq);
+                    let kind = if promotable {
                         K::TornWriteRepaired
                     } else {
                         K::TornWrite
@@ -382,12 +388,20 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy
         .iter()
         .filter_map(|(&seq, copies)| forked(copies).then_some(seq))
         .collect();
+    // Ruling 13-V5-d5: evaluate the section's `end=` once. A match
+    // grants the tail exemption, confirms bounds at or below `s`,
+    // and promotes 13-V5-d2 repairs at or below `s`; a mismatch
+    // grants none of them; no `end=` checks nothing. Threaded into
+    // file_findings (repair promotion), revocation::check (bound
+    // confirmation) and `with_tail_exempt` below.
+    let matched_end = end::check(trail, trust, &groups, &conflicting_seqs, &mut findings);
     for (idx, input) in collection.inputs.iter().enumerate() {
         let no_crash = mark_no_crash(&collection, idx);
         file_findings(
             input,
             no_crash,
             covered_through,
+            matched_end,
             trail,
             &conflicting_seqs,
             &mut findings,
@@ -518,7 +532,14 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy
     // `through=` bound on a key of the verified trail's section, in
     // key-byte order. Reads the same merged `groups` and fork set the
     // main seq-loop just filled, so no second file pass.
-    revocation::check(trail, trust, &groups, &conflicting_seqs, &mut findings);
+    revocation::check(
+        trail,
+        trust,
+        &groups,
+        &conflicting_seqs,
+        matched_end,
+        &mut findings,
+    );
     // Compute the per-declaration structural outcome once (ruling
     // 13-V3-d5 point 10, #195): both the `Resumed` detail suffix and the
     // candidate list derive from the same declarations.
@@ -584,6 +605,7 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy
         )
     });
     Report::new(trail, count, first_seq, last_seq, covered_through, findings)
+        .with_tail_exempt(matched_end.is_some())
 }
 
 /// Shared fork predicate (ruling 13-V5-d2): `true` iff the records at
