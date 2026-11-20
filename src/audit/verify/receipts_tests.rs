@@ -37,10 +37,7 @@ use crate::audit::{
     },
     verify::{Finding, Report, Verifier},
 };
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 // =====================================================================
 // Shared literal hex constants. Pinned by `fixture_hashes_match_literals`
@@ -207,26 +204,6 @@ fn parse_cp(record: &Record) -> crate::audit::Checkpoint {
         bytes.pop();
     }
     crate::audit::Checkpoint::parse(std::str::from_utf8(&bytes).unwrap()).unwrap()
-}
-
-/// Reads the record line of the live `audit.jsonl` in `dir` whose
-/// context carries `seq`, returning its 1-based line number. Used by
-/// the writer-built rotate row to anchor the `NoReceipt` location
-/// without hardcoding the rotation record's position.
-fn live_line_for_seq(dir: &Path, seq: u64) -> u64 {
-    let bytes = std::fs::read(dir.join("audit.jsonl")).unwrap();
-    let mut line: u64 = 0;
-    for chunk in bytes.split(|&b| b == b'\n') {
-        if chunk.is_empty() {
-            continue;
-        }
-        line += 1;
-        let records = Record::parse_line(chunk).unwrap();
-        if records.iter().any(|r| r.context.seq == seq) {
-            return line;
-        }
-    }
-    panic!("no record at seq {seq} in live file");
 }
 
 // =====================================================================
@@ -520,10 +497,13 @@ fn several_receipts_above_head_each_emit_receipt_mismatch_no_record() {
 // receipt deliberately omitted from the set. Exactly one
 // `NoReceipt` fires at the rotation record (ADR-0005 decision 11
 // l.922). Timestamps come from the system clock, so the record's
-// hash is non-fixed; the row computes it from the `Receipt` the
-// writer returned and asserts the rest literally. No incidental
-// `Resumed … invalid` or `SeqGap` findings arise, because the chain
-// is clean and no resume is issued.
+// hash is non-fixed and is computed from the `Receipt` the writer
+// returned; the rotation record's `seq` and the audit.jsonl line
+// number are literal (`create → record → close → rotate` always
+// places them at seq=3 line=4 in a fresh directory), and every
+// other field is pinned literally. No incidental `Resumed … invalid`
+// or `SeqGap` findings arise, because the chain is clean and no
+// resume is issued.
 // =====================================================================
 #[test]
 fn operator_rotate_without_receipt_emits_no_receipt_at_rotate_record() {
@@ -532,15 +512,13 @@ fn operator_rotate_without_receipt_emits_no_receipt_at_rotate_record() {
     let verifier = Verifier::new(trust).receipts([(rec_receipt.seq(), rec_receipt.hash())]);
     let report = verifier.verify_dir(&dir.0).unwrap();
     let live = dir.0.join("audit.jsonl");
-    let rot_line = live_line_for_seq(&dir.0, rot_receipt.seq());
     let expected = vec![located(
         K::NoReceipt,
         live,
-        rot_line,
-        rot_receipt.seq(),
+        4,
+        3,
         format!(
-            "no receipt for seq {} hash {}",
-            rot_receipt.seq(),
+            "no receipt for seq 3 hash {}",
             digest_string(&rot_receipt.hash())
         ),
     )];
@@ -1197,14 +1175,14 @@ fn end_before_receipt_naming_resume_line_is_matched() {
 }
 
 // =====================================================================
-// ACCEPTANCE. Second `end_before` layout: file records at or
-// above the end checkpoint's `seq` yield one `TrailEnded` (ruling
-// 13-V6-d4 point 3) and no `NoReceipt` for them, even when the
-// reconciled range would otherwise cover their `seq` (ruling
-// 13-V7-d1 point 3 and clarification 13-V7-d1a point 2). Pairs
-// with the "no record above the end" row above by forcing a file
-// record above the end anchor, so the `TrailEnded` branch is
-// exercised against receipts.
+// REGRESSION. Second `end_before` layout: file records strictly
+// ABOVE the end record's last line (`E`) yield one `TrailEnded`
+// (ruling 13-V6-d4 point 3) and no `NoReceipt` for them. Pairs
+// with the two "at or above the end checkpoint" rows below by
+// pinning the strictly-above-`E` case; together the three rows pin
+// `TrailEnded` from `end_seq` upward and no `NoReceipt` for any
+// file record in that range (ruling 13-V7-d1 point 3 and
+// clarification 13-V7-d1a point 2).
 // =====================================================================
 #[test]
 fn end_before_file_records_above_end_are_trail_ended_not_no_receipt() {
@@ -1220,7 +1198,7 @@ fn end_before_file_records_above_end_are_trail_ended_not_no_receipt() {
     let cp2 = signed_cp(2, e1.hash(), &mmr1);
     let e_above = entry_rec(3, cp2.hash());
     let seg = seal(&[&cp0, &e1, &e_above]);
-    let end_record = cp2_only_end_record_string(&cp2);
+    let end_record = cp_only_end_record_string(&cp2);
     let end_anchor = parse_cp(&cp2);
     let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
         .end_before(&end_record, Some(end_anchor))
@@ -1244,6 +1222,115 @@ fn end_before_file_records_above_end_are_trail_ended_not_no_receipt() {
     );
 }
 
+// =====================================================================
+// ACCEPTANCE. Honest overlap: the files hold the end record's two
+// lines (`cp2` + a `vigil.audit.resume` at seq=3 chaining from
+// `cp2`) as their last records, and the end record carries the
+// same two lines as its archive copy with the matching end anchor.
+// The band from the end checkpoint's `seq` through `E` (here
+// `[2..=3]`) is `TrailEnded` and not reconciled, even though `E=3`
+// would put the resume line "in range" for receipt reconciliation:
+// the file-record cut is at the end checkpoint's `seq`, the same
+// bound `TrailEnded` opens at (ruling 13-V6-d4 point 3;
+// clarification 13-V7-d1a point 2). No `NoReceipt` for the file
+// resume line.
+// =====================================================================
+#[test]
+fn end_before_file_records_in_end_band_are_trail_ended_not_no_receipt() {
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let cp2 = signed_cp(2, e1.hash(), &mmr1);
+    let resume_line = op_resume_rec(3, cp2.hash(), 2, cp2.hash());
+    let seg = seal(&[&cp0, &e1, &cp2, &resume_line]);
+    let end_record = end_record_string(&cp2, &resume_line);
+    let end_anchor = parse_cp(&cp2);
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .end_before(&end_record, Some(end_anchor))
+        .unwrap()
+        .receipts([(1, e1.hash())]);
+    let report = report_of(vec![seg.path.clone()], verifier);
+    let expected = vec![
+        located(
+            K::TrailEnded,
+            seg.path.clone(),
+            3,
+            2,
+            "end_before seq 2: records seq 2..=3 at or above the end".to_owned(),
+        ),
+        located(
+            K::Resumed,
+            seg.path,
+            4,
+            3,
+            RESUME_DETAIL_END_HEAD_CP2.to_owned(),
+        ),
+        unlocated(K::UncoveredTail, None, "records seq 3..=3".to_owned()),
+    ];
+    assert_findings(
+        report.findings(),
+        &expected,
+        "end_before_file_records_in_end_band_are_trail_ended_not_no_receipt",
+    );
+}
+
+// =====================================================================
+// ACCEPTANCE. A fork at the end checkpoint's `seq`: the files
+// hold an entry `e2` at seq=2 (chaining from `e1`), the end record
+// is `cp2` alone (also at seq=2) with no end anchor. The two
+// records at seq=2 fork, so `SeqConflict` fires at the file copy,
+// `UnanchoredEnd` fires without a location, and `TrailEnded` opens
+// at `end_seq=2`. The file-record cut at the end checkpoint's
+// `seq` leaves no `NoReceipt` for the file `e2` even though its
+// `seq` equals `E=2` (the end record has no resume line here), and
+// even though the forked `seq` would otherwise mean each distinct
+// record at the fork is `NoReceipt` at its own first copy
+// (clarification 13-V7-d1a points 1 and 2 at once).
+// =====================================================================
+#[test]
+fn end_before_fork_at_end_checkpoint_no_no_receipt_for_file_fork_copy() {
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let _mmr1 = pushed(&mmr0, &e1);
+    let e2 = entry_rec(2, e1.hash());
+    let cp2 = signed_cp(2, e1.hash(), &_mmr1);
+    let seg = seal(&[&cp0, &e1, &e2]);
+    let end_record = cp_only_end_record_string(&cp2);
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .end_before(&end_record, None)
+        .unwrap()
+        .receipts([(1, e1.hash())]);
+    let report = report_of(vec![seg.path.clone()], verifier);
+    let expected = vec![
+        unlocated(
+            K::UnanchoredEnd,
+            Some(2),
+            "end_before seq 2: no end anchor".to_owned(),
+        ),
+        located(
+            K::SeqConflict,
+            seg.path.clone(),
+            3,
+            2,
+            format!("conflicting hashes: {CP2_HONEST_DIGEST}, {E2_HONEST_DIGEST}"),
+        ),
+        located(
+            K::TrailEnded,
+            seg.path,
+            3,
+            2,
+            "end_before seq 2: records seq 2..=2 at or above the end".to_owned(),
+        ),
+    ];
+    assert_findings(
+        report.findings(),
+        &expected,
+        "end_before_fork_at_end_checkpoint_no_no_receipt_for_file_fork_copy",
+    );
+}
+
 /// Formats an `end_before` archive record string (checkpoint line +
 /// LF + resume line, no trailing LF). Shared by the end_before rows
 /// so the formatting is not spelled three times.
@@ -1258,7 +1345,7 @@ fn end_record_string(cp: &Record, resume: &Record) -> String {
 /// Formats an `end_before` archive record string with only the
 /// checkpoint line (no resume second line), so `last_line_seq =
 /// end_seq`.
-fn cp2_only_end_record_string(cp: &Record) -> String {
+fn cp_only_end_record_string(cp: &Record) -> String {
     std::str::from_utf8(&line_bytes(cp))
         .unwrap()
         .trim_end()

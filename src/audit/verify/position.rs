@@ -39,7 +39,23 @@ enum Position {
 /// anchor list and the end-record context (if any).
 pub(super) struct Classifier {
     accepted: Option<(u64, bool)>,
-    end_before: Option<(u64, bool)>,
+    end_before: Option<EndBounds>,
+}
+
+/// The two end-of-range bounds the classifier carries under
+/// [`crate::audit::Verifier::end_before`]. `end_seq` is the end
+/// checkpoint's `seq`, the bound [`super::end_before::check`]
+/// opens [`crate::audit::FindingKind::TrailEnded`] at and the one
+/// file-record reconciliation cuts at (ruling 13-V6-d4 point 3;
+/// clarification 13-V7-d1a point 2). `last_line_seq` is `E`, the
+/// `seq` of the end record's last line: the resume line when the
+/// end record has one, otherwise the checkpoint (ruling 13-V6-d7
+/// point 1); the set-aside bound for receipts above the end.
+#[derive(Clone, Copy)]
+struct EndBounds {
+    end_seq: u64,
+    last_line_seq: u64,
+    anchored: bool,
 }
 
 impl Classifier {
@@ -60,7 +76,11 @@ impl Classifier {
                 .any(|a| a.trail() == trail && a.seq() == start.seq() && a.hash() == start.hash());
             (start.seq(), anchored)
         });
-        let end_before = end_ctx.map(|ctx| (ctx.last_line_seq, ctx.is_anchored()));
+        let end_before = end_ctx.map(|ctx| EndBounds {
+            end_seq: ctx.end_seq,
+            last_line_seq: ctx.last_line_seq,
+            anchored: ctx.is_anchored(),
+        });
         Self {
             accepted,
             end_before,
@@ -75,21 +95,39 @@ impl Classifier {
         self.end_before.is_some()
     }
 
-    /// `true` iff `seq` is neither below the accepted start nor above
-    /// `E` (the one place the receipt reconciler reads to decide what
-    /// is reconciled, ruling 13-V7-d1 point 3). Consumed by
+    /// `true` iff file records at this `seq` are reconciled against
+    /// the receipt set (ruling 13-V7-d1 point 3; clarification
+    /// 13-V7-d1a point 2): at or above the accepted start and
+    /// STRICTLY BELOW the end checkpoint's `seq` under `end_before`.
+    /// This upper bound is narrower than [`Self::set_aside`]'s: file
+    /// records at or above the end checkpoint are
+    /// [`super::super::FindingKind::TrailEnded`] and not reconciled,
+    /// while receipts naming an end-record line are still matched at
+    /// `E` (the resume line's `seq` when one is present, otherwise
+    /// the checkpoint). Reading this bound from the shared
+    /// classifier keeps "the same bound `TrailEnded` uses" in one
+    /// place; no receipt-side code re-derives it. Consumed by
     /// [`super::receipts::check`] alongside [`Self::set_aside`]: the
     /// predicate here gates `NoReceipt`, and `set_aside` gates the
-    /// receipt-side set-aside, so both use the one classifier.
+    /// receipt-side set-aside.
     pub(super) fn is_in_range(&self, seq: u64) -> bool {
-        matches!(self.classify(seq), Position::InRange)
+        if self.end_before.is_some_and(|e| seq >= e.end_seq) {
+            return false;
+        }
+        if self.accepted.is_some_and(|(start, _)| seq < start) {
+            return false;
+        }
+        true
     }
 
     fn classify(&self, seq: u64) -> Position {
-        if let Some((end_seq, anchored)) = self.end_before
-            && seq > end_seq
+        if let Some(e) = self.end_before
+            && seq > e.last_line_seq
         {
-            return Position::AboveEnd { end_seq, anchored };
+            return Position::AboveEnd {
+                end_seq: e.last_line_seq,
+                anchored: e.anchored,
+            };
         }
         if let Some((start_seq, anchored)) = self.accepted
             && seq < start_seq

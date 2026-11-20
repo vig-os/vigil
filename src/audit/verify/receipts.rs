@@ -8,7 +8,7 @@
 //! none of them twice. The shared merged records per `seq`, fork
 //! set and position classifier come from [`super::engine::check`].
 
-use super::{Finding, first_copy, input::Summary, position::Classifier};
+use super::{Finding, input::Summary, position::Classifier};
 use crate::audit::{FindingKind as K, digest_string};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -56,24 +56,29 @@ pub(super) fn check(
         // 13-V6-d1 point 2), so a receipt naming one copy there is
         // `ReceiptMismatch "seq is forked"`, never a match, and
         // suppresses no `NoReceipt`.
+        //
+        // `copies` is already sorted by `(is_end_record, path, line,
+        // hash)` in [`super::engine::check`], which is the shared
+        // merge order used by [`super::first_copy`]. Inserting with
+        // `or_insert` picks the first copy per distinct hash in that
+        // order --- the same copy `DuplicateRecord` reports as the
+        // original (ruling 13-V5-d4) and the same copy `first_copy`
+        // would return --- without a dead "no copy for this hash"
+        // arm (every hash we iterate came from these `copies`).
         let forked = conflicting_seqs.contains(&seq);
-        let mut distinct: BTreeSet<[u8; 32]> = BTreeSet::new();
-        for &(_, record) in copies {
-            distinct.insert(record.hash);
+        let mut first_per_hash: BTreeMap<[u8; 32], Located<'_>> = BTreeMap::new();
+        for &copy in copies {
+            first_per_hash.entry(copy.1.hash).or_insert(copy);
         }
-        for hash in distinct {
+        for (hash, (path, record)) in first_per_hash {
             if !forked && receipts.contains(&(seq, hash)) {
                 continue;
             }
-            // Shared `first_copy`: the record's first copy in the
-            // engine's merge order (`(is_end_record, path, line,
-            // hash)`), the same copy `DuplicateRecord` reports as
-            // the original (ruling 13-V5-d4).
-            let Some((path, record)) = first_copy(copies.iter().filter(|(_, r)| r.hash == hash))
-            else {
-                continue;
-            };
-            if record.checkpoint.is_some() || record.is_end_record {
+            // Checkpoints are not reconciled (ruling 13-V7-d1 point
+            // 5). End-record copies cannot reach this point: their
+            // `seq` is at or above the end checkpoint's `seq`, which
+            // [`Classifier::is_in_range`] has already cut above.
+            if record.checkpoint.is_some() {
                 continue;
             }
             findings.push(Finding::new(
