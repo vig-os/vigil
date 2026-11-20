@@ -20,7 +20,7 @@
 use super::{
     Finding, Report, anchors, end, fold,
     input::{Collection, Input, LineContent, Summary},
-    resume, revocation, signatures, stale, start,
+    position, resume, revocation, signatures, stale, start,
 };
 use crate::audit::{Checkpoint, FindingKind as K, Record, TrustPolicy, digest_string, hex};
 use std::{
@@ -411,6 +411,11 @@ pub(super) fn check(
         &conflicting_seqs,
         &mut findings,
     );
+    // Ruling 13-V6-d3: the position classifier is the one place that
+    // decides "below the start"; built once per verify call and
+    // consumed by `anchors` and `revocation` through
+    // `Classifier::set_aside`. See `Verifier::start_from` for the rule.
+    let position = position::Classifier::new(accepted_start.and(start), trail, anchors);
     // Ruling 13-V5-d5: evaluate the section's `end=` once. A match
     // grants the tail exemption, confirms bounds at or below `s`,
     // and promotes 13-V5-d2 repairs at or below `s`; a mismatch
@@ -568,6 +573,7 @@ pub(super) fn check(
         &groups,
         &conflicting_seqs,
         matched_end,
+        &position,
         &mut findings,
     );
     // Ruling 13-V5-d1 point 7 and 13-V5-d6: emit 0 or 1 `StaleHead`
@@ -587,7 +593,14 @@ pub(super) fn check(
     // Ruling 13-V6-d1 points 1-2: each distinct `(trail, seq, hash)`
     // anchor is checked once against the already-merged `groups` and
     // the shared fork set, so no second file pass runs.
-    anchors::check(anchors, trail, &groups, &conflicting_seqs, &mut findings);
+    anchors::check(
+        anchors,
+        trail,
+        &groups,
+        &conflicting_seqs,
+        &position,
+        &mut findings,
+    );
     // Compute the per-declaration structural outcome once (ruling
     // 13-V3-d5 point 10, #195): both the `Resumed` detail suffix and the
     // candidate list derive from the same declarations.

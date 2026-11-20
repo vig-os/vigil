@@ -1,15 +1,15 @@
 //! Anchor check for the offline verifier (ADR-0005 decision 10;
-//! ruling 13-V6-d1 points 1-2).
-//!
-//! Each distinct `(trail, seq, hash)` anchor is checked once. One
-//! failing [`crate::audit::FindingKind::AnchorMismatch`] per anchor,
-//! located at the first copy of the record at `seq` in the engine's
-//! merge order, or with no location when no record exists at `seq`.
-//! Only the first failing condition counts (trail differs, no record,
-//! seq is forked, hash differs). The full rule and the detail grammar
-//! are on [`crate::audit::Verifier::anchor`].
+//! rulings 13-V6-d1 points 1-2 and 13-V6-d3 point 4). Each distinct
+//! `(trail, seq, hash)` anchor yields at most one finding, taken
+//! from the first failing step in this order: trail differs, then
+//! below the start (through [`super::position::Classifier::set_aside`]),
+//! no record, seq is forked, hash differs. The rule and the details
+//! are on [`crate::audit::Verifier::anchor`] and the finding kinds
+//! ([`crate::audit::FindingKind::AnchorMismatch`],
+//! [`crate::audit::FindingKind::OutOfRange`],
+//! [`crate::audit::FindingKind::UnanchoredStart`]).
 
-use super::{Finding, input::Summary};
+use super::{Finding, input::Summary, position::Classifier};
 use crate::audit::{Checkpoint, FindingKind as K, digest_string};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -19,13 +19,14 @@ use std::{
 type Located<'a> = (&'a Path, &'a Summary);
 
 /// Evaluates each distinct `(trail, seq, hash)` anchor once in the
-/// engine's final seq order and appends one `AnchorMismatch` per
-/// failing anchor (ruling 13-V6-d1 point 2).
+/// engine's final seq order and appends one finding per failing
+/// anchor.
 pub(super) fn check(
     anchors: &[Checkpoint],
     trail: [u8; 16],
     groups: &BTreeMap<u64, Vec<Located<'_>>>,
     conflicting_seqs: &BTreeSet<u64>,
+    position: &Classifier,
     findings: &mut Vec<Finding>,
 ) {
     let mut seen: BTreeSet<([u8; 16], u64, [u8; 32])> = BTreeSet::new();
@@ -35,45 +36,50 @@ pub(super) fn check(
         .collect();
     unique.sort_by_key(|a| (a.seq(), a.trail(), a.hash()));
     for anchor in unique {
-        if let Some(finding) = evaluate(anchor, trail, groups, conflicting_seqs) {
+        if let Some(finding) = evaluate(anchor, trail, groups, conflicting_seqs, position) {
             findings.push(finding);
         }
     }
 }
 
-/// Applies the four-step precedence and returns the single
-/// `AnchorMismatch` (if any) at the first failing condition.
-///
-/// Every finding locates at the first copy of the record at `seq`
-/// when the verified trail holds one, and has no location otherwise
-/// (ruling 13-V6-d1 point 2).
+/// Returns at most one finding per anchor, from the first failing
+/// step in the module's precedence.
 fn evaluate(
     anchor: &Checkpoint,
     trail: [u8; 16],
     groups: &BTreeMap<u64, Vec<Located<'_>>>,
     conflicting_seqs: &BTreeSet<u64>,
+    position: &Classifier,
 ) -> Option<Finding> {
     let prefix = format!(
-        "anchor seq {} hash {}: ",
+        "anchor seq {} hash {}",
         anchor.seq(),
         digest_string(&anchor.hash()),
     );
+    let located_prefix = format!("{prefix}: ");
     let location = groups.get(&anchor.seq()).and_then(super::first_copy);
     if anchor.trail() != trail {
         return Some(located(
             location,
             anchor.seq(),
-            format!("{prefix}trail differs"),
+            format!("{located_prefix}trail differs"),
         ));
     }
+    if let Some(finding) = position.set_aside(anchor.seq(), &prefix) {
+        return Some(finding);
+    }
     if location.is_none() {
-        return Some(located(None, anchor.seq(), format!("{prefix}no record")));
+        return Some(located(
+            None,
+            anchor.seq(),
+            format!("{located_prefix}no record"),
+        ));
     }
     if conflicting_seqs.contains(&anchor.seq()) {
         return Some(located(
             location,
             anchor.seq(),
-            format!("{prefix}seq is forked"),
+            format!("{located_prefix}seq is forked"),
         ));
     }
     let (_, record) = location.expect("checked is_none above");
@@ -82,7 +88,7 @@ fn evaluate(
             location,
             anchor.seq(),
             format!(
-                "{prefix}hash differs (record {})",
+                "{located_prefix}hash differs (record {})",
                 digest_string(&record.hash),
             ),
         ));
