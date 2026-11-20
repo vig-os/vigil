@@ -467,7 +467,12 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     let mut count = 0;
     let mut previous: Option<(u64, Vec<Located<'_>>)> = None;
     for (&seq, copies) in &mut groups {
-        copies.sort_by_key(|(path, r)| (*path, r.line, r.hash));
+        // Order copies by the input's position in the collection
+        // (ruling 13-V6-d4 point 3). The end-record input is
+        // appended last by `verify_files`, so its copies always
+        // sort after every file copy at the same `seq`; "first
+        // copy" never resolves to the end record.
+        copies.sort_by_key(|(_path, r)| (r.input_pos, r.line, r.hash));
         let mut distinct = BTreeMap::new();
         for &(path, record) in copies.iter() {
             distinct.entry(record.hash).or_insert((path, record));

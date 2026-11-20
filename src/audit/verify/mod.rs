@@ -19,10 +19,15 @@ mod stale;
 mod start;
 
 /// The first record copy in the engine's merge order
-/// (`(path, line, hash)`): the same copy [`FindingKind::DuplicateRecord`]
+/// (`(input_pos, line, hash)`): the same copy [`FindingKind::DuplicateRecord`]
 /// reports as the original (ruling 13-V5-d4). Shared by the location
 /// rule in `anchors`, `end` and `stale`; accepts a borrowed iterator
-/// so `stale` can pre-filter by its trusted predicate.
+/// so `stale` can pre-filter by its trusted predicate. The sort key
+/// is the input's position in the collection, set by
+/// [`input::collect`] and [`input::append_native`]: the end-record
+/// input is appended last, so at any shared `seq` its copies sort
+/// strictly after every file copy and "first copy" is always a file
+/// copy whenever one exists (ruling 13-V6-d4 point 3).
 pub(in crate::audit::verify) fn first_copy<'a, I>(
     copies: I,
 ) -> Option<(&'a Path, &'a input::Summary)>
@@ -31,7 +36,7 @@ where
 {
     copies
         .into_iter()
-        .min_by_key(|(path, record)| (*path, record.line, record.hash))
+        .min_by_key(|(_path, record)| (record.input_pos, record.line, record.hash))
         .copied()
 }
 

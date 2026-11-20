@@ -44,6 +44,15 @@ pub(super) struct Summary {
     // Only reserved records need text for #13 V3b resume/fragment context.
     pub(super) operator: Option<Operator>,
     pub(super) line: u64,
+    /// Index into [`Collection::inputs`] of the input that owns this
+    /// record, written by [`collect`] and [`append_native`] after the
+    /// `inputs` vector is fully ordered. Used as the primary sort key
+    /// for per-`seq` copies in the engine and in
+    /// [`super::first_copy`] (ruling 13-V5-d4, 13-V6-d4 point 3):
+    /// "first copy in merge order" is the copy whose input sorts
+    /// first, so the end-record input (appended last) is always the
+    /// last copy at its `seq` and never wins location over a file.
+    pub(super) input_pos: u32,
 }
 impl Summary {
     fn new(record: Record, line: u64) -> Self {
@@ -78,6 +87,7 @@ impl Summary {
             checkpoint,
             operator,
             line,
+            input_pos: 0,
         }
     }
 }
@@ -276,12 +286,19 @@ pub(super) fn end_record_input(bytes: Vec<u8>, path: PathBuf) -> Input {
 }
 
 /// Appends an in-memory native input to an already-built
-/// [`Collection`] and sets its spans' `seg` to its new position.
+/// [`Collection`] and sets its spans' `seg` and its records'
+/// `input_pos` to its new position. Called after [`collect`] has set
+/// every existing record's `input_pos`, so the appended input's
+/// position is strictly greater than every file input's position and
+/// its copies sort last at any shared `seq` (ruling 13-V6-d4 point 3).
 pub(super) fn append_native(collection: &mut Collection, mut input: Input) {
     let seg = u32::try_from(collection.inputs.len()).expect("too many native segments");
     let data = Rc::get_mut(&mut input.data).expect("appended end-record input owns its data");
     for span in &mut data.spans {
         span.seg = seg;
+    }
+    for record in &mut data.records {
+        record.input_pos = seg;
     }
     collection.inputs.push(input);
 }
@@ -416,6 +433,11 @@ fn collect_with(
     let mut shipped = Vec::new();
     for (i, input) in inputs.iter_mut().enumerate() {
         let data = Rc::get_mut(&mut input.data).expect("deduplicated input owns its data");
+        let pos = u32::try_from(i)
+            .map_err(|_| AuditError::new(AuditErrorKind::InvalidConfig, "too many inputs"))?;
+        for record in &mut data.records {
+            record.input_pos = pos;
+        }
         if input.native {
             for span in &mut data.spans {
                 span.seg = u32::try_from(i).map_err(|_| {

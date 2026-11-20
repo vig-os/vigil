@@ -162,15 +162,15 @@ pub(super) fn check(
 
 /// The first file copy at this `seq` in the engine's merge order,
 /// excluding the end-record segment; `None` when every copy sits on
-/// the end-record.
+/// the end-record. Shares the engine's input-position sort key so a
+/// `TrailEnded` always locates at the same copy the main seq-loop
+/// chose for `SeqConflict` and `DuplicateRecord` at that `seq`.
 fn first_file_copy<'a>(copies: &[Located<'a>], end_path: &Path) -> Option<Located<'a>> {
-    let mut sorted: Vec<Located<'a>> = copies
+    copies
         .iter()
         .filter(|(path, _)| *path != end_path)
+        .min_by_key(|(_, r)| (r.input_pos, r.line, r.hash))
         .copied()
-        .collect();
-    sorted.sort_by_key(|(path, r)| (*path, r.line, r.hash));
-    sorted.into_iter().next()
 }
 
 /// Sentinel path for the in-memory end-record segment. Findings

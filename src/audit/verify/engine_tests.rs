@@ -46,6 +46,7 @@ fn record(seq: u64, hash: u8, previous: [u8; 32], time: u64) -> Summary {
         checkpoint: None,
         operator: None,
         line: seq.saturating_add(1),
+        input_pos: 0,
     }
 }
 fn run(records: Vec<Summary>) -> Report {
@@ -174,13 +175,26 @@ fn ordering_is_seq_then_path_line_kind_with_unlocated_seq_last() {
         inputs: vec![],
         shipped: vec![],
     };
-    for name in ["z", "a"] {
+    // Build two shipped inputs. "z" is pushed first (input_pos 0),
+    // "a" second (input_pos 1); the engine's per-`seq` copy order
+    // is by `(input_pos, line, hash)` (ruling 13-V6-d4 point 3), so
+    // the first copy at `seq` 0 is "z", and the located
+    // `ChainBroken`/`DuplicateRecord` land there. The final
+    // report-level finding sort is still `(seq.is_none(), seq,
+    // file, line, kind)`, so unlocated-seq entries follow in the
+    // "a" < "z" path order.
+    for (pos, name) in ["z", "a"].iter().enumerate() {
+        let pos = u32::try_from(pos).unwrap();
         collection.inputs.push(Input {
-            path: name.into(),
+            path: (*name).into(),
             native: false,
             data: Rc::new(Data {
                 bytes: Some(Rc::from(&[][..])),
-                records: vec![record(0, 1, [9; 32], 0)],
+                records: vec![{
+                    let mut r = record(0, 1, [9; 32], 0);
+                    r.input_pos = pos;
+                    r
+                }],
                 items: vec![
                     LineItem {
                         line: 2,
@@ -213,8 +227,8 @@ fn ordering_is_seq_then_path_line_kind_with_unlocated_seq_last() {
     assert_eq!(
         found,
         vec![
-            (Some(0), "a", Some(1), K::ChainBroken),
-            (Some(0), "a", Some(1), K::DuplicateRecord),
+            (Some(0), "z", Some(1), K::ChainBroken),
+            (Some(0), "z", Some(1), K::DuplicateRecord),
             (None, "a", Some(1), K::InvalidField),
             (None, "a", Some(2), K::InvalidField),
             (None, "z", Some(1), K::InvalidField),
@@ -273,6 +287,7 @@ mod ctx {
             }),
             operator: None,
             line: seq + 1,
+            input_pos: 0,
         }
     }
     pub(super) fn resume_record(seq: u64, hash: u8, previous: [u8; 32], details: &str) -> Summary {
@@ -291,6 +306,7 @@ mod ctx {
                 Some(details.into()),
             )),
             line: seq + 1,
+            input_pos: 0,
         }
     }
     pub(super) fn item_records(range: Range<usize>, line: u64) -> LineItem {

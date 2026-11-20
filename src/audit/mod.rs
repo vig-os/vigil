@@ -222,17 +222,10 @@ pub enum FindingKind {
     /// precedence for an ordinary anchor are on
     /// [`Verifier::anchor`](crate::audit::Verifier::anchor); each
     /// of those details begins `anchor seq <s> hash blake3:<64
-    /// hex>: `.
-    ///
-    /// **End-record form.** With
-    /// [`Verifier::end_before`](crate::audit::Verifier::end_before),
-    /// one further `AnchorMismatch` fires at the end checkpoint's
-    /// `seq`, with no location and detail exactly `end record
-    /// differs from end anchor`, when the supplied end anchor's
-    /// line is not byte-equal to the record's first line (each
-    /// side without its LF; whitespace counts). The end anchor
-    /// also joins the ordinary anchors and goes through the
-    /// four-step precedence above independently.
+    /// hex>: `. An end-record form with detail exactly `end record
+    /// differs from end anchor` is emitted by
+    /// [`Verifier::end_before`](crate::audit::Verifier::end_before);
+    /// see that method for the rule.
     AnchorMismatch,
     /// Error: The requested start does not match the verified
     /// history (ADR-0005 decision 11 `.start_from`; ruling
@@ -256,11 +249,11 @@ pub enum FindingKind {
     /// Error: With
     /// [`Verifier::end_before`](crate::audit::Verifier::end_before)
     /// set and no end anchor supplied, one `UnanchoredEnd` fires
-    /// at the end checkpoint's `seq`, with no location and detail
+    /// at the end checkpoint's `seq`, unlocated, with detail
     /// exactly `end_before seq <e>: no end anchor` (ADR-0005
     /// decision 11 `.end_before`; ruling 13-V6-d4 point 5). See
     /// [`Verifier::end_before`](crate::audit::Verifier::end_before)
-    /// for the end-record and end-anchor rules.
+    /// for the rule.
     UnanchoredEnd,
     /// Error: A record violates the trail's retirement pin
     /// `end=<s>:<h>` (ADR-0005 decision 9; rulings 13-V5-d1 point 5
@@ -290,16 +283,11 @@ pub enum FindingKind {
     ///
     /// **`end_before` form.** With
     /// [`Verifier::end_before`](crate::audit::Verifier::end_before)
-    /// set, one further `TrailEnded` fires when any file record of
-    /// the verified trail carries a `seq` at or above the end
-    /// checkpoint's `seq`. Detail is exactly `end_before seq <e>:
-    /// records seq <a>..=<b> at or above the end`, with `a` and
-    /// `b` the lowest and highest such `seq`, located at the
-    /// first such record in the engine's merge order. At those
-    /// `seq`s no `DuplicateRecord` is reported, even for a
-    /// byte-identical file copy of an end line; a different
-    /// record at such a `seq` is still a `SeqConflict` (ruling
-    /// 13-V6-d4 point 3).
+    /// set, one further `TrailEnded` with detail exactly
+    /// `end_before seq <e>: records seq <a>..=<b> at or above the
+    /// end` is emitted when any file record of the verified trail
+    /// carries a `seq` at or above the end checkpoint's `seq`;
+    /// see that method for the rule.
     TrailEnded,
     /// Error: With `Verifier::max_age` set, the verified trail is
     /// stale (ADR-0005 decision 5; rulings 13-V5-d1 point 7 and

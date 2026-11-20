@@ -198,6 +198,7 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
             checkpoint: None,
             operator: None,
             line: seq + 1,
+            input_pos: 0,
         }
     }
     // The chain loop emits one ChainBroken for the seq-0 record (its
