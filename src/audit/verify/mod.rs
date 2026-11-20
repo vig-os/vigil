@@ -521,13 +521,29 @@ impl Verifier {
     /// The start must come from the **batch-start anchor entry** of
     /// the previous batch in the anchor store (ADR-0005 decision 11
     /// "Where it comes from", amended #123), never the trail
-    /// directory and never the archive record. An anchor or a
-    /// `through=` pin whose `seq` is strictly below an accepted start
-    /// is set aside (ruling 13-V6-d3 points 4-5): its ordinary
-    /// mismatch check is replaced by one unlocated finding, with kind
+    /// directory and never the archive record.
+    ///
+    /// An anchor or a `through=<b>:<h>` pin whose `seq` is strictly
+    /// below an accepted start is **set aside** (ADR-0005 decision 11
+    /// "A signature alone never demotes anything", ~l.753-757; ruling
+    /// 13-V6-d3 points 4-5): its ordinary mismatch check is replaced
+    /// by one unlocated finding at the input's `seq`, with kind
     /// [`FindingKind::OutOfRange`] (info) when the start is anchored
-    /// and [`FindingKind::UnanchoredStart`] (error) otherwise. Another
-    /// trail's anchor is still `AnchorMismatch … trail differs`.
+    /// and [`FindingKind::UnanchoredStart`] (error) otherwise. The
+    /// start is anchored exactly when some anchor's `(trail, seq,
+    /// hash)` equals the accepted start (point 3); acceptance
+    /// guarantees that anchor matches under 13-V6-d1 point 2. Detail
+    /// grammars:
+    /// `anchor seq <a> hash blake3:<64 hex>: below start seq <s>` and
+    /// `key <64 hex> through=<b>: below start seq <s>`. Another
+    /// trail's anchor is never set aside and still gives
+    /// `AnchorMismatch … trail differs` (point 4). The pin's
+    /// confirmation check runs unchanged (point 5), so the revocation
+    /// rules above the start still apply; a bound below an accepted
+    /// start is always confirmed by that start. A bound at `b = s` or
+    /// above it is in range and runs the ordinary pin and
+    /// confirmation. Without an accepted start, every `seq` is in
+    /// range and nothing is set aside (point 2).
     pub fn start_from(mut self, start: Checkpoint) -> Self {
         self.start = Some(start);
         self

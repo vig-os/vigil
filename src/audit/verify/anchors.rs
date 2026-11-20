@@ -1,21 +1,15 @@
 //! Anchor check for the offline verifier (ADR-0005 decision 10;
 //! rulings 13-V6-d1 points 1-2 and 13-V6-d3 point 4). Each distinct
 //! `(trail, seq, hash)` anchor yields at most one finding, taken
-//! from the first failing step in this order: trail differs (then
-//! below the start, if applicable), no record, seq is forked, hash
-//! differs. The two below-start variants are
-//! [`crate::audit::FindingKind::OutOfRange`] /
-//! [`crate::audit::FindingKind::UnanchoredStart`] (see the
-//! [`crate::audit::verify::position`] module); the others are
-//! [`crate::audit::FindingKind::AnchorMismatch`]. The rule and the
-//! details are on [`crate::audit::Verifier::anchor`] and the two
-//! finding kinds.
+//! from the first failing step in this order: trail differs, then
+//! below the start (through [`super::position::Classifier::set_aside`]),
+//! no record, seq is forked, hash differs. The rule and the details
+//! are on [`crate::audit::Verifier::anchor`] and the finding kinds
+//! ([`crate::audit::FindingKind::AnchorMismatch`],
+//! [`crate::audit::FindingKind::OutOfRange`],
+//! [`crate::audit::FindingKind::UnanchoredStart`]).
 
-use super::{
-    Finding,
-    input::Summary,
-    position::{Classifier, Position},
-};
+use super::{Finding, input::Summary, position::Classifier};
 use crate::audit::{Checkpoint, FindingKind as K, digest_string};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -58,44 +52,34 @@ fn evaluate(
     position: &Classifier,
 ) -> Option<Finding> {
     let prefix = format!(
-        "anchor seq {} hash {}: ",
+        "anchor seq {} hash {}",
         anchor.seq(),
         digest_string(&anchor.hash()),
     );
+    let located_prefix = format!("{prefix}: ");
     let location = groups.get(&anchor.seq()).and_then(super::first_copy);
     if anchor.trail() != trail {
         return Some(located(
             location,
             anchor.seq(),
-            format!("{prefix}trail differs"),
+            format!("{located_prefix}trail differs"),
         ));
     }
-    if let Position::BelowStart {
-        start_seq,
-        anchored,
-    } = position.classify(anchor.seq())
-    {
-        let kind = if anchored {
-            K::OutOfRange
-        } else {
-            K::UnanchoredStart
-        };
-        return Some(Finding::new(
-            kind,
-            None,
-            None,
-            Some(anchor.seq()),
-            format!("{prefix}below start seq {start_seq}"),
-        ));
+    if let Some(finding) = position.set_aside(anchor.seq(), &prefix) {
+        return Some(finding);
     }
     if location.is_none() {
-        return Some(located(None, anchor.seq(), format!("{prefix}no record")));
+        return Some(located(
+            None,
+            anchor.seq(),
+            format!("{located_prefix}no record"),
+        ));
     }
     if conflicting_seqs.contains(&anchor.seq()) {
         return Some(located(
             location,
             anchor.seq(),
-            format!("{prefix}seq is forked"),
+            format!("{located_prefix}seq is forked"),
         ));
     }
     let (_, record) = location.expect("checked is_none above");
@@ -104,7 +88,7 @@ fn evaluate(
             location,
             anchor.seq(),
             format!(
-                "{prefix}hash differs (record {})",
+                "{located_prefix}hash differs (record {})",
                 digest_string(&record.hash),
             ),
         ));

@@ -255,13 +255,13 @@ fn p1_anchored_start_below_start_anchors_are_out_of_range() {
 }
 
 // =====================================================================
-// P2 — ACCEPTANCE. Same archived layout as P1, but the anchor at the
-// start's seq carries a wrong hash on the verified trail: it does
-// not anchor the start, so the below-start anchor is
-// `UnanchoredStart` (error) and the wrong-hash anchor keeps its
-// ordinary `AnchorMismatch … hash differs` (ADR-0005 d11 l.937;
-// ruling 13-V6-d3 points 3-4; "anchored" is `(trail, seq, hash)`
-// equality, not a bare `seq` match). First failing line on base: the
+// P2 — ACCEPTANCE. P1's layout with the start unanchored: the anchor
+// at the start's `seq` carries a wrong hash on the verified trail, so
+// it does not anchor the start. Every anchor below the start is
+// `UnanchoredStart` (error); the wrong-hash anchor keeps its ordinary
+// `AnchorMismatch … hash differs` (ADR-0005 d11 l.937; ruling
+// 13-V6-d3 points 3-4; "anchored" is `(trail, seq, hash)` equality,
+// not a bare `seq` match). First failing line on base: the
 // `assert_findings` call below.
 // =====================================================================
 #[test]
@@ -271,17 +271,18 @@ fn p2_unanchored_start_wrong_hash_anchor_at_s_below_is_error() {
     let seg = seal(&[&cp4]);
     // Wrong-hash anchor at seq=4 on TRAIL: same trail, same seq, but
     // its `(size, root, peaks, key)` combination yields a different
-    // record hash from `cp4`. The classifier's anchored predicate
-    // must compare by full `(trail, seq, hash)`. `size.count_ones()`
-    // must equal `peaks.len()` (a `CheckpointFields::new` invariant).
+    // record hash from `cp4`. `size.count_ones()` must equal
+    // `peaks.len()` (a `CheckpointFields::new` invariant).
     let wrong = signed_cp_explicit(4, fx.e1.hash(), 2, [0x7a; 32], vec![[0x66; 32]]);
     let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
         .anchor(parse_cp(&fx.cp0))
+        .anchor(parse_cp(&fx.cp2))
         .anchor(parse_cp(&wrong))
         .start_from(parse_cp(&cp4));
     let report = report_of(vec![seg.path.clone()], verifier);
     let expected = vec![
         below_anchor_err(0, CP0_HONEST_DIGEST, 4),
+        below_anchor_err(2, CP2_HONEST_DIGEST, 4),
         located(
             K::AnchorMismatch,
             seg.path,
@@ -297,53 +298,28 @@ fn p2_unanchored_start_wrong_hash_anchor_at_s_below_is_error() {
 }
 
 // =====================================================================
-// P3 — ACCEPTANCE. The stolen-key attack (ADR-0005 d11 l.937
-// "Probe"; ruling 13-V6-d3 point 4): the operator took anchors at
-// `cp0` and `cp2`, then an attacker with the not-yet-revoked key
-// cut just above `cp2`, signed a new start at `cp3` and rewrote the
-// rest. Verifying with every honest anchor and that start yields
-// `UnanchoredStart` for each anchor and the report fails `--strict`.
-// First failing line on base: the `assert_findings` call below.
+// P3 — ACCEPTANCE. The stolen-key cut (ADR-0005 d11 l.937): the
+// operator took anchors at `cp0` and `cp2`; an attacker with the
+// not-yet-revoked key cut just above `cp2`, signed a new start at
+// `cp3`, rewrote and re-signed above it, and moved the rest away.
+// Verifying with every honest anchor (`cp0`, `cp2`) and that start,
+// and nothing else, yields `UnanchoredStart` for each anchor and the
+// report fails `--strict` (ruling 13-V6-d3 point 4). First failing
+// line on base: the `assert_findings` call below.
 // =====================================================================
 #[test]
 fn p3_stolen_key_cut_above_newest_anchor_is_unanchored_start() {
     let fx = honest();
     let cp3 = signed_cp(3, fx.cp2.hash(), &fx.mmr2);
     let seg = seal(&[&cp3]);
-    // A wrong-hash anchor at the start's seq=3 on TRAIL: same trail
-    // and same seq, distinct hash. The classifier's "anchored" test
-    // must compare by full `(trail, seq, hash)`, so this anchor does
-    // not anchor the attacker's new start.
-    let wrong_at_s = signed_cp_explicit(3, fx.cp2.hash(), 2, [0x9a; 32], vec![[0x88; 32]]);
-    // Another trail's anchor below the start is never set aside; it
-    // keeps `AnchorMismatch … trail differs` (ruling 13-V6-d3
-    // point 4). Another kill row for the "set aside another trail's
-    // anchor" mutant alongside P7.
-    let foreign = signed_cp_other(1, [0xaa; 32], &foreign_mmr_one());
     let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
         .anchor(parse_cp(&fx.cp0))
         .anchor(parse_cp(&fx.cp2))
-        .anchor(parse_cp(&wrong_at_s))
-        .anchor(parse_cp(&foreign))
         .start_from(parse_cp(&cp3));
-    let report = report_of(vec![seg.path.clone()], verifier);
+    let report = report_of(vec![seg.path], verifier);
     let expected = vec![
         below_anchor_err(0, CP0_HONEST_DIGEST, 3),
-        unlocated(
-            K::AnchorMismatch,
-            Some(1),
-            format!("anchor seq 1 hash {CP1_OTHER_DIGEST}: trail differs"),
-        ),
         below_anchor_err(2, CP2_HONEST_DIGEST, 3),
-        located(
-            K::AnchorMismatch,
-            seg.path,
-            1,
-            3,
-            format!(
-                "anchor seq 3 hash {SYNTH_CP3_DIGEST}: hash differs (record {CP3_ATTACK_DIGEST})"
-            ),
-        ),
     ];
     assert_findings(report.findings(), &expected, "P3");
     assert!(!report.is_strict_valid(), "P3 report must fail --strict");
@@ -382,11 +358,9 @@ fn p4_unanchored_start_through_pin_below_is_unanchored_start() {
 
 // =====================================================================
 // P5 — REGRESSION. An honest unanchored start with nothing below it
-// is accepted by its signature alone (ADR-0005 d11 l.938
-// "An unanchored start with nothing below it"): no error, no
-// warning, no info. Pairs with P1 as the baseline "no inputs below"
-// case. Named-mutant kills: 0; reported in the PR body as a design
-// question, anchoring the d11 bullet.
+// is accepted by its signature alone (ADR-0005 d11 l.938 "An
+// unanchored start with nothing below it"): no error, no warning, no
+// info. Pairs with P1 as the baseline "no inputs below" case.
 // =====================================================================
 #[test]
 fn p5_unanchored_start_nothing_below_is_clean() {
@@ -445,10 +419,7 @@ fn p6_anchored_start_below_pin_is_out_of_range_above_still_untrusted() {
 // P7 — REGRESSION. An anchor from another trail with a `seq` below
 // the start keeps its ordinary `AnchorMismatch … trail differs`
 // (ruling 13-V6-d3 point 4 "another trail still gives `trail
-// differs`"). Base passes. Named-mutant kills: set aside another
-// trail's anchor (expected `AnchorMismatch`, mutant emits
-// `OutOfRange`/`UnanchoredStart`); give the below-start finding a
-// location (not triggered, no kill here — see P1/P2/P3).
+// differs`"): another trail's anchor is never set aside.
 // =====================================================================
 #[test]
 fn p7_anchored_start_other_trail_anchor_below_keeps_trail_differs() {
@@ -466,8 +437,7 @@ fn p7_anchored_start_other_trail_anchor_below_keeps_trail_differs() {
         format!("anchor seq 1 hash {CP1_OTHER_DIGEST}: trail differs"),
     )];
     assert_findings(report.findings(), &expected, "P7");
-    // The `trail differs` AnchorMismatch is an error; another trail's
-    // anchor is never set aside, so the report is not strict-valid.
+    // The `trail differs` AnchorMismatch is an error (ADR-0005 d10).
     assert!(!report.is_valid(), "P7 report must carry the error");
 }
 
@@ -491,12 +461,13 @@ fn p8_anchor_at_start_seq_with_start_hash_is_in_range() {
 // =====================================================================
 // P9 — REGRESSION. A `through=` pin at `b = s` is in range, so the
 // pin is checked as usual (ruling 13-V6-d3 point 5 "A bound at
-// `b = s` or above it is in range"). Here the pin fails
-// (`no record at seq 2` is not the case; the hash is the same and
-// the record is a checkpoint signed by the bounded key, so the pin
-// passes), and the confirmation also runs as usual: no trusted
-// checkpoint above the bound fires `RevocationUnconfirmed`. Pairs
-// with P8 as the b == s pair. Base passes.
+// `b = s` or above it is in range"). The pin passes (one record at
+// `s`, same hash, checkpoint signed by the bounded key), and the
+// confirmation runs as usual: with no trusted checkpoint by another
+// key above the bound, `RevocationUnconfirmed` fires at `s`. A bound
+// below an accepted start is always confirmed by that start, so this
+// row doubles as the pair to P6: the `RevocationUnconfirmed` half of
+// ADR-0005 d11 l.939 fires only when the bound is `>= s`.
 // =====================================================================
 #[test]
 fn p9_pin_at_b_equals_s_runs_as_usual() {
@@ -617,26 +588,53 @@ fn p11_anchor_below_with_wrong_hash_under_anchored_start() {
     assert!(report.is_strict_valid(), "P11 report must pass --strict");
 }
 
-// Prints the computed hashes so the literals can be regenerated
-// when a fixture changes. Not an assertion.
+// =====================================================================
+// P12 — REGRESSION. Below-start anchors coexist with an extra
+// wrong-hash anchor at the start's `seq` on the verified trail and
+// an extra other-trail anchor. The wrong-hash anchor keeps
+// `AnchorMismatch … hash differs` (ruling 13-V6-d3 point 3:
+// "anchored" is `(trail, seq, hash)` equality, not a bare `seq`
+// match); the other-trail anchor keeps `AnchorMismatch … trail
+// differs` (point 4: another trail is never set aside); the
+// below-start honest anchors stay `UnanchoredStart`. Pairs with P3
+// as the "stolen-key cut with incidental anchors" variant.
+// =====================================================================
 #[test]
-#[ignore]
-fn print_fixture_hashes() {
+fn p12_stolen_key_cut_with_extra_wrong_hash_and_foreign_anchors() {
     let fx = honest();
-    let (cp4, _) = cp4_above(&fx);
-    let wrong = signed_cp_explicit(4, fx.e1.hash(), 2, [0x7a; 32], vec![[0x66; 32]]);
-    let foreign = signed_cp_other(1, [0xaa; 32], &foreign_mmr_one());
-    let cp2_alt = sign_as(&alt_signer(), 2, fx.e1.hash(), &fx.mmr1);
     let cp3 = signed_cp(3, fx.cp2.hash(), &fx.mmr2);
-    let cp0_twin = signed_cp_explicit(0, Record::genesis(&TRAIL), 0, [0xaa; 32], vec![]);
-    let synth3 = signed_cp_explicit(3, fx.cp2.hash(), 2, [0x9a; 32], vec![[0x88; 32]]);
-    println!("CP4_FROM_E3_DIGEST = {}", digest_string(&cp4.hash()));
-    println!("SYNTH_CP4_DIGEST   = {}", digest_string(&wrong.hash()));
-    println!("CP1_OTHER_DIGEST   = {}", digest_string(&foreign.hash()));
-    println!("CP2_ALT_DIGEST     = {}", digest_string(&cp2_alt.hash()));
-    println!("CP3_ATTACK_DIGEST  = {}", digest_string(&cp3.hash()));
-    println!("CP0_TWIN_DIGEST    = {}", digest_string(&cp0_twin.hash()));
-    println!("SYNTH_CP3_DIGEST   = {}", digest_string(&synth3.hash()));
+    let seg = seal(&[&cp3]);
+    // Wrong-hash anchor at the start's seq=3 on TRAIL: same trail
+    // and same seq, distinct hash.
+    let wrong_at_s = signed_cp_explicit(3, fx.cp2.hash(), 2, [0x9a; 32], vec![[0x88; 32]]);
+    let foreign = signed_cp_other(1, [0xaa; 32], &foreign_mmr_one());
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .anchor(parse_cp(&fx.cp0))
+        .anchor(parse_cp(&fx.cp2))
+        .anchor(parse_cp(&wrong_at_s))
+        .anchor(parse_cp(&foreign))
+        .start_from(parse_cp(&cp3));
+    let report = report_of(vec![seg.path.clone()], verifier);
+    let expected = vec![
+        below_anchor_err(0, CP0_HONEST_DIGEST, 3),
+        unlocated(
+            K::AnchorMismatch,
+            Some(1),
+            format!("anchor seq 1 hash {CP1_OTHER_DIGEST}: trail differs"),
+        ),
+        below_anchor_err(2, CP2_HONEST_DIGEST, 3),
+        located(
+            K::AnchorMismatch,
+            seg.path,
+            1,
+            3,
+            format!(
+                "anchor seq 3 hash {SYNTH_CP3_DIGEST}: hash differs (record {CP3_ATTACK_DIGEST})"
+            ),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "P12");
+    assert!(!report.is_strict_valid(), "P12 report must fail --strict");
 }
 
 // =====================================================================

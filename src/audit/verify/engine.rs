@@ -412,11 +412,9 @@ pub(super) fn check(
         &mut findings,
     );
     // Ruling 13-V6-d3: the position classifier is the one place that
-    // decides "below the start". Built once from the accepted start
-    // (and its anchoring anchor, if any); consumed by `anchors` and
-    // `revocation` to replace below-start mismatches with the ruled
-    // `OutOfRange` / `UnanchoredStart` finding (points 4-5). With no
-    // accepted start, every `seq` is `InRange` (point 2).
+    // decides "below the start"; built once per verify call and
+    // consumed by `anchors` and `revocation` through
+    // `Classifier::set_aside`. See `Verifier::start_from` for the rule.
     let position = position::Classifier::new(accepted_start.and(start), trail, anchors);
     // Ruling 13-V5-d5: evaluate the section's `end=` once. A match
     // grants the tail exemption, confirms bounds at or below `s`,
