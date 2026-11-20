@@ -516,9 +516,11 @@ fn e2_no_end_anchor_emits_unanchored_end() {
 // record is P's line and the end anchor is S from the anchor store.
 // The record (P's line) differs from S's line, so `AnchorMismatch
 // "end record differs from end anchor"` fires at P's seq. S also
-// joins the anchors; S points at a seq the verified set does not
-// hold, so the ordinary anchor rule emits
-// `anchor seq 5 hash <S_HONEST_DIGEST>: no record`.
+// joins the anchors; S's `seq` is strictly above `E = 3` (P's seq),
+// so the set-aside rule applies and the end is unanchored (the end
+// anchor's line differs from the record), emitting one
+// `UnanchoredEnd` at S's `seq` (ADR-0005 decision 11 "It ends the
+// range"; ruling 13-V6-d7).
 // =====================================================================
 #[test]
 fn e3a_record_replaced_with_p_line_has_anchor_mismatch_with_s() {
@@ -536,9 +538,9 @@ fn e3a_record_replaced_with_p_line_has_anchor_mismatch_with_s() {
             "end record differs from end anchor".into(),
         ),
         unlocated(
-            K::AnchorMismatch,
+            K::UnanchoredEnd,
             Some(5),
-            format!("anchor seq 5 hash {S_HONEST_DIGEST}: no record"),
+            format!("anchor seq 5 hash {S_HONEST_DIGEST}: above end seq 3"),
         ),
     ];
     assert_findings(report.findings(), &expected, "E3a");

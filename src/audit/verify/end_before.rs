@@ -24,6 +24,10 @@ type Located<'a> = (&'a Path, &'a Summary);
 pub(super) struct Parsed {
     pub(super) checkpoint: Checkpoint,
     pub(super) segment_bytes: Vec<u8>,
+    /// `seq` of the end record's last line: the resume line when one
+    /// is present, otherwise the checkpoint (ruling 13-V6-d7 point 1).
+    /// This is `E`, the end of the range for inputs above the end.
+    pub(super) last_line_seq: u64,
 }
 
 /// Parses the archive record per ruling 13-V6-d4 point 4. Returns
@@ -48,14 +52,20 @@ pub(super) fn parse(end_record: &str) -> Result<Parsed, AuditError> {
     let mut segment_bytes = Vec::with_capacity(end_record.len() + 2);
     segment_bytes.extend_from_slice(first.as_bytes());
     segment_bytes.push(b'\n');
+    let mut last_line_seq = checkpoint.seq();
     if let Some(second) = second {
         validate_resume(second, &checkpoint)?;
         segment_bytes.extend_from_slice(second.as_bytes());
         segment_bytes.push(b'\n');
+        last_line_seq = checkpoint
+            .seq()
+            .checked_add(1)
+            .ok_or_else(|| invalid("end_record checkpoint seq overflows"))?;
     }
     Ok(Parsed {
         checkpoint,
         segment_bytes,
+        last_line_seq,
     })
 }
 
@@ -96,8 +106,22 @@ fn invalid(detail: impl Into<String>) -> AuditError {
 /// End-of-range inputs the engine reads once for a verify call.
 pub(super) struct Context<'a> {
     pub(super) end_seq: u64,
+    /// `E`, the `seq` of the end record's last line (ruling 13-V6-d7
+    /// point 1): the resume line when one is present, otherwise the
+    /// checkpoint. The end of the range for inputs above the end.
+    pub(super) last_line_seq: u64,
     pub(super) first_line: &'a str,
     pub(super) anchor: Option<&'a Checkpoint>,
+}
+
+impl<'a> Context<'a> {
+    /// `true` iff the end anchor was given and byte-equals the end
+    /// record's first line (ruling 13-V6-d4 point 5; ruling 13-V6-d7
+    /// point 2). The one place "anchored" is decided for the above-end
+    /// set-aside.
+    pub(super) fn is_anchored(&self) -> bool {
+        self.anchor.is_some_and(|a| a.line() == self.first_line)
+    }
 }
 
 /// `true` iff this `seq` is at or above the end checkpoint's `seq`

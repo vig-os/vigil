@@ -279,6 +279,8 @@ fn severity(kind: FindingKind) -> Severity {
 }
 
 #[cfg(test)]
+mod above_end_tests;
+#[cfg(test)]
 mod anchors_tests;
 #[cfg(test)]
 mod coverage_tests;
@@ -386,6 +388,10 @@ pub struct Verifier {
 struct EndBefore {
     parsed_bytes: Vec<u8>,
     end_seq: u64,
+    /// `E`: the end record's last line's `seq` (ruling 13-V6-d7
+    /// point 1). The resume line's `seq` when present, otherwise
+    /// equal to `end_seq`.
+    last_line_seq: u64,
     first_line: String,
     anchor: Option<Checkpoint>,
 }
@@ -626,6 +632,31 @@ impl Verifier {
     /// finding carries no file and no line (ruling 13-V6-d4 point
     /// 6).
     ///
+    /// An anchor, a `through=<b>:<h>` pin or a trust-file `end=<s>`
+    /// whose `seq` is strictly above `E` — the end record's last
+    /// line's `seq` (the resume line when present, otherwise the
+    /// checkpoint; ruling 13-V6-d7 point 1) — is **set aside**
+    /// (ADR-0005 decision 11 "It ends the range"; ruling 13-V6-d7):
+    /// its ordinary mismatch check is replaced by one unlocated
+    /// finding at the input's `seq`, with kind
+    /// [`FindingKind::OutOfRange`] (info) when the end is anchored
+    /// (an end anchor was given and byte-equals the record's first
+    /// line) and [`FindingKind::UnanchoredEnd`] (error) otherwise.
+    /// Detail grammars, all unlocated:
+    /// `anchor seq <a> hash blake3:<64 hex>: above end seq <E>`,
+    /// `key <64 hex> through=<b>: above end seq <E>` and
+    /// `end=<s>:blake3:<64 hex>: above end seq <E>`. Another trail's
+    /// anchor above `E` is never set aside and still gives
+    /// `AnchorMismatch … trail differs`. A trust-file `end=` above
+    /// `E` replaces both `TrailEnded` conditions and grants nothing
+    /// from decision 9 (no tail exemption, no bound confirmation and
+    /// no repair promotion).
+    /// [`FindingKind::RevocationUnconfirmed`] is not reported in an
+    /// end-bounded verification (a confirming checkpoint may lie
+    /// above the end, ruling 13-V6-d7 point 4); the pinned and
+    /// bounded checks still run. A pin at `b = E` or an anchor at
+    /// `E` is in range and is checked as usual.
+    ///
     /// # Errors
     /// Returns `InvalidConfig` when `archive_record` violates the
     /// grammar above, or when [`Self::max_age`] was already called
@@ -648,6 +679,7 @@ impl Verifier {
         self.end_before = Some(EndBefore {
             parsed_bytes: parsed.segment_bytes,
             end_seq: parsed.checkpoint.seq(),
+            last_line_seq: parsed.last_line_seq,
             first_line: parsed.checkpoint.line().to_owned(),
             anchor: end_anchor,
         });
@@ -698,6 +730,7 @@ impl Verifier {
             joined_anchors.extend(eb.anchor.clone());
             end_before::Context {
                 end_seq: eb.end_seq,
+                last_line_seq: eb.last_line_seq,
                 first_line: &eb.first_line,
                 anchor: eb.anchor.as_ref(),
             }

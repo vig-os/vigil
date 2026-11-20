@@ -278,6 +278,19 @@ pub enum FindingKind {
     /// decision 11 `.end_before`; ruling 13-V6-d4 point 5). See
     /// [`Verifier::end_before`](crate::audit::Verifier::end_before)
     /// for the rule.
+    ///
+    /// An input (anchor, `through=` pin or trust-file `end=`) whose
+    /// `seq` is strictly above the end record's last line's `seq` is
+    /// set aside instead of being checked against the batch, because
+    /// nothing above the end can be checked. When the end is not
+    /// anchored (no end anchor or the end anchor differs from the
+    /// record), one further `UnanchoredEnd` fires per such input,
+    /// unlocated, at the input's `seq`; see
+    /// [`Verifier::end_before`](crate::audit::Verifier::end_before)
+    /// for the detail grammars and the set-aside rule. The
+    /// corresponding anchored form is [`FindingKind::OutOfRange`]
+    /// (info) (ADR-0005 decision 11 "It ends the range"; ruling
+    /// 13-V6-d7).
     UnanchoredEnd,
     /// Error: A record violates the trail's retirement pin
     /// `end=<s>:<h>` (ADR-0005 decision 9; rulings 13-V5-d1 point 5
@@ -379,13 +392,24 @@ pub enum FindingKind {
     /// `covered_through` is `None`. The last record being itself
     /// covered yields no `UncoveredTail`.
     UncoveredTail,
-    /// Info: An input below an **anchored** accepted start. Detail
-    /// grammar, both unlocated:
+    /// Info: An input below an **anchored** accepted start, or
+    /// strictly above the end record's last line's `seq` under an
+    /// anchored
+    /// [`Verifier::end_before`](crate::audit::Verifier::end_before)
+    /// (ADR-0005 decision 11 "A signature alone never demotes
+    /// anything" and "It ends the range"; rulings 13-V6-d3 and
+    /// 13-V6-d7). Detail grammars, all unlocated:
     /// `anchor seq <a> hash blake3:<64 hex>: below start seq <s>` or
-    /// `key <64 hex> through=<b>: below start seq <s>`. The `AboveEnd`
-    /// form arrives with `Verifier::end_before` (#13). See
+    /// `key <64 hex> through=<b>: below start seq <s>` (below an
+    /// anchored start); and
+    /// `anchor seq <a> hash blake3:<64 hex>: above end seq <E>`,
+    /// `key <64 hex> through=<b>: above end seq <E>` or
+    /// `end=<s>:blake3:<64 hex>: above end seq <E>` (above an
+    /// anchored end). See
     /// [`Verifier::start_from`](crate::audit::Verifier::start_from)
-    /// for the rule.
+    /// and
+    /// [`Verifier::end_before`](crate::audit::Verifier::end_before)
+    /// for the rules.
     OutOfRange,
     /// Info: Records follow the reconciled receipts prefix.
     Unreconciled,

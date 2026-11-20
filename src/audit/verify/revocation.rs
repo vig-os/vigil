@@ -41,6 +41,14 @@
 //! pin itself still runs (rulings 13-V5-d3 and 13-V5-d4). Threaded
 //! as `matched_end` from [`super::end::check`], whose single call
 //! `super::engine::check` owns.
+//!
+//! Ruling 13-V6-d7 point 4: in an end-bounded verification
+//! (`Verifier::end_before`), `RevocationUnconfirmed` is not reported
+//! at all, because the confirming checkpoint may lie above the end
+//! (ADR-0005 decision 11 "It ends the range"). The pinned check and
+//! the bounded check (`UntrustedKey` above the bound inside the
+//! batch) still run. A pin above `E` is routed through the shared
+//! set-aside helper and replaces the pin check (point 3).
 
 use super::{Finding, input::Summary, position::Classifier, signatures};
 use crate::audit::{FindingKind as K, TrustPolicy, digest_string, hex};
@@ -58,6 +66,7 @@ struct Ctx<'a> {
     groups: &'a BTreeMap<u64, Vec<Located<'a>>>,
     conflicting_seqs: &'a BTreeSet<u64>,
     matched_end: Option<u64>,
+    end_bounded: bool,
 }
 
 pub(super) fn check(
@@ -75,12 +84,15 @@ pub(super) fn check(
         groups,
         conflicting_seqs,
         matched_end,
+        end_bounded: position.end_bounded(),
     };
     for (key, (s, h)) in trust.bounds_in(&trail) {
         let key_hex = hex(&key);
-        // Ruling 13-V6-d3 point 5: a pin below an accepted start
-        // replaces the pin finding through the shared set-aside
-        // helper; the confirmation check is unchanged.
+        // Rulings 13-V6-d3 point 5 and 13-V6-d7 point 3: a pin below
+        // an accepted start or strictly above the end replaces the
+        // pin finding through the shared set-aside helper; the
+        // confirmation check is unchanged for below-start and skipped
+        // entirely under `end_bounded` (point 4, below).
         let pin_location = if let Some(finding) =
             position.set_aside(s, format_args!("key {key_hex} through={s}"))
         {
@@ -169,7 +181,9 @@ fn pin(
 /// the pin passed or failed: ruling 13-V5-d1 point 4 makes the two
 /// checks independent so one bound can carry both findings. A
 /// matching `end=` whose `seq` is at or above `s` also confirms the
-/// bound (ruling 13-V5-d5 point 2.2).
+/// bound (ruling 13-V5-d5 point 2.2). Ruling 13-V6-d7 point 4: under
+/// `Verifier::end_before` nothing is reported, because the confirming
+/// checkpoint may lie above the end; the one place that skip lives.
 fn confirmation(
     ctx: &Ctx<'_>,
     s: u64,
@@ -178,6 +192,9 @@ fn confirmation(
     location: Option<(PathBuf, u64)>,
     findings: &mut Vec<Finding>,
 ) {
+    if ctx.end_bounded {
+        return;
+    }
     if ctx.matched_end.is_some_and(|e| s <= e) {
         return;
     }

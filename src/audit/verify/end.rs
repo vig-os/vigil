@@ -1,5 +1,5 @@
 //! `end=` retirement check (ADR-0005 decision 9; rulings 13-V5-d1
-//! point 5 and 13-V5-d5).
+//! point 5, 13-V5-d5 and 13-V6-d7).
 //!
 //! Two independent conditions are evaluated against the engine's
 //! merged records per `seq` and the shared `conflicting_seqs` set
@@ -10,10 +10,17 @@
 //! of `through=` bounds at or below `s` (the pin still runs), and
 //! promotion of 13-V5-d2 repairs at or below `s`; a mismatch grants
 //! none of them; no `end=` checks nothing (ruling 13-V5-d5 point 2).
+//!
+//! Ruling 13-V6-d7 point 3: a trust-file `end=<s>` with `s` strictly
+//! above the end record's last line's `seq` is routed through
+//! [`super::position::Classifier::set_aside`] like the anchors and
+//! pins above the end. It replaces both `TrailEnded` conditions and
+//! grants nothing, because nothing above the end can be checked.
+//!
 //! Reads only what the engine already has from the one snapshot
 //! (ruling 13-V4-d5): no second file pass.
 
-use super::{Finding, input::Summary};
+use super::{Finding, input::Summary, position::Classifier};
 use crate::audit::{FindingKind as K, TrustPolicy, digest_string};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -31,10 +38,20 @@ pub(super) fn check(
     trust: &TrustPolicy,
     groups: &BTreeMap<u64, Vec<Located<'_>>>,
     conflicting_seqs: &BTreeSet<u64>,
+    position: &Classifier,
     findings: &mut Vec<Finding>,
 ) -> Option<u64> {
     let (s, h) = trust.end(&trail)?;
-    let prefix = format!("end={s}:{}: ", digest_string(&h));
+    let subject = format!("end={s}:{}", digest_string(&h));
+    // Ruling 13-V6-d7 point 3: a trust-file `end=<s>` strictly above
+    // the end record's last line's `seq` replaces both conditions and
+    // grants nothing. The classifier returns `None` outside an
+    // end-bounded verification, so the usual check runs.
+    if let Some(finding) = position.set_aside(s, &subject) {
+        findings.push(finding);
+        return None;
+    }
+    let prefix = format!("{subject}: ");
     let mut matched = at_seq(s, h, &prefix, groups, conflicting_seqs, findings);
     if above_seq(s, &prefix, groups, findings) {
         matched = false;

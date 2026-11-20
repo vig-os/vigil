@@ -430,18 +430,26 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         &conflicting_seqs,
         &mut findings,
     );
-    // Ruling 13-V6-d3: the position classifier is the one place that
-    // decides "below the start"; built once per verify call and
-    // consumed by `anchors` and `revocation` through
-    // `Classifier::set_aside`. See `Verifier::start_from` for the rule.
-    let position = position::Classifier::new(accepted_start.and(start), trail, anchors);
+    // Rulings 13-V6-d3 and 13-V6-d7: the position classifier is the
+    // one place that decides "below the start" and "above the end";
+    // built once per verify call and consumed by `anchors`,
+    // `revocation` and `end` through `Classifier::set_aside`. See
+    // `Verifier::start_from` and `Verifier::end_before` for the rules.
+    let position = position::Classifier::new(accepted_start.and(start), trail, anchors, end_ctx);
     // Ruling 13-V5-d5: evaluate the section's `end=` once. A match
     // grants the tail exemption, confirms bounds at or below `s`,
     // and promotes 13-V5-d2 repairs at or below `s`; a mismatch
     // grants none of them; no `end=` checks nothing. Threaded into
     // file_findings (repair promotion), revocation::check (bound
     // confirmation) and `with_tail_exempt` below.
-    let matched_end = end::check(trail, trust, &groups, &conflicting_seqs, &mut findings);
+    let matched_end = end::check(
+        trail,
+        trust,
+        &groups,
+        &conflicting_seqs,
+        &position,
+        &mut findings,
+    );
     for (idx, input) in collection.inputs.iter().enumerate() {
         let no_crash = mark_no_crash(&collection, idx);
         file_findings(
@@ -602,7 +610,9 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // Ruling 13-V5-d1 point 4 and 13-V5-d3: pin and confirm every
     // `through=` bound on a key of the verified trail's section, in
     // key-byte order. Reads the same merged `groups` and fork set the
-    // main seq-loop just filled, so no second file pass.
+    // main seq-loop just filled, so no second file pass. Ruling
+    // 13-V6-d7 point 4: `end_bounded` suppresses `RevocationUnconfirmed`
+    // in an end-bounded verification.
     revocation::check(
         trail,
         trust,
