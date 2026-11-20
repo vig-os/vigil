@@ -20,12 +20,13 @@
 use super::{
     Finding, Report, end, fold,
     input::{Collection, Input, LineContent, Summary},
-    resume, revocation, signatures,
+    resume, revocation, signatures, stale,
 };
 use crate::audit::{FindingKind as K, Record, TrustPolicy, digest_string, hex};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    time::{Duration, SystemTime},
 };
 
 type Located<'a> = (&'a Path, &'a Summary);
@@ -341,7 +342,13 @@ fn emit_resumed(declarations: &[resume::Declaration<'_>], findings: &mut Vec<Fin
     }
 }
 
-pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy) -> Report {
+pub(super) fn check(
+    collection: Collection,
+    trail: [u8; 16],
+    trust: &TrustPolicy,
+    max_age: Option<Duration>,
+    now: SystemTime,
+) -> Report {
     let mut findings = Vec::new();
     let mut groups: BTreeMap<u64, Vec<Located<'_>>> = BTreeMap::new();
     // Bucket records by seq first so coverage (ruling 13-V5-d1 point 6)
@@ -538,6 +545,20 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], trust: &TrustPolicy
         &groups,
         &conflicting_seqs,
         matched_end,
+        &mut findings,
+    );
+    // Ruling 13-V5-d1 point 7 and 13-V5-d6: emit 0 or 1 `StaleHead`
+    // against the verifier's `max_age` and the one `now` read at the
+    // start of the verify call. Reuses the shared fork set
+    // (`conflicting_seqs`) and the V5a trusted predicate; no second
+    // file pass.
+    stale::check(
+        trail,
+        trust,
+        max_age,
+        now,
+        &groups,
+        &conflicting_seqs,
         &mut findings,
     );
     // Compute the per-declaration structural outcome once (ruling

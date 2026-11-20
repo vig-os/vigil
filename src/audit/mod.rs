@@ -248,7 +248,33 @@ pub enum FindingKind {
     /// below `s`; a mismatch grants none of them, and no `end=`
     /// checks nothing.
     TrailEnded,
-    /// Error: The head exceeds the permitted age.
+    /// Error: With `Verifier::max_age` set, the verified trail is
+    /// stale (ADR-0005 decision 5; rulings 13-V5-d1 point 7 and
+    /// 13-V5-d6). At most one finding fires per verify call.
+    ///
+    /// "Newest trusted checkpoint" is the trusted checkpoint (ruling
+    /// 13-V5-d1 point 3: `verify_strict` passes AND the signing key
+    /// is trusted at the checkpoint's `seq`) with the highest `seq`,
+    /// including shipped-only copies; at a forked `seq` (ruling
+    /// 13-V5-d2), the highest unforked trusted one below it. "Now" is
+    /// the verifier's clock at the start of the verify call. Age is
+    /// `now - time` in nanoseconds against the checkpoint's signed
+    /// `time` with checked arithmetic; a future `time` saturates to
+    /// age zero and is not stale (clock problems are the business of
+    /// `ClockWentBackwards`, not `StaleHead`).
+    ///
+    /// - **stale:** the newest trusted checkpoint's age exceeds
+    ///   `max_age`. Detail exactly `newest trusted checkpoint seq
+    ///   <n> time <t> is older than max_age <d> at <now>`, located at
+    ///   the checkpoint's first copy in the engine's merge order (the
+    ///   same copy `DuplicateRecord` treats as the original). `<t>`
+    ///   and `<now>` are Unix nanoseconds, `<d>` is nanoseconds; all
+    ///   are decimal integers.
+    /// - **no trusted checkpoint:** `max_age` is set and no trusted
+    ///   checkpoint exists. Detail exactly `no trusted checkpoint
+    ///   (max_age <d>)`; no file, no line and no `seq`.
+    ///
+    /// Without `max_age` set, nothing is checked.
     StaleHead,
     /// Error: A required receipt is absent.
     NoReceipt,

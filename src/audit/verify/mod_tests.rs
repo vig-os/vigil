@@ -239,7 +239,13 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
         .trail(TRAIL)
         .build()
         .unwrap();
-    let report = super::engine::check(collection, TRAIL, &trust);
+    let report = super::engine::check(
+        collection,
+        TRAIL,
+        &trust,
+        None,
+        std::time::SystemTime::now(),
+    );
     // Confirm both error findings are present before asserting the order.
     let errors: Vec<_> = report
         .findings()
