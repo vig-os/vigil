@@ -519,8 +519,8 @@ impl Verifier {
     /// the previous batch in the anchor store (ADR-0005 decision 11
     /// "Where it comes from", amended #123), never the trail
     /// directory and never the archive record. Inputs below the
-    /// start (anchors, pins) keep their current findings at this
-    /// head (ruling 13-V6-d2 point 6); `OutOfRange` and
+    /// start (anchors, pins) keep their current findings for
+    /// now (ruling 13-V6-d2 point 6); `OutOfRange` and
     /// `UnanchoredStart` arrive with later work on #13.
     pub fn start_from(mut self, start: Checkpoint) -> Self {
         self.start = Some(start);

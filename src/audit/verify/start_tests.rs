@@ -897,6 +897,40 @@ fn b9c_foreign_trail_records_only_no_record_unlocated() {
 }
 
 // =====================================================================
+// B9d — ACCEPTANCE. Second `no record` row with foreign-trail records
+// coming from a different source than B9c: here they live in a native
+// segment file (B9c uses a shipped copy). The engine still filters
+// every record out of the verified set as `TrailMismatch`, so the
+// `no record` branch fires with no location (ruling 13-V6-d2 point 3).
+// First failing line on base: the `assert_findings` call below.
+// =====================================================================
+#[test]
+fn b9d_foreign_trail_native_segment_no_record_unlocated() {
+    let fx = honest();
+    let foreign = signed_cp_other(0, Record::genesis(&OTHER_TRAIL), &Mmr::new());
+    let d = Temp::new();
+    put_segment(&d.0, 0, &[&foreign], &[]);
+    let seg = segment_path(&d.0, 0);
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey())).start_from(parse_start(&fx.cp2));
+    let report = report_of(vec![seg.clone()], verifier);
+    let expected = vec![
+        located(
+            K::TrailMismatch,
+            seg,
+            1,
+            0,
+            format!("expected trail {TRAIL_HEX}, found {OTHER_TRAIL_HEX}"),
+        ),
+        unlocated(
+            K::StartMismatch,
+            Some(2),
+            format!("start seq 2 hash {CP2_HONEST_DIGEST}: no record"),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "B9d");
+}
+
+// =====================================================================
 // B10 — ACCEPTANCE. Precedence: another trail AND not the first
 // record. `trail differs` wins.
 // =====================================================================
