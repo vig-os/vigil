@@ -344,6 +344,7 @@ impl Record {
 /// to #13. [`super::super::AuditTrail::close`] returns the clean-stop head.
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
+    trail: [u8; 16],
     seq: u64,
     hash: [u8; 32],
     fields: CheckpointFields,
@@ -370,6 +371,7 @@ impl Checkpoint {
             return Err(corrupt());
         };
         Ok(Self {
+            trail: record.context.trail,
             seq: record.context.seq,
             hash,
             fields,
@@ -379,6 +381,14 @@ impl Checkpoint {
     /// Returns the checkpoint's sequence number.
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+    /// Returns the trail identity this checkpoint carries, filled on
+    /// construction from the record line (`audit.trail`) so an anchor
+    /// built in process matches its own trail (ADR-0005 decision 10;
+    /// ruling 13-d1 OQ15). Crate-private: the public API has no
+    /// accessor because no caller needs it outside `verify`.
+    pub(crate) fn trail(&self) -> [u8; 16] {
+        self.trail
     }
     /// Returns its recomputed record hash, including the signature.
     pub fn hash(&self) -> [u8; 32] {

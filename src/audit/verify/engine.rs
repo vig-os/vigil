@@ -18,11 +18,11 @@
 //! attributed to the native copy when present; a malformed declaration leaves
 //! any `SeqGap` the chain loop emitted.
 use super::{
-    Finding, Report, end, fold,
+    Finding, Report, anchors, end, fold,
     input::{Collection, Input, LineContent, Summary},
     resume, revocation, signatures, stale,
 };
-use crate::audit::{FindingKind as K, Record, TrustPolicy, digest_string, hex};
+use crate::audit::{Checkpoint, FindingKind as K, Record, TrustPolicy, digest_string, hex};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -347,6 +347,7 @@ pub(super) fn check(
     trail: [u8; 16],
     trust: &TrustPolicy,
     max_age: Option<Duration>,
+    anchors: &[Checkpoint],
     now: SystemTime,
 ) -> Report {
     let mut findings = Vec::new();
@@ -561,6 +562,10 @@ pub(super) fn check(
         &conflicting_seqs,
         &mut findings,
     );
+    // Ruling 13-V6-d1 points 1-2: each distinct `(trail, seq, hash)`
+    // anchor is checked once against the already-merged `groups` and
+    // the shared fork set, so no second file pass runs.
+    anchors::check(anchors, trail, &groups, &conflicting_seqs, &mut findings);
     // Compute the per-declaration structural outcome once (ruling
     // 13-V3-d5 point 10, #195): both the `Resumed` detail suffix and the
     // candidate list derive from the same declarations.

@@ -216,7 +216,12 @@ pub enum FindingKind {
     RevocationUnconfirmed,
     /// Error: A segment or run violates the required structure.
     SegmentStructure,
-    /// Error: An anchor does not match the verified history.
+    /// Error: An anchor does not match the verified history
+    /// (ADR-0005 decision 10; ruling 13-V6-d1 points 1-2). The full
+    /// rule and the four-step detail precedence are on
+    /// [`Verifier::anchor`](crate::audit::Verifier::anchor); each
+    /// detail begins `anchor seq <s> hash blake3:<64 hex>: `. An
+    /// end-record form arrives with `end_before` (#13).
     AnchorMismatch,
     /// Error: The requested start does not match the history.
     StartMismatch,

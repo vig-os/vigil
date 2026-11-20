@@ -109,10 +109,10 @@ fn newest_trusted<'a>(
         .rev()
         .filter(|(seq, _)| !conflicting_seqs.contains(seq))
         .find_map(|(_, copies)| {
-            copies
-                .iter()
-                .filter(|(_, r)| signatures::trusted(trail, trust, r))
-                .min_by_key(|(path, record)| (*path, record.line, record.hash))
-                .copied()
+            super::first_copy(
+                copies
+                    .iter()
+                    .filter(|(_, r)| signatures::trusted(trail, trust, r)),
+            )
         })
 }
