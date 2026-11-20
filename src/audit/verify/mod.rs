@@ -307,6 +307,8 @@ mod runs_tests;
 mod stale_tests;
 #[cfg(test)]
 mod start_tests;
+#[cfg(test)]
+mod waivers_tests;
 
 /// Verifies a directory using a cloned, validated trust policy.
 ///
@@ -379,12 +381,30 @@ pub struct Verifier {
     anchors: Vec<Checkpoint>,
     start: Option<Checkpoint>,
     end_before: Option<EndBefore>,
-    /// `None` leaves reconciliation off; `Some(set)` turns it on, so
-    /// an empty set still reports every in-range `audit.record` as
-    /// `NoReceipt` (ruling 13-V7-d1 point 2). See [`Self::receipts`].
+    /// Reconciliation runs when any of `receipts`, `waivers` or
+    /// `receipts_from` has been set (ruling 13-V7-d1 point 2); see
+    /// [`Self::receipts`], [`Self::waive`] and
+    /// [`Self::receipts_from`]. `waivers` holds at most one entry
+    /// per `seq` and `receipts_from` at most one value overall
+    /// (point 6).
     receipts: Option<std::collections::BTreeSet<(u64, [u8; 32])>>,
+    waivers: std::collections::BTreeMap<u64, ([u8; 32], String)>,
+    receipts_from: Option<(u64, [u8; 32], String)>,
     #[cfg(test)]
     now_override: Option<SystemTime>,
+}
+
+/// Non-empty, single-line reason check for waivers and the `from`
+/// input (ruling 13-V7-d1 point 6). Otherwise `InvalidConfig` with
+/// `<label>` naming the field.
+fn validate_reason(reason: String, label: &str) -> Result<String, AuditError> {
+    if reason.is_empty() || reason.contains('\n') || reason.contains('\r') {
+        return Err(AuditError::new(
+            AuditErrorKind::InvalidConfig,
+            format!("{label} must be a non-empty single line (no LF or CR)"),
+        ));
+    }
+    Ok(reason)
 }
 
 /// Parsed archive record and its end anchor, retained between the
@@ -413,6 +433,8 @@ impl Verifier {
             start: None,
             end_before: None,
             receipts: None,
+            waivers: std::collections::BTreeMap::new(),
+            receipts_from: None,
             #[cfg(test)]
             now_override: None,
         }
@@ -698,7 +720,8 @@ impl Verifier {
     /// ruling 13-V7-d1 points 2-5 and clarification 13-V7-d1a). Each
     /// receipt is `(seq, hash)` with the raw blake3 bytes.
     ///
-    /// **The rule.** The call turns reconciliation on; without it
+    /// **The rule.** The call turns reconciliation on; without it,
+    /// and without [`Self::waive`] or [`Self::receipts_from`],
     /// nothing is reconciled. A second call adds to the receipt set,
     /// so several batches can be supplied in sequence; identical
     /// receipts collapse, and two receipts for one `seq` are each
@@ -716,8 +739,8 @@ impl Verifier {
     ///
     /// See [`FindingKind::NoReceipt`] and
     /// [`FindingKind::ReceiptMismatch`] for the detail grammars.
-    /// `waive`, `receipts_from`, `receipts_live` and resume-gap
-    /// confirmation ([`LostRecord`](FindingKind::LostRecord),
+    /// `receipts_live` and resume-gap confirmation
+    /// ([`LostRecord`](FindingKind::LostRecord),
     /// [`Unreconciled`](FindingKind::Unreconciled)) land in later
     /// #13 work.
     pub fn receipts(mut self, receipts: impl IntoIterator<Item = (u64, [u8; 32])>) -> Self {
@@ -726,6 +749,84 @@ impl Verifier {
             .get_or_insert_with(std::collections::BTreeSet::new);
         set.extend(receipts);
         self
+    }
+    /// Waives one unreceipted `audit.record` on its exact `(seq,
+    /// hash)` so a crashed writer's orphan is reviewable rather than
+    /// a plain [`NoReceipt`](FindingKind::NoReceipt) (ADR-0005
+    /// decision 5 "Waivers, for an honest crash"; ruling 13-V7-d1
+    /// point 6). The call also turns reconciliation on, so a waiver
+    /// alone still reports every other in-range record as
+    /// `NoReceipt`. The match rule is [`Self::receipts`]' rule under
+    /// subject `waive seq <s> hash blake3:<64 hex>`: a match emits
+    /// one [`ReceiptWaived`](FindingKind::ReceiptWaived) at the
+    /// record (detail `waived seq <s> hash blake3:<64 hex>: <reason>`)
+    /// and suppresses `NoReceipt` there; a mismatch is
+    /// `ReceiptMismatch` with that subject; a waiver below the start
+    /// or above the end is set aside. The hash pins the record, so a
+    /// waiver cannot be moved: if the record at `<seq>` differs, it
+    /// is `ReceiptMismatch` and still `NoReceipt`, never silently
+    /// applied to the replacement.
+    ///
+    /// **Review criterion** (ADR-0005 decision 5; vigil cannot apply
+    /// it itself). A record may be waived only if its **full hashed
+    /// content** equals an entry in the application's durable request
+    /// log --- written and fsynced before `record` and marked done
+    /// once the receipt is stored --- no other waiver uses that
+    /// entry, and the record's time lies between the entry and the
+    /// crash. Any other unreceipted record is tampering, not a crash.
+    ///
+    /// # Errors
+    /// Returns [`InvalidConfig`](AuditErrorKind::InvalidConfig) when
+    /// `reason` is empty or contains LF/CR, or when a waiver for the
+    /// same `seq` was already registered (ruling 13-V7-d1 point 6).
+    pub fn waive(
+        mut self,
+        seq: u64,
+        hash: [u8; 32],
+        reason: impl Into<String>,
+    ) -> Result<Self, AuditError> {
+        let reason = validate_reason(reason.into(), "waive reason")?;
+        if self.waivers.contains_key(&seq) {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                format!("duplicate waive for seq {seq}"),
+            ));
+        }
+        self.waivers.insert(seq, (hash, reason));
+        Ok(self)
+    }
+    /// Pins a late-adoption deployment's receipt coverage at `(seq,
+    /// hash)`: records up to and including that one are not
+    /// reconciled (ADR-0005 decision 5 "Late adoption"; ruling
+    /// 13-V7-d1 point 6). The call also turns reconciliation on. The
+    /// match rule is [`Self::receipts`]' rule under subject
+    /// `from seq <s> hash blake3:<64 hex>`: a match emits one
+    /// [`ReceiptWaived`](FindingKind::ReceiptWaived) at the record
+    /// (detail `from seq <s> hash blake3:<64 hex>: <reason>`) and
+    /// exempts every record at or below `s` from reconciliation; a
+    /// mismatch is `ReceiptMismatch` and exempts nothing, so a
+    /// mismatched `from` cannot silently cover a rewritten prefix; a
+    /// `from` below the start or above the end is set aside.
+    ///
+    /// # Errors
+    /// Returns [`InvalidConfig`](AuditErrorKind::InvalidConfig) when
+    /// `reason` is empty or contains LF/CR, or when `receipts_from`
+    /// was already called on this verifier (ruling 13-V7-d1 point 6).
+    pub fn receipts_from(
+        mut self,
+        seq: u64,
+        hash: [u8; 32],
+        reason: impl Into<String>,
+    ) -> Result<Self, AuditError> {
+        let reason = validate_reason(reason.into(), "receipts_from reason")?;
+        if self.receipts_from.is_some() {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                "duplicate receipts_from",
+            ));
+        }
+        self.receipts_from = Some((seq, hash, reason));
+        Ok(self)
     }
 
     /// Expands a directory's vigil files and verifies its confirmed snapshot.
@@ -784,6 +885,15 @@ impl Verifier {
                 end_anchor_matches: false,
             }
         });
+        let empty_receipts: std::collections::BTreeSet<(u64, [u8; 32])> =
+            std::collections::BTreeSet::new();
+        let reconcile =
+            self.receipts.is_some() || !self.waivers.is_empty() || self.receipts_from.is_some();
+        let receipt_inputs = reconcile.then(|| receipts::Inputs {
+            receipts: self.receipts.as_ref().unwrap_or(&empty_receipts),
+            waivers: &self.waivers,
+            receipts_from: self.receipts_from.as_ref(),
+        });
         Ok(engine::check(
             collection,
             trail,
@@ -793,7 +903,7 @@ impl Verifier {
                 anchors: &joined_anchors,
                 start: self.start.as_ref(),
                 end_ctx: end_ctx.as_ref(),
-                receipts: self.receipts.as_ref(),
+                receipts: receipt_inputs.as_ref(),
                 now: self.now(),
             },
         ))
