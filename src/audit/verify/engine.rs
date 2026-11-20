@@ -430,18 +430,54 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         &conflicting_seqs,
         &mut findings,
     );
-    // Ruling 13-V6-d3: the position classifier is the one place that
-    // decides "below the start"; built once per verify call and
-    // consumed by `anchors` and `revocation` through
-    // `Classifier::set_aside`. See `Verifier::start_from` for the rule.
-    let position = position::Classifier::new(accepted_start.and(start), trail, anchors);
+    // Ruling 13-V6-d7 clarification 13-V6-d7a: evaluate the end
+    // anchor through the shared anchor rule once, before the
+    // classifier is built, so `Context::is_anchored` can reuse the
+    // result without re-implementing the rule. The end anchor is
+    // never set aside (clarification 13-V6-d7a), so
+    // `anchors::match_only` is the full rule for it. The finding
+    // (if any) is pushed here and `anchors::check` is told to skip
+    // this anchor's identity so it is not emitted twice.
+    let (end_anchor_identity, end_anchor_matches) =
+        match end_ctx.and_then(|c| c.anchor.map(|a| (c, a))) {
+            Some((_, a)) => {
+                let result = anchors::match_only(a, trail, &groups, &conflicting_seqs);
+                let matches = result.is_none();
+                if let Some(f) = result {
+                    findings.push(f);
+                }
+                (Some((a.trail(), a.seq(), a.hash())), matches)
+            }
+            None => (None, false),
+        };
+    let end_ctx_filled: Option<end_before::Context<'_>> = end_ctx.map(|c| end_before::Context {
+        end_seq: c.end_seq,
+        last_line_seq: c.last_line_seq,
+        first_line: c.first_line,
+        anchor: c.anchor,
+        end_anchor_matches,
+    });
+    let end_ctx = end_ctx_filled.as_ref();
+    // Rulings 13-V6-d3 and 13-V6-d7: the position classifier is the
+    // one place that decides "below the start" and "above the end";
+    // built once per verify call and consumed by `anchors`,
+    // `revocation` and `end` through `Classifier::set_aside`. See
+    // `Verifier::start_from` and `Verifier::end_before` for the rules.
+    let position = position::Classifier::new(accepted_start.and(start), trail, anchors, end_ctx);
     // Ruling 13-V5-d5: evaluate the section's `end=` once. A match
     // grants the tail exemption, confirms bounds at or below `s`,
     // and promotes 13-V5-d2 repairs at or below `s`; a mismatch
     // grants none of them; no `end=` checks nothing. Threaded into
     // file_findings (repair promotion), revocation::check (bound
     // confirmation) and `with_tail_exempt` below.
-    let matched_end = end::check(trail, trust, &groups, &conflicting_seqs, &mut findings);
+    let matched_end = end::check(
+        trail,
+        trust,
+        &groups,
+        &conflicting_seqs,
+        &position,
+        &mut findings,
+    );
     for (idx, input) in collection.inputs.iter().enumerate() {
         let no_crash = mark_no_crash(&collection, idx);
         file_findings(
@@ -602,7 +638,9 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // Ruling 13-V5-d1 point 4 and 13-V5-d3: pin and confirm every
     // `through=` bound on a key of the verified trail's section, in
     // key-byte order. Reads the same merged `groups` and fork set the
-    // main seq-loop just filled, so no second file pass.
+    // main seq-loop just filled, so no second file pass. Ruling
+    // 13-V6-d7 point 4: `end_bounded` suppresses `RevocationUnconfirmed`
+    // in an end-bounded verification.
     revocation::check(
         trail,
         trust,
@@ -626,15 +664,19 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         &conflicting_seqs,
         &mut findings,
     );
-    // Ruling 13-V6-d1 points 1-2: each distinct `(trail, seq, hash)`
-    // anchor is checked once against the already-merged `groups` and
-    // the shared fork set, so no second file pass runs.
+    // Ruling 13-V6-d1 points 1-2 and 13-V6-d7 clarification 13-V6-d7a:
+    // each distinct `(trail, seq, hash)` anchor is checked once
+    // against the already-merged `groups` and the shared fork set,
+    // so no second file pass runs. The end anchor was evaluated
+    // ahead of the classifier (its finding was pushed above), so this
+    // call skips it by identity -- the shared anchor rule runs once.
     anchors::check(
         anchors,
         trail,
         &groups,
         &conflicting_seqs,
         &position,
+        end_anchor_identity,
         &mut findings,
     );
     // Compute the per-declaration structural outcome once (ruling

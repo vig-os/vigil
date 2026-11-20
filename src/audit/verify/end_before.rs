@@ -24,6 +24,10 @@ type Located<'a> = (&'a Path, &'a Summary);
 pub(super) struct Parsed {
     pub(super) checkpoint: Checkpoint,
     pub(super) segment_bytes: Vec<u8>,
+    /// `seq` of the end record's last line: the resume line when one
+    /// is present, otherwise the checkpoint (ruling 13-V6-d7 point 1).
+    /// This is `E`, the end of the range for inputs above the end.
+    pub(super) last_line_seq: u64,
 }
 
 /// Parses the archive record per ruling 13-V6-d4 point 4. Returns
@@ -48,14 +52,20 @@ pub(super) fn parse(end_record: &str) -> Result<Parsed, AuditError> {
     let mut segment_bytes = Vec::with_capacity(end_record.len() + 2);
     segment_bytes.extend_from_slice(first.as_bytes());
     segment_bytes.push(b'\n');
+    let mut last_line_seq = checkpoint.seq();
     if let Some(second) = second {
         validate_resume(second, &checkpoint)?;
         segment_bytes.extend_from_slice(second.as_bytes());
         segment_bytes.push(b'\n');
+        last_line_seq = checkpoint
+            .seq()
+            .checked_add(1)
+            .ok_or_else(|| invalid("end_record checkpoint seq overflows"))?;
     }
     Ok(Parsed {
         checkpoint,
         segment_bytes,
+        last_line_seq,
     })
 }
 
@@ -96,8 +106,43 @@ fn invalid(detail: impl Into<String>) -> AuditError {
 /// End-of-range inputs the engine reads once for a verify call.
 pub(super) struct Context<'a> {
     pub(super) end_seq: u64,
+    /// `E`, the `seq` of the end record's last line (ruling 13-V6-d7
+    /// point 1): the resume line when one is present, otherwise the
+    /// checkpoint. The end of the range for inputs above the end.
+    pub(super) last_line_seq: u64,
     pub(super) first_line: &'a str,
     pub(super) anchor: Option<&'a Checkpoint>,
+    /// `true` iff the end anchor was given and passed the shared
+    /// anchor rule (ruling 13-V6-d1 point 2). The result comes from
+    /// [`super::anchors::match_only`] once per verify call, so
+    /// [`Self::is_anchored`] reuses it rather than reimplementing
+    /// the rule (ruling 13-V6-d7 clarification 13-V6-d7a). Left
+    /// `false` outside [`super::engine::check`].
+    pub(super) end_anchor_matches: bool,
+}
+
+impl<'a> Context<'a> {
+    /// `true` iff an end anchor was given and its line byte-equals
+    /// the end record's first line (ruling 13-V6-d4 point 5: each
+    /// side without its LF; whitespace counts). The one place the
+    /// byte-equality check lives; [`Self::is_anchored`] and
+    /// [`check`] both consume it so the comparison runs in exactly
+    /// one place.
+    pub(super) fn bytes_match(&self) -> bool {
+        self.anchor.is_some_and(|a| a.line() == self.first_line)
+    }
+
+    /// `true` iff all three "anchored" conditions hold: the end
+    /// anchor was given, its bytes match the record's first line,
+    /// and the shared anchor rule produced no finding for it
+    /// (ruling 13-V6-d4 point 5; ruling 13-V6-d7 clarification
+    /// 13-V6-d7a — a fork at `e` leaves the end unanchored). The
+    /// one place "anchored" is decided for the above-end
+    /// set-aside; neither the byte-equality nor the anchor rule
+    /// is re-checked here.
+    pub(super) fn is_anchored(&self) -> bool {
+        self.bytes_match() && self.end_anchor_matches
+    }
 }
 
 /// `true` iff this `seq` is at or above the end checkpoint's `seq`
@@ -143,7 +188,11 @@ pub(super) fn check(
             Some(ctx.end_seq),
             format!("end_before seq {}: no end anchor", ctx.end_seq),
         )),
-        Some(anchor) if anchor.line() != ctx.first_line => findings.push(Finding::new(
+        // Ruling 13-V6-d4 point 5 (byte equality lives in one place,
+        // `Context::bytes_match`): the end record's first line must
+        // byte-equal the end anchor's line (each side without its LF;
+        // whitespace counts).
+        Some(_) if !ctx.bytes_match() => findings.push(Finding::new(
             K::AnchorMismatch,
             None,
             None,
