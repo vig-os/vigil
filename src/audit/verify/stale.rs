@@ -44,11 +44,11 @@ pub(super) fn check(
     // A "now" before `UNIX_EPOCH` is a value `SystemTime::now()` never
     // returns in practice, and `Record::time` is a `u64` nanosecond
     // offset from the epoch (so a record's `time` is always `>= 0`).
-    // Mapping the error to `0` is therefore exact, not a fallback: an
-    // age computed against a pre-epoch "now" would be larger than any
-    // non-negative `record.time`, which the saturating subtraction
-    // clamps to `0` below -- precisely what `map_or(0, …)` produces
-    // here, without a panic path.
+    // Mapping the error to `0` is therefore exact, not a fallback: a
+    // pre-epoch "now" is smaller than any non-negative `record.time`,
+    // so `now - record.time` would be negative, which the saturating
+    // subtraction below clamps to `0` -- precisely what `map_or(0, …)`
+    // produces here, without a panic path.
     let now_ns = now
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());

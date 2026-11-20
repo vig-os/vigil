@@ -932,3 +932,73 @@ fn s11b_second_max_age_call_can_tighten_to_zero() {
     assert!(!r.is_strict_valid());
     assert_eq!(r.covered_through(), Some(0));
 }
+
+// =====================================================================
+// S6b — ACCEPTANCE sibling of S6: separates "highest `seq`" from
+// "latest `time`" across a second, independent layout -- cp2 (the
+// highest-`seq` trusted checkpoint) sits in a shipped-only file while
+// cp0/e1 are native, so `StaleHead`'s location follows cp2 across to
+// the shipped copy at its `(shipped.jsonl, line 1, hash)`. Pairs with
+// S6 so ruling 13-V5-d6 point 3's "highest trusted `seq`, including
+// shipped-only copies" rule is pinned on native and shipped placements
+// of the winning checkpoint.
+//
+// The two incidental `ClockWentBackwards` findings are inherent to any
+// honest layout of this scenario: separating "highest `seq`" from
+// "latest `time`" on a fork-free trail requires cp2 (the highest
+// `seq`) to carry an earlier `time` than at least one lower-`seq`
+// record, so the engine's per-`seq` time-order check (engine.rs ~l.520)
+// fires whenever such a pair has one candidate on each side. With
+// T_S6_CP0 > T_S6_E1 > T_S6_CP2 both adjacent `seq` pairs qualify, so
+// the engine reports one `ClockWentBackwards` at seq 1 (e1 at native
+// l2, previous cp0) and one at seq 2 (cp2 at shipped l1, previous e1
+// cross-file) -- which the ADR treats as independent findings from
+// `StaleHead`.
+// =====================================================================
+#[test]
+fn s6b_highest_seq_wins_over_latest_time_shipped_only() {
+    let d = Temp::new();
+    let cp0 = signed_cp_at(0, Record::genesis(&TRAIL), &Mmr::new(), T_S6_CP0);
+    let mmr0 = {
+        let mut m = Mmr::new();
+        m.push(cp0.hash()).unwrap();
+        m
+    };
+    let e1 = entry_at(1, cp0.hash(), T_S6_E1);
+    let mmr1 = {
+        let mut m = mmr0.clone();
+        m.push(e1.hash()).unwrap();
+        m
+    };
+    let cp2 = signed_cp_at(2, e1.hash(), &mmr1, T_S6_CP2);
+    put_segment(&d.0, 0, &[&cp0, &e1], &[]);
+    let native = segment_path(&d.0, 0);
+    let shipped = d.0.join("shipped.jsonl");
+    write_bytes(&shipped, &line_bytes(&cp2));
+    let r = report(
+        vec![native.clone(), shipped.clone()],
+        trusted_policy(),
+        Some(MAX_AGE),
+        now(),
+    );
+    let expected = vec![
+        located(
+            K::ClockWentBackwards,
+            native,
+            2,
+            1,
+            format!("expected time >= {T_S6_CP0}, found {T_S6_E1}"),
+        ),
+        located(
+            K::ClockWentBackwards,
+            shipped.clone(),
+            1,
+            2,
+            format!("expected time >= {T_S6_E1}, found {T_S6_CP2}"),
+        ),
+        stale(shipped, 1, 2, T_S6_CP2),
+    ];
+    assert_findings(r.findings(), &expected, "S6b");
+    assert!(!r.is_strict_valid());
+    assert_eq!(r.covered_through(), Some(2));
+}
