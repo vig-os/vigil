@@ -235,7 +235,17 @@ pub enum FindingKind {
     /// own `BadSignature` and `UntrustedKey` are independent and
     /// still fire as usual.
     StartMismatch,
-    /// Error: An input below the start lacks an anchor.
+    /// Error: An input below an **unanchored** accepted start
+    /// (ADR-0005 decision 11; ruling 13-V6-d3): nothing below can be
+    /// checked, so the stolen-key cut is caught. Replaces the ordinary
+    /// [`AnchorMismatch`](Self::AnchorMismatch) /
+    /// [`RevocationMismatch`](Self::RevocationMismatch) at that `seq`;
+    /// another trail's anchor keeps `AnchorMismatch … trail differs`.
+    /// One finding per offending input. Detail grammar, both
+    /// unlocated:
+    /// `anchor seq <a> hash blake3:<64 hex>: below start seq <s>` or
+    /// `key <64 hex> through=<b>: below start seq <s>`. See
+    /// [`Verifier::start_from`](crate::audit::Verifier::start_from).
     UnanchoredStart,
     /// Error: The batch start does not anchor the requested end.
     UnanchoredEnd,
@@ -329,7 +339,16 @@ pub enum FindingKind {
     /// `covered_through` is `None`. The last record being itself
     /// covered yields no `UncoveredTail`.
     UncoveredTail,
-    /// Info: An input lies outside anchored verification bounds.
+    /// Info: An input below an **anchored** accepted start (ADR-0005
+    /// decision 11; ruling 13-V6-d3). Replaces the ordinary
+    /// [`AnchorMismatch`](Self::AnchorMismatch) /
+    /// [`RevocationMismatch`](Self::RevocationMismatch) at that `seq`;
+    /// another trail's anchor keeps `AnchorMismatch … trail differs`.
+    /// Detail grammar, both unlocated:
+    /// `anchor seq <a> hash blake3:<64 hex>: below start seq <s>` or
+    /// `key <64 hex> through=<b>: below start seq <s>`. The `AboveEnd`
+    /// form arrives with `Verifier::end_before` (#13). See
+    /// [`Verifier::start_from`](crate::audit::Verifier::start_from).
     OutOfRange,
     /// Info: Records follow the reconciled receipts prefix.
     Unreconciled,

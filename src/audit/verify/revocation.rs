@@ -42,7 +42,12 @@
 //! as `matched_end` from [`super::end::check`], whose single call
 //! `super::engine::check` owns.
 
-use super::{Finding, input::Summary, signatures};
+use super::{
+    Finding,
+    input::Summary,
+    position::{Classifier, Position},
+    signatures,
+};
 use crate::audit::{FindingKind as K, TrustPolicy, digest_string, hex};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -66,6 +71,7 @@ pub(super) fn check(
     groups: &BTreeMap<u64, Vec<Located<'_>>>,
     conflicting_seqs: &BTreeSet<u64>,
     matched_end: Option<u64>,
+    position: &Classifier,
     findings: &mut Vec<Finding>,
 ) {
     let ctx = Ctx {
@@ -78,8 +84,32 @@ pub(super) fn check(
     for (key, (s, h)) in trust.bounds_in(&trail) {
         let key_hex = hex(&key);
         let bound_prefix = format!("key {key_hex} through={s}:{}", digest_string(&h));
-        let location = pin(&ctx, s, h, &key, &bound_prefix, findings);
-        confirmation(&ctx, s, &key, &key_hex, location, findings);
+        // Ruling 13-V6-d3 point 5: a pin below an accepted start
+        // replaces the pin finding with one unlocated finding (kind
+        // from the `position` module); the confirmation check is
+        // unchanged.
+        let pin_location = match position.classify(s) {
+            Position::BelowStart {
+                start_seq,
+                anchored,
+            } => {
+                let kind = if anchored {
+                    K::OutOfRange
+                } else {
+                    K::UnanchoredStart
+                };
+                findings.push(Finding::new(
+                    kind,
+                    None,
+                    None,
+                    Some(s),
+                    format!("key {key_hex} through={s}: below start seq {start_seq}"),
+                ));
+                None
+            }
+            Position::InRange => pin(&ctx, s, h, &key, &bound_prefix, findings),
+        };
+        confirmation(&ctx, s, &key, &key_hex, pin_location, findings);
     }
 }
 

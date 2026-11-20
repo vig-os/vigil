@@ -10,6 +10,7 @@ mod engine;
 mod fold;
 mod input;
 pub(crate) mod lines;
+mod position;
 mod resume;
 mod revocation;
 mod signatures;
@@ -273,6 +274,8 @@ mod end_tests;
 #[cfg(test)]
 mod mod_tests;
 #[cfg(test)]
+mod position_tests;
+#[cfg(test)]
 mod revocation_tests;
 #[cfg(test)]
 mod rule2_tests;
@@ -518,10 +521,13 @@ impl Verifier {
     /// The start must come from the **batch-start anchor entry** of
     /// the previous batch in the anchor store (ADR-0005 decision 11
     /// "Where it comes from", amended #123), never the trail
-    /// directory and never the archive record. Inputs below the
-    /// start (anchors, pins) keep their current findings for
-    /// now (ruling 13-V6-d2 point 6); `OutOfRange` and
-    /// `UnanchoredStart` arrive with later work on #13.
+    /// directory and never the archive record. An anchor or a
+    /// `through=` pin whose `seq` is strictly below an accepted start
+    /// is set aside (ruling 13-V6-d3 points 4-5): its ordinary
+    /// mismatch check is replaced by one unlocated finding, with kind
+    /// [`FindingKind::OutOfRange`] (info) when the start is anchored
+    /// and [`FindingKind::UnanchoredStart`] (error) otherwise. Another
+    /// trail's anchor is still `AnchorMismatch … trail differs`.
     pub fn start_from(mut self, start: Checkpoint) -> Self {
         self.start = Some(start);
         self
