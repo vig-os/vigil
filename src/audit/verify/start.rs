@@ -5,10 +5,11 @@
 //! precedence are on [`crate::audit::Verifier::start_from`]. This
 //! module owns neither of them twice: it evaluates the one start the
 //! verifier was given against the already-merged records per `seq`
-//! and the shared fork set, reusing V6a's verified trail id,
-//! `forked()` and the shared first-copy helper in
-//! [`super::first_copy`], and V5's single `trusted` predicate in
-//! [`super::signatures::trusted`] (13-V6-d1 points 1-2).
+//! and the shared fork set, reusing the shared verified trail id,
+//! the `forked()` predicate and the first-copy helper in
+//! [`super::first_copy`], and the single `trusted` predicate in
+//! [`super::signatures::trusted`] (rulings 13-V6-d1 points 1-2 and
+//! 13-V5-d1 point 3).
 //!
 //! Returns `Some(s)` only when the start is accepted, so the engine
 //! suppresses the prefix `SeqGap` for `0..s−1` in exactly one place

@@ -10,8 +10,8 @@
 //! ACCEPTANCE or REGRESSION in its doc comment.
 
 use crate::audit::{
-    AuditConfig, Checkpoint, Entry, FindingKind as K, KeyFileSigner, Mmr, Record, RecordContext,
-    Signer, TrustPolicy, digest_string,
+    Checkpoint, Entry, FindingKind as K, KeyFileSigner, Mmr, Record, RecordContext, Signer,
+    TrustPolicy, digest_string,
     format::CheckpointFields,
     hex,
     runs_v4a_fixtures::{
@@ -20,7 +20,7 @@ use crate::audit::{
     },
     verify::{Finding, Report, Verifier},
 };
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 // =====================================================================
 // Shared literal hex constants.
@@ -42,15 +42,21 @@ const E1_HONEST_DIGEST: &str =
 const CP2_HONEST_DIGEST: &str =
     "blake3:4164966a12a675e55eb6e133b9e50313907f164fe142d941447defcdfdb25d06";
 /// `signed_cp_explicit(2, e1.hash(), 2, [0x5a; 32], vec![[0x22; 32]])`,
-/// shared with the V6a anchors module.
+/// shared with the anchors module.
 const SYNTH_CP2_DIGEST: &str =
     "blake3:a4145e2e1465ae13c3afccdf696b8354b0a8620d167615d4ea72cbab57a5cf56";
+/// `signed_cp_other(0, Record::genesis(&OTHER_TRAIL), &Mmr::new())` on `OTHER_TRAIL`.
+const CP0_OTHER_DIGEST: &str =
+    "blake3:b57a644cf07f1180908b840976740bf6624c17aab435a2d9f6b4e9b77aa177c0";
 /// `signed_cp_other(2, [0xaa; 32], &foreign_mmr_one())` on `OTHER_TRAIL`.
 const CP2_OTHER_DIGEST: &str =
     "blake3:301689fd93fc2ff30bc03a1f775f6f1590dd0f4cd92f2e50847003c4ebd5e87b";
 /// `signed_cp_other(3, [0xaa; 32], &foreign_mmr_one())` on `OTHER_TRAIL`.
 const CP3_OTHER_DIGEST: &str =
     "blake3:9c77bb62a57fed3f28d22014354c4fccc0b35051f1c1d4579c9624709eb9d97d";
+/// `signed_cp_other(5, [0xaa; 32], &foreign_mmr_one())` on `OTHER_TRAIL`.
+const CP5_OTHER_DIGEST: &str =
+    "blake3:5642c84c7cb858d1acc2b0bb8ea45adda145d419d63ff35810b507212afcfbc0";
 /// `signed_cp(3, cp2.hash(), &mmr2)` chained from the honest `cp2`.
 const CP3_FROM_CP2_DIGEST: &str =
     "blake3:dfbf4e5a7173125e6d43847fa1c1b05420adc1c09022566ebbb292b72cf0203c";
@@ -67,22 +73,17 @@ const SYNTH_CP3_DIGEST: &str =
 /// `cp2` signed by the alt key `0x55` (`sign_as(alt, 2, e1.hash, &mmr1)`).
 const CP2_UNLISTED_DIGEST: &str =
     "blake3:8f71deebb1a2b11df8703bc9210730f478d3f5f0688e042b9469a5bf4eaaba33";
-/// Honest `cp2` with one bit of its signature flipped (`flip_signature_byte`).
+/// Honest `cp2` with one bit of its signature flipped
+/// (`flip_signature_byte`). Shared by the signature-flip rows for the
+/// start's hash and for the rewritten record on the trail.
 const CP2_FLIPPED_DIGEST: &str =
     "blake3:6cd338542f05123f02d86b51c67a880924320e64ef06f9fc1c7aed0ae7c5925d";
-/// Rewritten `cp2`: fixture key, honest previous and fold, but one byte
-/// of the signature flipped so its canonical hash shifts
-/// (`flip_signature_byte` yields the same value as `CP2_FLIPPED_DIGEST`
-/// because B2b uses the same mutation; both constants pin the same
-/// value for readability in the respective row details).
-const CP2_REWRITE_DIGEST: &str =
-    "blake3:6cd338542f05123f02d86b51c67a880924320e64ef06f9fc1c7aed0ae7c5925d";
 /// `signed_cp_explicit(0, genesis(TRAIL), 0, [0xaa; 32], vec![])`, shared
-/// with the V6a anchors module.
+/// with the anchors module.
 const CP0_TWIN_DIGEST: &str =
     "blake3:1c2090cbf40864380a0bf92e4dc439c77146d8020e46fe172da7098a6b3077a7";
 /// `signed_cp_explicit(2, e1.hash(), 2, [0xde; 32], vec![[0x22; 32]])`,
-/// shared with the V6a anchors module.
+/// shared with the anchors module.
 const CP2_TWIN_DIGEST: &str =
     "blake3:aee5a47d9814a55594371fa3bb0bd34a48531533983898590ef72f511d42f45c";
 
@@ -247,11 +248,12 @@ fn seal(records: &[&Record]) -> Segment {
 }
 
 // =====================================================================
-// B1 — REGRESSION. The live directory begins at the opening
+// B1 — ACCEPTANCE. The live directory begins at the opening
 // checkpoint of a kept segment, and the start is that checkpoint ->
 // no finding. Pairs with the existing engine row
 // `missing_prefix_does_not_hide_later_forgery`, which pins the same
-// layout without a start.
+// layout without a start. First failing line on base: the
+// `assert_findings` call below.
 // =====================================================================
 #[test]
 fn b1_accepted_start_suppresses_prefix_seqgap() {
@@ -263,9 +265,10 @@ fn b1_accepted_start_suppresses_prefix_seqgap() {
 }
 
 // =====================================================================
-// B1b — REGRESSION. Shipped-only `cp2` as the first record. Pairs
+// B1b — ACCEPTANCE. Shipped-only `cp2` as the first record. Pairs
 // with B1 to pin that the "first record" is the lowest `seq` across
-// native AND shipped copies.
+// native AND shipped copies. First failing line on base: the
+// `assert_findings` call below.
 // =====================================================================
 #[test]
 fn b1b_accepted_start_with_shipped_only_first_record() {
@@ -279,10 +282,11 @@ fn b1b_accepted_start_with_shipped_only_first_record() {
 }
 
 // =====================================================================
-// B1c — REGRESSION. The lowest `seq` record is only in a shipped
+// B1c — ACCEPTANCE. The lowest `seq` record is only in a shipped
 // copy, but a later native segment carries a higher-`seq` record;
 // the start matches the shipped-only record. Pairs with B1b to pin
-// that the "first record" merge includes shipped copies.
+// that the "first record" merge includes shipped copies. First
+// failing line on base: the `assert_findings` call below.
 // =====================================================================
 #[test]
 fn b1c_shipped_first_record_native_above_accepts() {
@@ -377,7 +381,7 @@ fn b2b_rewritten_record_hash_differs_from_honest_start() {
             1,
             2,
             format!(
-                "start seq 2 hash {CP2_HONEST_DIGEST}: hash differs (record {CP2_REWRITE_DIGEST})"
+                "start seq 2 hash {CP2_HONEST_DIGEST}: hash differs (record {CP2_FLIPPED_DIGEST})"
             ),
         ),
         uncovered(2, 2),
@@ -408,9 +412,49 @@ fn b3_full_trail_start_above_first_record() {
 }
 
 // =====================================================================
+// B3b — ACCEPTANCE. A second `not the first record` layout: the
+// start is present at `s`, records below `s` exist, and the first
+// record is not `seq 0`. An older kept segment opens at `cp2` and
+// continues with `[e3, cp4]`; the start names `cp4`. First failing
+// line on base: the `assert_findings` call below.
+// =====================================================================
+#[test]
+fn b3b_start_present_at_s_records_below_first_not_zero() {
+    let fx = honest();
+    let e3 = entry_rec(3, fx.cp2.hash());
+    let mmr3 = pushed(&fx.mmr2, &e3);
+    let cp4 = signed_cp(4, e3.hash(), &mmr3);
+    let seg = seal(&[&fx.cp2, &e3, &cp4]);
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey())).start_from(parse_start(&cp4));
+    let report = report_of(vec![seg.path.clone()], verifier);
+    let expected = vec![
+        located(
+            K::SeqGap,
+            seg.path.clone(),
+            1,
+            2,
+            "missing seq 0..=1".into(),
+        ),
+        located(
+            K::StartMismatch,
+            seg.path,
+            1,
+            4,
+            format!("start seq 4 hash {CP4_FROM_E3_DIGEST}: not the first record (first seq 2)"),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "B3b");
+}
+
+// =====================================================================
 // B4 — ACCEPTANCE. "Kept segments deleted up to a later opening
 // checkpoint": the first record is at a seq strictly above the
-// start's. `StartMismatch (first seq <f>)` plus the prefix `SeqGap`.
+// start's. Every checkpoint of the original trail is passed as an
+// anchor, so the anchors below the start keep their current
+// `AnchorMismatch … no record` findings (ruling 13-V6-d2 point 6).
+// Expected: `StartMismatch (first seq <f>)` plus the prefix `SeqGap`
+// plus `AnchorMismatch` for every checkpoint absent from the live
+// set.
 // =====================================================================
 #[test]
 fn b4_kept_segment_deleted_leaves_first_record_above_start() {
@@ -419,9 +463,23 @@ fn b4_kept_segment_deleted_leaves_first_record_above_start() {
     let mmr3 = pushed(&fx.mmr2, &e3);
     let cp4 = signed_cp(4, e3.hash(), &mmr3);
     let seg = seal(&[&cp4]);
-    let verifier = Verifier::new(trust_with_key(fixture_pubkey())).start_from(parse_start(&fx.cp2));
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .anchor(parse_start(&fx.cp0))
+        .anchor(parse_start(&fx.cp2))
+        .anchor(parse_start(&cp4))
+        .start_from(parse_start(&fx.cp2));
     let report = report_of(vec![seg.path.clone()], verifier);
     let expected = vec![
+        unlocated(
+            K::AnchorMismatch,
+            Some(0),
+            format!("anchor seq 0 hash {CP0_HONEST_DIGEST}: no record"),
+        ),
+        unlocated(
+            K::AnchorMismatch,
+            Some(2),
+            format!("anchor seq 2 hash {CP2_HONEST_DIGEST}: no record"),
+        ),
         located(
             K::StartMismatch,
             seg.path.clone(),
@@ -473,7 +531,7 @@ fn b5_first_record_at_start_seq_is_an_entry() {
 }
 
 /// `signed_cp_explicit(1, cp0.hash(), 1, [0x77; 32], vec![[0x55; 32]])`,
-/// shared with the V6a anchors module.
+/// shared with the anchors module.
 const SYNTH_CP1_DIGEST: &str =
     "blake3:6f29546e36b4f2e5563838f6a53d324832a27d0fb89ea9768459a028992bf915";
 
@@ -599,6 +657,59 @@ fn b6b_start_bad_signature_not_trusted() {
 }
 
 // =====================================================================
+// B6c — ACCEPTANCE. `not trusted at its seq` through a `through=`
+// bound: the start is signed by a listed key at a `seq` above that
+// key's bound, after a rotation whose confirmation (`cp3` by alt) is
+// above the bound. The bound's pin record was archived, so the pin
+// fires `RevocationMismatch` at seq 0; the confirmation keeps
+// `RevocationUnconfirmed` silent. First failing line on base: the
+// `assert_findings` call below.
+// =====================================================================
+#[test]
+fn b6c_start_signed_by_bounded_key_above_its_bound() {
+    let fx = honest();
+    let cp3_alt = sign_as(&alt_signer(), 3, fx.cp2.hash(), &fx.mmr2);
+    let seg = seal(&[&fx.cp2, &cp3_alt]);
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key_through(fixture_pubkey(), 0, fx.cp0.hash())
+        .key(alt_signer().public_key())
+        .build()
+        .unwrap();
+    let verifier = Verifier::new(trust).start_from(parse_start(&fx.cp2));
+    let report = report_of(vec![seg.path.clone()], verifier);
+    let expected = vec![
+        unlocated(
+            K::RevocationMismatch,
+            Some(0),
+            format!("key {FIXTURE_KEY_HEX} through=0:{CP0_HONEST_DIGEST}: no record at seq 0"),
+        ),
+        located(
+            K::SeqGap,
+            seg.path.clone(),
+            1,
+            2,
+            "missing seq 0..=1".into(),
+        ),
+        located(
+            K::StartMismatch,
+            seg.path.clone(),
+            1,
+            2,
+            format!("start seq 2 hash {CP2_HONEST_DIGEST}: not trusted at its seq"),
+        ),
+        located(
+            K::UntrustedKey,
+            seg.path,
+            1,
+            2,
+            format!("key {FIXTURE_KEY_HEX} bounded through seq 0"),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "B6c");
+}
+
+// =====================================================================
 // B7 — ACCEPTANCE. `trail differs`: the start comes from another
 // trail, at the same `seq` as the verified trail's first record.
 // `trail differs` wins over any later step.
@@ -633,7 +744,7 @@ fn b7_start_from_other_trail_same_seq() {
 // =====================================================================
 // B8 — ACCEPTANCE. `seq is forked`: two different records at `s`,
 // one matching the start (native and shipped copy). A forked `seq`
-// is never matched (fail-closed, same rule as V6a's anchor check,
+// is never matched (fail-closed, same rule as the anchor check,
 // ruling 13-V6-d1 point 2).
 // =====================================================================
 #[test]
@@ -723,6 +834,66 @@ fn b9_empty_directory_no_record() {
         format!("start seq 2 hash {CP2_HONEST_DIGEST}: no record"),
     )];
     assert_findings(report.findings(), &expected, "B9");
+}
+
+// =====================================================================
+// B9b — ACCEPTANCE. `trail differs`: the start's trail differs from
+// the verified trail, and the start's `seq` is absent from the
+// verified set. The finding carries a location, the first copy of
+// the first record on the verified trail (ruling 13-V6-d2 point 3).
+// First failing line on base: the `assert_findings` call below.
+// =====================================================================
+#[test]
+fn b9b_other_trail_start_seq_absent_locates_at_first_record() {
+    let fx = honest();
+    let seg = seal(&[&fx.cp0, &fx.e1, &fx.cp2]);
+    let foreign = signed_cp_other(5, [0xaa; 32], &foreign_mmr_one());
+    let verifier =
+        Verifier::new(trust_with_key(fixture_pubkey())).start_from(parse_start(&foreign));
+    let report = report_of(vec![seg.path.clone()], verifier);
+    let expected = vec![located(
+        K::StartMismatch,
+        seg.path,
+        1,
+        5,
+        format!("start seq 5 hash {CP5_OTHER_DIGEST}: trail differs"),
+    )];
+    assert_findings(report.findings(), &expected, "B9b");
+}
+
+// =====================================================================
+// B9c — ACCEPTANCE. `no record` with records from another trail
+// present: the verified set is empty because every file carries a
+// foreign-trail record, which `engine::check` filters out of the
+// merged set and reports as `TrailMismatch`. The `no record` branch
+// still fires with no location, since there is no record on the
+// verified trail to locate against (ruling 13-V6-d2 point 3). First
+// failing line on base: the `assert_findings` call below.
+// =====================================================================
+#[test]
+fn b9c_foreign_trail_records_only_no_record_unlocated() {
+    let fx = honest();
+    let foreign = signed_cp_other(0, Record::genesis(&OTHER_TRAIL), &Mmr::new());
+    let d = Temp::new();
+    let shipped = d.0.join("foreign.shipped");
+    write_bytes(&shipped, &line_bytes(&foreign));
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey())).start_from(parse_start(&fx.cp2));
+    let report = report_of(vec![shipped.clone()], verifier);
+    let expected = vec![
+        located(
+            K::TrailMismatch,
+            shipped,
+            1,
+            0,
+            format!("expected trail {TRAIL_HEX}, found {OTHER_TRAIL_HEX}"),
+        ),
+        unlocated(
+            K::StartMismatch,
+            Some(2),
+            format!("start seq 2 hash {CP2_HONEST_DIGEST}: no record"),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "B9c");
 }
 
 // =====================================================================
@@ -881,7 +1052,8 @@ fn b13_revocation_rules_still_apply_above_accepted_start() {
 // =====================================================================
 // B14 — decision 2 step 6, batch 2 (ADR-0005 d11 bullet).
 //   (a) `start_from(batch-start entry 1)` over archive 2 + live is
-//       clean (REGRESSION).
+//       clean (ACCEPTANCE; first failing line on base: the (a)
+//       `assert_findings` call).
 //   (b) a segment deleted from archive 2 -> `SeqGap` (ACCEPTANCE).
 //   (c) the first segment of archive 2 deleted -> `StartMismatch`
 //       (ACCEPTANCE).
@@ -965,13 +1137,14 @@ fn fixture_hashes_match_literals() {
     assert_eq!(digest_string(&cp2_alt.hash()), CP2_UNLISTED_DIGEST);
     let cp2_bad = flip_signature_byte(&fx.cp2);
     assert_eq!(digest_string(&cp2_bad.hash()), CP2_FLIPPED_DIGEST);
-    // The rewrite row reuses the same `flip_signature_byte` so its
-    // digest is the flipped one; both constants pin the same value.
-    assert_eq!(CP2_REWRITE_DIGEST, CP2_FLIPPED_DIGEST);
+    let foreign0 = signed_cp_other(0, Record::genesis(&OTHER_TRAIL), &Mmr::new());
+    assert_eq!(digest_string(&foreign0.hash()), CP0_OTHER_DIGEST);
     let foreign2 = signed_cp_other(2, [0xaa; 32], &foreign_mmr_one());
     assert_eq!(digest_string(&foreign2.hash()), CP2_OTHER_DIGEST);
     let foreign3 = signed_cp_other(3, [0xaa; 32], &foreign_mmr_one());
     assert_eq!(digest_string(&foreign3.hash()), CP3_OTHER_DIGEST);
+    let foreign5 = signed_cp_other(5, [0xaa; 32], &foreign_mmr_one());
+    assert_eq!(digest_string(&foreign5.hash()), CP5_OTHER_DIGEST);
     let cp3 = signed_cp(3, fx.cp2.hash(), &fx.mmr2);
     assert_eq!(digest_string(&cp3.hash()), CP3_FROM_CP2_DIGEST);
     let e3 = entry_rec(3, fx.cp2.hash());
@@ -989,10 +1162,4 @@ fn fixture_hashes_match_literals() {
     assert_eq!(digest_string(&twin2.hash()), CP2_TWIN_DIGEST);
     let twin0 = signed_cp_explicit(0, Record::genesis(&TRAIL), 0, [0xaa; 32], vec![]);
     assert_eq!(digest_string(&twin0.hash()), CP0_TWIN_DIGEST);
-    // `AuditConfig`, `KeyFileSigner` and `Arc<dyn Signer>` are
-    // imported so the compiler reports a hash mismatch if another
-    // test deletes the symbols without updating this consistency
-    // pin.
-    let _ = AuditConfig::new("svc");
-    let _: Arc<dyn Signer> = Arc::new(KeyFileSigner::from_hex(&"42".repeat(32)).unwrap());
 }
