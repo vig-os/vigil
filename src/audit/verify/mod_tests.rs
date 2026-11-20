@@ -250,6 +250,7 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
             anchors: &[],
             start: None,
             end_ctx: None,
+            receipts: None,
             now: std::time::SystemTime::now(),
         },
     );

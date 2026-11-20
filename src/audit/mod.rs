@@ -354,9 +354,44 @@ pub enum FindingKind {
     ///
     /// Without `max_age` set, nothing is checked.
     StaleHead,
-    /// Error: A required receipt is absent.
+    /// Error: An in-range `audit.record` is not named by any
+    /// receipt supplied to
+    /// [`Verifier::receipts`](crate::audit::Verifier::receipts)
+    /// (ADR-0005 decision 5 "Receipt reconciliation"; ruling
+    /// 13-V7-d1 point 5). Reconciliation runs only when
+    /// `Verifier::receipts` has been called; see that method for the
+    /// full rule, the range and the shipped-copy behaviour.
+    ///
+    /// Detail is exactly
+    /// `no receipt for seq <s> hash blake3:<64 hex>`, located at
+    /// the record's first copy in the engine's merge order (the
+    /// same copy `DuplicateRecord` reports as the original).
+    /// Operator `vigil.audit.*` records are included; checkpoints
+    /// are not. End-record lines
+    /// ([`Verifier::end_before`](crate::audit::Verifier::end_before))
+    /// are not reconciled; a receipt naming one still matches.
     NoReceipt,
-    /// Error: A receipt conflicts with the history.
+    /// Error: A receipt supplied to
+    /// [`Verifier::receipts`](crate::audit::Verifier::receipts) does
+    /// not match the verified history (ADR-0005 decision 5 "Receipt
+    /// reconciliation"; ruling 13-V7-d1 point 4). Every
+    /// `ReceiptMismatch` fires at the receipt's `seq`, with no
+    /// location. Of these details, the first failing one applies:
+    ///
+    ///   1. `receipt seq <s> hash blake3:<64 hex>: no record`
+    ///   2. `receipt seq <s> hash blake3:<64 hex>: seq is forked`
+    ///   3. `receipt seq <s> hash blake3:<64 hex>: hash differs (record blake3:<64 hex>)`
+    ///
+    /// See
+    /// [`Verifier::receipts`](crate::audit::Verifier::receipts) for
+    /// the match rule, the range and the collapse of identical
+    /// receipts. A receipt below an accepted
+    /// [`start_from`](crate::audit::Verifier::start_from) or above
+    /// an [`end_before`](crate::audit::Verifier::end_before) end is
+    /// set aside instead of reported here
+    /// ([`FindingKind::OutOfRange`],
+    /// [`FindingKind::UnanchoredStart`],
+    /// [`FindingKind::UnanchoredEnd`]).
     ReceiptMismatch,
     /// Error: The following record does not attest the fragment gap.
     RepairMismatch,

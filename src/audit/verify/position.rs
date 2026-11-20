@@ -75,6 +75,16 @@ impl Classifier {
         self.end_before.is_some()
     }
 
+    /// `true` iff `seq` is neither below the accepted start nor above
+    /// `E` (the one place the receipt reconciler reads to decide what
+    /// is reconciled, ruling 13-V7-d1 point 3). Consumed by
+    /// [`super::receipts::check`] alongside [`Self::set_aside`]: the
+    /// predicate here gates `NoReceipt`, and `set_aside` gates the
+    /// receipt-side set-aside, so both use the one classifier.
+    pub(super) fn is_in_range(&self, seq: u64) -> bool {
+        matches!(self.classify(seq), Position::InRange)
+    }
+
     fn classify(&self, seq: u64) -> Position {
         if let Some((end_seq, anchored)) = self.end_before
             && seq > end_seq
