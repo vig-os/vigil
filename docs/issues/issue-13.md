@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-09T13:22:04Z
-updated: 2026-11-19T08:46:56Z
+updated: 2026-11-20T07:01:48Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/13
-comments: 34
+comments: 44
 labels: feature, security, priority:medium, area:testing, effort:medium
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-19T09:58:15.306Z
+synced: 2026-11-20T09:45:04.541Z
 ---
 
 # [Issue 13]: [feat(audit): verify API/CLI and tamper tests](https://github.com/vig-os/vigil/issues/13)
@@ -824,5 +824,295 @@ _Posted on November 19, 2026 at 08:46 AM_
 7. **Proof.** The classifier is shared with the reader, so V4b proves:
    - `Reaction::Stop` and the reader's accept/reject decisions are unchanged: reader differential 0 differences, fe_full/fe_snap 0 mismatches, syn gate 49;
    - every new verifier finding comes from rows that follow the row standard.
+
+
+---
+
+# [Comment #35]() by [gerchowl]()
+
+_Posted on November 19, 2026 at 03:28 PM_
+
+**Ruling 13-V5-d1 (#13 V5): signatures, trust, revocation, `end=`, coverage and `max_age`**
+
+At dev 63fedd5, the verifier checks no checkpoint signature. `verify_signature` (`verify_strict`) and `TrustPolicy::trusted_at`/`bound`/`end` exist, but only tests use them. `covered_through` is always `None`. `UncoveredTail` covers every record. No code emits `BadSignature`, `UntrustedKey`, `RevocationMismatch`, `RevocationUnconfirmed`, `TrailEnded` or `StaleHead`. The "no crash outcome" mark has already landed (`mark_no_crash`), so it is no longer part of V5.
+
+This ruling decides the points where ADR-0005 allows more than one reading.
+
+1. **Which checkpoints are checked.** Every distinct `(seq, hash)` checkpoint in the verified set: native and shipped-only copies, inside runs and outside them. Signature and trust checks never feed the shared classifier. They never demote, excuse or empty a run (decision 5: a signature "never demotes"). Reader behaviour does not change (the reader checks no signatures, decision 8).
+2. **`BadSignature` and `UntrustedKey` are independent facts** (decision 8 "What is signed"; decision 9). `audit.key_id` is the Ed25519 public key itself, so every checkpoint's signature can be checked whether or not the key is trusted.
+   - `verify_strict` fails over `checkpoint_message`: `BadSignature`. This includes a key that does not decode, a small-order key and a non-canonical signature.
+   - The key is not listed for the trail, or the checkpoint's `seq` is above the key's `through=` bound: `UntrustedKey`.
+
+   A checkpoint can carry both findings. There is no precedence logic, and neither finding suppresses the other.
+3. **A checkpoint is trusted** only if its signature verifies under `verify_strict` **and** its key is trusted at its `seq`. Only trusted checkpoints count for coverage (point 6), for confirmation (point 4) and for `StaleHead` (point 7).
+4. **Revocation** (decision 9, amendment 8). A `through=<seq>:<hash>` bound is:
+   - **pinned:** the record at that `seq` must exist, have exactly that hash **and be a checkpoint**. Otherwise `RevocationMismatch`. Decision 9 says the bound names "a checkpoint the operator has verified as good" and that "a key's `through=` bound is always a checkpoint"; amendment 8's `rotate` refuses a non-checkpoint bound.
+   - **confirmed:** a trusted checkpoint (point 3) above the bound, signed by a different key that is trusted at its own `seq`. Otherwise `RevocationUnconfirmed`, unless a matching `end=` (point 5) lies at or above the bound.
+   - **bounded:** the old key's checkpoints above the bound are `UntrustedKey` (point 2).
+
+   How a pin interacts with gaps (`LostRecord` inside a confirmed gap with an anchored opening) is decided with anchors and gaps in V6/V7. In V5, a pin whose record is absent is `RevocationMismatch`.
+5. **`end=` retires a trail exactly at one record** (decision 9 "Trust file format"). It matches only when the record at that `seq` is present with exactly that hash **and** no record lies above it. Otherwise `TrailEnded`, an error. That covers a different record at that `seq`, any record above it, and **the record at that `seq` being absent** (a rollback below `end=`). The finding's detail says which case applies. A matching `end=` sets the report's tail exemption (`--strict` does not fail on `UncoveredTail`) and confirms any bound at or below it. A mismatched `end=` exempts nothing. How `end=` interacts with `end_before` belongs to V6.
+6. **Coverage is inclusive** (decision 5). `covered_through` is the highest `seq` of a trusted checkpoint, or `None` if there is none. `UncoveredTail` lists exactly the records above it.
+   - A `TornWrite` becomes `TornWriteRepaired` only when its attesting line is at or below `covered_through`, or is pinned by a matching `end=`.
+   - A fragment is reported by its length and digest, never by its text.
+7. **`StaleHead`** (decision 5, `--max-age`). The newest trusted checkpoint is the trusted checkpoint (point 3) with the **highest `seq`**, not the latest `time`. Its `time` is compared with the verifier's clock through a crate-private seam, and `StaleHead` is reported if `now - time > max_age`. The highest `seq` is the chain's own order: a rollback that leaves an old head is exactly what `max_age` exists to catch, and `time` is not monotonic (`ClockWentBackwards` is a separate finding). With `max_age` set and no trusted checkpoint at all, the report is `StaleHead`: nothing proves the trail is fresh, so the check fails closed. Without `max_age`, nothing is checked. `Verifier::max_age` returns `Result<Self, AuditError>` (ADR §19.2). It cannot fail in V5; `end_before` (V6) adds the conflict.
+8. **Resume candidates (applies in V7).** A candidate whose opening checkpoint is not trusted (point 3) is dropped from the candidates a later receipt or `accept Resumed` line can confirm. This fails closed, consistent with 13-V4-d10 point 4. Decision 11 says "a gap opened with an untrusted key: `UntrustedKey`", and that gap must stay unconfirmed. In V5, nothing consumes the candidates, so this is implemented and tested when V7 consumes them.
+
+**Order.** V5a signatures and trust (points 1–3) → V5b coverage and repairs (point 6) → V5c revocation (point 4) → V5d `end=` (point 5) → V5e `max_age` (point 7). Each is its own PR into dev, merged in that order, because all of them touch `engine.rs`, the `FindingKind` docs and `CHANGELOG.md`.
+
+
+---
+
+# [Comment #36]() by [gerchowl]()
+
+_Posted on November 19, 2026 at 06:27 PM_
+
+**Ruling 13-V5-d2 (#13 V5b): which attesting lines count as covered**
+
+Clarifies 13-V5-d1 point 6. A covered checkpoint protects the records of the verified trail at or below its `seq` through the hash chain (decision 5). It protects no other record. So a `TornWrite` becomes `TornWriteRepaired` only when its attesting line meets all three conditions:
+- it is a record of the verified trail;
+- its `seq` is at or below `covered_through`;
+- no other record has the same `seq`, so the attester is not one side of a `SeqConflict` fork.
+
+An attester of another trail, or one that is part of a fork, stays `TornWrite`. Its `TrailMismatch` or `SeqConflict` error is reported as before. This choice fails closed. It costs nothing on an honest trail, where every attester belongs to the trail and has a unique `seq`.
+
+
+---
+
+# [Comment #37]() by [gerchowl]()
+
+_Posted on November 19, 2026 at 07:49 PM_
+
+**Ruling 13-V5-d3 (#13 V5c): revocation findings: location, forks, scope**
+
+Clarifies 13-V5-d1 point 4 for the implementation.
+
+1. **Pinned.** A `through=<s>:<h>` bound on a key of the verified trail's section is pinned only if the verified set holds exactly one distinct record at `s`, that record's hash is `h`, and it is a checkpoint. Byte-identical copies count as one record. If `s` is forked (a `SeqConflict`), the bound is **not** pinned: an attacker who holds the old key and can write a twin at `s` must not satisfy the pin. This is the same fail-closed rule as 13-V5-d2.
+   - If the bound is not pinned, the finding is `RevocationMismatch` at `seq` `s`. It points to the record's file and line when exactly one record is present, and carries no location when the record is absent or forked. Its detail is exactly one of:
+     - `key <64 hex> through=<s>:blake3:<64 hex>: no record at seq <s>`
+     - `…: record at seq <s> has hash blake3:<64 hex>`
+     - `…: record at seq <s> is not a checkpoint`
+     - `…: seq <s> is forked`
+2. **Confirmed.** The bound is confirmed when a checkpoint at a `seq` above `s` is trusted (13-V5-d1 point 3: valid signature, key trusted at its `seq` for the verified trail) and is signed by a key other than the bounded one. Otherwise the finding is `RevocationUnconfirmed`, located at `seq` `s` like the pin finding above, with detail exactly `key <64 hex> through=<s>: no trusted checkpoint by another key above the bound`. Pinned and confirmed are checked independently: one bound can carry both findings. The `end=` exemption in 13-V5-d1 point 4 arrives with `end=` itself (V5d). Until then, a retired trail with no confirming checkpoint reports `RevocationUnconfirmed`, and the rustdoc says so.
+3. **Scope.** Only the bounds in the verified trail's section are checked. Each bound is checked once, in key order. The parse-time rule that a key revoked in one section must be revoked in every section that lists it is already enforced by `TrustPolicy`.
+4. **A bound inside a resume gap.** A record lost in a gap is absent, so its bound is `RevocationMismatch` ("no record"), as decision 11 requires for an unconfirmed gap. Demoting it to `LostRecord` inside a confirmed gap with an anchored opening belongs to V6/V7.
+
+
+---
+
+# [Comment #38]() by [gerchowl]()
+
+_Posted on November 19, 2026 at 08:49 PM_
+
+**Ruling 13-V5-d4 (#13 V5c): the bound must be the bounded key's own checkpoint; detail precedence; location**
+
+This ruling extends 13-V5-d3 point 1.
+
+1. **Signer of the bound.** Amendment 8 defines a bound as a checkpoint whose `key_id` supplies the old key. A bound on key A therefore names a checkpoint that A signed. The trust file pins the same bound as `rotate --bound`, so it must satisfy the same condition. A `through=` on key A is pinned only when 13-V5-d3 point 1 holds **and** the record's `audit.key_id` is A. Otherwise the result is `RevocationMismatch` with detail `key <64 hex> through=<s>:blake3:<64 hex>: record at seq <s> is signed by key <64 hex>`. The record's location is used.
+
+   This fails closed. Without this rule, a bound naming another key's checkpoint pins nothing that A's trust ends at. The honest procedure never produces such a bound.
+2. **Confirmation is strictly above the bound.** Decision 9 says "at a `seq` above the bound". The checkpoint at `s` never confirms its own bound, whoever signed it.
+3. **One pin detail per bound.** Report the first condition that fails, in this order:
+   1. no record;
+   2. forked;
+   3. other hash;
+   4. not a checkpoint;
+   5. signed by another key.
+4. **Location.** When the pinned record has byte-identical copies, the finding points at the first copy in the engine's merge order. That is the copy `DuplicateRecord` treats as the original.
+5. **A shipped-only trusted checkpoint confirms** (13-V5-d1 point 1).
+
+
+---
+
+# [Comment #39]() by [gerchowl]()
+
+_Posted on November 19, 2026 at 10:18 PM_
+
+**Ruling 13-V5-d5 (#13 V5d): `end=` findings: grammar, location, and what a match grants**
+
+This ruling makes 13-V5-d1 point 5 concrete. Here `end=<s>:<h>` is the verified trail's section's end pin.
+
+1. **Two independent conditions.** Each yields at most one `TrailEnded` (error).
+   - **At `s`:** the verified set must hold exactly one distinct record at `s` (byte-identical copies count once; the fork set is V5b's `forked()`), and that record's hash must be `h`. If not, one finding is reported, choosing the first failing check in this order:
+     1. `seq <s> is forked` (no location);
+     2. `no record at seq <s>` (no location);
+     3. `record at seq <s> has hash blake3:<64 hex>` (at that record).
+   - **Above `s`:** there must be no record of the verified trail with a `seq` above `s`. If there is, one finding is reported, at the first such record in merge order, with detail `records seq <a>..=<b> above the end`, where `a` and `b` are the lowest and highest such `seq`.
+
+   Every detail starts with `end=<s>:blake3:<64 hex>: `.
+2. **A matching `end=`** is one where neither condition fails. A match grants exactly three things, and a mismatch grants none of them:
+   1. **Tail exemption.** The report's tail exemption is set: `UncoveredTail` is still reported (info), but `--strict` does not fail on it.
+   2. **Bounds confirmed.** Every `through=` bound in the section whose `seq` is at or below `s` is confirmed, so no `RevocationUnconfirmed`. Its pin is still checked (13-V5-d3, 13-V5-d4).
+   3. **Repairs.** A `TornWrite` whose attester meets 13-V5-d2 (a record of the verified trail, not forked) and has `seq` at or below `s` becomes `TornWriteRepaired`, just as when coverage reaches it.
+3. **No `end=`** in the section: nothing is checked and nothing is granted.
+
+
+---
+
+# [Comment #40]() by [gerchowl]()
+
+_Posted on November 19, 2026 at 11:44 PM_
+
+**Ruling 13-V5-d6 (#13 V5e): `max_age` API, clock seam and `StaleHead` grammar**
+
+This ruling makes 13-V5-d1 point 7 concrete.
+
+1. **API.**
+   - `Verifier::max_age(self, max_age: Duration) -> Result<Self, AuditError>` (ADR §19.2, decision 11 l.771). In V5e it always returns `Ok`. `InvalidConfig` arrives with `end_before` in V6, raised by whichever of the two calls comes second.
+   - Calling it again replaces the earlier value.
+   - `Duration::ZERO` is accepted: then any trusted checkpoint older than "now" is stale.
+2. **Clock.** "Now" comes from a crate-private clock seam. Production reads `SystemTime::now()` once per verify call. Tests inject a fixed instant through a `#[cfg(test)]` constructor and never sleep.
+   - A checkpoint's age is `now − time`, computed in nanoseconds on the record's signed `time` field with checked arithmetic.
+   - A `time` in the future has age 0, so it is not stale. That case is a clock problem, which `ClockWentBackwards` and other findings cover; it is not staleness.
+3. **Which checkpoint.** Use the trusted checkpoint (13-V5-d1 point 3) with the highest `seq`, including shipped-only copies (point 1). Ties at one `seq` cannot occur, because a forked `seq` has no single record; at a forked `seq`, take the highest unforked trusted one below it. This is the same fail-closed rule as 13-V5-d2.
+4. **`StaleHead`** is an error.
+   - **Stale:** if that checkpoint's age exceeds `max_age`, report one finding at its `seq` and its first copy's file and line, with detail exactly `newest trusted checkpoint seq <n> time <t> is older than max_age <d> at <now>`. `<t>` and `<now>` are Unix nanoseconds; `<d>` is nanoseconds; all are decimal integers.
+   - **No trusted checkpoint:** if `max_age` is set and no trusted checkpoint exists, report one finding with no location and no `seq`, detail exactly `no trusted checkpoint (max_age <d>)`.
+   - **Not set:** without `max_age`, nothing is checked.
+
+
+---
+
+# [Comment #41]() by [gerchowl]()
+
+_Posted on November 20, 2026 at 02:30 AM_
+
+**Ruling 13-V6-d1 (#13 V6): split, anchors, and the `end_before` readings**
+
+A design check at dev `dea5500` found that `AnchorMismatch`, `StartMismatch`, `UnanchoredStart`, `UnanchoredEnd` and `OutOfRange` are declared but never emitted, that `Verifier` has no `anchor`, `start_from` or `end_before`, and that `Checkpoint` carries no trail and no `prev_hash`. Decision 11 and ruling 13-d1 (OQ3, OQ15) already fix the API shapes. This ruling settles the readings where the ADR text admits two outcomes.
+
+1. **Split.** V6 lands as five serial PRs, because each touches `engine.rs`, the `FindingKind` docs, `CHANGELOG.md` and the API snapshot:
+   - **V6a, anchors:** a private trail on `Checkpoint`, `Verifier::anchor`, `AnchorMismatch` (decision 10).
+   - **V6b, `start_from` acceptance:** a private `prev_hash` on `Checkpoint`, `Verifier::start_from`, `StartMismatch`, and no `SeqGap` below an accepted start.
+   - **V6c, inputs below a start:** a crate-private position classifier (`InRange`, `BelowStart { anchored }`, `AboveEnd`) and one shared "anchored" predicate. Anchors and `through=` pins below the start become `OutOfRange` or `UnanchoredStart`. The revocation rules still apply above the start.
+   - **V6d, `end_before`:** parsing the record, the end anchor, `TrailEnded` at or above the end, the chain link to the end, and the conflict with `max_age`.
+   - **V6e, inputs above the end:** `OutOfRange` or `UnanchoredEnd` per input, `RevocationUnconfirmed` suppressed, and point 6 below.
+
+   The classifier has no gap arm before V7, because nothing can confirm a gap until receipts and `accept Resumed` exist. The anchors-and-pins-in-a-gap half of decision 5 ("set aside only when the opening is anchored") therefore lands with V7, as do the receipt, waiver and `from` halves of the decision 11 bullets.
+2. **What an anchor matches (decision 10).** An anchor matches only when the trail holds exactly one record at its `seq`, and that record has the anchor's hash, in an anchor from the verified trail. Each distinct anchor `(trail, seq, hash)` is checked once; duplicates collapse. A failure is one `AnchorMismatch` (error) at that `seq`. Its location is the first copy of the record at that `seq`; if no record exists, there is no location. Only the first failing condition counts, in this order:
+   1. `anchor seq <s> hash <hex>: trail differs`
+   2. `anchor seq <s> hash <hex>: no record`
+   3. `anchor seq <s> hash <hex>: seq is forked`
+   4. `anchor seq <s> hash <hex>: hash differs (record <hex>)`
+
+   A forked `seq` is never matched, even when one copy has the anchor's hash. This is the same fail-closed rule as 13-V5-d3, d5 and d6, and it uses the one fork definition, `forked()`. Byte-identical duplicates are not a fork. An anchor that does not match never counts as anchoring anything: a start, an end, or an opening.
+
+   Shipped-only copies count as records "in the trail" for matching, as in 13-V5-d4. The anchor pins the content by its hash, whichever file holds it. Anchors need no signature check, because supplying one is the operator's statement (decision 10).
+3. **The chain link to the end (decision 11 `end_before` "It pins the tail"; the "Tail cut" and H1 bullets).** The end checkpoint must link to the last record in the files by the chain rule. If it does not, report `ChainBroken` (its `prev_hash` is not the hash of the last record), and also `SeqGap` where the `seq` does not follow. Both findings are reported. A resume line in the record makes a jump into a gap only when its head names exactly the last record; otherwise it is `SeqGap`.
+4. **A record that differs from the end anchor (the "Step 7 takes the end from the anchor store" bullet).**
+   - `UnanchoredEnd` (error) is reported once, at the end checkpoint's `seq`, exactly when no end anchor is given.
+   - When an end anchor is given and the record's first line is not byte-equal to the entry's line, the finding is `AnchorMismatch` with detail `end record differs from end anchor`.
+     - The comparison takes the first line of each side without its terminating LF. Whitespace counts.
+     - The entry also runs through point 2 as an ordinary anchor against the verified set, which includes the record's lines.
+   - The end is **anchored** only when an end anchor is given, the record's first line is byte-equal to it, and the entry passes point 2.
+5. **Inputs above the end.** Above an anchored end, each input is `OutOfRange` (info). Above an end that is not anchored, each input is `UnanchoredEnd` (error), one per input, naming it. This is the counterpart of `UnanchoredStart`; see the "Inputs outside a batch" bullet. The single `UnanchoredEnd` of point 4 is reported as well.
+6. **A trust-file `end=` above the end of a batch** (deferred from 13-V5-d1 point 5). It is `OutOfRange` (info), like every other trust-file input above the end. It grants nothing from 13-V5-d5: no tail exemption, no confirmation, no repair promotion.
+   - Why: the trust file cannot be cut per batch (decision 9; decision 11, "It ends the range"). Under the other reading, every batch of a retired trail would fail step 7 forever with `TrailEnded "no record"`.
+   - V6e adds an amendment line to decision 11 citing this ruling.
+7. **Still open (decided before V6d is dispatched).** It is not yet settled whether the end record's lines take part in run classification as "the segment that follows the files". The question is whether an archive batch whose end is a resume opening seals the run before it for `accept-run`. Rulings 13-V4-d5, d6 and d8 bear on this. A design check scoped to V6d will settle it, and it will be ruled before V6d is dispatched. V6a to V6c do not depend on it.
+8. **`max_age` × `end_before`.** The conflict is `InvalidConfig`, raised by whichever of the two calls comes second (§19.2). V6d adds the check to both `end_before` and `max_age`. Until then `max_age` returns `Ok`.
+
+
+---
+
+# [Comment #42]() by [gerchowl]()
+
+_Posted on November 20, 2026 at 05:03 AM_
+
+**Ruling 13-V6-d2 (#13 V6b): `start_from` acceptance and the `StartMismatch` grammar**
+
+This makes 13-V6-d1 point 1 (V6b) concrete. Decision 11 `.start_from` (ADR-0005 ~l.749–759) fixes the rule. This ruling fixes what the text leaves open.
+
+1. **API.** `Verifier::start_from(self, start: Checkpoint) -> Self`, which is infallible (decision 11). A second call replaces the first. Without a call, nothing changes.
+2. **"The first record in the files"** is the record with the lowest `seq` in the verified set (native and shipped copies merged by `seq`, OQ4). A byte-identical duplicate counts as one record.
+3. **Acceptance.** The start is accepted only when every condition below holds. If one fails, report exactly one `StartMismatch` (error) at the start's `seq`, with the detail of the first failing condition, in this order:
+   1. `start seq <s> hash <hex>: trail differs` (the start's trail is not the verified trail);
+   2. `start seq <s> hash <hex>: no record` (the verified set is empty);
+   3. `start seq <s> hash <hex>: not the first record (first seq <f>)`;
+   4. `start seq <s> hash <hex>: seq is forked` (13-V6-d1 point 2; `forked()`);
+   5. `start seq <s> hash <hex>: not a checkpoint`;
+   6. `start seq <s> hash <hex>: hash differs (record <hex>)`;
+   7. `start seq <s> hash <hex>: not trusted at its seq`. This is V5's single `trusted` predicate: a valid `verify_strict` signature by a key trusted for the trail at `s`. The predicate's own findings (`BadSignature`, `UntrustedKey`) are still reported as usual.
+
+   Location: the first copy of the first record. With no record, there is no location.
+4. **A start that is not accepted is not used** (decision 11). Verification runs exactly as if no start had been given. In particular, the `SeqGap` for the missing prefix is still reported.
+5. **An accepted start.**
+   - No `SeqGap` is reported for `0..s−1`. Nothing else changes: the chain, the fold, signatures, trust, coverage and revocation run as they do today from the first checkpoint, and "the revocation rules above the start still apply" holds with no special case.
+   - The start's line is identical to the first record's, because its hash matches. So the start supplies no `prev_hash` or peaks beyond what the record already carries. `Checkpoint` gains no `prev_hash` field in V6b; this narrows 13-V6-d1 point 1, since such a field would be dead state.
+6. **Inputs below the start** (anchors, pins) keep their current findings in V6b. V6c gives them `OutOfRange` or `UnanchoredStart` (13-V6-d1 point 1).
+
+
+---
+
+# [Comment #43]() by [gerchowl]()
+
+_Posted on November 20, 2026 at 06:35 AM_
+
+**Ruling 13-V6-d3 (#13 V6c): inputs below an accepted start**
+
+This makes concrete the V6c item of 13-V6-d1 point 1, together with decision 11's "A signature alone never demotes anything" (ADR-0005 ~l.753–757) and its test bullets (~l.935–939).
+
+1. **Scope.** V6c covers the two outside inputs that exist today: anchors and `through=` pins. Receipts, waivers, `from`, `accept` and `accept-run` follow the same rule through the same classifier once they land (#13).
+2. **Classifier.** A crate-private position function sorts a `seq` into one of two cases:
+   - `BelowStart { anchored }` when there is an accepted start (13-V6-d2) and the `seq` is strictly below it;
+   - `InRange` otherwise, including always when no start was accepted.
+
+   The `AboveEnd` arm is added with `end_before`, and the gap arm with receipts. Neither has a producer before then, so neither is written now. This narrows 13-V6-d1 point 1.
+3. **The start is anchored** exactly when the anchors include one whose `(trail, seq, hash)` equals the accepted start. Acceptance already guarantees that this anchor matches under 13-V6-d1 point 2.
+4. **An anchor below the start.**
+   - An anchor from another trail is still `AnchorMismatch … trail differs`. Another trail's anchor is never set aside.
+   - Otherwise, the anchor's `AnchorMismatch` check is replaced by one finding at the anchor's `seq`, with no location. The detail is exactly `anchor seq <a> hash <hex>: below start seq <s>`.
+     - It is `OutOfRange` (info) when the start is anchored.
+     - It is `UnanchoredStart` (error) otherwise.
+5. **A `through=<b>:<h>` pin below the start** (`b < s`).
+   - The pin check (13-V5-d3 and d4) is replaced by one finding at `b`, with no location. The detail is exactly `key <64 hex> through=<b>: below start seq <s>`.
+     - It is `OutOfRange` (info) when the start is anchored.
+     - It is `UnanchoredStart` (error) otherwise.
+   - The confirmation check is unchanged ("the revocation rules above the start still apply"). It needs only records above the bound.
+   - A bound at `b = s` or above it is in range.
+6. **Nothing below the start → no finding.** An unanchored start with nothing below it is accepted and reports nothing extra.
+7. **Unchanged in V6c.** A trust-file `end=` below the start keeps its 13-V5-d5 behaviour. Decision 11 does not list `end=` among the inputs it sets aside below a start. 13-V6-d1 point 6 covers `end=` only above an end.
+
+
+---
+
+# [Comment #44]() by [gerchowl]()
+
+_Posted on November 20, 2026 at 07:01 AM_
+
+**Ruling 13-V6-d4 (#13 V6d): `end_before`, how the end record is read, and the end of the range**
+
+This ruling settles 13-V6-d1 point 7 and the rest of the `end_before` mechanics, after a design check at dev `ffd729a`. The probes used a trail archived at a resume opening:
+- archive plus live gave one run finding with digest D;
+- the archive alone gave no run finding;
+- the archive with the end record walked as a following native segment gave the same finding and the same digest D;
+- the end record merged only by `seq` gave no run finding.
+
+1. **The end record is the segment that follows the files** (decision 11, "It pins the tail"; l.857 item 5(b); l.956). Its lines go into the verify call as one in-memory native segment after the last file. The shared classifier walks it through the existing in-memory byte source, so every existing rule applies to it: chain, signatures, trust, resume declarations, run sealing and the run digest. That gives the step 6 and step 7 checks of decision 2 the same run finding and digest for a run archived in the batch. One snapshot (13-V4-d5) still holds: the record is an input string, not a second read.
+2. **The end of the range is the record's last line.** This is the resume line's `seq` when there is one, otherwise the checkpoint's `seq` (decision 11 l.760, "a `seq` above the last line of the file"). The following are in range, so an `accept-run` or `accept Resumed` line that names the end record's own resume is not out of range:
+   - the end checkpoint;
+   - its resume line.
+
+   This refines 13-V6-d1 point 5: "above the end" means above that last line.
+3. **Records in the files at or above the end checkpoint's `seq`.** Report one `TrailEnded` (error) with detail exactly `end_before seq <e>: records seq <a>..=<b> at or above the end`, located at the first such record in merge order.
+   - At those `seq`s no `DuplicateRecord` is reported, even for a byte-identical copy of an end line.
+   - A different record at such a `seq` is still a fork (`SeqConflict`), as it is anywhere.
+4. **Parsing (exit 2 / `InvalidConfig`).** The record is valid only when all of these hold:
+   - It is one line, or two lines, separated by LF, with one optional final LF.
+   - The first line passes `Checkpoint::parse`.
+   - A second line, if present, is a single record whose action is `vigil.audit.resume`, whose `seq` is the checkpoint's `seq + 1`, and whose `prev_hash` is the checkpoint's hash.
+
+   Anything else is `InvalidConfig` and names the reason. That includes an empty line, a third line, CR, a non-checkpoint first line, and a second line that does not follow the checkpoint. Whether the resume's head is right is a finding (`Resumed … structural=…`, `SeqGap`), not a usage error.
+5. **The end anchor.**
+   - **No end anchor:** report one `UnanchoredEnd` (error) at the end checkpoint's `seq`, with no location and detail exactly `end_before seq <e>: no end anchor`.
+   - **End anchor given:** if its line is not byte-equal to the record's first line (each side without its LF; whitespace counts), report `AnchorMismatch` at the end checkpoint's `seq`, with no location and detail exactly `end record differs from end anchor`.
+   - **Anchor rule:** the end anchor also joins the anchors, and so goes through 13-V6-d1 point 2 against the verified set, which includes the record's lines.
+   - **Anchored:** the end is anchored when the anchor was given, the bytes are equal, and the anchor matches.
+6. **Locations.** A finding that sits on an end-record line has no file and no line. Its `seq` identifies it, and no synthetic path is invented.
+7. **Conflicts.** `end_before` with `max_age` set, and `max_age` with `end_before` set, are both `InvalidConfig`, raised by whichever call comes second (§19.2). A second `end_before` call replaces the first.
+8. **Split.**
+   - **V6d1:** points 1, 3, 4, 5, 6 and 7, with rows for "Step 7 takes the end from the anchor store", the third line of "Batch 2" (exit 2), the step 6 and step 7 digest equality, and the conflict clause.
+   - **V6d2:** the chain link to the end across a `seq` jump (13-V6-d1 point 3: `ChainBroken` plus `SeqGap`), the resume line's head rule, and the "Tail cut" and H1 step 7 rows.
+   - **V6e:** the `AboveEnd` arm and inputs above the end (13-V6-d1 points 5 and 6).
 
 
