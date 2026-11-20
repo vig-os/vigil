@@ -1,6 +1,9 @@
 //! Offline collecting verifier and results (ADR-0005).
 use super::{AuditError, AuditErrorKind, FindingKind, TrustPolicy};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+};
 mod end;
 mod engine;
 mod fold;
@@ -9,6 +12,7 @@ pub(crate) mod lines;
 mod resume;
 mod revocation;
 mod signatures;
+mod stale;
 
 /// Severity of a finding produced by the offline verifier (#13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -253,6 +257,8 @@ mod revocation_tests;
 mod rule2_tests;
 #[cfg(test)]
 mod runs_tests;
+#[cfg(test)]
+mod stale_tests;
 
 /// Verifies a directory using a cloned, validated trust policy.
 ///
@@ -321,11 +327,20 @@ pub fn verify(dir: &Path, trust: &TrustPolicy) -> Result<Report, AuditError> {
 pub struct Verifier {
     trust: TrustPolicy,
     trail: Option<[u8; 16]>,
+    max_age: Option<Duration>,
+    #[cfg(test)]
+    now_override: Option<SystemTime>,
 }
 impl Verifier {
     /// Takes ownership of a validated policy. Multiple pins require [`Self::trail`].
     pub fn new(trust: TrustPolicy) -> Self {
-        Self { trust, trail: None }
+        Self {
+            trust,
+            trail: None,
+            max_age: None,
+            #[cfg(test)]
+            now_override: None,
+        }
     }
     /// Narrows verification to a pinned trail, independently of input contents.
     ///
@@ -339,6 +354,34 @@ impl Verifier {
             ));
         }
         self.trail = Some(id);
+        Ok(self)
+    }
+    /// Reports [`StaleHead`](FindingKind::StaleHead) when the newest
+    /// trusted checkpoint (ruling 13-V5-d1 point 3) is older than
+    /// `max_age` (ADR-0005 decision 5; rulings 13-V5-d1 point 7 and
+    /// 13-V5-d6). `Duration::ZERO` is accepted; calling this again
+    /// replaces the earlier value.
+    ///
+    /// "Now" is taken once per verify call from the system clock. Age
+    /// is `now - time` in nanoseconds against the checkpoint's signed
+    /// `time` with checked arithmetic; a `time` in the future
+    /// saturates to age zero and is not stale (clock problems are the
+    /// business of [`ClockWentBackwards`](FindingKind::ClockWentBackwards),
+    /// not `StaleHead`).
+    ///
+    /// It detects a stopped writer and a rollback after which **no**
+    /// checkpoint was signed again. It does **not** detect a rollback
+    /// once any writer has signed a fresh checkpoint on the shortened
+    /// trail; for example, a writer restarted without `expect_head` on
+    /// a live file truncated at a record boundary, or a sealed segment
+    /// renamed back to `audit.jsonl`.
+    ///
+    /// # Errors
+    /// Always `Ok` in #13 V5e. Combining `max_age` with `end_before`
+    /// yields `InvalidConfig` from whichever call comes second
+    /// (ADR-0005 §19.2; #13 V6).
+    pub fn max_age(mut self, max_age: Duration) -> Result<Self, AuditError> {
+        self.max_age = Some(max_age);
         Ok(self)
     }
     /// Expands a directory's vigil files and verifies its confirmed snapshot.
@@ -371,6 +414,28 @@ impl Verifier {
             .ok_or_else(|| {
                 AuditError::new(AuditErrorKind::InvalidConfig, "select a pinned trail")
             })?;
-        Ok(engine::check(input::collect(files)?, trail, &self.trust))
+        Ok(engine::check(
+            input::collect(files)?,
+            trail,
+            &self.trust,
+            self.max_age,
+            self.now(),
+        ))
+    }
+    #[cfg(not(test))]
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+    #[cfg(test)]
+    fn now(&self) -> SystemTime {
+        self.now_override.unwrap_or_else(SystemTime::now)
+    }
+    /// `#[cfg(test)]` clock seam (ruling 13-V5-d6 point 2): injects the
+    /// fixed instant `verify_*` reads once per call, so the rows pin
+    /// the age arithmetic without any wall-clock assertion.
+    #[cfg(test)]
+    pub(crate) fn with_now_for_test(mut self, now: SystemTime) -> Self {
+        self.now_override = Some(now);
+        self
     }
 }

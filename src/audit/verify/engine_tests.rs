@@ -22,7 +22,13 @@ fn trust_trail() -> crate::audit::TrustPolicy {
         .unwrap()
 }
 fn check(collection: Collection, trail: [u8; 16]) -> Report {
-    super::check(collection, trail, &trust_trail())
+    super::check(
+        collection,
+        trail,
+        &trust_trail(),
+        None,
+        std::time::SystemTime::now(),
+    )
 }
 fn record(seq: u64, hash: u8, previous: [u8; 32], time: u64) -> Summary {
     Summary {
