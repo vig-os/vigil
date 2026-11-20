@@ -19,15 +19,14 @@ mod stale;
 mod start;
 
 /// The first record copy in the engine's merge order
-/// (`(input_pos, line, hash)`): the same copy [`FindingKind::DuplicateRecord`]
-/// reports as the original (ruling 13-V5-d4). Shared by the location
-/// rule in `anchors`, `end` and `stale`; accepts a borrowed iterator
-/// so `stale` can pre-filter by its trusted predicate. The sort key
-/// is the input's position in the collection, set by
-/// [`input::collect`] and [`input::append_native`]: the end-record
-/// input is appended last, so at any shared `seq` its copies sort
-/// strictly after every file copy and "first copy" is always a file
-/// copy whenever one exists (ruling 13-V6-d4 point 3).
+/// (`(is_end_record, path, line, hash)`): the same copy
+/// [`FindingKind::DuplicateRecord`] reports as the original (ruling
+/// 13-V5-d4). Shared by the location rule in `anchors`, `end` and
+/// `stale`; accepts a borrowed iterator so `stale` can pre-filter by
+/// its trusted predicate. [`input::Summary::is_end_record`] sorts
+/// the end-record copies strictly after every file copy at a shared
+/// `seq`, so "first copy" is always a file copy whenever one exists
+/// (ruling 13-V6-d4 point 3).
 pub(in crate::audit::verify) fn first_copy<'a, I>(
     copies: I,
 ) -> Option<(&'a Path, &'a input::Summary)>
@@ -36,7 +35,7 @@ where
 {
     copies
         .into_iter()
-        .min_by_key(|(_path, record)| (record.input_pos, record.line, record.hash))
+        .min_by_key(|(path, record)| (record.is_end_record, *path, record.line, record.hash))
         .copied()
 }
 
@@ -685,20 +684,20 @@ impl Verifier {
         let mut collection = input::collect(files)?;
         // Ruling 13-V6-d4 points 1 and 5: the archive record goes
         // in as one native segment after the files, and the end
-        // anchor also joins the anchors.
-        let record_path = end_before::record_path();
+        // anchor also joins the anchors. The path is a plain label
+        // for diagnostics only; [`input::Input::is_end_record`]
+        // identifies the segment for ordering and strip-location.
         let mut joined_anchors = self.anchors.clone();
         let end_ctx = self.end_before.as_ref().map(|eb| {
             input::append_native(
                 &mut collection,
-                input::end_record_input(eb.parsed_bytes.clone(), record_path.clone()),
+                input::end_record_input(eb.parsed_bytes.clone(), PathBuf::from("<end record>")),
             );
             joined_anchors.extend(eb.anchor.clone());
             end_before::Context {
                 end_seq: eb.end_seq,
                 first_line: &eb.first_line,
                 anchor: eb.anchor.as_ref(),
-                record_path: &record_path,
             }
         });
         Ok(engine::check(

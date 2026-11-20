@@ -15,10 +15,7 @@ use super::{Finding, input::Summary};
 use crate::audit::{
     AuditError, AuditErrorKind, Checkpoint, FindingKind as K, Record, format::Kind,
 };
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, path::Path};
 
 type Located<'a> = (&'a Path, &'a Summary);
 
@@ -33,9 +30,6 @@ pub(super) struct Parsed {
 /// `InvalidConfig` naming the first failing rule; a trailing LF is
 /// accepted.
 pub(super) fn parse(end_record: &str) -> Result<Parsed, AuditError> {
-    if end_record.is_empty() {
-        return Err(invalid("end_record is empty"));
-    }
     if end_record.as_bytes().contains(&b'\r') {
         return Err(invalid("end_record contains CR"));
     }
@@ -55,9 +49,6 @@ pub(super) fn parse(end_record: &str) -> Result<Parsed, AuditError> {
     segment_bytes.extend_from_slice(first.as_bytes());
     segment_bytes.push(b'\n');
     if let Some(second) = second {
-        if second.is_empty() {
-            return Err(invalid("end_record has an empty second line"));
-        }
         validate_resume(second, &checkpoint)?;
         segment_bytes.extend_from_slice(second.as_bytes());
         segment_bytes.push(b'\n');
@@ -68,17 +59,21 @@ pub(super) fn parse(end_record: &str) -> Result<Parsed, AuditError> {
     })
 }
 
+/// One unified check for "the second line is a `vigil.audit.resume`
+/// record": parsing it, demanding a single record, and demanding the
+/// `vigil.audit.resume` action all funnel through the same filter
+/// and the same error. Both an unparsable line and a parseable but
+/// non-resume entry fail the same check, so a mutation that removes
+/// the check fails on either kind of row.
 fn validate_resume(line: &str, checkpoint: &Checkpoint) -> Result<(), AuditError> {
-    let records = Record::parse_line(line.as_bytes())
-        .map_err(|_| invalid("end_record second line is not a resume"))?;
-    let [record] = <[Record; 1]>::try_from(records)
-        .map_err(|_| invalid("end_record second line is not a single record"))?;
-    let Kind::Entry(entry) = &record.kind else {
-        return Err(invalid("end_record second line is not a resume"));
-    };
-    if entry.action != "vigil.audit.resume" {
-        return Err(invalid("end_record second line is not a resume"));
-    }
+    let record = Record::parse_line(line.as_bytes())
+        .ok()
+        .filter(|records| records.len() == 1)
+        .and_then(|mut records| records.pop())
+        .filter(|record| {
+            matches!(&record.kind, Kind::Entry(entry) if entry.action == "vigil.audit.resume")
+        })
+        .ok_or_else(|| invalid("end_record second line is not a resume"))?;
     let expected_seq = checkpoint
         .seq()
         .checked_add(1)
@@ -103,7 +98,6 @@ pub(super) struct Context<'a> {
     pub(super) end_seq: u64,
     pub(super) first_line: &'a str,
     pub(super) anchor: Option<&'a Checkpoint>,
-    pub(super) record_path: &'a Path,
 }
 
 /// `true` iff this `seq` is at or above the end checkpoint's `seq`
@@ -124,7 +118,7 @@ pub(super) fn check(
 ) {
     let mut in_files: Vec<(u64, Located<'_>)> = Vec::new();
     for (&seq, copies) in groups.range(ctx.end_seq..) {
-        if let Some(located) = first_file_copy(copies, ctx.record_path) {
+        if let Some(located) = first_file_copy(copies) {
             in_files.push((seq, located));
         }
     }
@@ -161,21 +155,15 @@ pub(super) fn check(
 }
 
 /// The first file copy at this `seq` in the engine's merge order,
-/// excluding the end-record segment; `None` when every copy sits on
-/// the end-record. Shares the engine's input-position sort key so a
-/// `TrailEnded` always locates at the same copy the main seq-loop
-/// chose for `SeqConflict` and `DuplicateRecord` at that `seq`.
-fn first_file_copy<'a>(copies: &[Located<'a>], end_path: &Path) -> Option<Located<'a>> {
+/// excluding the end-record segment. The filter reads
+/// [`Summary::is_end_record`] so no path value is compared against a
+/// sentinel; the sort key `(path, line, hash)` matches the file
+/// copies the engine's main seq-loop would pick for `SeqConflict`
+/// and `DuplicateRecord` at that `seq`.
+fn first_file_copy<'a>(copies: &[Located<'a>]) -> Option<Located<'a>> {
     copies
         .iter()
-        .filter(|(path, _)| *path != end_path)
-        .min_by_key(|(_, r)| (r.input_pos, r.line, r.hash))
+        .filter(|(_, r)| !r.is_end_record)
+        .min_by_key(|(path, r)| (*path, r.line, r.hash))
         .copied()
-}
-
-/// Sentinel path for the in-memory end-record segment. Findings
-/// located on this path are unlocated by
-/// [`super::engine::check`] before the sort (ruling 13-V6-d4 point 6).
-pub(super) fn record_path() -> PathBuf {
-    PathBuf::new()
 }

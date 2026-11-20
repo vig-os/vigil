@@ -467,12 +467,12 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     let mut count = 0;
     let mut previous: Option<(u64, Vec<Located<'_>>)> = None;
     for (&seq, copies) in &mut groups {
-        // Order copies by the input's position in the collection
-        // (ruling 13-V6-d4 point 3). The end-record input is
-        // appended last by `verify_files`, so its copies always
-        // sort after every file copy at the same `seq`; "first
-        // copy" never resolves to the end record.
-        copies.sort_by_key(|(_path, r)| (r.input_pos, r.line, r.hash));
+        // Order copies by `(is_end_record, path, line, hash)` so
+        // the end-record copies always sort after every file copy
+        // at the same `seq` (ruling 13-V6-d4 point 3); "first copy"
+        // never resolves to the end record, and files are ordered
+        // by path exactly as they were before `end_before`.
+        copies.sort_by_key(|(path, r)| (r.is_end_record, *path, r.line, r.hash));
         let mut distinct = BTreeMap::new();
         for &(path, record) in copies.iter() {
             distinct.entry(record.hash).or_insert((path, record));
@@ -685,8 +685,17 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // happens inside the seq loop; these three are the rest.
     if let Some(ctx) = end_ctx {
         end_before::check(ctx, &groups, &mut findings);
+        // Identify the end-record inputs by their
+        // `Input::is_end_record` flag (not by path value), then
+        // unlocate every finding whose file is one of their paths.
+        let end_paths: Vec<&Path> = collection
+            .inputs
+            .iter()
+            .filter(|i| i.is_end_record)
+            .map(|i| i.path.as_path())
+            .collect();
         for f in &mut findings {
-            if f.file() == Some(ctx.record_path) {
+            if f.file().is_some_and(|fp| end_paths.contains(&fp)) {
                 f.strip_location();
             }
         }

@@ -198,7 +198,7 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
             checkpoint: None,
             operator: None,
             line: seq + 1,
-            input_pos: 0,
+            is_end_record: false,
         }
     }
     // The chain loop emits one ChainBroken for the seq-0 record (its
@@ -225,6 +225,7 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
     let input = Input {
         path: PathBuf::from("copy"),
         native: false,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: None,
             records: vec![broken_record],

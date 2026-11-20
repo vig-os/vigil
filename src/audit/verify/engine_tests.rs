@@ -46,7 +46,7 @@ fn record(seq: u64, hash: u8, previous: [u8; 32], time: u64) -> Summary {
         checkpoint: None,
         operator: None,
         line: seq.saturating_add(1),
-        input_pos: 0,
+        is_end_record: false,
     }
 }
 fn run(records: Vec<Summary>) -> Report {
@@ -56,6 +56,7 @@ fn run(records: Vec<Summary>) -> Report {
             inputs: vec![Input {
                 path: PathBuf::from("shipped"),
                 native: false,
+                is_end_record: false,
                 data: Rc::new(Data {
                     bytes: Some(Rc::from(&[][..])),
                     records,
@@ -175,26 +176,14 @@ fn ordering_is_seq_then_path_line_kind_with_unlocated_seq_last() {
         inputs: vec![],
         shipped: vec![],
     };
-    // Build two shipped inputs. "z" is pushed first (input_pos 0),
-    // "a" second (input_pos 1); the engine's per-`seq` copy order
-    // is by `(input_pos, line, hash)` (ruling 13-V6-d4 point 3), so
-    // the first copy at `seq` 0 is "z", and the located
-    // `ChainBroken`/`DuplicateRecord` land there. The final
-    // report-level finding sort is still `(seq.is_none(), seq,
-    // file, line, kind)`, so unlocated-seq entries follow in the
-    // "a" < "z" path order.
-    for (pos, name) in ["z", "a"].iter().enumerate() {
-        let pos = u32::try_from(pos).unwrap();
+    for name in ["z", "a"] {
         collection.inputs.push(Input {
-            path: (*name).into(),
+            path: name.into(),
             native: false,
+            is_end_record: false,
             data: Rc::new(Data {
                 bytes: Some(Rc::from(&[][..])),
-                records: vec![{
-                    let mut r = record(0, 1, [9; 32], 0);
-                    r.input_pos = pos;
-                    r
-                }],
+                records: vec![record(0, 1, [9; 32], 0)],
                 items: vec![
                     LineItem {
                         line: 2,
@@ -227,8 +216,8 @@ fn ordering_is_seq_then_path_line_kind_with_unlocated_seq_last() {
     assert_eq!(
         found,
         vec![
-            (Some(0), "z", Some(1), K::ChainBroken),
-            (Some(0), "z", Some(1), K::DuplicateRecord),
+            (Some(0), "a", Some(1), K::ChainBroken),
+            (Some(0), "a", Some(1), K::DuplicateRecord),
             (None, "a", Some(1), K::InvalidField),
             (None, "a", Some(2), K::InvalidField),
             (None, "z", Some(1), K::InvalidField),
@@ -287,7 +276,7 @@ mod ctx {
             }),
             operator: None,
             line: seq + 1,
-            input_pos: 0,
+            is_end_record: false,
         }
     }
     pub(super) fn resume_record(seq: u64, hash: u8, previous: [u8; 32], details: &str) -> Summary {
@@ -306,7 +295,7 @@ mod ctx {
                 Some(details.into()),
             )),
             line: seq + 1,
-            input_pos: 0,
+            is_end_record: false,
         }
     }
     pub(super) fn item_records(range: Range<usize>, line: u64) -> LineItem {
@@ -339,6 +328,7 @@ mod ctx {
         Input {
             path: path.into(),
             native: true,
+            is_end_record: false,
             data: Rc::new(Data {
                 bytes: Some(Rc::from(&[][..])),
                 records,
@@ -487,6 +477,7 @@ fn resume_at_genesis_with_no_opening_marks_structural_invalid_and_strict_fails()
             inputs: vec![Input {
                 path: "audit.jsonl".into(),
                 native: true,
+                is_end_record: false,
                 data: Rc::new(Data {
                     bytes: Some(Rc::from(&[][..])),
                     records: vec![open, r],
@@ -528,6 +519,7 @@ fn malformed_resume_declaration_emits_resumed_and_keeps_seq_gap() {
             c.inputs.push(Input {
                 path: "audit.jsonl".into(),
                 native: true,
+                is_end_record: false,
                 data: Rc::new(Data {
                     bytes: Some(Rc::from(&[][..])),
                     records: vec![open, r],
@@ -565,6 +557,7 @@ fn resume_in_native_and_shipped_emits_once_on_native() {
     let native_input = Input {
         path: "audit.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![open, r],
@@ -575,6 +568,7 @@ fn resume_in_native_and_shipped_emits_once_on_native() {
     let shipped_input = Input {
         path: "copy".into(),
         native: false,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![open2, r2],
@@ -618,6 +612,7 @@ fn no_crash_mark_appends_when_successor_opens_without_resume() {
     let current = Input {
         path: "audit-0.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![closing],
@@ -632,6 +627,7 @@ fn no_crash_mark_appends_when_successor_opens_without_resume() {
     let successor = Input {
         path: "audit.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![opening, next_record],
@@ -661,6 +657,7 @@ fn no_crash_mark_absent_when_archive_last_record_is_not_a_checkpoint() {
     let current = Input {
         path: "audit-0.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![last],
@@ -672,6 +669,7 @@ fn no_crash_mark_absent_when_archive_last_record_is_not_a_checkpoint() {
     let successor = Input {
         path: "audit.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![opening],
@@ -702,6 +700,7 @@ fn no_crash_mark_absent_when_opening_does_not_link_to_closing() {
     let current = Input {
         path: "audit-0.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![closing],
@@ -714,6 +713,7 @@ fn no_crash_mark_absent_when_opening_does_not_link_to_closing() {
     let successor = Input {
         path: "audit.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![opening],
@@ -744,6 +744,7 @@ fn no_crash_mark_absent_when_opening_seq_is_not_closing_plus_one() {
     let current = Input {
         path: "audit-0.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![closing],
@@ -756,6 +757,7 @@ fn no_crash_mark_absent_when_opening_seq_is_not_closing_plus_one() {
     let successor = Input {
         path: "audit.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![opening],
@@ -786,6 +788,7 @@ fn no_crash_mark_absent_when_successor_first_record_is_not_a_checkpoint() {
     let current = Input {
         path: "audit-0.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![closing],
@@ -798,6 +801,7 @@ fn no_crash_mark_absent_when_successor_first_record_is_not_a_checkpoint() {
     let successor = Input {
         path: "audit.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![opening],
@@ -827,6 +831,7 @@ fn no_crash_mark_absent_when_successor_second_record_is_resume() {
     let current = Input {
         path: "audit-0.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![closing],
@@ -844,6 +849,7 @@ fn no_crash_mark_absent_when_successor_second_record_is_resume() {
     let successor = Input {
         path: "audit.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![opening, r],
@@ -870,6 +876,7 @@ fn no_crash_mark_absent_for_archive_verified_alone() {
     let input = Input {
         path: "audit-0.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![closing],
@@ -907,6 +914,7 @@ fn no_crash_mark_takes_next_native_input_not_a_shipped_copy() {
     let archive = Input {
         path: "audit-0.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![closing],
@@ -921,6 +929,7 @@ fn no_crash_mark_takes_next_native_input_not_a_shipped_copy() {
     let shipped = Input {
         path: "copy".into(),
         native: false,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![shipped_record],
@@ -934,6 +943,7 @@ fn no_crash_mark_takes_next_native_input_not_a_shipped_copy() {
     let successor = Input {
         path: "audit.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![opening, next_record],
@@ -970,6 +980,7 @@ fn no_crash_mark_absent_when_successor_starts_with_fragment() {
     let current = Input {
         path: "audit-0.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![closing],
@@ -981,6 +992,7 @@ fn no_crash_mark_absent_when_successor_starts_with_fragment() {
     let successor = Input {
         path: "audit.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![opening],
@@ -1087,6 +1099,7 @@ fn foreign_trail_resume_is_trail_mismatch_without_resumed() {
     let input = Input {
         path: "audit.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![open, foreign_resume],
@@ -1117,6 +1130,7 @@ fn one_native(records: Vec<Summary>) -> Collection {
         inputs: vec![Input {
             path: "audit.jsonl".into(),
             native: true,
+            is_end_record: false,
             data: Rc::new(Data {
                 bytes: Some(Rc::from(&[][..])),
                 records,
@@ -1605,6 +1619,7 @@ fn v3b2_native_and_shipped_same_resume_show_same_suffix_once() {
     let native_input = Input {
         path: "audit.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![open, r],
@@ -1615,6 +1630,7 @@ fn v3b2_native_and_shipped_same_resume_show_same_suffix_once() {
     let shipped_input = Input {
         path: "copy".into(),
         native: false,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![open2, r2],
@@ -1811,6 +1827,7 @@ fn v3b2_collect_candidates_records_validated_tuple() {
     let native_copy = Input {
         path: "audit.jsonl".into(),
         native: true,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![
@@ -1834,6 +1851,7 @@ fn v3b2_collect_candidates_records_validated_tuple() {
     let shipped_copy = Input {
         path: "copy".into(),
         native: false,
+        is_end_record: false,
         data: Rc::new(Data {
             bytes: Some(Rc::from(&[][..])),
             records: vec![resume_record(

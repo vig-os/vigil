@@ -44,15 +44,15 @@ pub(super) struct Summary {
     // Only reserved records need text for #13 V3b resume/fragment context.
     pub(super) operator: Option<Operator>,
     pub(super) line: u64,
-    /// Index into [`Collection::inputs`] of the input that owns this
-    /// record, written by [`collect`] and [`append_native`] after the
-    /// `inputs` vector is fully ordered. Used as the primary sort key
-    /// for per-`seq` copies in the engine and in
-    /// [`super::first_copy`] (ruling 13-V5-d4, 13-V6-d4 point 3):
-    /// "first copy in merge order" is the copy whose input sorts
-    /// first, so the end-record input (appended last) is always the
-    /// last copy at its `seq` and never wins location over a file.
-    pub(super) input_pos: u32,
+    /// `true` iff this record belongs to the in-memory end-record
+    /// segment the verifier appended after the files (ruling 13-V6-d4
+    /// points 1, 3 and 6). Written where the end-record input is
+    /// built ([`end_record_input`]) and nowhere else; the engine and
+    /// [`super::first_copy`] read it as the primary sort key so file
+    /// copies always sort before the end-record copy at a shared
+    /// `seq`, and [`super::end_before::check`] reads it to pick the
+    /// first file copy for [`FindingKind::TrailEnded`].
+    pub(super) is_end_record: bool,
 }
 impl Summary {
     fn new(record: Record, line: u64) -> Self {
@@ -87,7 +87,7 @@ impl Summary {
             checkpoint,
             operator,
             line,
-            input_pos: 0,
+            is_end_record: false,
         }
     }
 }
@@ -127,6 +127,12 @@ pub(super) struct Data {
 pub(super) struct Input {
     pub(super) path: PathBuf,
     pub(super) native: bool,
+    /// `true` iff this input is the in-memory end-record segment
+    /// [`end_record_input`] built. The engine reads this to find the
+    /// end-record input in [`Collection::inputs`] when unlocating
+    /// end-record findings (ruling 13-V6-d4 point 6), and
+    /// [`Summary::is_end_record`] mirrors it on each record.
+    pub(super) is_end_record: bool,
     pub(super) data: Rc<Data>,
 }
 pub(super) struct Collection {
@@ -269,36 +275,36 @@ fn stream_into_data(reader: impl io::BufRead, retain: Option<Rc<[u8]>>) -> io::R
 
 /// Builds an in-memory native [`Input`] for the `end_before`
 /// archive record so the shared classifier walks it as the segment
-/// that follows the files (ruling 13-V6-d4 point 1). The `path` is a
-/// sentinel chosen by the caller (`end_before::record_path`),
-/// unlocated by the engine before the sort (ruling 13-V6-d4 point
-/// 6); its `file_name` is `None` so `native_segments` picks it up as
-/// sealed (`is_live = false`).
+/// that follows the files (ruling 13-V6-d4 point 1). The returned
+/// [`Input`] and every [`Summary`] it carries are marked
+/// [`Summary::is_end_record`]/[`Input::is_end_record`], so the
+/// engine and [`super::first_copy`] sort file copies ahead of them
+/// at any shared `seq` and [`super::end_before::check`] can pick a
+/// file copy for [`FindingKind::TrailEnded`] without consulting the
+/// path. The `file_name` of `path` is `None` so `native_segments`
+/// picks it up as sealed (`is_live = false`).
 pub(super) fn end_record_input(bytes: Vec<u8>, path: PathBuf) -> Input {
     let rc: Rc<[u8]> = Rc::from(bytes.into_boxed_slice());
-    let data = stream_into_data(io::Cursor::new(Rc::clone(&rc)), Some(rc))
+    let mut data = stream_into_data(io::Cursor::new(Rc::clone(&rc)), Some(rc))
         .expect("in-memory Cursor reads are infallible");
+    for record in &mut data.records {
+        record.is_end_record = true;
+    }
     Input {
         path,
         native: true,
+        is_end_record: true,
         data: Rc::new(data),
     }
 }
 
 /// Appends an in-memory native input to an already-built
-/// [`Collection`] and sets its spans' `seg` and its records'
-/// `input_pos` to its new position. Called after [`collect`] has set
-/// every existing record's `input_pos`, so the appended input's
-/// position is strictly greater than every file input's position and
-/// its copies sort last at any shared `seq` (ruling 13-V6-d4 point 3).
+/// [`Collection`] and sets its spans' `seg` to its new position.
 pub(super) fn append_native(collection: &mut Collection, mut input: Input) {
     let seg = u32::try_from(collection.inputs.len()).expect("too many native segments");
     let data = Rc::get_mut(&mut input.data).expect("appended end-record input owns its data");
     for span in &mut data.spans {
         span.seg = seg;
-    }
-    for record in &mut data.records {
-        record.input_pos = seg;
     }
     collection.inputs.push(input);
 }
@@ -336,6 +342,7 @@ fn copy(
             inode,
             Input {
                 native: native(&path),
+                is_end_record: false,
                 path,
                 data,
             },
@@ -433,11 +440,6 @@ fn collect_with(
     let mut shipped = Vec::new();
     for (i, input) in inputs.iter_mut().enumerate() {
         let data = Rc::get_mut(&mut input.data).expect("deduplicated input owns its data");
-        let pos = u32::try_from(i)
-            .map_err(|_| AuditError::new(AuditErrorKind::InvalidConfig, "too many inputs"))?;
-        for record in &mut data.records {
-            record.input_pos = pos;
-        }
         if input.native {
             for span in &mut data.spans {
                 span.seg = u32::try_from(i).map_err(|_| {
