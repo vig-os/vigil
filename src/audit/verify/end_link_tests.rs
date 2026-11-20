@@ -10,15 +10,16 @@
 //! Labels in each row's doc comment (ACCEPTANCE / REGRESSION)
 //! follow the repo-wide row standard.
 //!
-//! Fixture style: `AuditConfig::create`/`resume` always draw a
-//! random trail (and on `create`, use the wall clock) and the only
-//! clock seam is `pub(super)` inside `sink`, so these rows are
-//! hand-built. They use the fixture `TRAIL` and `signed_cp` /
-//! `entry_rec`, which construct a record through the same
-//! `Record::checkpoint` / `CheckpointFields` call the writer's
-//! `sink::signed` uses (`sink.rs` ~765..=781) and the same fixture
-//! signer, so the resulting records are byte-for-byte what the
-//! writer would emit at the fixture clock.
+//! Fixture style: the writer stamps every record with a wall-clock
+//! time stamp through a time hook that is `pub(super)` inside
+//! `sink` and is not reachable from this module, so the writer's
+//! record hashes drift per run and these rows are hand-built. They
+//! use the fixture `TRAIL` and `signed_cp` / `entry_rec`, which
+//! construct a record through the same `Record::checkpoint` /
+//! `CheckpointFields` call the writer's `sink::signed` uses
+//! (`sink.rs` ~765..=781) and the same fixture signer, so the
+//! resulting records are byte-for-byte what the writer would emit
+//! at the fixture clock.
 
 use crate::audit::{
     Checkpoint, Entry, FindingKind as K, Mmr, Record, TrustPolicy, digest_string, hex,
@@ -41,9 +42,8 @@ use super::end_before_tests::{
 // =====================================================================
 
 /// Record hash of `signed_cp(4, e3.hash(), &fold([cp0, e1, cp2, e3]))`
-/// on the hand-built L1/L4/L10 chain (`build_chain`): the close
-/// checkpoint reused as the end record for L1 and as the end anchor
-/// for L4.
+/// on the hand-built L1/L10 chain (`build_chain`): the close
+/// checkpoint reused as the end record for L1.
 const CP4_L1_DIGEST: &str =
     "blake3:3800e98faa1a668c094936a2489dd8d0c1db9ed5dd3c337dd1de87e030b784cd";
 /// Record hash of `signed_cp(3, e2.hash(), &fold([cp0, e1, e2]))` on
@@ -83,13 +83,13 @@ const MMR_SIZE1_CP0_ROOT: &str =
 const MMR_SIZE2_CP0_E1_ROOT: &str =
     "blake3:0233f700d6b926ff4f4b5acb5e25bae37975cd23a97ebe25d7c096fb281b12a2";
 /// MMR root of a size-3 fold over `[cp0, e1, cp2]` on the hand-built
-/// L1/L4/L10 chain. Appears in L1's and L4 step-7's `MmrMismatch`
-/// ("expected size 3 root ..." for the archive side).
+/// L1/L10 chain. Appears in L1's `MmrMismatch` ("expected size 3
+/// root ..." for the archive side).
 const MMR_SIZE3_CP0_E1_CP2_ROOT: &str =
     "blake3:3e3070dd2dba8c267662fb89cbeb5b88848d5146895bc4bb1258bf87aa510160";
 /// MMR root of a size-4 fold over `[cp0, e1, cp2, e3]` on the
-/// hand-built L1/L4/L10 chain: the root `cp4` declares. Appears in
-/// L1's and L4 step-7's `MmrMismatch` ("found size 4 root ...").
+/// hand-built L1/L10 chain: the root `cp4` declares. Appears in
+/// L1's `MmrMismatch` ("found size 4 root ...").
 const MMR_SIZE4_CP4_DECL_ROOT: &str =
     "blake3:a0500d3db204068be41c921d0141b63695101542cd99195fd796cc63695c2c82";
 /// MMR root of a size-3 fold over `[cp0, e1, e2_alt]` on the L3
@@ -101,6 +101,54 @@ const MMR_SIZE3_L3_ARCHIVE_ROOT: &str =
 /// scenario (a second independent seq-2 payload).
 const MMR_SIZE3_L3B_ARCHIVE_ROOT: &str =
     "blake3:9d2cc781b7cc611dc6bf301c634e0c96a55a1da29f9b68e47ea670f31918e6c6";
+/// Record hash of `signed_cp(1, cp0.hash(), &seeded(&cp0))` on the
+/// hand-built prefix-deletion chain (`build_prefix_deletion_chain`):
+/// the opening of S1.
+const CP1_PD_DIGEST: &str =
+    "blake3:8a7785644d05dbdbcd8b128eb1f17aca5206eca1b9448483a49e5cdfb7ed4c42";
+/// Record hash of `signed_cp(2, cp1.hash(), &pushed(&seeded(&cp0),
+/// &cp1))` on the prefix-deletion chain: the opening of S2 and
+/// the highest archive record for the step-7 chain compare.
+const CP2_PD_DIGEST: &str =
+    "blake3:5994ebc0656cdc5b1fbe0b37a163b3686b0e571d7b16c84737938149694f25b5";
+/// Record hash of `signed_cp(3, cp2_pd.hash(), fold {cp0,cp1,cp2})`
+/// on the prefix-deletion chain: the opening of the deleted S3.
+const CP3_PD_DIGEST: &str =
+    "blake3:76bcfbe5932c390604c73e365f19a517100860f01ccb38a9b46a16d9083d26d7";
+/// Record hash of `signed_cp(4, cp3_pd.hash(), fold
+/// {cp0,cp1,cp2,cp3})` on the prefix-deletion chain: the opening
+/// of the deleted S4, named in cp5's `previous`.
+const CP4_PD_DIGEST: &str =
+    "blake3:83753b3c20f7280bf6b5c2025b5ec251b2bd1948f0b92ea216b69a041eff55c6";
+/// Record hash of `signed_cp(5, cp4_pd.hash(), fold
+/// {cp0,cp1,cp2,cp3,cp4})` on the prefix-deletion chain: the
+/// opening of S5, the kept sealed segment in the live directory
+/// and the end record for forms (a)/(b) plus the start anchor
+/// for form (c).
+const CP5_PD_DIGEST: &str =
+    "blake3:ab2548e8b8def5ae2058e302b480792a212145b1e5ff5a5227ab88604638a2a1";
+/// MMR root of the size-3 fold over `[cp0, cp1, cp2]` on the
+/// prefix-deletion chain: the archive fold seen by step 7.
+/// Appears in L4 step 7's `MmrMismatch` ("expected size 3
+/// root ...").
+const MMR_PD_SIZE3_ARCHIVE_ROOT: &str =
+    "blake3:b4897d1be713bbb840c652cb7037e92604b8df6267467d8bf7a406c236c45a03";
+/// MMR root of the size-5 fold over `[cp0, cp1, cp2, cp3, cp4]`
+/// that cp5 declares. Appears in L4 step 7's `MmrMismatch`
+/// ("found size 5 root ...").
+const MMR_PD_SIZE5_CP5_DECL_ROOT: &str =
+    "blake3:4d550db8f3135847465ce01f949ad2b7607d6cc4c08fe5207cd45043cc9efc60";
+/// MMR root of the size-4 fold `{cp0, cp1, cp2, cp5}` that form
+/// (b) sees after pushing `cp5` on top of the archive's fold.
+/// Appears in L4 step 6's second `MmrMismatch` ("expected size
+/// 4 root ...").
+const MMR_PD_SIZE4_STEP6_AT_CP6_ROOT: &str =
+    "blake3:8d59d646d628261a6ea589ec43436d67df9a31f5a31b1801227a4d8153d84fee";
+/// MMR root of the size-6 fold `{cp0, cp1, cp2, cp3, cp4, cp5}`
+/// that cp6 declares. Appears in L4 step 6's second
+/// `MmrMismatch` ("found size 6 root ...").
+const MMR_PD_SIZE6_CP6_DECL_ROOT: &str =
+    "blake3:6d898b44f005a4db8cb0401f42afa3a40e74d281b476d1123290a125de458ffa";
 /// MMR root of a size-3 fold over `[cp0, e1, e2]` on the hand-built
 /// L5/L3 chain: the root `cp3` declares. Appears in L3's, L3b's,
 /// L7's, L7b's and L12's `MmrMismatch` ("found size 3 root ..." for
@@ -186,12 +234,12 @@ fn resume_entry_with(
     Record::new_internal(ctx, entry).unwrap()
 }
 
-/// The hand-built L1/L4/L10 chain: `cp0(0), e1(1), cp2(2), e3(3),
+/// The hand-built L1/L10 chain: `cp0(0), e1(1), cp2(2), e3(3),
 /// cp4(4)` at the fixture `TRAIL` and fixture signer. Each record
 /// is produced through `signed_cp` (checkpoints) and `entry_rec`
 /// (entries), which call `Record::checkpoint` /
 /// `CheckpointFields::new` exactly as the writer's `sink::signed`
-/// does (`sink.rs` ~765..=781) at the fixture clock seam, so each
+/// does (`sink.rs` ~765..=781) at the fixture clock, so each
 /// record hash is a literal pinned in
 /// [`fixture_hashes_match_literals`].
 struct Chain {
@@ -225,7 +273,7 @@ fn build_chain() -> Chain {
 /// L7, L7b, L8, L12, L13 and L14 (`cp3` as the end record over
 /// various archive shapes). Constructed through the same helpers as
 /// [`build_chain`] so the writer's record construction is mirrored
-/// exactly (`sink.rs` ~765..=781) at the fixture clock seam.
+/// exactly (`sink.rs` ~765..=781) at the fixture clock.
 struct ChainL5 {
     cp0: Record,
     e1: Record,
@@ -393,124 +441,229 @@ fn l3b_replaced_last_record_second_variant_has_one_chain_broken() {
 }
 
 // =====================================================================
-// L4 -- ACCEPTANCE. The prefix-deletion bullet (ADR-0005 l.943):
-// sealed segments archived before a start, with intermediate
-// segments deleted. Three forms exercise the same fixture from
+// L4 -- ACCEPTANCE. The prefix-deletion layout per ADR-0005
+// l.942..=943: six sealed segments `S0..=S5`, each starting with
+// its own opening checkpoint; `S0..=S4` were archived and `S5`
+// kept, then `S3` and `S4` were deleted from the archive. `S5`
+// lives in the live directory as a sealed segment with the live
+// file `audit.jsonl` after it. The start, for form (c), is `S5`'s
+// opening checkpoint. Three forms exercise the same layout from
 // different verify-side angles. Hand-built because each form pins
 // literal hashes of the records at the deletion boundary.
 // =====================================================================
 
-/// Hand-built prefix-deletion scenario at the fixture `TRAIL`: two
-/// sealed segments stay archived (`S0=[cp0, e1]`, `S1=[cp2]`), the
-/// inner segment that would hold `e3` is deleted from the archive,
-/// and the next batch's opening `cp4` lives in the live directory.
-/// This matches ADR-0005 l.943: segments deleted from the archive
-/// create a `SeqGap` at the next segment's opening; the end-record
-/// variant also fires `ChainBroken` through the chain rule.
-struct PrefixDeletion {
+/// The hand-built prefix-deletion chain: six checkpoints
+/// `cp0..=cp5`, each at the fixture `TRAIL` and fixture signer,
+/// linked `cpN.previous = cp(N-1).hash` and declaring the running
+/// MMR fold over the records at `seq < N`. Constructed through
+/// the same `signed_cp` helper as the other chains in this module
+/// so each record goes through the writer's `Record::checkpoint`
+/// / `CheckpointFields` call (`sink.rs` ~765..=781) at the
+/// fixture clock.
+struct PrefixDelChain {
+    cp0: Record,
+    cp1: Record,
+    cp2: Record,
+    cp3: Record,
+    cp4: Record,
+    cp5: Record,
+    /// MMR fold `{cp0, cp1, cp2}` -- the fold the archive produces
+    /// after sealing `S0..=S2`, used for step 7's `MmrMismatch`.
+    archive_mmr: Mmr,
+    /// MMR fold `{cp0, cp1, cp2, cp3, cp4}` that `cp5` declares.
+    cp5_declared_mmr: Mmr,
+}
+fn build_prefix_deletion_chain() -> PrefixDelChain {
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr_after_cp0 = seeded(&cp0);
+    let cp1 = signed_cp(1, cp0.hash(), &mmr_after_cp0);
+    let mmr_after_cp1 = pushed(&mmr_after_cp0, &cp1);
+    let cp2 = signed_cp(2, cp1.hash(), &mmr_after_cp1);
+    let mmr_after_cp2 = pushed(&mmr_after_cp1, &cp2);
+    let cp3 = signed_cp(3, cp2.hash(), &mmr_after_cp2);
+    let mmr_after_cp3 = pushed(&mmr_after_cp2, &cp3);
+    let cp4 = signed_cp(4, cp3.hash(), &mmr_after_cp3);
+    let mmr_after_cp4 = pushed(&mmr_after_cp3, &cp4);
+    let cp5 = signed_cp(5, cp4.hash(), &mmr_after_cp4);
+    PrefixDelChain {
+        cp0,
+        cp1,
+        cp2,
+        cp3,
+        cp4,
+        cp5,
+        archive_mmr: mmr_after_cp2,
+        cp5_declared_mmr: mmr_after_cp4,
+    }
+}
+
+/// Hand-built prefix-deletion scenario at the fixture `TRAIL`.
+///
+/// The archive holds three sealed segments after `S3` and `S4`
+/// were deleted: `S0 = [cp0]`, `S1 = [cp1]`, `S2 = [cp2]`, at
+/// writer-style segment ids 0, 1 and 2. The live directory holds
+/// the kept sealed segment `S5 = [cp5]` at segment id 5 (its
+/// writer-style name keeps `seq` and segment id aligned, so it
+/// sorts after the archive's segments) and the writer's live file
+/// `audit.jsonl` after it, which starts the next batch with a
+/// fresh opening checkpoint `cp6 = signed_cp(6, cp5.hash(), fold
+/// through cp5)` so the writer's directory shape is complete.
+/// `cp5`'s opening checkpoint is the end record for forms (a)
+/// and (b) and the start anchor for form (c).
+struct PrefixDelScenario {
     _archive_tmp: Temp,
     _live_tmp: Temp,
     archive_dir: PathBuf,
     live_dir: PathBuf,
-    live_path: PathBuf,
-    /// The opening of the kept segment, at seq 4 -- both the end
-    /// record for forms (a)/(b) and the start anchor for form (c).
+    /// The published path of the live directory's sealed segment
+    /// `S5` -- the file verify_files locates `ChainBroken` /
+    /// `SeqGap` at in form (b).
+    s5_segment_path: PathBuf,
+    /// The published path of the live file (`audit.jsonl`) that
+    /// follows `S5`, where form (b) locates `MmrMismatch` at
+    /// the next batch's opening `cp6`.
+    live_file_path: PathBuf,
+    /// The opening of `S5`, at seq 5: the end record for (a)/(b)
+    /// and the start anchor for (c).
     s5_opening: Record,
 }
-fn build_prefix_deletion() -> PrefixDeletion {
-    let c = build_chain();
+fn build_prefix_deletion_scenario() -> PrefixDelScenario {
+    let c = build_prefix_deletion_chain();
     let archive_tmp = Temp::new();
-    put_segment(&archive_tmp.0, 0, &[&c.cp0, &c.e1], &[]);
-    put_segment(&archive_tmp.0, 1, &[&c.cp2], &[]);
-    // The deleted "S2" would have held `e3`; the archive does not.
+    put_segment(&archive_tmp.0, 0, &[&c.cp0], &[]);
+    put_segment(&archive_tmp.0, 1, &[&c.cp1], &[]);
+    put_segment(&archive_tmp.0, 2, &[&c.cp2], &[]);
+    // S3 and S4 were deleted from the archive.
     let live_tmp = Temp::new();
-    let live_path = live_tmp.0.join("audit.jsonl");
-    write_bytes(&live_path, &line_bytes(&c.cp4));
-    PrefixDeletion {
+    put_segment(&live_tmp.0, 5, &[&c.cp5], &[]);
+    let s5_segment_path = segment_path(&live_tmp.0, 5);
+    // The live file follows the kept sealed segment: the writer's
+    // next batch opens with cp6, which chains from cp5 and
+    // declares the running fold through cp5.
+    let mmr_after_cp5 = pushed(&c.cp5_declared_mmr, &c.cp5);
+    let cp6 = signed_cp(6, c.cp5.hash(), &mmr_after_cp5);
+    let live_file_path = live_tmp.0.join("audit.jsonl");
+    write_bytes(&live_file_path, &line_bytes(&cp6));
+    PrefixDelScenario {
         archive_dir: archive_tmp.0.clone(),
         _archive_tmp: archive_tmp,
         live_dir: live_tmp.0.clone(),
         _live_tmp: live_tmp,
-        live_path,
-        s5_opening: c.cp4,
+        s5_segment_path,
+        live_file_path,
+        s5_opening: c.cp5,
     }
 }
 
-/// Form (a): step 7 over the archive alone, with
-/// `end_before(opening)` and the matching end anchor. Chain rule at
-/// `e = 4` compares with `cp2.hash` (highest `seq` below); `cp4.prev
-/// = e3.hash` mismatches. `ChainBroken` + `MmrMismatch` + `SeqGap`
-/// at `e`, each unlocated (ruling 13-V6-d4 point 6).
+/// Form (a): step 7 over the archive alone, with `end_before(S5
+/// opening)` and the matching end anchor. The archive holds
+/// `[cp0, cp1, cp2]`; the chain rule at `e = 5` compares with the
+/// record at the highest `seq` below (`cp2`) and `cp5.previous =
+/// cp4.hash` mismatches, so `ChainBroken` fires at `e`. The
+/// archive fold through `S0..=S2` is size 3, while `cp5` declares
+/// a size-5 fold through `[cp0..=cp4]`, so `MmrMismatch` fires at
+/// `e`. `S3` and `S4`'s `seq`s are missing, so `SeqGap` covers
+/// `3..=4` at `e`. Each finding is unlocated because it sits on
+/// the end-record segment (ruling 13-V6-d4 point 6).
 #[test]
 fn l4_step7_archive_alone_literal() {
-    let h = build_prefix_deletion();
-    let cp4_line = line_without_lf(&h.s5_opening);
+    let h = build_prefix_deletion_scenario();
+    let cp5_line = line_without_lf(&h.s5_opening);
     let anchor = checkpoint_of(&h.s5_opening);
     let report = verifier()
-        .end_before(&cp4_line, Some(anchor))
+        .end_before(&cp5_line, Some(anchor))
         .unwrap()
         .verify_files(vec![h.archive_dir.clone()])
         .unwrap();
     let expected = vec![
         unlocated(
             K::ChainBroken,
-            Some(4),
-            format!("expected previous {CP2_HONEST_DIGEST}, found {E3_HONEST_DIGEST}"),
+            Some(5),
+            format!("expected previous {CP2_PD_DIGEST}, found {CP4_PD_DIGEST}"),
         ),
         unlocated(
             K::MmrMismatch,
-            Some(4),
+            Some(5),
             format!(
-                "expected size 3 root {MMR_SIZE3_CP0_E1_CP2_ROOT}, found size 4 root {MMR_SIZE4_CP4_DECL_ROOT}",
+                "expected size 3 root {MMR_PD_SIZE3_ARCHIVE_ROOT}, found size 5 root {MMR_PD_SIZE5_CP5_DECL_ROOT}",
             ),
         ),
-        unlocated(K::SeqGap, Some(4), "missing seq 3..=3".into()),
+        unlocated(K::SeqGap, Some(5), "missing seq 3..=4".into()),
     ];
     assert_findings(report.findings(), &expected, "L4 (a) step 7");
 }
 
-/// Form (b): step 6 over archive + live, no start. The chain rule
-/// at seq 4 fires `ChainBroken` + `SeqGap` at the live file's cp4;
-/// the live cp4 carries its location (ruling 13-V6-d4 point 6 does
-/// not apply here because cp4 is a real file record, not the end
-/// record).
+/// Form (b): step 6 over the archive directory plus the live
+/// directory, with no start. The archive's `[cp0, cp1, cp2]` plus
+/// `S5 = [cp5]` and the live file's `cp6` are the verified set.
+/// The chain rule at seq 5 compares `cp5` with the record at the
+/// highest `seq` below (`cp2`) and `cp5.previous = cp4.hash`
+/// mismatches, so `ChainBroken` fires at `cp5`'s location in the
+/// live sealed segment file. `SeqGap` covers the missing range
+/// `3..=4`, located at `cp5`. `MmrMismatch` also fires at `cp5`
+/// because the classifier's running fold after `[cp0, cp1, cp2]`
+/// is size 3, while `cp5` declares the fold through the deleted
+/// `cp3` and `cp4` (size 5) (ruling 13-V4-d10 points 2-3). A
+/// second `MmrMismatch` fires at `cp6` in the live file because
+/// the running fold there is `{cp0, cp1, cp2, cp5}` (size 4) and
+/// `cp6` declares the fold through `cp5` with `cp3` and `cp4`
+/// included (size 6).
 #[test]
 fn l4_step6_archive_plus_live_literal() {
-    let h = build_prefix_deletion();
+    let h = build_prefix_deletion_scenario();
     let report = verifier()
-        .verify_files(vec![h.archive_dir.clone(), h.live_path.clone()])
+        .verify_files(vec![h.archive_dir.clone(), h.live_dir.clone()])
         .unwrap();
     let expected = vec![
         located(
             K::ChainBroken,
-            h.live_path.clone(),
+            h.s5_segment_path.clone(),
             1,
-            4,
-            format!("expected previous {CP2_HONEST_DIGEST}, found {E3_HONEST_DIGEST}"),
+            5,
+            format!("expected previous {CP2_PD_DIGEST}, found {CP4_PD_DIGEST}"),
+        ),
+        located(
+            K::MmrMismatch,
+            h.s5_segment_path.clone(),
+            1,
+            5,
+            format!(
+                "expected size 3 root {MMR_PD_SIZE3_ARCHIVE_ROOT}, found size 5 root {MMR_PD_SIZE5_CP5_DECL_ROOT}",
+            ),
         ),
         located(
             K::SeqGap,
-            h.live_path.clone(),
+            h.s5_segment_path.clone(),
             1,
-            4,
-            "missing seq 3..=3".into(),
+            5,
+            "missing seq 3..=4".into(),
+        ),
+        located(
+            K::MmrMismatch,
+            h.live_file_path.clone(),
+            1,
+            6,
+            format!(
+                "expected size 4 root {MMR_PD_SIZE4_STEP6_AT_CP6_ROOT}, found size 6 root {MMR_PD_SIZE6_CP6_DECL_ROOT}",
+            ),
         ),
     ];
     assert_findings(report.findings(), &expected, "L4 (b) step 6");
 }
 
-/// Form (c): `start_from(opening)` over the live file alone. The
-/// accepted start suppresses the prefix `SeqGap` and no other
-/// finding fires, so the report is clean. The `_live_dir` is kept
-/// in scope through `h`.
+/// Form (c): `start_from(S5 opening)` over the live directory
+/// alone (which holds the sealed `S5`). The accepted start
+/// anchors `cp5`, so the prefix `SeqGap` for `0..=4` is
+/// suppressed and no other finding fires. The live directory
+/// alone cannot see the archived part, which is the "limit
+/// visible" assertion of ADR-0005 l.943.
 #[test]
 fn l4_start_from_live_only_literal() {
-    let h = build_prefix_deletion();
-    let _ = &h.live_dir;
+    let h = build_prefix_deletion_scenario();
     let start_anchor = checkpoint_of(&h.s5_opening);
     let report = verifier()
         .start_from(start_anchor)
-        .verify_files(vec![h.live_path.clone()])
+        .verify_files(vec![h.live_dir.clone()])
         .unwrap();
     let expected: Vec<Finding> = Vec::new();
     assert_findings(report.findings(), &expected, "L4 (c) start_from");
@@ -1204,5 +1357,33 @@ fn fixture_hashes_match_literals() {
     assert_eq!(
         format!("blake3:{}", hex(&cp3_decl.root())),
         MMR_SIZE3_CP3_DECL_ROOT,
+    );
+    let h = build_prefix_deletion_chain();
+    assert_eq!(digest_string(&h.cp0.hash()), CP0_HONEST_DIGEST);
+    assert_eq!(digest_string(&h.cp1.hash()), CP1_PD_DIGEST);
+    assert_eq!(digest_string(&h.cp2.hash()), CP2_PD_DIGEST);
+    assert_eq!(digest_string(&h.cp3.hash()), CP3_PD_DIGEST);
+    assert_eq!(digest_string(&h.cp4.hash()), CP4_PD_DIGEST);
+    assert_eq!(digest_string(&h.cp5.hash()), CP5_PD_DIGEST);
+    assert_eq!(
+        format!("blake3:{}", hex(&h.archive_mmr.root())),
+        MMR_PD_SIZE3_ARCHIVE_ROOT,
+    );
+    assert_eq!(
+        format!("blake3:{}", hex(&h.cp5_declared_mmr.root())),
+        MMR_PD_SIZE5_CP5_DECL_ROOT,
+    );
+    // Step 6's running fold at cp6: {cp0, cp1, cp2, cp5} (size 4),
+    // formed by pushing cp5 on top of the archive's size-3 fold.
+    let step6_at_cp6 = pushed(&h.archive_mmr, &h.cp5);
+    assert_eq!(
+        format!("blake3:{}", hex(&step6_at_cp6.root())),
+        MMR_PD_SIZE4_STEP6_AT_CP6_ROOT,
+    );
+    // cp6's declared size-6 fold: {cp0..cp4, cp5}.
+    let cp6_decl = pushed(&h.cp5_declared_mmr, &h.cp5);
+    assert_eq!(
+        format!("blake3:{}", hex(&cp6_decl.root())),
+        MMR_PD_SIZE6_CP6_DECL_ROOT,
     );
 }
