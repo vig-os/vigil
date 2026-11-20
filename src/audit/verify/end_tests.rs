@@ -246,11 +246,15 @@ fn e2_records_above_end_emit_records_above() {
 // =====================================================================
 // E2f — ACCEPTANCE. Records of ANOTHER trail at seqs above `s` do
 // NOT count for the "above" check: only records of the verified
-// trail do. The verified trail stops at `s=2` with cp2, and the
-// same native segment carries foreign records at `seq=3` and `4`;
-// each foreign record emits `TrailMismatch` and the match at `s=2`
-// holds (no `TrailEnded`). Pairs with E2f2 to pin "above reads the
-// verified trail only" across native and shipped layouts.
+// trail do. Foreign records sit in the same native segment at
+// `seq=3` and `4`; the match at `s=2` holds and the section's
+// `through=0` bound at or below `s` is confirmed, so the expected
+// list carries no `RevocationUnconfirmed`. With the match voided,
+// the bound would stay unconfirmed, so the observable grant is the
+// absence of `RevocationUnconfirmed` here. Pairs with E2f2 to pin
+// "above reads the verified trail only" across two independent
+// grants (bound confirmation vs. repair promotion) and two
+// independent foreign-record layouts (native vs. shipped).
 // =====================================================================
 #[test]
 fn e2f_foreign_records_above_end_in_native_file_do_not_count() {
@@ -266,12 +270,19 @@ fn e2f_foreign_records_above_end_in_native_file_do_not_count() {
     let path = segment_path(&d.0, 0);
     let trust = TrustPolicy::builder()
         .trail(TRAIL)
-        .key(fixture_pubkey())
+        .key_through(fixture_pubkey(), 0, cp0.hash())
         .end(2, cp2.hash())
         .build()
         .unwrap();
     let report = report_of(vec![path.clone()], trust);
     let expected = vec![
+        located(
+            K::UntrustedKey,
+            path.clone(),
+            3,
+            2,
+            format!("key {FIXTURE_KEY_HEX} bounded through seq 0"),
+        ),
         located(
             K::TrailMismatch,
             path.clone(),
@@ -286,36 +297,58 @@ fn e2f_foreign_records_above_end_in_native_file_do_not_count() {
             4,
             format!("expected trail {TRAIL_HEX}, found {OTHER_TRAIL_HEX}"),
         ),
+        uncovered(1, 2),
     ];
     assert_findings(report.findings(), &expected, "E2f");
     assert!(!report.is_strict_valid(), "E2f strict fails: TrailMismatch");
-    assert_eq!(report.covered_through(), Some(2));
+    assert_eq!(report.covered_through(), Some(0));
 }
 
 // =====================================================================
-// E2f2 — ACCEPTANCE. Second "foreign records above `s`" row, with
-// the foreign records in a SHIPPED copy instead of the native
-// segment: layout differs from E2f but the ruling is the same,
-// foreign-trail records above `s` are ignored for the "above"
-// check.
+// E2f2 — ACCEPTANCE. Second "foreign records above `s`" row with a
+// different observable grant: the verified trail has a crashed-tail
+// repair at `seq=1` and `end=1:e1.hash` matches, so the repair is
+// `TornWriteRepaired` (the match's third grant). Foreign records
+// sit in a SHIPPED copy at `seq=3` and `4`. With the match voided,
+// the repair would stay `TornWrite`, so the observable grant is
+// `TornWriteRepaired` here. Pairs with E2f: different grant, and
+// foreign records in a shipped copy instead of the native segment.
 // =====================================================================
 #[test]
 fn e2f2_foreign_records_above_end_in_shipped_copy_do_not_count() {
-    let fx = two_checkpoints();
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let gap = repair_digest(FRAG);
+    let e1 = entry_with_repaired(1, cp0.hash(), gap);
+    let mut bytes = line_bytes(&cp0);
+    bytes.extend_from_slice(FRAG);
+    bytes.extend_from_slice(&line_bytes(&e1));
+    let native = segment_path(&d.0, 0);
+    write_bytes(&native, &bytes);
     let foreign_a = entry_on_trail(OTHER_TRAIL, 3, [0; 32]);
     let foreign_b = entry_on_trail(OTHER_TRAIL, 4, [0; 32]);
-    let mut bytes = line_bytes(&foreign_a);
-    bytes.extend_from_slice(&line_bytes(&foreign_b));
-    let shipped_path = fx._dir.0.join("foreign.jsonl");
-    fs::write(&shipped_path, &bytes).unwrap();
+    let mut shipped_bytes = line_bytes(&foreign_a);
+    shipped_bytes.extend_from_slice(&line_bytes(&foreign_b));
+    let shipped_path = d.0.join("foreign.jsonl");
+    fs::write(&shipped_path, &shipped_bytes).unwrap();
     let trust = TrustPolicy::builder()
         .trail(TRAIL)
         .key(fixture_pubkey())
-        .end(2, fx.cp2.hash())
+        .end(1, e1.hash())
         .build()
         .unwrap();
-    let report = report_of(vec![fx.path.clone(), shipped_path.clone()], trust);
+    let report = report_of(vec![native.clone(), shipped_path.clone()], trust);
     let expected = vec![
+        located(
+            K::TornWriteRepaired,
+            native,
+            2,
+            1,
+            format!(
+                "lines 2..=2 ({len} bytes), attested at line 3 seq 1",
+                len = FRAG.len()
+            ),
+        ),
         located(
             K::TrailMismatch,
             shipped_path.clone(),
@@ -330,13 +363,14 @@ fn e2f2_foreign_records_above_end_in_shipped_copy_do_not_count() {
             4,
             format!("expected trail {TRAIL_HEX}, found {OTHER_TRAIL_HEX}"),
         ),
+        uncovered(1, 1),
     ];
     assert_findings(report.findings(), &expected, "E2f2");
     assert!(
         !report.is_strict_valid(),
         "E2f2 strict fails: TrailMismatch"
     );
-    assert_eq!(report.covered_through(), Some(2));
+    assert_eq!(report.covered_through(), Some(0));
 }
 
 // =====================================================================
