@@ -6,6 +6,7 @@ use std::{
 };
 mod anchors;
 mod end;
+mod end_before;
 mod engine;
 mod fold;
 mod input;
@@ -88,6 +89,14 @@ impl Finding {
         assert_eq!(self.kind, FindingKind::SegmentStructure);
         self.run_digest = Some(digest);
         self
+    }
+    /// Clears the finding's file and line (ruling 13-V6-d4
+    /// point 6): a finding that sits on an end-record line has no
+    /// file and no line, and its `seq` identifies it. Called once
+    /// per finding by [`engine::check`] after every rule has run.
+    pub(crate) fn strip_location(&mut self) {
+        self.file = None;
+        self.line = None;
     }
     /// Returns the diagnostic category.
     pub fn kind(&self) -> FindingKind {
@@ -270,6 +279,8 @@ mod anchors_tests;
 #[cfg(test)]
 mod coverage_tests;
 #[cfg(test)]
+mod end_before_tests;
+#[cfg(test)]
 mod end_tests;
 #[cfg(test)]
 mod mod_tests;
@@ -356,8 +367,21 @@ pub struct Verifier {
     max_age: Option<Duration>,
     anchors: Vec<Checkpoint>,
     start: Option<Checkpoint>,
+    end_before: Option<EndBefore>,
     #[cfg(test)]
     now_override: Option<SystemTime>,
+}
+
+/// Parsed archive record and its end anchor, retained between the
+/// `end_before` call and the verify call (ADR-0005 decision 11
+/// `.end_before`; ruling 13-V6-d4). Private; the verifier's one
+/// outside-facing form is [`Verifier::end_before`].
+#[derive(Debug, Clone)]
+struct EndBefore {
+    parsed_bytes: Vec<u8>,
+    end_seq: u64,
+    first_line: String,
+    anchor: Option<Checkpoint>,
 }
 impl Verifier {
     /// Takes ownership of a validated policy. Multiple pins require [`Self::trail`].
@@ -368,6 +392,7 @@ impl Verifier {
             max_age: None,
             anchors: Vec::new(),
             start: None,
+            end_before: None,
             #[cfg(test)]
             now_override: None,
         }
@@ -407,10 +432,18 @@ impl Verifier {
     /// renamed back to `audit.jsonl`.
     ///
     /// # Errors
-    /// Always `Ok` in #13 V5e. Combining `max_age` with `end_before`
-    /// yields `InvalidConfig` from whichever call comes second
-    /// (ADR-0005 §19.2; #13 V6).
+    /// Returns `InvalidConfig` when [`Verifier::end_before`] was
+    /// already called on this verifier (ADR-0005 §19.2; ruling
+    /// 13-V6-d4 point 7): `max_age` and `end_before` are mutually
+    /// exclusive, and the error is raised by whichever call comes
+    /// second.
     pub fn max_age(mut self, max_age: Duration) -> Result<Self, AuditError> {
+        if self.end_before.is_some() {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                "max_age conflicts with end_before",
+            ));
+        }
         self.max_age = Some(max_age);
         Ok(self)
     }
@@ -548,6 +581,72 @@ impl Verifier {
         self.start = Some(start);
         self
     }
+    /// Verifies one archive batch against its end record and the
+    /// batch-start anchor entry that pins it (ADR-0005 decision 11
+    /// `.end_before`; ruling 13-V6-d4).
+    ///
+    /// `archive_record` is one line, or two lines separated by one
+    /// LF with one optional final LF. The first line passes
+    /// [`Checkpoint::parse`]; it is the opening checkpoint of the
+    /// batch that follows. A second line, when present, is a single
+    /// record whose action is `vigil.audit.resume`, whose `seq` is
+    /// the checkpoint's `seq + 1`, and whose `prev_hash` is the
+    /// checkpoint's hash. Anything else (an empty record, a third
+    /// line, CR, a non-checkpoint first line, a non-resume second
+    /// line, a resume line with the wrong `seq` or the wrong
+    /// `prev_hash`) is a usage error.
+    ///
+    /// `end_anchor` must come from the batch-start anchor entry in
+    /// the anchor store (ADR-0005 decision 11 "Where the end comes
+    /// from"), never the trail directory and never only the archive
+    /// record (which is kept with the archive and can be rewritten
+    /// by whoever can delete inside it). The record's lines go into
+    /// the verified set as the segment that follows the files, so
+    /// every existing rule applies to them. File records of the
+    /// verified trail with `seq` at or above the end checkpoint's
+    /// `seq` yield one [`TrailEnded`](FindingKind::TrailEnded)
+    /// (error); a byte-identical file copy of an end line never
+    /// becomes `DuplicateRecord`, and a different record at such a
+    /// `seq` is still [`SeqConflict`](FindingKind::SeqConflict).
+    /// Without `end_anchor`, one
+    /// [`UnanchoredEnd`](FindingKind::UnanchoredEnd) (error) fires;
+    /// with `end_anchor`, the anchor's line must byte-equal the
+    /// record's first line (each side without its LF; whitespace
+    /// counts) else one
+    /// [`AnchorMismatch`](FindingKind::AnchorMismatch) (error)
+    /// fires with detail `end record differs from end anchor`. The
+    /// end anchor also joins the anchors ([`Self::anchor`]) and
+    /// goes through the ordinary anchor rule. Every end-record
+    /// finding carries no file and no line (ruling 13-V6-d4 point
+    /// 6).
+    ///
+    /// # Errors
+    /// Returns `InvalidConfig` when `archive_record` violates the
+    /// grammar above, or when [`Self::max_age`] was already called
+    /// on this verifier (ADR-0005 §19.2; ruling 13-V6-d4 point 7):
+    /// `max_age` and `end_before` are mutually exclusive, and the
+    /// error is raised by whichever call comes second. A second
+    /// `end_before` call replaces the first.
+    pub fn end_before(
+        mut self,
+        archive_record: &str,
+        end_anchor: Option<Checkpoint>,
+    ) -> Result<Self, AuditError> {
+        if self.max_age.is_some() {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                "end_before conflicts with max_age",
+            ));
+        }
+        let parsed = end_before::parse(archive_record)?;
+        self.end_before = Some(EndBefore {
+            parsed_bytes: parsed.segment_bytes,
+            end_seq: parsed.checkpoint.seq(),
+            first_line: parsed.checkpoint.line().to_owned(),
+            anchor: end_anchor,
+        });
+        Ok(self)
+    }
     /// Expands a directory's vigil files and verifies its confirmed snapshot.
     /// See [`verify`] for review limitations and error semantics.
     ///
@@ -578,14 +677,36 @@ impl Verifier {
             .ok_or_else(|| {
                 AuditError::new(AuditErrorKind::InvalidConfig, "select a pinned trail")
             })?;
+        let mut collection = input::collect(files)?;
+        // Ruling 13-V6-d4 points 1 and 5: the archive record goes
+        // in as one native segment after the files, and the end
+        // anchor also joins the anchors.
+        let record_path = end_before::record_path();
+        let mut joined_anchors = self.anchors.clone();
+        let end_ctx = self.end_before.as_ref().map(|eb| {
+            input::append_native(
+                &mut collection,
+                input::end_record_input(eb.parsed_bytes.clone(), record_path.clone()),
+            );
+            joined_anchors.extend(eb.anchor.clone());
+            end_before::Context {
+                end_seq: eb.end_seq,
+                first_line: &eb.first_line,
+                anchor: eb.anchor.as_ref(),
+                record_path: &record_path,
+            }
+        });
         Ok(engine::check(
-            input::collect(files)?,
+            collection,
             trail,
-            &self.trust,
-            self.max_age,
-            &self.anchors,
-            self.start.as_ref(),
-            self.now(),
+            engine::Policy {
+                trust: &self.trust,
+                max_age: self.max_age,
+                anchors: &joined_anchors,
+                start: self.start.as_ref(),
+                end_ctx: end_ctx.as_ref(),
+                now: self.now(),
+            },
         ))
     }
     #[cfg(not(test))]

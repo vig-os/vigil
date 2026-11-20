@@ -25,11 +25,14 @@ fn check(collection: Collection, trail: [u8; 16]) -> Report {
     super::check(
         collection,
         trail,
-        &trust_trail(),
-        None,
-        &[],
-        None,
-        std::time::SystemTime::now(),
+        super::Policy {
+            trust: &trust_trail(),
+            max_age: None,
+            anchors: &[],
+            start: None,
+            end_ctx: None,
+            now: std::time::SystemTime::now(),
+        },
     )
 }
 fn record(seq: u64, hash: u8, previous: [u8; 32], time: u64) -> Summary {

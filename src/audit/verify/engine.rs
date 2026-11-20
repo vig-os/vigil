@@ -18,7 +18,7 @@
 //! attributed to the native copy when present; a malformed declaration leaves
 //! any `SeqGap` the chain loop emitted.
 use super::{
-    Finding, Report, anchors, end, fold,
+    Finding, Report, anchors, end, end_before, fold,
     input::{Collection, Input, LineContent, Summary},
     position, resume, revocation, signatures, stale, start,
 };
@@ -342,15 +342,28 @@ fn emit_resumed(declarations: &[resume::Declaration<'_>], findings: &mut Vec<Fin
     }
 }
 
-pub(super) fn check(
-    collection: Collection,
-    trail: [u8; 16],
-    trust: &TrustPolicy,
-    max_age: Option<Duration>,
-    anchors: &[Checkpoint],
-    start: Option<&Checkpoint>,
-    now: SystemTime,
-) -> Report {
+/// Per-call verifier inputs the engine reads alongside the merged
+/// snapshot. Grouping them keeps [`check`] a readable function
+/// signature and keeps callers (production and the engine tests)
+/// pointed at the same fields.
+pub(super) struct Policy<'a> {
+    pub(super) trust: &'a TrustPolicy,
+    pub(super) max_age: Option<Duration>,
+    pub(super) anchors: &'a [Checkpoint],
+    pub(super) start: Option<&'a Checkpoint>,
+    pub(super) end_ctx: Option<&'a end_before::Context<'a>>,
+    pub(super) now: SystemTime,
+}
+
+pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>) -> Report {
+    let Policy {
+        trust,
+        max_age,
+        anchors,
+        start,
+        end_ctx,
+        now,
+    } = policy;
     let mut findings = Vec::new();
     let mut groups: BTreeMap<u64, Vec<Located<'_>>> = BTreeMap::new();
     // Bucket records by seq first so coverage (ruling 13-V5-d1 point 6)
@@ -469,7 +482,10 @@ pub(super) fn check(
             signatures::check(trail, trust, path, record, &mut findings);
         }
         let (path, record) = copies[0];
-        if copies.len() > candidates.len() {
+        // Ruling 13-V6-d4 point 3: at or above the end checkpoint's
+        // `seq` no `DuplicateRecord` is reported, even for a
+        // byte-identical copy of an end line. One place.
+        if copies.len() > candidates.len() && !end_before::covers(end_ctx, seq) {
             findings.push(finding(
                 K::DuplicateRecord,
                 path,
@@ -655,6 +671,20 @@ pub(super) fn check(
             None,
             format!("records seq {a}..={last}"),
         ));
+    }
+    // Ruling 13-V6-d4 points 3, 5 and 6: the TrailEnded range over
+    // the file records at or above the end checkpoint's `seq`, the
+    // UnanchoredEnd / end-record AnchorMismatch from the byte
+    // equality check, and the unlocation of findings that sit on
+    // the end-record segment. The suppression of DuplicateRecord
+    // happens inside the seq loop; these three are the rest.
+    if let Some(ctx) = end_ctx {
+        end_before::check(ctx, &groups, &mut findings);
+        for f in &mut findings {
+            if f.file() == Some(ctx.record_path) {
+                f.strip_location();
+            }
+        }
     }
     findings.sort_by_key(|f| {
         (

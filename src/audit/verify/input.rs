@@ -212,12 +212,6 @@ fn key(path: &Path) -> (u8, (String, u64), PathBuf) {
     (rank, rotate::segment_key(path, "audit"), path.to_owned())
 }
 fn decode(file: File, keep_bytes: bool) -> io::Result<Data> {
-    let mut data = Data {
-        records: Vec::new(),
-        items: Vec::new(),
-        spans: Vec::new(),
-        bytes: None,
-    };
     let bytes: Option<Rc<[u8]>> = if keep_bytes {
         let mut raw = Vec::new();
         {
@@ -227,6 +221,19 @@ fn decode(file: File, keep_bytes: bool) -> io::Result<Data> {
         Some(Rc::from(raw.into_boxed_slice()))
     } else {
         None
+    };
+    match &bytes {
+        Some(buf) => stream_into_data(io::Cursor::new(Rc::clone(buf)), Some(Rc::clone(buf))),
+        None => stream_into_data(BufReader::new(file), None),
+    }
+}
+
+fn stream_into_data(reader: impl io::BufRead, retain: Option<Rc<[u8]>>) -> io::Result<Data> {
+    let mut data = Data {
+        records: Vec::new(),
+        items: Vec::new(),
+        spans: Vec::new(),
+        bytes: None,
     };
     let mut emit = |item: lines::Item| {
         let content = match item.content {
@@ -245,12 +252,38 @@ fn decode(file: File, keep_bytes: bool) -> io::Result<Data> {
             content,
         });
     };
-    data.spans = match &bytes {
-        Some(buf) => lines::stream(io::Cursor::new(buf.as_ref()), 0, &mut emit)?,
-        None => lines::stream(BufReader::new(file), 0, &mut emit)?,
-    };
-    data.bytes = bytes;
+    data.spans = lines::stream(reader, 0, &mut emit)?;
+    data.bytes = retain;
     Ok(data)
+}
+
+/// Builds an in-memory native [`Input`] for the `end_before`
+/// archive record so the shared classifier walks it as the segment
+/// that follows the files (ruling 13-V6-d4 point 1). The `path` is a
+/// sentinel chosen by the caller (`end_before::record_path`),
+/// unlocated by the engine before the sort (ruling 13-V6-d4 point
+/// 6); its `file_name` is `None` so `native_segments` picks it up as
+/// sealed (`is_live = false`).
+pub(super) fn end_record_input(bytes: Vec<u8>, path: PathBuf) -> Input {
+    let rc: Rc<[u8]> = Rc::from(bytes.into_boxed_slice());
+    let data = stream_into_data(io::Cursor::new(Rc::clone(&rc)), Some(rc))
+        .expect("in-memory Cursor reads are infallible");
+    Input {
+        path,
+        native: true,
+        data: Rc::new(data),
+    }
+}
+
+/// Appends an in-memory native input to an already-built
+/// [`Collection`] and sets its spans' `seg` to its new position.
+pub(super) fn append_native(collection: &mut Collection, mut input: Input) {
+    let seg = u32::try_from(collection.inputs.len()).expect("too many native segments");
+    let data = Rc::get_mut(&mut input.data).expect("appended end-record input owns its data");
+    for span in &mut data.spans {
+        span.seg = seg;
+    }
+    collection.inputs.push(input);
 }
 
 /// Reads each inode once within a successful snapshot. Failed attempts own all
