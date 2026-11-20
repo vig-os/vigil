@@ -96,17 +96,17 @@ const E3_FROM_CP2_DIGEST: &str =
 /// Honest hash of the resume line `resume_entry(3, cp2.hash(), 1,
 /// e1.hash())`, the end record's last line in X4c and X13b. Shared
 /// so both rows pin the same resume record identity.
-const X4C_RESUME_DIGEST: &str =
+const X13B_RESUME_DIGEST: &str =
     "blake3:ad258fa0f95950e5b19df75734d9a4b282a918a85c0b7150e01f47e853aaf485";
 /// Honest hash of the resume line `resume_entry(2, cp1.hash(), 0,
 /// cp0.hash())`, the end record's last line in X4d.
 const X4D_RESUME_DIGEST: &str =
     "blake3:ba9a61ea18ee008efe0622651ec9ca24bc91cce0abec1a359355cb8d3717e13b";
-/// Honest hash of `cp2_alt = sign_as(&alt_signer(), 2, e1.hash(),
-/// &pushed(&seeded(&cp0), &e1))`, the alt-signed checkpoint at seq 2
-/// that forks `cp2` in X12b.
-const CP2_ALT_DIGEST: &str =
-    "blake3:8f71deebb1a2b11df8703bc9210730f478d3f5f0688e042b9469a5bf4eaaba33";
+/// Honest hash of `signed_cp_other(2, [0xaa; 32], &foreign_mmr_one())`,
+/// the `OTHER_TRAIL` checkpoint used as the end record in X12b. Pinned
+/// so the literal row self-contains the hash.
+const CP_OTHER2_DIGEST: &str =
+    "blake3:301689fd93fc2ff30bc03a1f775f6f1590dd0f4cd92f2e50847003c4ebd5e87b";
 
 /// Fake hash `blake3:4444...4444` reused as the trust-file `end=4`'s
 /// target in X4c, for the detail `end=4:<hex>: above end seq 3`.
@@ -119,6 +119,11 @@ const END_H5_HEX: &str = "blake3:55555555555555555555555555555555555555555555555
 /// `cp0` and its attester, to pin that an `end=` above `E` does not
 /// promote the gap at or below `s` to `TornWriteRepaired`.
 const FRAG_X4B: &[u8] = b"{\"crash\":\n";
+/// Fragment byte string the X4e repair-promotion row stamps between
+/// `e1` and its attester on a second layout (different gap position,
+/// different `s`), pairing with X4b to pin the "no repair promotion"
+/// invariant on two independent `(E, s)` pairs.
+const FRAG_X4E: &[u8] = b"{\"half\":\n";
 
 // =====================================================================
 // Helpers.
@@ -606,9 +611,10 @@ fn x4b_trust_file_end_above_e_does_not_grant_repair_promotion() {
 // the tail exemption of ruling 13-V5-d5 point 2.1. The archive holds
 // `[cp0, e1]`; the end record is `cp2 + resume(seq=3)` so `E = 3`
 // and the resume at seq 3 is the uncovered record above the last
-// trusted checkpoint `cp2`. The set-aside leaves `UncoveredTail`
-// NOT exempt, so `--strict` fails. The `Resumed` warning is a
-// second, independent reason `--strict` fails on this layout.
+// trusted checkpoint `cp2`. The row asserts `Report::tail_exempt`
+// stays `false` (the one field `is_strict_valid` reads for the
+// `UncoveredTail` exemption, `mod.rs` ~l.230), so the "no grant"
+// invariant holds whatever other warnings the layout produces.
 // =====================================================================
 #[test]
 fn x4c_trust_file_end_above_e_does_not_grant_tail_exemption() {
@@ -641,9 +647,10 @@ fn x4c_trust_file_end_above_e_does_not_grant_tail_exemption() {
     ];
     assert_findings(report.findings(), &expected, "X4c");
     assert!(
-        !report.is_strict_valid(),
-        "X4c must fail --strict (UncoveredTail is not exempt)"
+        !report.tail_exempt,
+        "X4c report's tail_exempt must stay false"
     );
+    assert!(!report.is_strict_valid(), "X4c report must fail --strict");
 }
 
 // =====================================================================
@@ -652,9 +659,9 @@ fn x4c_trust_file_end_above_e_does_not_grant_tail_exemption() {
 // the end record is `cp1 + resume(seq=2)` so `E = 2`, and the
 // resume at seq 2 is the uncovered record above the last trusted
 // checkpoint `cp1`. Trust-file `end=5:<h>` sits two seqs above the
-// end, so the set-aside leaves `UncoveredTail` not exempt and
-// `--strict` fails. Pairs with X4c to pin the "no tail exemption"
-// invariant on two independent `(E, s)` pairs.
+// end. The row asserts `Report::tail_exempt` stays `false`, pairing
+// with X4c to pin the "no tail exemption" invariant on two
+// independent `(E, s)` pairs.
 // =====================================================================
 #[test]
 fn x4d_trust_file_end_above_e_does_not_grant_tail_exemption_second_layout() {
@@ -689,9 +696,81 @@ fn x4d_trust_file_end_above_e_does_not_grant_tail_exemption_second_layout() {
     ];
     assert_findings(report.findings(), &expected, "X4d");
     assert!(
-        !report.is_strict_valid(),
-        "X4d must fail --strict (UncoveredTail is not exempt)"
+        !report.tail_exempt,
+        "X4d report's tail_exempt must stay false"
     );
+    assert!(!report.is_strict_valid(), "X4d report must fail --strict");
+}
+
+// =====================================================================
+// X4e -- ACCEPTANCE. Second repair-promotion row (ruling 13-V6-d7
+// point 3; ruling 13-V5-d5 point 2.3): a trust-file `end=<s>` with
+// `s` strictly above `E` must not promote 13-V5-d2 repairs at or
+// below `s` on a different torn-write position and a different `s`
+// from X4b. The archive carries an attested gap stamped between
+// `e1` and its attester `e2` (so the attester is `e2` at seq 2, not
+// `e1` at seq 1 as in X4b). Trust-file `end=5` sits two seqs above
+// `E = 3`. The attester `e2` sits above the lone trusted checkpoint
+// (`cp0`, fixture bounded `through=0`), so a match would promote
+// the gap to `TornWriteRepaired`; the set-aside keeps it as
+// `TornWrite` and emits the `OutOfRange` for the `end=`.
+// =====================================================================
+#[test]
+fn x4e_trust_file_end_above_e_does_not_grant_repair_promotion_second_layout() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let gap_digest = repair_digest(FRAG_X4E);
+    let e2 = entry_rec_with_repaired(2, e1.hash(), gap_digest);
+    let mmr2 = pushed(&mmr1, &e2);
+    // Native archive segment: [cp0, e1, {fragment}, e2_with_repaired].
+    // The fragment sits between `e1` and its attester `e2` (so the
+    // attester seq is 2, not X4b's 1).
+    let seg_path = segment_path(&d.0, 0);
+    let mut seg_bytes = line_bytes(&cp0);
+    seg_bytes.extend_from_slice(&line_bytes(&e1));
+    seg_bytes.extend_from_slice(FRAG_X4E);
+    seg_bytes.extend_from_slice(&line_bytes(&e2));
+    write_bytes(&seg_path, &seg_bytes);
+    // End record `cp3` sits above the archive at seq 3 (so `E = 3`);
+    // it is `UntrustedKey` because the fixture key is bounded
+    // `through=0`. Trust-file `end=5:<h>` is two seqs above `E`.
+    let cp3 = signed_cp(3, e2.hash(), &mmr2);
+    let cp3_line = line_without_lf(&cp3);
+    let end_anchor = checkpoint_of(&cp3);
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key_through(fixture_pubkey(), 0, cp0.hash())
+        .end(5, [0x55; 32])
+        .build()
+        .unwrap();
+    let report = Verifier::new(trust)
+        .end_before(&cp3_line, Some(end_anchor))
+        .unwrap()
+        .verify_files(vec![d.0.clone()])
+        .unwrap();
+    let expected = vec![
+        located(
+            K::TornWrite,
+            seg_path,
+            3,
+            2,
+            format!(
+                "lines 3..=3 ({len} bytes), attested at line 4 seq 2",
+                len = FRAG_X4E.len(),
+            ),
+        ),
+        unlocated(
+            K::UntrustedKey,
+            Some(3),
+            format!("key {FIXTURE_KEY_HEX} bounded through seq 0"),
+        ),
+        out_of_range_end(5, END_H5_HEX, 3),
+        unlocated(K::UncoveredTail, None, "records seq 1..=3".into()),
+    ];
+    assert_findings(report.findings(), &expected, "X4e");
 }
 
 // =====================================================================
@@ -1250,63 +1329,50 @@ fn x12_fork_at_end_leaves_end_unanchored_for_above_end_inputs() {
 // =====================================================================
 // X12b -- ACCEPTANCE. Second "end anchor byte-equals the record but
 // still fails the anchor rule" row (ruling 13-V6-d7 clarification
-// 13-V6-d7a; ruling 13-V6-d4 point 5): a different seq and a
-// different trusted signer for the forked record. The archive
-// holds `[cp0, e1, c.cp2]` (fixture-signed `cp2`), and the end
-// record is `cp2_alt`, an alt-signed checkpoint at seq 2 whose
-// hash differs from `cp2`'s. Both signers are listed, so
-// signatures are trusted on both sides. The byte-equality rule
-// passes (end anchor line equals the end record's first line);
-// the shared anchor rule reports `seq is forked` because the
-// archive's `cp2` and the end record's `cp2_alt` are two distinct
-// records at seq 2. The end stays UNANCHORED, so an anchor above
-// `E = 2` (`cp4` at seq 4) is `UnanchoredEnd`, not `OutOfRange`.
+// 13-V6-d7a; ruling 13-V6-d4 point 5), on a layout independent of
+// X12's fork at `e`: an end record whose checkpoint is on another
+// trail, so the verified set holds no record at the end anchor's
+// `seq`. The archive holds `[cp0, e1]` on `TRAIL`; the end record
+// is a checkpoint on `OTHER_TRAIL` at seq 2, which fires
+// `TrailMismatch` and is not added to the verified set. The end
+// anchor byte-equals the end record's first line, so the byte-
+// equality rule passes; the shared anchor rule reports
+// `trail differs` because the anchor sits on `OTHER_TRAIL`. The
+// end stays UNANCHORED, so an anchor above `E = 2` (`cp4` at seq
+// 4 on `TRAIL`) is `UnanchoredEnd`, not `OutOfRange`.
 // =====================================================================
 #[test]
-fn x12b_fork_at_end_by_alt_signed_record_leaves_end_unanchored() {
+fn x12b_end_record_on_other_trail_leaves_end_unanchored() {
     let c = build_chain();
-    let mmr1 = pushed(&seeded(&c.cp0), &c.e1);
-    let cp2_alt = sign_as(&alt_signer(), 2, c.e1.hash(), &mmr1);
-    let seg = seal(&[&c.cp0, &c.e1, &c.cp2]);
-    let seg_path = seg.path.clone();
-    let cp2_alt_line = line_without_lf(&cp2_alt);
-    let end_anchor = checkpoint_of(&cp2_alt);
+    let seg = seal(&[&c.cp0, &c.e1]);
+    let cp_other2 = signed_cp_other(2, [0xaa; 32], &foreign_mmr_one());
+    let cp_other2_line = line_without_lf(&cp_other2);
+    let end_anchor = checkpoint_of(&cp_other2);
     let cp4 = signed_cp(4, c.cp3.hash(), &c.mmr3);
     let trust = TrustPolicy::builder()
         .trail(TRAIL)
         .key(fixture_pubkey())
-        .key(alt_signer().public_key())
         .build()
         .unwrap();
     let report = Verifier::new(trust)
         .anchor(checkpoint_of(&cp4))
-        .end_before(&cp2_alt_line, Some(end_anchor))
+        .end_before(&cp_other2_line, Some(end_anchor))
         .unwrap()
         .verify_files(vec![seg.dir_path])
         .unwrap();
     let expected = vec![
-        located(
+        unlocated(
             K::AnchorMismatch,
-            seg_path.clone(),
-            3,
-            2,
-            format!("anchor seq 2 hash {CP2_ALT_DIGEST}: seq is forked"),
+            Some(2),
+            format!("anchor seq 2 hash {CP_OTHER2_DIGEST}: trail differs"),
         ),
-        located(
-            K::SeqConflict,
-            seg_path.clone(),
-            3,
-            2,
-            format!("conflicting hashes: {CP2_HONEST_DIGEST}, {CP2_ALT_DIGEST}"),
-        ),
-        located(
-            K::TrailEnded,
-            seg_path,
-            3,
-            2,
-            "end_before seq 2: records seq 2..=2 at or above the end".into(),
+        unlocated(
+            K::TrailMismatch,
+            Some(2),
+            format!("expected trail {TRAIL_HEX}, found {OTHER_TRAIL_HEX}"),
         ),
         unanchored_end_anchor(4, CP4_ABOVE_DIGEST, 2),
+        unlocated(K::UncoveredTail, None, "records seq 1..=1".into()),
     ];
     assert_findings(report.findings(), &expected, "X12b");
 }
@@ -1381,7 +1447,7 @@ fn x13b_trust_file_end_at_exactly_e_from_resume_line_is_in_range() {
 }
 
 // =====================================================================
-// X14 -- ACCEPTANCE. "The end anchor is never set aside"
+// X14 -- REGRESSION. "The end anchor is never set aside"
 // (ruling 13-V6-d7 clarification 13-V6-d7a; ruling 13-V6-d4 point
 // 5). The end record is `cp3` (fixture-signed, seq 3), and the
 // end anchor passed through `end_before(record, Some(anchor))` is
@@ -1471,18 +1537,18 @@ fn fixture_hashes_match_literals() {
     let cp2_x4b = signed_cp(2, e1_x4b.hash(), &mmr1_x4b);
     let e3_x4b = entry_rec(3, cp2_x4b.hash());
     assert_eq!(digest_string(&e3_x4b.hash()), E3_FROM_CP2_DIGEST);
-    // Pin the X4c and X13b resume line's record hash (same resume
-    // record: `resume_entry(3, cp2.hash(), 1, e1.hash())`).
-    let resume_x4c = resume_entry(3, c.cp2.hash(), 1, c.e1.hash());
-    assert_eq!(digest_string(&resume_x4c.hash()), X4C_RESUME_DIGEST);
+    // Pin the X13b resume line's record hash (same `resume_entry(3,
+    // cp2.hash(), 1, e1.hash())` that X13b builds from the fixture
+    // chain).
+    let resume_x13b = resume_entry(3, c.cp2.hash(), 1, c.e1.hash());
+    assert_eq!(digest_string(&resume_x13b.hash()), X13B_RESUME_DIGEST);
     // Pin the X4d resume line's record hash
     // (`resume_entry(2, cp1.hash(), 0, cp0.hash())`).
     let cp1_x4d = signed_cp(1, c.cp0.hash(), &mmr0);
     let resume_x4d = resume_entry(2, cp1_x4d.hash(), 0, c.cp0.hash());
     assert_eq!(digest_string(&resume_x4d.hash()), X4D_RESUME_DIGEST);
-    // Pin the X12b alt-signed checkpoint hash
-    // (`sign_as(&alt_signer(), 2, e1.hash(), &pushed(&mmr0, &e1))`).
-    let mmr1 = pushed(&mmr0, &c.e1);
-    let cp2_alt = sign_as(&alt_signer(), 2, c.e1.hash(), &mmr1);
-    assert_eq!(digest_string(&cp2_alt.hash()), CP2_ALT_DIGEST);
+    // Pin the X12b `OTHER_TRAIL` end-record hash
+    // (`signed_cp_other(2, [0xaa; 32], &foreign_mmr_one())`).
+    let cp_other2 = signed_cp_other(2, [0xaa; 32], &foreign_mmr_one());
+    assert_eq!(digest_string(&cp_other2.hash()), CP_OTHER2_DIGEST);
 }
