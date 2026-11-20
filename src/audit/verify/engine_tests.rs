@@ -31,6 +31,7 @@ fn check(collection: Collection, trail: [u8; 16]) -> Report {
             anchors: &[],
             start: None,
             end_ctx: None,
+            receipts: None,
             now: std::time::SystemTime::now(),
         },
     )

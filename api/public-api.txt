@@ -202,6 +202,7 @@ pub fn vigil::audit::Verifier::anchor(self, anchor: vigil::audit::Checkpoint) ->
 pub fn vigil::audit::Verifier::end_before(self, archive_record: &str, end_anchor: core::option::Option<vigil::audit::Checkpoint>) -> core::result::Result<Self, vigil::audit::AuditError>
 pub fn vigil::audit::Verifier::max_age(self, max_age: core::time::Duration) -> core::result::Result<Self, vigil::audit::AuditError>
 pub fn vigil::audit::Verifier::new(trust: vigil::audit::TrustPolicy) -> Self
+pub fn vigil::audit::Verifier::receipts(self, receipts: impl core::iter::traits::collect::IntoIterator<Item = (u64, [u8; 32])>) -> Self
 pub fn vigil::audit::Verifier::start_from(self, start: vigil::audit::Checkpoint) -> Self
 pub fn vigil::audit::Verifier::trail(self, id: [u8; 16]) -> core::result::Result<Self, vigil::audit::AuditError>
 pub fn vigil::audit::Verifier::verify_dir(&self, dir: &std::path::Path) -> core::result::Result<vigil::audit::Report, vigil::audit::AuditError>

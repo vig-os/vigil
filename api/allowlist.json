@@ -402,6 +402,7 @@
       "vigil::audit::Verifier::end_before": "fn",
       "vigil::audit::Verifier::max_age": "fn",
       "vigil::audit::Verifier::new": "fn",
+      "vigil::audit::Verifier::receipts": "fn",
       "vigil::audit::Verifier::start_from": "fn",
       "vigil::audit::Verifier::trail": "fn",
       "vigil::audit::Verifier::verify_dir": "fn",
