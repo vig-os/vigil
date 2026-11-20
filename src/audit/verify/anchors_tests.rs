@@ -17,9 +17,7 @@ use std::{path::PathBuf, sync::Arc};
 // Shared literal hex constants (see `fixture_hashes_match_literals`).
 // =====================================================================
 
-const TRAIL_HEX: &str = "11111111111111111111111111111111";
 const OTHER_TRAIL_HEX: &str = "01010101010101010101010101010101";
-const FIXTURE_KEY_HEX: &str = "ee45ecb9aca01a0abd83ef56dd985c8c874e6e7f4aebcedf20bd8d88c2a0add7";
 const CP0_HONEST_DIGEST: &str =
     "blake3:fc26c6f2bb830592aaaca5413da1599489d86ac6e240a4a7a010681e0d4c8e77";
 const E1_HONEST_DIGEST: &str =
@@ -30,10 +28,6 @@ const CP2_TWIN_V6A_DIGEST: &str =
     "blake3:aee5a47d9814a55594371fa3bb0bd34a48531533983898590ef72f511d42f45c";
 const CP0_TWIN_A6B_DIGEST: &str =
     "blake3:1c2090cbf40864380a0bf92e4dc439c77146d8020e46fe172da7098a6b3077a7";
-const SYNTH_HASH_5A_DIGEST: &str =
-    "blake3:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
-const SYNTH_HASH_77_DIGEST: &str =
-    "blake3:7777777777777777777777777777777777777777777777777777777777777777";
 // Shipped-only cp3 at seq=3 on TRAIL, prev=cp2_honest.hash, empty mmr root
 // fold {cp0,e1,cp2}; pinned in `fixture_hashes_match_literals`.
 const CP3_SHIPPED_DIGEST: &str =
@@ -57,6 +51,10 @@ const SYNTH_CP2_V6A_DIGEST: &str =
 // `signed_cp_explicit(1, cp0.hash, 1, [0x77; 32], vec![[0x55; 32]])`.
 const SYNTH_CP1_V6A_DIGEST: &str =
     "blake3:6f29546e36b4f2e5563838f6a53d324832a27d0fb89ea9768459a028992bf915";
+// `signed_cp_explicit(3, cp2.hash, 1, [0xdd; 32], vec![[0xee; 32]])`;
+// used by A3b as an anchor inside a seq gap.
+const SYNTH_CP3_V6A_DIGEST: &str =
+    "blake3:4aabc11a93d3f4e9f2c8604be0f5d77c1a54548dbd9ea515ac646714221794bb";
 // `signed_cp(99, [0x88; 32], fold(cp0, e1, cp2))`.
 const GHOST_CP99_DIGEST: &str =
     "blake3:1732cbb351492d4576b1e43cd12ec99180df1ba14093fe3b2447d7846dc818a5";
@@ -192,7 +190,6 @@ fn a2_wrong_hash_at_existing_seq() {
     let synth = signed_cp_explicit(2, fx.e1.hash(), 2, [0x5a; 32], vec![[0x22; 32]]);
     let verifier = Verifier::new(trust_with_key()).anchor(parse_anchor(&synth));
     let report = report_of(vec![fx.path.clone(), dup], verifier);
-    let _ = &synth;
     let expected = vec![
         located(
             K::AnchorMismatch,
@@ -232,7 +229,6 @@ fn a3_anchor_above_head_no_record_no_location() {
         .anchor(anchor.clone())
         .anchor(anchor);
     let report = report_of(vec![fx.path], verifier);
-    let _ = &ghost;
     let expected = vec![unlocated(
         K::AnchorMismatch,
         Some(99),
@@ -242,19 +238,53 @@ fn a3_anchor_above_head_no_record_no_location() {
 }
 
 // =====================================================================
+// A3b — REGRESSION. An anchor whose `seq` falls inside a `SeqGap` of
+// the verified trail: no record exists below the head at that `seq`,
+// so the `AnchorMismatch` has no location. Pairs with A3 so the "no
+// record" branch is pinned on two independent rows: A3 above the
+// head, A3b strictly inside a gap below it.
+// =====================================================================
+#[test]
+fn a3b_anchor_in_seq_gap_no_record_no_location() {
+    let fx = two_checkpoints();
+    // A shipped copy at seq=4 opens a 3..=3 `SeqGap` above cp2 on the
+    // verified trail; the anchor's seq=3 lies strictly inside that gap.
+    let mut mmr_gap = pushed(&seeded(&fx.cp0), &fx.e1);
+    mmr_gap = pushed(&mmr_gap, &fx.cp2);
+    let cp4 = signed_cp(4, fx.cp2.hash(), &mmr_gap);
+    let shipped = fx._dir.0.join("cp4.shipped");
+    write_bytes(&shipped, &line_bytes(&cp4));
+    let synth = signed_cp_explicit(3, fx.cp2.hash(), 1, [0xdd; 32], vec![[0xee; 32]]);
+    let verifier = Verifier::new(trust_with_key()).anchor(parse_anchor(&synth));
+    let report = report_of(vec![fx.path.clone(), shipped.clone()], verifier);
+    let expected = vec![
+        unlocated(
+            K::AnchorMismatch,
+            Some(3),
+            format!("anchor seq 3 hash {SYNTH_CP3_V6A_DIGEST}: no record"),
+        ),
+        located(K::SeqGap, shipped, 1, 4, "missing seq 3..=3".into()),
+    ];
+    assert_findings(report.findings(), &expected, "A3b");
+}
+
+// =====================================================================
 // A4 — ACCEPTANCE. An anchor from another trail, at a `seq` the
-// verified trail holds. `trail differs` wins over any hash check.
+// verified trail holds. `trail differs` wins over any hash check and
+// locates at the first copy of the record at that `seq` (ruling
+// 13-V6-d1 point 2).
 // =====================================================================
 #[test]
 fn a4_other_trail_at_existing_seq() {
     let fx = two_checkpoints();
     let foreign = signed_cp_other(0, Record::genesis(&OTHER_TRAIL), &Mmr::new());
     let verifier = Verifier::new(trust_with_key()).anchor(parse_anchor(&foreign));
-    let report = report_of(vec![fx.path], verifier);
-    let _ = &foreign;
-    let expected = vec![unlocated(
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let expected = vec![located(
         K::AnchorMismatch,
-        Some(0),
+        fx.path,
+        1,
+        0,
         format!("anchor seq 0 hash {CP0_OTHER_DIGEST}: trail differs"),
     )];
     assert_findings(report.findings(), &expected, "A4");
@@ -272,7 +302,6 @@ fn a5_other_trail_at_absent_seq_still_trail_differs() {
     let foreign = signed_cp_other(99, [0; 32], &mmr_one);
     let verifier = Verifier::new(trust_with_key()).anchor(parse_anchor(&foreign));
     let report = report_of(vec![fx.path], verifier);
-    let _ = &foreign;
     let expected = vec![unlocated(
         K::AnchorMismatch,
         Some(99),
@@ -295,7 +324,6 @@ fn a5b_other_trail_at_a_second_absent_seq_still_trail_differs() {
     let foreign = signed_cp_other(50, [0x11; 32], &mmr_one);
     let verifier = Verifier::new(trust_with_key()).anchor(parse_anchor(&foreign));
     let report = report_of(vec![fx.path], verifier);
-    let _ = &foreign;
     let expected = vec![unlocated(
         K::AnchorMismatch,
         Some(50),
@@ -374,7 +402,7 @@ fn a6b_forked_seq_zero_with_one_matching_copy_stays_fork() {
 }
 
 // =====================================================================
-// A7 — ACCEPTANCE. A byte-identical native-plus-shipped duplicate
+// A7 — REGRESSION. A byte-identical native-plus-shipped duplicate
 // of the anchored checkpoint still matches the anchor (one record
 // in the trail). The only engine finding is the `DuplicateRecord`
 // warning; no `AnchorMismatch`.
@@ -424,7 +452,6 @@ fn a8_shipped_only_copy_matches_and_mismatch_locates_there() {
     let synth = signed_cp_explicit(2, e1.hash(), 2, [0x5a; 32], vec![[0x22; 32]]);
     let mismatch = Verifier::new(trust_with_key()).anchor(parse_anchor(&synth));
     let report = report_of(vec![native, shipped.clone()], mismatch);
-    let _ = &synth;
     let expected = vec![located(
         K::AnchorMismatch,
         shipped,
@@ -451,7 +478,6 @@ fn a9_same_anchor_twice_collapses_to_one_finding() {
         .anchor(anchor.clone())
         .anchor(anchor);
     let report = report_of(vec![fx.path.clone()], verifier);
-    let _ = &synth;
     let expected = vec![located(
         K::AnchorMismatch,
         fx.path,
@@ -465,9 +491,11 @@ fn a9_same_anchor_twice_collapses_to_one_finding() {
 }
 
 // =====================================================================
-// A10 — ACCEPTANCE. An anchor taken in process (from
+// A10 — REGRESSION. An anchor taken in process (from
 // `AuditTrail::checkpoint()`) matches the verified trail; and
-// `Checkpoint::parse` of its line carries the same trail.
+// `Checkpoint::parse` of its line carries the same trail (ruling 13-d1
+// OQ15). Whole-list literal: no `AnchorMismatch` and no other finding
+// on the clean trail.
 // =====================================================================
 #[test]
 fn a10_in_process_anchor_matches_and_parse_round_trips_trail() {
@@ -496,14 +524,90 @@ fn a10_in_process_anchor_matches_and_parse_round_trips_trail() {
         .unwrap();
     let verifier = Verifier::new(trust).anchor(cp).anchor(closed);
     let report = verifier.verify_dir(&d.0).unwrap();
-    let anchor_findings: Vec<_> = report
+    assert_findings(report.findings(), &[], "A10");
+}
+
+// =====================================================================
+// A10b — REGRESSION. Pairs with A10: the opening checkpoint returned
+// by `AuditTrail::close()` on a freshly created trail (no `record`
+// call) is in process and must carry its trail. Whole-list literal:
+// no finding on the clean trail.
+// =====================================================================
+#[test]
+fn a10b_in_process_anchor_from_close_matches() {
+    let d = Temp::new();
+    let signer: Arc<dyn Signer> = Arc::new(KeyFileSigner::from_hex(&"42".repeat(32)).unwrap());
+    let pubkey = signer.public_key();
+    let trail = AuditConfig::new("svc").dir(&d.0).create(signer).unwrap();
+    let trail_id = trail.trail();
+    let closed = trail.close().unwrap();
+    assert_eq!(closed.trail(), trail_id, "A10b: close() carries its trail");
+    let trust = TrustPolicy::builder()
+        .trail(trail_id)
+        .key(pubkey)
+        .build()
+        .unwrap();
+    let verifier = Verifier::new(trust).anchor(closed);
+    let report = verifier.verify_dir(&d.0).unwrap();
+    assert_findings(report.findings(), &[], "A10b");
+}
+
+// =====================================================================
+// A10c — REGRESSION. Pairs with A10: the opening checkpoint returned
+// by `AuditConfig::resume` is in process and must carry its trail.
+// The full verify report cannot be pinned literally here because
+// `AuditConfig` draws a random trail id per `create` (there is no
+// public seam to pin it), so the `Resumed` detail and the per-call
+// temporary path are not literal across runs; the identity of the
+// returned checkpoint's trail is the load-bearing claim, and the
+// anchor roundtrip under `verify_dir` without an `AnchorMismatch` is
+// what the "parse fills, in-process constructors must too" rule
+// protects.
+// =====================================================================
+#[test]
+fn a10c_in_process_anchor_from_resume_opening_matches() {
+    let d = Temp::new();
+    let signer: Arc<dyn Signer> = Arc::new(KeyFileSigner::from_hex(&"42".repeat(32)).unwrap());
+    let pubkey = signer.public_key();
+    let trail = AuditConfig::new("svc")
+        .dir(&d.0)
+        .create(signer.clone())
+        .unwrap();
+    let trail_id = trail.trail();
+    drop(trail);
+    std::fs::remove_file(d.0.join("audit.jsonl")).unwrap();
+    let (trail_b, _receipt, opening) = AuditConfig::new("svc")
+        .dir(&d.0)
+        .resume(signer, (0, Record::genesis(&trail_id)), 5, "op", "r")
+        .unwrap();
+    drop(trail_b);
+    assert_eq!(
+        opening.trail(),
+        trail_id,
+        "A10c: resume opening carries its trail",
+    );
+    let round_trip = Checkpoint::parse(opening.line()).unwrap();
+    assert_eq!(
+        round_trip.trail(),
+        trail_id,
+        "A10c: parse of the resume opening's line carries the same trail",
+    );
+    let trust = TrustPolicy::builder()
+        .trail(trail_id)
+        .key(pubkey)
+        .build()
+        .unwrap();
+    let verifier = Verifier::new(trust).anchor(opening);
+    let report = verifier.verify_dir(&d.0).unwrap();
+    let anchor_findings: Vec<&Finding> = report
         .findings()
         .iter()
         .filter(|f| f.kind() == K::AnchorMismatch)
         .collect();
-    assert!(
-        anchor_findings.is_empty(),
-        "A10: in-process anchors match, got {anchor_findings:?}",
+    assert_eq!(
+        anchor_findings,
+        Vec::<&Finding>::new(),
+        "A10c: in-process resume anchor matches, got {anchor_findings:?}",
     );
 }
 
@@ -528,7 +632,6 @@ fn a11_rewritten_above_anchor_fires_hash_differs_each() {
         .anchor(parse_anchor(&fx_honest.cp0))
         .anchor(parse_anchor(&fx_honest.cp2));
     let report = report_of(vec![path.clone()], verifier);
-    let _ = &cp2;
     let expected = vec![located(
         K::AnchorMismatch,
         path,
@@ -552,7 +655,6 @@ fn a12_anchor_at_non_checkpoint_record() {
     let synth = signed_cp_explicit(1, fx.cp0.hash(), 1, [0x77; 32], vec![[0x55; 32]]);
     let verifier = Verifier::new(trust_with_key()).anchor(parse_anchor(&synth));
     let report = report_of(vec![fx.path.clone()], verifier);
-    let _ = &synth;
     let expected = vec![located(
         K::AnchorMismatch,
         fx.path,
@@ -566,6 +668,42 @@ fn a12_anchor_at_non_checkpoint_record() {
 }
 
 // =====================================================================
+// A13 — REGRESSION. The record hash is computed from the canonical
+// encoding of the record's fields, not from the anchor's raw line
+// bytes (ADR-0005 decision 11, "Checkpoint"). An anchor parsed from a
+// non-canonical copy of a checkpoint line (here, a soft CR inserted
+// inside the line) still carries the same hash as the canonical copy
+// and still matches the trail: `[]`. Pins the rule that a verifier
+// that matched line bytes instead of the record hash would miss.
+// =====================================================================
+#[test]
+fn a13_noncanonical_line_parses_to_same_hash_and_matches() {
+    let fx = two_checkpoints();
+    let canonical = String::from_utf8(line_bytes(&fx.cp2))
+        .unwrap()
+        .trim_end_matches('\n')
+        .to_owned();
+    // Insert an insignificant JSON whitespace after the first `,`
+    // (RFC 8259 §2): a separate byte sequence that decodes to the
+    // same record, so `Checkpoint::parse` reconstructs the same
+    // canonical fields and therefore the same hash.
+    let noncanonical = canonical.replacen(',', ", ", 1);
+    assert_ne!(
+        noncanonical, canonical,
+        "A13: the non-canonical and canonical lines must differ as bytes",
+    );
+    let anchor = Checkpoint::parse(&noncanonical).unwrap();
+    assert_eq!(
+        anchor.hash(),
+        fx.cp2.hash(),
+        "A13: non-canonical parse carries the same record hash",
+    );
+    let verifier = Verifier::new(trust_with_key()).anchor(anchor);
+    let report = report_of(vec![fx.path.clone()], verifier);
+    assert_findings(report.findings(), &[], "A13");
+}
+
+// =====================================================================
 // Pins every literal hex constant in this module to the fixture it
 // names so a hash change in `runs_v4a_fixtures` or elsewhere never
 // slips through the literal-row assertions.
@@ -574,9 +712,7 @@ fn a12_anchor_at_non_checkpoint_record() {
 fn fixture_hashes_match_literals() {
     use crate::audit::hex;
     let fx = two_checkpoints();
-    assert_eq!(hex(&TRAIL), TRAIL_HEX);
     assert_eq!(hex(&OTHER_TRAIL), OTHER_TRAIL_HEX);
-    assert_eq!(hex(&fixture_pubkey()), FIXTURE_KEY_HEX);
     assert_eq!(digest_string(&fx.cp0.hash()), CP0_HONEST_DIGEST);
     assert_eq!(digest_string(&fx.e1.hash()), E1_HONEST_DIGEST);
     assert_eq!(digest_string(&fx.cp2.hash()), CP2_HONEST_DIGEST);
@@ -584,8 +720,6 @@ fn fixture_hashes_match_literals() {
     assert_eq!(digest_string(&twin.hash()), CP2_TWIN_V6A_DIGEST);
     let twin0 = signed_cp_explicit(0, Record::genesis(&TRAIL), 0, [0xaa; 32], vec![]);
     assert_eq!(digest_string(&twin0.hash()), CP0_TWIN_A6B_DIGEST);
-    assert_eq!(digest_string(&[0x5a; 32]), SYNTH_HASH_5A_DIGEST);
-    assert_eq!(digest_string(&[0x77; 32]), SYNTH_HASH_77_DIGEST);
     let mut fold = pushed(&seeded(&fx.cp0), &fx.e1);
     fold = pushed(&fold, &fx.cp2);
     let cp3 = signed_cp(3, fx.cp2.hash(), &fold);
@@ -605,6 +739,8 @@ fn fixture_hashes_match_literals() {
     assert_eq!(digest_string(&synth_cp2.hash()), SYNTH_CP2_V6A_DIGEST);
     let synth_cp1 = signed_cp_explicit(1, fx.cp0.hash(), 1, [0x77; 32], vec![[0x55; 32]]);
     assert_eq!(digest_string(&synth_cp1.hash()), SYNTH_CP1_V6A_DIGEST);
+    let synth_cp3 = signed_cp_explicit(3, fx.cp2.hash(), 1, [0xdd; 32], vec![[0xee; 32]]);
+    assert_eq!(digest_string(&synth_cp3.hash()), SYNTH_CP3_V6A_DIGEST);
     let mut fold99 = pushed(&seeded(&fx.cp0), &fx.e1);
     fold99 = pushed(&fold99, &fx.cp2);
     let ghost99 = signed_cp(99, [0x88; 32], &fold99);

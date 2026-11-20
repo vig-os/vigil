@@ -15,6 +15,23 @@ mod revocation;
 mod signatures;
 mod stale;
 
+/// The first record copy in the engine's merge order
+/// (`(path, line, hash)`): the same copy [`FindingKind::DuplicateRecord`]
+/// reports as the original (ruling 13-V5-d4). Shared by the location
+/// rule in `anchors`, `end` and `stale`; accepts a borrowed iterator
+/// so `stale` can pre-filter by its trusted predicate.
+pub(in crate::audit::verify) fn first_copy<'a, I>(
+    copies: I,
+) -> Option<(&'a Path, &'a input::Summary)>
+where
+    I: IntoIterator<Item = &'a (&'a Path, &'a input::Summary)>,
+{
+    copies
+        .into_iter()
+        .min_by_key(|(path, record)| (*path, record.line, record.hash))
+        .copied()
+}
+
 /// Severity of a finding produced by the offline verifier (#13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -411,9 +428,14 @@ impl Verifier {
     ///   3. `anchor seq <s> hash <hex>: seq is forked`
     ///   4. `anchor seq <s> hash <hex>: hash differs (record <hex>)`
     ///
-    /// The location is the first copy of the record at `seq` in the
-    /// engine's merge order, or no location when no record exists at
-    /// `seq`.
+    /// The hex values are `blake3:<64 lowercase hex>`; whitespace in
+    /// the detail is significant. Every finding locates at the first
+    /// copy of the record at `seq` in the engine's merge order (the
+    /// same copy [`FindingKind::DuplicateRecord`] reports as the
+    /// original); the one `no record` case has no record to locate
+    /// against and therefore no location. A `trail differs` anchor
+    /// at a `seq` the verified trail holds is still located at that
+    /// record's first copy.
     ///
     /// Anchors must come from a source the attacker cannot write: a
     /// [`Checkpoint`] returned by [`AuditTrail::checkpoint`],

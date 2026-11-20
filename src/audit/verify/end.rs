@@ -74,7 +74,7 @@ fn at_seq(
         ));
         return false;
     };
-    let (path, record) = first_copy(copies);
+    let (path, record) = super::first_copy(copies).expect("non-empty seq group");
     if record.hash != h {
         findings.push(Finding::new(
             K::TrailEnded,
@@ -108,7 +108,7 @@ fn above_seq(
         return false;
     };
     let b = above.next_back().map_or(a, |(&last, _)| last);
-    let (path, record) = first_copy(copies);
+    let (path, record) = super::first_copy(copies).expect("non-empty seq group");
     findings.push(Finding::new(
         K::TrailEnded,
         Some(path.to_owned()),
@@ -117,13 +117,4 @@ fn above_seq(
         format!("{prefix}records seq {a}..={b} above the end"),
     ));
     true
-}
-
-/// The first copy in the engine's merge order (`(path, line,
-/// hash)`): same copy `DuplicateRecord` reports as the original.
-fn first_copy<'a>(copies: &[Located<'a>]) -> Located<'a> {
-    *copies
-        .iter()
-        .min_by_key(|(path, record)| (*path, record.line, record.hash))
-        .expect("non-empty seq group")
 }
