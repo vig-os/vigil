@@ -281,8 +281,9 @@ fn stream_into_data(reader: impl io::BufRead, retain: Option<Rc<[u8]>>) -> io::R
 /// engine and [`super::first_copy`] sort file copies ahead of them
 /// at any shared `seq` and [`super::end_before::check`] can pick a
 /// file copy for [`FindingKind::TrailEnded`] without consulting the
-/// path. The `file_name` of `path` is `None` so `native_segments`
-/// picks it up as sealed (`is_live = false`).
+/// path. `path` is a plain label for diagnostics (the verifier
+/// passes `<end record>`); its `file_name` is not `audit.jsonl`, so
+/// `native_segments` picks it up as sealed (`is_live = false`).
 pub(super) fn end_record_input(bytes: Vec<u8>, path: PathBuf) -> Input {
     let rc: Rc<[u8]> = Rc::from(bytes.into_boxed_slice());
     let mut data = stream_into_data(io::Cursor::new(Rc::clone(&rc)), Some(rc))

@@ -8,16 +8,20 @@
 //! written in the engine's final sort order (`(seq.is_none(), seq,
 //! file, line, kind_debug)`), so no per-row sort runs here.
 //!
-//! Fixture style: honest-scenario rows (E1, E3a/E3b, E10/E10b) run
-//! the real writer (`AuditConfig`/`AuditTrail`) and archive the
-//! batch by moving its segment bytes to a new directory. The writer
-//! picks the trail at `create`, so their expected details interpolate
-//! the drawn trail id and record hashes at test time; `E10`/`E10b`
-//! use a pre-seeded `audit.trail` and `AuditConfig::resume` so the
-//! run digest stays pinned across runs. Rows for scenarios the real
-//! writer cannot produce (forged, foreign or parse-error) stay
-//! hand-built with the fixture `TRAIL` and `signed_cp`/`put_segment`;
-//! their comments say so truthfully.
+//! Fixture style: the honest-scenario batches E1 and E10 run the
+//! real writer (`AuditConfig`/`AuditTrail`) and archive the batch
+//! by moving its segment bytes to a new directory. E1 picks its
+//! trail at `create`, so its expected details interpolate the drawn
+//! trail id at test time; E10 pre-seeds `audit.trail` and calls
+//! `AuditConfig::resume` so the run digest stays pinned across runs.
+//! E3a/E3b are built at the fixture `TRAIL` with `signed_cp` and
+//! `entry_rec` so P and S have literal record hashes pinned in
+//! [`fixture_hashes_match_literals`]; `create` draws a random trail
+//! and does not accept a pre-seeded `audit.trail`, so the writer
+//! cannot produce the E3 layout with deterministic hashes without a
+//! production-side clock and trail seam. Rows for scenarios the
+//! real writer cannot produce (forged, foreign or parse-error) stay
+//! hand-built with the fixture `TRAIL` and `signed_cp`/`put_segment`.
 
 use crate::audit::{
     AuditConfig, AuditError, AuditErrorKind, Checkpoint, CheckpointFields, Entry, FindingKind as K,
@@ -28,7 +32,10 @@ use crate::audit::{
     },
     verify::{Finding, Verifier},
 };
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+};
 
 // =====================================================================
 // Shared literal hex constants pinned by `fixture_hashes_match_literals`.
@@ -61,6 +68,11 @@ const CP2_HONEST_DIGEST: &str =
 /// the end `seq` in E7.
 const FORGED_E2_DIGEST: &str =
     "blake3:8a5ea9c989aad7e89033b58ad6f59a6384af43dfe6df5bada042420c0040c306";
+/// Record hash of `Record::new(context(2, e1.hash()), Entry::new(
+/// "actor", "change", "alt"))`, the alternate forged record at the
+/// end `seq` in E7c2.
+const FORGED_E2_ALT_DIGEST: &str =
+    "blake3:b0a0082469a0a510874383b5c46630665a6952dd3e0ee8a05ed3eb3704f77287";
 /// Record hash of `entry_rec(3, cp2.hash())` on the honest chain
 /// past the end, used by E7b.
 const E3_HONEST_DIGEST: &str =
@@ -70,11 +82,31 @@ const E3_HONEST_DIGEST: &str =
 /// shipped file copies at seq 3 fork.
 const E3_ALT_DIGEST: &str =
     "blake3:4ce25936f5be0fe59ac6784f645b38397915b56d1d840aa99a31a9fa17ac9d1e";
-/// Run digest the shared classifier emits for the E10/E10b
-/// writer-built A8-style archive (`S0=[cp0]`, `S1=[]`) walked with
-/// the resume-opening end record. Fixed because the fixture seeds
-/// `audit.trail` with `TRAIL`.
+/// Run digest the shared classifier emits for the E10 writer-built
+/// A8-style archive (`S0=[]`, `S1=[]`) walked with the
+/// resume-opening end record. Fixed because the fixture seeds
+/// `audit.trail` with `TRAIL` and the run digest depends only on
+/// the loss-point ranges and the (empty) gap spans. E10b uses the
+/// same loss layout and reuses this constant for its own run finding.
 const RUN_DIGEST_E10_HEX: &str = "1c02f080d9c70df74de0c13a4a30323f1b49ee624bab2c5d68fa5ee31c4400e4";
+/// Record hash of `entry_rec(2, cp0.hash() chain)` on the honest
+/// E3 chain, where seq 2's previous is `e1.hash()`. The same hash
+/// also appears in E7 as the forged record at the end seq (same
+/// context, same signer).
+const E2_HONEST_DIGEST: &str = FORGED_E2_DIGEST;
+/// Record hash of `signed_cp(3, e2.hash(), &mmr_through_e2)` on the
+/// honest E3 chain -- the P checkpoint whose line the E3 archive
+/// record replays.
+const P_HONEST_DIGEST: &str =
+    "blake3:dda83f7bbaaf877076831dd97e6563148bf337d350bc58cf8bc6e8802eed2f66";
+/// Record hash of `entry_rec(4, p.hash())` on the honest E3 chain.
+const E4_HONEST_DIGEST: &str =
+    "blake3:c0d53ffca7d1358ec842a15694a00833b408e2a6d43f49f2f1de7225fabba4e6";
+/// Record hash of `signed_cp(5, e4.hash(), &mmr_through_e4)` on the
+/// honest E3 chain -- the S close checkpoint used as the end anchor
+/// in E3a.
+const S_HONEST_DIGEST: &str =
+    "blake3:8c2a212152faa447de5f329dc79b90a503eec4ec0f18cfb9b6717a749d6a4cd0";
 
 // =====================================================================
 // Helpers.
@@ -107,6 +139,32 @@ fn assert_invalid(result: Result<Verifier, AuditError>, reason: &str, label: &st
             );
         }
     }
+}
+
+/// Process-wide lock used by the relative-path rows so that at most
+/// one test at a time changes `std::env::current_dir`. Other rows in
+/// this module use absolute temp paths and do not read `cwd`.
+fn cwd_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Runs `f` with `cwd` temporarily set to `dir`, restoring the
+/// previous `cwd` on return. Used by [`e5d_byte_identical_copy_relative_paths_locate_trail_ended_at_file`]
+/// and [`e7c_files_hold_different_record_at_end_seq_relative_paths`]:
+/// relative paths starting with lowercase letters sort AFTER
+/// `<end record>` (`<` = 0x3C, `a` = 0x61), so these rows would
+/// locate `TrailEnded` at the end record if the engine sort dropped
+/// `is_end_record`. Absolute `/tmp/...` paths sort BEFORE
+/// `<end record>` (`/` = 0x2F) and do not stress that mutation.
+fn with_cwd<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+    let guard = cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let previous = std::env::current_dir().unwrap();
+    std::env::set_current_dir(dir).unwrap();
+    let out = f();
+    std::env::set_current_dir(&previous).unwrap();
+    drop(guard);
+    out
 }
 
 /// Trust policy pinned to the fixture `TRAIL` and the fixture signer
@@ -264,83 +322,57 @@ fn writer_honest_batch() -> WriterBatch {
     }
 }
 
-/// Real-writer E3 scenario: `create`, `record` twice, `P =
-/// checkpoint()`, `record`, `S = close()`. The archive holds the
-/// records BEFORE P (seqs before P). The archive record is P's line;
-/// the end anchor is S (or `None` for E3b).
-struct WriterE3 {
-    _writer_dir: Temp,
-    _archive_dir_tmp: Temp,
-    archive_segment: PathBuf,
-    p_seq: u64,
+/// Hand-built E3 scenario at the fixture `TRAIL` and fixture
+/// signer: cp0 (genesis checkpoint) at seq 0, entries at seq 1 and
+/// 2, P (checkpoint) at seq 3, entry at seq 4, S (close checkpoint)
+/// at seq 5. The archive holds the records strictly before P as one
+/// sealed segment (`[cp0, e1, e2]`). Hand-built, not writer-built,
+/// because `AuditConfig::create` always draws a random trail and the
+/// writer's wall-clock timestamps vary per run; the hand-built
+/// records at the fixed `context(seq, previous)` ensure every record
+/// hash is a literal constant pinned in
+/// [`fixture_hashes_match_literals`], as decision 11 "Step 7 takes
+/// the end from the anchor store" requires the P-vs-S mismatch and
+/// S's own anchor lookup to be assertable byte-for-byte.
+struct HandE3 {
+    _dir: Temp,
+    archive_dir: PathBuf,
+    p: Record,
     p_line: String,
-    s_checkpoint: Checkpoint,
-    trust: TrustPolicy,
+    s: Record,
 }
-fn writer_e3_scenario() -> WriterE3 {
-    let writer_dir = Temp::new();
-    let signer = fixture_signer();
-    let trail = AuditConfig::new("svc")
-        .dir(&writer_dir.0)
-        .create(signer.clone())
-        .unwrap();
-    let trail_id = trail.trail();
-    trail
-        .record(&Entry::new("actor", "change", "obj1"))
-        .unwrap();
-    trail
-        .record(&Entry::new("actor", "change", "obj2"))
-        .unwrap();
-    let p_checkpoint = trail.checkpoint().unwrap();
-    trail
-        .record(&Entry::new("actor", "change", "obj3"))
-        .unwrap();
-    let s_checkpoint = trail.close().unwrap();
-    // Split the live stream at P: records before P go into the
-    // archive segment, matching the "lines before P as segment 0"
-    // layout of ruling 13-V6-d4. P and everything after it are
-    // dropped from the archive (the brief's "delete batch n from P
-    // onwards"); the archive record is P's line.
-    let live = writer_dir.0.join("audit.jsonl");
-    let bytes = std::fs::read(&live).unwrap();
-    let p_line_with_lf = {
-        let mut v = p_checkpoint.line().as_bytes().to_vec();
-        v.push(b'\n');
-        v
-    };
-    let p_pos =
-        find_subsequence(&bytes, &p_line_with_lf).expect("P's line is in the writer's live file");
-    let archive_bytes = &bytes[..p_pos];
-    let archive_tmp = Temp::new();
-    let archive_segment = segment_path(&archive_tmp.0, 0);
-    std::fs::write(&archive_segment, archive_bytes).unwrap();
-    let p_line = p_checkpoint.line().to_owned();
-    let p_seq = p_checkpoint.seq();
-    let trust = TrustPolicy::builder()
-        .trail(trail_id)
-        .key(fixture_pubkey())
-        .build()
-        .unwrap();
-    WriterE3 {
-        _writer_dir: writer_dir,
-        _archive_dir_tmp: archive_tmp,
-        archive_segment,
-        p_seq,
+fn hand_built_e3() -> HandE3 {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let e2 = entry_rec(2, e1.hash());
+    let mmr2 = pushed(&mmr1, &e2);
+    let p = signed_cp(3, e2.hash(), &mmr2);
+    let mmr3 = pushed(&mmr2, &p);
+    let e4 = entry_rec(4, p.hash());
+    let mmr4 = pushed(&mmr3, &e4);
+    let s = signed_cp(5, e4.hash(), &mmr4);
+    put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
+    let p_line = line_without_lf(&p);
+    HandE3 {
+        archive_dir: d.0.clone(),
+        _dir: d,
+        p,
         p_line,
-        s_checkpoint,
-        trust,
+        s,
     }
-}
-
-fn find_subsequence(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Real-writer E10 scenario: a trail archived at a `resume`
 /// opening. Pre-seeds `audit.trail` with the fixture `TRAIL` so the
 /// run digest the shared classifier emits stays pinned across runs.
-/// Yields the A8-style layout (archive `S0=[cp0]`, `S1=[]`, end
-/// record `[cp_opening, resume_entry]`) under the fixture signer.
+/// Yields the A8-style layout (archive `S0=[]`, `S1=[]`, end record
+/// `[cp_opening, resume_entry]`) under the fixture signer. Both
+/// sealed segments are empty so the resume opens from genesis
+/// without inviting a pre-opening chain finding (ruling 13-V3-d5's
+/// genesis-not-first check).
 struct WriterE10 {
     _writer_dir: Temp,
     _archive_dir_tmp: Temp,
@@ -352,6 +384,9 @@ struct WriterE10 {
     resume_line_bytes_with_lf: Vec<u8>,
 }
 fn writer_e10_scenario() -> WriterE10 {
+    writer_e10_scenario_with("operator", "incident")
+}
+fn writer_e10_scenario_with(operator: &str, reason: &str) -> WriterE10 {
     let writer_dir = Temp::new();
     // Pre-seed the trail marker so `resume` loads the fixture
     // `TRAIL` and the drawn record hashes stay stable.
@@ -366,8 +401,8 @@ fn writer_e10_scenario() -> WriterE10 {
             signer.clone(),
             (0, Record::genesis(&TRAIL)),
             0,
-            "operator",
-            "incident",
+            operator,
+            reason,
         )
         .unwrap();
     // Closing the handle writes an extra checkpoint line into the
@@ -475,69 +510,59 @@ fn e2_no_end_anchor_emits_unanchored_end() {
 
 // =====================================================================
 // E3a -- ACCEPTANCE. Decision 11 bullet "Step 7 takes the end from
-// the anchor store" built by the real writer: `create`, record
-// twice, `P = checkpoint()`, record once, `S = close()`. Delete the
-// batch from P onwards and replace the record with P's line. With
-// the end anchor `S` from the anchor store, the record (`P`)
-// differs from `S`'s line, so `AnchorMismatch "end record differs
-// from end anchor"` fires at P's seq. `S` also joins the anchors;
-// `S` points at a seq the verified set does not hold, so the
-// ordinary anchor rule emits `anchor seq <s> hash <s_hash>: no record`.
+// the anchor store": at the hand-built E3 layout (cp0, e1, e2 in the
+// archive; P at seq 3; S at seq 5 off to the side), the archive
+// record is P's line and the end anchor is S from the anchor store.
+// The record (P's line) differs from S's line, so `AnchorMismatch
+// "end record differs from end anchor"` fires at P's seq. S also
+// joins the anchors; S points at a seq the verified set does not
+// hold, so the ordinary anchor rule emits
+// `anchor seq 5 hash <S_HONEST_DIGEST>: no record`.
 // =====================================================================
 #[test]
 fn e3a_record_replaced_with_p_line_has_anchor_mismatch_with_s() {
-    let fx = writer_e3_scenario();
-    let archive_dir = fx.archive_segment.parent().unwrap().to_owned();
-    let report = Verifier::new(fx.trust.clone())
-        .end_before(&fx.p_line, Some(fx.s_checkpoint.clone()))
+    let fx = hand_built_e3();
+    let s_anchor = checkpoint_of(&fx.s);
+    let report = verifier()
+        .end_before(&fx.p_line, Some(s_anchor))
         .unwrap()
-        .verify_files(vec![archive_dir])
+        .verify_files(vec![fx.archive_dir.clone()])
         .unwrap();
-    let p_seq = fx.p_seq;
-    let s_seq = fx.s_checkpoint.seq();
     let expected = vec![
         unlocated(
             K::AnchorMismatch,
-            Some(p_seq),
+            Some(3),
             "end record differs from end anchor".into(),
         ),
         unlocated(
             K::AnchorMismatch,
-            Some(s_seq),
-            format!(
-                "anchor seq {s_seq} hash {}: no record",
-                digest_string(&fx.s_checkpoint.hash()),
-            ),
+            Some(5),
+            format!("anchor seq 5 hash {S_HONEST_DIGEST}: no record"),
         ),
     ];
     assert_findings(report.findings(), &expected, "E3a");
     assert!(!report.is_valid(), "E3a exit 1");
-    let _ = &fx.archive_segment;
 }
 
 // =====================================================================
-// E3b -- ACCEPTANCE. Same writer-built layout as E3a but without
-// an end anchor: one `UnanchoredEnd` at the record's seq. Pairs
-// with E3a to pin both bullets of decision 11 "Where the end comes
-// from".
+// E3b -- ACCEPTANCE. Same hand-built E3 layout as E3a but with no
+// end anchor: one `UnanchoredEnd` at P's seq. Pairs with E3a to pin
+// both bullets of decision 11 "Where the end comes from".
 // =====================================================================
 #[test]
 fn e3b_record_replaced_with_p_line_no_anchor_is_unanchored_end() {
-    let fx = writer_e3_scenario();
-    let archive_dir = fx.archive_segment.parent().unwrap().to_owned();
-    let report = Verifier::new(fx.trust.clone())
+    let fx = hand_built_e3();
+    let report = verifier()
         .end_before(&fx.p_line, None)
         .unwrap()
-        .verify_files(vec![archive_dir])
+        .verify_files(vec![fx.archive_dir.clone()])
         .unwrap();
-    let p_seq = fx.p_seq;
     let expected = vec![unlocated(
         K::UnanchoredEnd,
-        Some(p_seq),
-        format!("end_before seq {p_seq}: no end anchor"),
+        Some(3),
+        "end_before seq 3: no end anchor".into(),
     )];
     assert_findings(report.findings(), &expected, "E3b");
-    let _ = &fx.archive_segment;
 }
 
 // =====================================================================
@@ -619,14 +644,12 @@ fn e5_byte_identical_copy_of_end_line_is_trail_ended_not_duplicate() {
 }
 
 // =====================================================================
-// E5b -- ACCEPTANCE. One duplicate strictly below the end plus the
-// honest archive ending at `e1` (writer-equivalent hand-built so
-// the archive segment and the extra shipped copy live in the same
-// directory with stable path ordering). The shipped copy of `cp0`
-// at seq 0 creates a duplicate below the end; the archive still
-// pairs with the end record `cp2` at the end seq. The whole-list
-// literal pins both findings together, so widening the suppression
-// below the end fails at the seq-0 entry (ruling 13-V6-d4 point 3).
+// E5b -- ACCEPTANCE. One duplicate strictly below the end: the
+// archive holds `[cp0, e1]` and a shipped copy of `cp0` at seq 0
+// lives alongside it, so seq 0 has two copies while seq 2 is the
+// end. The expected list pins the `DuplicateRecord` at seq 0
+// alone, so widening the suppression below the end makes this list
+// empty and the assertion fails (ruling 13-V6-d4 point 3).
 // =====================================================================
 #[test]
 fn e5b_duplicate_below_end_still_fires_at_or_above_is_suppressed() {
@@ -690,6 +713,59 @@ fn e5c_duplicate_of_e1_below_end_still_fires() {
         "2 copies of 1 distinct records".into(),
     )];
     assert_findings(report.findings(), &expected, "E5c");
+}
+
+// =====================================================================
+// E5d -- ACCEPTANCE. E5's byte-identical end-line scenario through
+// RELATIVE paths: the archive segment (`audit.0.jsonl`) and the
+// extra shipped copy (`x_shipped.jsonl`) both live in a tempdir,
+// and the verify call runs with `cwd` set to that tempdir. The
+// relative paths both sort AFTER `<end record>` (`<` = 0x3C, `a` =
+// 0x61, `x` = 0x78), so if the engine drops `is_end_record` from
+// its per-`seq` copy sort the end record becomes the first copy at
+// seq 2 and `TrailEnded` locates at the end record (which the
+// strip-location pass then unlocates). The expected list pins
+// `TrailEnded` at the shipped copy's path and line, so dropping the
+// flag turns the finding into an unlocated one and the assertion
+// fails (ruling 13-V6-d4 point 3). Pairs with E5 (absolute paths)
+// so that the test survives on hosts where `/tmp` sorts before `<`.
+// =====================================================================
+#[test]
+fn e5d_byte_identical_copy_relative_paths_locate_trail_ended_at_file() {
+    let fx = hand_built_batch();
+    // Build the archive segment and the extra shipped copy inside a
+    // fresh tempdir, then verify with `cwd` set to that tempdir and
+    // only the file names in the paths list. Both file names start
+    // with an ASCII letter >= `a` (0x61), so without the
+    // `is_end_record` flag the end-record copy (`<end record>`,
+    // 0x3C) would sort first and `TrailEnded` would locate at the
+    // end record rather than at the shipped file copy.
+    let d = Temp::new();
+    put_segment(&d.0, 0, &[&fx.cp0, &fx.e1], &[]);
+    let shipped_name = "x_shipped.jsonl";
+    let shipped_absolute = d.0.join(shipped_name);
+    write_bytes(&shipped_absolute, &line_bytes(&fx.cp2));
+    let archive_relative: PathBuf = segment_path(&d.0, 0)
+        .file_name()
+        .expect("segment path has a file name")
+        .into();
+    let shipped_relative: PathBuf = shipped_name.into();
+    let anchor = checkpoint_of(&fx.cp2);
+    let report = with_cwd(&d.0, || {
+        verifier()
+            .end_before(&fx.cp2_line, Some(anchor))
+            .unwrap()
+            .verify_files(vec![archive_relative.clone(), shipped_relative.clone()])
+            .unwrap()
+    });
+    let expected = vec![located(
+        K::TrailEnded,
+        shipped_relative,
+        1,
+        2,
+        "end_before seq 2: records seq 2..=2 at or above the end".into(),
+    )];
+    assert_findings(report.findings(), &expected, "E5d");
 }
 
 // =====================================================================
@@ -866,6 +942,124 @@ fn e7b_fork_above_end_emits_seq_conflict_and_trail_ended() {
         unlocated(K::UncoveredTail, None, "records seq 3..=3".into()),
     ];
     assert_findings(report.findings(), &expected, "E7b");
+}
+
+// =====================================================================
+// E7c -- ACCEPTANCE. E7's scenario reached through RELATIVE paths:
+// the archive segment is `audit.0.jsonl` in a tempdir, and the
+// verify call runs with `cwd` set to that tempdir. The relative
+// path starts with `a` (0x61), which sorts AFTER `<end record>`
+// (`<` = 0x3C), so if the engine drops `is_end_record` from its
+// per-`seq` copy sort (or `verify::first_copy` drops it) the end
+// record would become the first copy at seq 2 and the three
+// findings would locate at the end record instead of the archive
+// segment. The expected list pins the archive-copy location, so
+// dropping the flag flips `AnchorMismatch`/`SeqConflict`/`TrailEnded`
+// off the file path and the assertion fails (ruling 13-V6-d4 point
+// 3). Pairs with E7 (absolute paths) so that the test survives on
+// hosts where `/tmp` sorts before `<`.
+// =====================================================================
+#[test]
+fn e7c_files_hold_different_record_at_end_seq_relative_paths() {
+    let fx = hand_built_batch();
+    let forged = entry_rec(2, fx.e1.hash());
+    let d = Temp::new();
+    put_segment(&d.0, 0, &[&fx.cp0, &fx.e1, &forged], &[]);
+    let anchor = checkpoint_of(&fx.cp2);
+    // The fixture segment file name is `audit-<stamp>_<id>.jsonl`;
+    // keep just the file name so the path is relative to `cwd`.
+    let relative_segment: PathBuf = segment_path(&d.0, 0)
+        .file_name()
+        .expect("segment path has a file name")
+        .into();
+    let report = with_cwd(&d.0, || {
+        verifier()
+            .end_before(&fx.cp2_line, Some(anchor))
+            .unwrap()
+            .verify_files(vec![relative_segment.clone()])
+            .unwrap()
+    });
+    let expected = vec![
+        located(
+            K::AnchorMismatch,
+            relative_segment.clone(),
+            3,
+            2,
+            format!("anchor seq 2 hash {CP2_HONEST_DIGEST}: seq is forked"),
+        ),
+        located(
+            K::SeqConflict,
+            relative_segment.clone(),
+            3,
+            2,
+            format!("conflicting hashes: {CP2_HONEST_DIGEST}, {FORGED_E2_DIGEST}"),
+        ),
+        located(
+            K::TrailEnded,
+            relative_segment,
+            3,
+            2,
+            "end_before seq 2: records seq 2..=2 at or above the end".into(),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "E7c");
+}
+
+// =====================================================================
+// E7c2 -- ACCEPTANCE. Second relative-paths row for the end-record
+// ordering flag: same relative-paths setup as E7c but the file's
+// record at the end `seq` forks through a DIFFERENT hash (a
+// `Record::new` with an unrelated entry object rather than
+// `entry_rec`). Keeps the same expected locations so that dropping
+// `is_end_record` from either `verify::first_copy` or the engine's
+// per-`seq` copy sort fails on two independent file paths (E7c's
+// forged record and E7c2's), not only one.
+// =====================================================================
+#[test]
+fn e7c2_different_forged_record_at_end_seq_relative_paths() {
+    let fx = hand_built_batch();
+    let alt_forged = {
+        let ctx = context(2, fx.e1.hash());
+        Record::new(ctx, Entry::new("actor", "change", "alt")).unwrap()
+    };
+    let d = Temp::new();
+    put_segment(&d.0, 0, &[&fx.cp0, &fx.e1, &alt_forged], &[]);
+    let anchor = checkpoint_of(&fx.cp2);
+    let relative_segment: PathBuf = segment_path(&d.0, 0)
+        .file_name()
+        .expect("segment path has a file name")
+        .into();
+    let report = with_cwd(&d.0, || {
+        verifier()
+            .end_before(&fx.cp2_line, Some(anchor))
+            .unwrap()
+            .verify_files(vec![relative_segment.clone()])
+            .unwrap()
+    });
+    let expected = vec![
+        located(
+            K::AnchorMismatch,
+            relative_segment.clone(),
+            3,
+            2,
+            format!("anchor seq 2 hash {CP2_HONEST_DIGEST}: seq is forked"),
+        ),
+        located(
+            K::SeqConflict,
+            relative_segment.clone(),
+            3,
+            2,
+            format!("conflicting hashes: {CP2_HONEST_DIGEST}, {FORGED_E2_ALT_DIGEST}"),
+        ),
+        located(
+            K::TrailEnded,
+            relative_segment,
+            3,
+            2,
+            "end_before seq 2: records seq 2..=2 at or above the end".into(),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "E7c2");
 }
 
 // =====================================================================
@@ -1101,6 +1295,26 @@ fn e9b_end_before_then_max_age_errors() {
     }
 }
 #[test]
+fn e9b2_end_before_then_max_age_hour_errors() {
+    // Pair for E9b with a non-zero `max_age`: the duration value
+    // is not part of the conflict rule (ADR-0005 §19.2; ruling
+    // 13-V6-d4 point 7), so a zero-duration row cannot be the only
+    // one that proves the `max_age` side of the check.
+    let fx = hand_built_batch();
+    let v = verifier().end_before(&fx.cp2_line, None).unwrap();
+    match v.max_age(std::time::Duration::from_secs(3600)) {
+        Ok(_) => panic!("E9b2: expected InvalidConfig, got Ok"),
+        Err(e) => {
+            assert_eq!(e.kind(), AuditErrorKind::InvalidConfig);
+            assert!(
+                e.to_string().contains("max_age conflicts with end_before"),
+                "E9b2: {}",
+                e,
+            );
+        }
+    }
+}
+#[test]
 fn e9c_end_before_twice_keeps_second() {
     let fx = hand_built_batch();
     let anchor = checkpoint_of(&fx.cp2);
@@ -1234,14 +1448,72 @@ fn e10_step6_and_step7_report_the_same_findings() {
     assert_eq!(run6.run_digest(), Some(run_digest), "E10 run digest pin");
 }
 
+// =====================================================================
+// E10b -- ACCEPTANCE. A second step-7 row with the SAME archive
+// layout as E10 but different operator and reason strings on the
+// resume record. The loss layout is identical (opening at seq 1,
+// `lost_through = 0`), so the run digest reuses `RUN_DIGEST_E10_HEX`
+// (ruling 13-V4-d8 point 1: the digest covers only ranges and gap
+// spans, not record contents). The `Resumed` detail and the resume
+// line bytes differ from E10's, so if the end record is merged by
+// `seq` only and never walked by the classifier the digest-bearing
+// `SegmentStructure` finding disappears and this row fails
+// independently of E10.
+// =====================================================================
+#[test]
+fn e10b_second_step7_row_different_operator_reason() {
+    let fx = writer_e10_scenario_with("admin", "dry-run");
+    let run_digest = digest_bytes_from_hex(RUN_DIGEST_E10_HEX);
+    let record = format!("{}\n{}", fx.cp_opening.line(), &fx.resume_line);
+    let report = Verifier::new(trust_writer_e10())
+        .end_before(&record, Some(fx.cp_opening.clone()))
+        .unwrap()
+        .verify_files(vec![fx.archive_dir.clone()])
+        .unwrap();
+    let s0 = segment_path(&fx.archive_dir, 0);
+    let s1 = fx.s1_path.clone();
+    let resumed = resumed_detail_e10_with("admin", "dry-run");
+    let expected = vec![
+        unlocated(K::SeqGap, Some(1), "missing seq 0..=0".into()),
+        unlocated(K::Resumed, Some(2), resumed),
+        unlocated(K::UncoveredTail, None, "records seq 2..=2".into()),
+        Finding::new(
+            K::SegmentStructure,
+            Some(s0.clone()),
+            None,
+            None,
+            "expected first complete record to be a checkpoint".into(),
+        ),
+        Finding::new(
+            K::SegmentStructure,
+            Some(s0),
+            None,
+            None,
+            format!("digest blake3:{RUN_DIGEST_E10_HEX}"),
+        )
+        .with_run_digest(run_digest),
+        Finding::new(
+            K::SegmentStructure,
+            Some(s1),
+            None,
+            None,
+            "expected first complete record to be a checkpoint".into(),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "E10b");
+}
+
 fn resumed_detail_e10(_fx: &WriterE10) -> String {
+    resumed_detail_e10_with("operator", "incident")
+}
+fn resumed_detail_e10_with(operator: &str, reason: &str) -> String {
     // The resume opens from genesis (`AuditConfig::resume` with
     // head=(0, genesis(TRAIL))) and declares lost_through=0, so the
     // detail's head hash is the trail's genesis digest and the gap
     // takes the fixed genesis form `0..=L` (ADR l.407; ruling
     // 13-V3-d5 point 3).
     format!(
-        "operator=operator reason=incident head=0:{} gap=0..=0 lost_records=0 structural=valid",
+        "operator={operator} reason={reason} head=0:{} gap=0..=0 lost_records=0 structural=valid",
         digest_string(&Record::genesis(&TRAIL)),
     )
 }
@@ -1297,6 +1569,11 @@ fn fixture_hashes_match_literals() {
     assert_eq!(digest_string(&fx.cp2.hash()), CP2_HONEST_DIGEST);
     let forged = entry_rec(2, fx.e1.hash());
     assert_eq!(digest_string(&forged.hash()), FORGED_E2_DIGEST);
+    let alt_forged = {
+        let ctx = context(2, fx.e1.hash());
+        Record::new(ctx, Entry::new("actor", "change", "alt")).unwrap()
+    };
+    assert_eq!(digest_string(&alt_forged.hash()), FORGED_E2_ALT_DIGEST);
     let e3 = entry_rec(3, fx.cp2.hash());
     assert_eq!(digest_string(&e3.hash()), E3_HONEST_DIGEST);
     let alt = {
@@ -1310,6 +1587,18 @@ fn fixture_hashes_match_literals() {
     // builder returned).
     let parsed = Checkpoint::parse(&fx.cp2_line).unwrap();
     assert_eq!(parsed.hash(), fx.cp2.hash());
+    // Pin the E3 record hashes (P, E4, S) through a second,
+    // independent build of the hand-built E3 chain. E2's hash is
+    // the same byte sequence as E7's `FORGED_E2_DIGEST`
+    // (`entry_rec(2, e1.hash())` under the fixture signer); pin
+    // that equality explicitly through `E2_HONEST_DIGEST`.
+    let e3_fx = hand_built_e3();
+    let e2 = entry_rec(2, fx.e1.hash());
+    assert_eq!(digest_string(&e2.hash()), E2_HONEST_DIGEST);
+    assert_eq!(digest_string(&e3_fx.p.hash()), P_HONEST_DIGEST);
+    let e4 = entry_rec(4, e3_fx.p.hash());
+    assert_eq!(digest_string(&e4.hash()), E4_HONEST_DIGEST);
+    assert_eq!(digest_string(&e3_fx.s.hash()), S_HONEST_DIGEST);
     // Pin the E10 run digest: build the A8-style resume archive and
     // walk it through the verifier; the SegmentStructure run
     // finding's digest must equal the literal constant.
