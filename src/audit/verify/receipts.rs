@@ -1,14 +1,15 @@
 //! Receipt reconciliation (ADR-0005 decision 5 "Receipt
-//! reconciliation", "Waivers, for an honest crash" and "Late
-//! adoption"; ruling 13-V7-d1 points 2-6 and its clarification
-//! 13-V7-d1a). The range, match rule, `ReceiptMismatch` precedence
-//! and the `NoReceipt` / `ReceiptWaived` detail grammars live on
-//! [`crate::audit::Verifier::receipts`],
-//! [`crate::audit::Verifier::waive`] and
-//! [`crate::audit::Verifier::receipts_from`]; this module owns
+//! reconciliation", "Waivers, for an honest crash", "Late adoption"
+//! and "Live trails"; ruling 13-V7-d1 points 2-6 and 10 and its
+//! clarification 13-V7-d1a). The range, match rule, `ReceiptMismatch`
+//! precedence and the `NoReceipt` / `ReceiptWaived` / `Unreconciled`
+//! detail grammars live on [`crate::audit::Verifier::receipts`],
+//! [`crate::audit::Verifier::waive`],
+//! [`crate::audit::Verifier::receipts_from`] and
+//! [`crate::audit::Verifier::receipts_live`]; this module owns
 //! none of them twice.
 
-use super::{Finding, input::Summary, position::Classifier};
+use super::{Finding, first_copy, input::Summary, position::Classifier};
 use crate::audit::{FindingKind as K, digest_string};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -17,13 +18,18 @@ use std::{
 
 type Located<'a> = (&'a Path, &'a Summary);
 
-/// Reconciliation inputs bundle (ruling 13-V7-d1 point 2: receipts,
-/// waivers and `from` all turn reconciliation on). Built in
-/// [`crate::audit::Verifier::verify_files`].
+/// Reconciliation inputs bundle (ruling 13-V7-d1 points 2 and 10:
+/// receipts, waivers, `from` and `live` all turn reconciliation on).
+/// Built in [`crate::audit::Verifier::verify_files`].
 pub(super) struct Inputs<'a> {
     pub(super) receipts: &'a BTreeSet<(u64, [u8; 32])>,
     pub(super) waivers: &'a BTreeMap<u64, ([u8; 32], String)>,
     pub(super) receipts_from: Option<&'a (u64, [u8; 32], String)>,
+    /// `true` iff [`crate::audit::Verifier::receipts_live`]`(true)`
+    /// was the last call: records above the longest fully
+    /// reconciled prefix collapse to one `Unreconciled` (info) and
+    /// get no `NoReceipt` (ruling 13-V7-d1 point 10).
+    pub(super) live: bool,
 }
 
 /// Which subject the one match rule is running for (ruling 13-V7-d1
@@ -83,10 +89,26 @@ pub(super) fn check(
     for (&seq, (hash, reason)) in inputs.waivers {
         match_one(seq, *hash, &Subject::Waive(reason), &ctx, findings);
     }
+    // One pass over the in-range groups (ruling 13-V7-d1 points 3
+    // and 10): it emits (or defers under `live`) one `NoReceipt`
+    // per unmatched non-checkpoint copy and, from the same per-seq
+    // match outcome, records the lowest in-range `seq` whose record
+    // breaks the reconciled prefix (`first_unreconciled`) and the
+    // highest in-range `seq` (`head_in_range`). `first_unreconciled`
+    // is `None` when every in-range `audit.record` is matched,
+    // waived or exempted by a matched `from`, so checkpoints -- which
+    // never emit `NoReceipt` here -- never break the prefix. In
+    // stopped mode `findings` grows as it did before; in live mode
+    // the per-seq `NoReceipt` vectors are held in `pending` until the
+    // cut is known, so no `NoReceipt` ever lands above the cut.
+    let mut pending: Vec<(u64, Vec<Finding>)> = Vec::new();
+    let mut first_unreconciled: Option<u64> = None;
+    let mut head_in_range: Option<u64> = None;
     for (&seq, copies) in groups {
         if !position.is_in_range(seq) {
             continue;
         }
+        head_in_range = Some(seq);
         if matched_from_seq.is_some_and(|s| seq <= s) {
             continue;
         }
@@ -110,6 +132,7 @@ pub(super) fn check(
         for &copy in copies {
             first_per_hash.entry(copy.1.hash).or_insert(copy);
         }
+        let mut seq_no_receipts: Vec<Finding> = Vec::new();
         for (hash, (path, record)) in first_per_hash {
             if !forked && inputs.receipts.contains(&(seq, hash)) {
                 continue;
@@ -117,14 +140,16 @@ pub(super) fn check(
             if !forked && inputs.waivers.get(&seq).is_some_and(|(h, _)| *h == hash) {
                 continue;
             }
-            // Checkpoints are not reconciled (ruling 13-V7-d1 point
-            // 5). End-record copies cannot reach this point: their
-            // `seq` is at or above the end checkpoint's `seq`, which
-            // [`Classifier::is_in_range`] has already cut above.
+            // Checkpoints are not reconciled (ruling 13-V7-d1 points
+            // 5 and 10): they emit no `NoReceipt` and never break
+            // the prefix. End-record copies cannot reach this point:
+            // their `seq` is at or above the end checkpoint's `seq`,
+            // which [`Classifier::is_in_range`] has already cut
+            // above.
             if record.checkpoint.is_some() {
                 continue;
             }
-            findings.push(Finding::new(
+            seq_no_receipts.push(Finding::new(
                 K::NoReceipt,
                 Some(path.to_owned()),
                 Some(record.line),
@@ -132,7 +157,67 @@ pub(super) fn check(
                 format!("no receipt for seq {seq} hash {}", digest_string(&hash)),
             ));
         }
+        if !seq_no_receipts.is_empty() && first_unreconciled.is_none() {
+            first_unreconciled = Some(seq);
+        }
+        pending.push((seq, seq_no_receipts));
     }
+    if !inputs.live {
+        for (_, items) in pending {
+            findings.extend(items);
+        }
+        return;
+    }
+    // Ruling 13-V7-d1 point 10: `cut = min(first unreconciled seq,
+    // highest receipt seq + 1)`, and with no receipts it drops to
+    // the first in-range record. A matched `from` or waiver extends
+    // the reconciled prefix through its record (both leave
+    // `first_unreconciled` unchanged there), while the "never above
+    // the highest receipt" cap keeps the cut in the exported history
+    // so an honest hole above the receipts is still `Unreconciled`
+    // (L6).
+    let Some(head) = head_in_range else {
+        return;
+    };
+    let cut = match inputs.receipts.iter().map(|(s, _)| *s).max() {
+        Some(hr) => first_unreconciled.map_or(hr + 1, |f| f.min(hr + 1)),
+        None => first_record_in_range(groups, position).unwrap_or(head),
+    };
+    for (seq, items) in pending {
+        if seq < cut {
+            findings.extend(items);
+        }
+    }
+    // One `Unreconciled` (info) located at the first in-range record
+    // whose `seq >= cut` (ruling 13-V7-d1 point 10). Nothing above
+    // the cut yields no finding; checkpoints above the cut are
+    // eligible locations, so "never above the highest receipt"
+    // places the locator on a checkpoint when the next record is one
+    // (L6).
+    if let Some((&first_seq, copies)) = groups.range(cut..).find(|&(&s, _)| position.is_in_range(s))
+        && let Some((path, record)) = first_copy(copies.iter())
+    {
+        findings.push(Finding::new(
+            K::Unreconciled,
+            Some(path.to_owned()),
+            Some(record.line),
+            Some(first_seq),
+            format!("records seq {first_seq}..={head} not reconciled"),
+        ));
+    }
+}
+
+/// Lowest in-range `seq` with a record in `groups`, read off the
+/// ascending `BTreeMap` iteration once (ruling 13-V7-d1 point 10's
+/// "with no receipts at all it is the first record of the range").
+fn first_record_in_range(
+    groups: &BTreeMap<u64, Vec<Located<'_>>>,
+    position: &Classifier,
+) -> Option<u64> {
+    groups
+        .keys()
+        .copied()
+        .find(|&seq| position.is_in_range(seq))
 }
 
 /// Shared verifier state the one match rule reads (ruling 13-V7-d1
