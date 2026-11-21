@@ -344,6 +344,43 @@ fn g2_unconfirmed_gap_keeps_receipt_mismatch_no_record() {
 }
 
 // =====================================================================
+// G2b - ACCEPTANCE. Confirmation uses the full match rule, not
+// `seq` alone (ruling 13-V7-d1 point 8 reuses `receipts::mismatch`).
+// A receipt at the resume `seq` with a **wrong hash** is a
+// `ReceiptMismatch "hash differs"` and does not confirm the gap; a
+// second receipt inside the gap stays `ReceiptMismatch "no record"`
+// and is not `LostRecord`. First failing line on base: the
+// `assert_findings` call below.
+// =====================================================================
+#[test]
+fn g2b_wrong_hash_receipt_at_resume_seq_does_not_confirm() {
+    let fx = non_genesis(GAP_HIGH, None);
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey())).receipts([
+        (1, fx.e1.hash()),
+        (RESUME_SEQ, WRONG_HASH_55),
+        (4, WRONG_HASH_55),
+    ]);
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let findings = report.findings();
+    assert!(
+        !findings.iter().any(|f| f.kind() == K::LostRecord),
+        "G2b wrong-hash receipt must not confirm the gap; got {findings:?}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.kind() == K::ReceiptMismatch && f.seq() == Some(4)),
+        "G2b in-gap receipt must stay `ReceiptMismatch`; got {findings:?}"
+    );
+    assert!(
+        findings.iter().any(|f| f.kind() == K::ReceiptMismatch
+            && f.seq() == Some(RESUME_SEQ)
+            && f.detail().contains("hash differs")),
+        "G2b resume-seq receipt must be `ReceiptMismatch hash differs`; got {findings:?}"
+    );
+}
+
+// =====================================================================
 // G3 - ACCEPTANCE. ADR-0005 decision 11 l.989: a gap opened with an
 // **untrusted** key is not a candidate (ruling 13-V5-d1 point 8;
 // 13-V7-d1 point 7), so its jump keeps its ordinary `SeqGap` and
@@ -390,6 +427,35 @@ fn g3_untrusted_opening_is_not_a_candidate_seq_gap_stays() {
         unlocated(K::UncoveredTail, None, "records seq 3..=7".to_owned()),
     ];
     assert_findings(report.findings(), &expected, "G3");
+}
+
+// =====================================================================
+// G3b - ACCEPTANCE. Companion to G3: with the same untrusted
+// opening, a receipt for a seq in the gap keeps its ordinary
+// `ReceiptMismatch "no record"` (not `LostRecord`) because the
+// candidate is dropped by the trust filter (ruling 13-V5-d1 point 8,
+// 13-V7-d1 point 7 "An untrusted opening is not a candidate"). Pairs
+// with G3 as the receipt-side of the untrusted-opening case. First
+// failing line on base: the `assert_findings` call below.
+// =====================================================================
+#[test]
+fn g3b_untrusted_opening_receipt_in_gap_stays_receipt_mismatch() {
+    let other = KeyFileSigner::from_hex(&"44".repeat(32)).unwrap();
+    let fx = non_genesis(GAP_HIGH, Some(&other));
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts([(RESUME_SEQ, fx.resume.hash()), (4, WRONG_HASH_55)]);
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let findings = report.findings();
+    assert!(
+        !findings.iter().any(|f| f.kind() == K::LostRecord),
+        "G3b must emit no `LostRecord`; got {findings:?}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.kind() == K::ReceiptMismatch && f.seq() == Some(4)),
+        "G3b lost receipt must stay `ReceiptMismatch`; got {findings:?}"
+    );
 }
 
 // =====================================================================
@@ -475,6 +541,34 @@ fn g5_waiver_and_from_inside_confirmed_gap_are_lost_record() {
         unlocated(K::UncoveredTail, None, "records seq 7..=7".to_owned()),
     ];
     assert_findings(report.findings(), &expected, "G5");
+}
+
+// =====================================================================
+// G5c - ACCEPTANCE. Second pin of the `from` exemption through a
+// confirmed gap (ruling 13-V7-d1 point 6 propagates through the
+// gap): a `from` at the HIGHEST gap seq still exempts every record
+// at or below it, including the sealed e1 at seq 1. Pairs with G5
+// as the "from's `seq` varies" pair for the exemption rule.
+// =====================================================================
+#[test]
+fn g5c_from_at_top_of_gap_still_exempts_below() {
+    let fx = non_genesis(GAP_HIGH, None);
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts([(RESUME_SEQ, fx.resume.hash())])
+        .receipts_from(GAP_HIGH, WRONG_HASH_55, "late adoption")
+        .unwrap();
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let findings = report.findings();
+    assert!(
+        !findings.iter().any(|f| f.kind() == K::NoReceipt),
+        "G5c: from at top of gap must exempt e1; got {findings:?}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.kind() == K::LostRecord && f.seq() == Some(GAP_HIGH)),
+        "G5c: from must be `LostRecord`; got {findings:?}"
+    );
 }
 
 // =====================================================================
@@ -753,6 +847,66 @@ fn g9_two_confirmed_resumes_each_gap_has_lost_records() {
 // `--lost-through` equal to the head: no gap, no `LostRecord`". The
 // resume detail carries `gap=none lost_records=0`.
 // =====================================================================
+// =====================================================================
+// G9c - ACCEPTANCE. Second pin of the per-gap `lost_records` count
+// (ruling 13-V7-d1 point 8): two confirmed gaps with **different**
+// `LostRecord` counts, so a mutant that sums across gaps (every
+// `Resumed` showing the total) differs from a mutant that keeps
+// per-gap counts.
+// =====================================================================
+#[test]
+fn g9c_two_gaps_with_asymmetric_lost_record_counts() {
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let cp2 = signed_cp(2, e1.hash(), &mmr1);
+    let mmr2 = pushed(&mmr1, &cp2);
+    let open1 = signed_cp(6, cp2.hash(), &mmr2);
+    let res1 = resume_decl(&open1, 2, cp2.hash(), GAP_HIGH);
+    let mmr_after_r1 = pushed(&pushed(&mmr2, &open1), &res1);
+    let open2 = signed_cp(11, res1.hash(), &mmr_after_r1);
+    let res2 = resume_decl(&open2, RESUME_SEQ, res1.hash(), 10);
+    let d = Temp::new();
+    put_segment(&d.0, 0, &[&cp0, &e1, &cp2], &[]);
+    std::fs::write(
+        d.0.join("audit.jsonl"),
+        [open1.clone(), res1.clone(), open2.clone(), res2.clone()]
+            .iter()
+            .flat_map(line_bytes)
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey())).receipts([
+        (1, e1.hash()),
+        (RESUME_SEQ, res1.hash()),
+        (12, res2.hash()),
+        (3, WRONG_HASH_55),
+        (4, WRONG_HASH_55),
+        (5, WRONG_HASH_55),
+    ]);
+    let report = report_of(vec![d.0.clone()], verifier);
+    let findings = report.findings();
+    let resumed: Vec<_> = findings.iter().filter(|f| f.kind() == K::Resumed).collect();
+    assert_eq!(resumed.len(), 2, "G9c must emit two `Resumed` findings");
+    let r1 = resumed
+        .iter()
+        .find(|f| f.seq() == Some(RESUME_SEQ))
+        .unwrap();
+    let r2 = resumed.iter().find(|f| f.seq() == Some(12)).unwrap();
+    assert!(
+        r1.detail().contains("lost_records=3"),
+        "G9c gap1 must carry `lost_records=3`; got {}",
+        r1.detail()
+    );
+    assert!(
+        r2.detail().contains("lost_records=0"),
+        "G9c gap2 must carry `lost_records=0`; got {}",
+        r2.detail()
+    );
+    drop(d);
+}
+
 #[test]
 fn g9b_lost_through_equal_to_head_has_no_gap() {
     // head=(2, cp2), lost_through=2, so no gap (gap=none). Opening
