@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-09T13:22:04Z
-updated: 2026-11-20T07:01:48Z
+updated: 2026-11-21T01:50:33Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/13
-comments: 44
+comments: 51
 labels: feature, security, priority:medium, area:testing, effort:medium
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-20T09:45:04.541Z
+synced: 2026-11-21T09:17:34.241Z
 ---
 
 # [Issue 13]: [feat(audit): verify API/CLI and tamper tests](https://github.com/vig-os/vigil/issues/13)
@@ -1114,5 +1114,177 @@ This ruling settles 13-V6-d1 point 7 and the rest of the `end_before` mechanics,
    - **V6d1:** points 1, 3, 4, 5, 6 and 7, with rows for "Step 7 takes the end from the anchor store", the third line of "Batch 2" (exit 2), the step 6 and step 7 digest equality, and the conflict clause.
    - **V6d2:** the chain link to the end across a `seq` jump (13-V6-d1 point 3: `ChainBroken` plus `SeqGap`), the resume line's head rule, and the "Tail cut" and H1 step 7 rows.
    - **V6e:** the `AboveEnd` arm and inputs above the end (13-V6-d1 points 5 and 6).
+
+
+---
+
+# [Comment #45]() by [gerchowl]()
+
+_Posted on November 20, 2026 at 12:20 PM_
+
+**Ruling 13-V6-d5 (#13 V6d2): the end checkpoint's link to the files**
+
+This makes 13-V6-d1 point 3 concrete. It applies decision 11 `end_before` "It pins the tail" (ADR-0005 ~l.763) and the "Tail cut" and H1 step 7 bullets (~l.943–944) on top of 13-V6-d4.
+
+1. **Which record must precede the end.** Let `e` be the `seq` of the end checkpoint. The record that must precede it is the record at the highest `seq` below `e` in the files: the verified set without the end record's lines. That includes native segments, the live file and shipped copies.
+2. **Without a resume line.** The end checkpoint links only when that `seq` holds exactly one record (by 13-V5-d2, a byte-identical copy is one record) and the end checkpoint's `prev_hash` equals that record's hash. Otherwise, report one `ChainBroken` (an error) at `e`, located like every end-record finding (no file, no line, 13-V6-d4 point 6). The detail is exactly one of these, chosen in this order:
+   1. `end_before seq <e>: no record precedes the end`. This applies when the files hold no record below `e` and `e > 0`. At `e = 0` nothing is checked.
+   2. `end_before seq <e>: seq <p> is forked`.
+   3. `end_before seq <e>: expected previous <hash of the record at p>, found <prev_hash>`.
+
+   This check applies whether or not `e = p + 1`. Where `e > p + 1`, the existing chain loop's `SeqGap` for `p+1..=e−1` is also reported. That gives both findings for a cut tail, as decision 11 and the "Tail cut" bullet require. The existing chain loop does not report this case, because its expected set is empty across a jump. This check is the only place that compares the end's `prev_hash`.
+3. **With a resume line.** The end checkpoint is a resume's opening checkpoint. Point 2 does not apply. The existing resume rules (decision 5) judge the link:
+   - a resume whose head names exactly the files' last record (`seq` and hash) is a resume gap;
+   - any other head is the existing `SeqGap` with `Resumed … structural=invalid(<reason>)`.
+
+   This matches the "Tail cut" bullet: "a cut tail is `SeqGap` (the line names a head that is not the last record)". No `ChainBroken` is added. An uncut tail gives only what the resume rules give today for a valid resume, until receipts and `accept Resumed` land with #13.
+4. **A forged record appended to the archive.** This is a record at or above `e` in the files. It is `TrailEnded` by 13-V6-d4 point 3, and point 2 above does not change that.
+5. **No-crash mark.** The end record is the segment that follows the files (13-V6-d4 point 1), so `mark_no_crash` sees it as the next input. A trailing `TornWrite` in the last file is marked "no crash outcome" exactly when the end record opens cleanly without a resume line. This is the existing rule, so it needs no new code. V6d2 pins it with a row.
+
+
+---
+
+# [Comment #46]() by [gerchowl]()
+
+_Posted on November 20, 2026 at 01:19 PM_
+
+**Ruling 13-V6-d6 (#13 V6d2): one chain rule across `seq` jumps, which replaces the end-only link check**
+
+A review of the first V6d2 implementation found three problems:
+- a separate end-link check plus a skip in the chain loop lost the genesis check at `e = 0`;
+- the same design reported two `ChainBroken` when the files hold a copy of the end line;
+- the H1 step-6 form (`verify <archive> <live>` with S3 and S4 deleted, no start) gives only `SeqGap` today, while the ADR expects `SeqGap` **and** `ChainBroken`.
+
+ADR-0005 expects `ChainBroken` together with `SeqGap` at any deletion, not only at the end:
+- decision 2 step 6, l.198: a deleted segment is "`SeqGap`, `ChainBroken` or `StartMismatch`";
+- decision 11 `accept-run` item 2, l.854: "at each loss point, its `ChainBroken`, and its `SeqGap` for the named range";
+- the H1 bullet, l.943;
+- the "Tail cut" bullet, l.944;
+- l.1216: "a cut tail … is `ChainBroken`, `SeqGap` …".
+
+The engine's chain loop compares a record only with the record at `seq − 1`, so across a jump it checks nothing. That is the root cause. This ruling **supersedes 13-V6-d5 points 2 and 3**. Points 1, 4 and 5 stand.
+
+1. **The chain rule.**
+   - **Which records are checked.** Every record of the verified set is checked, including the end record's lines (13-V6-d4 point 1). Two are exempt:
+     - the record at the lowest `seq`, which keeps the existing genesis and prefix rules (`seq 0` genesis check, prefix `SeqGap`, accepted start);
+     - nothing else.
+   - **What it is compared with.** The record is compared with the record at the **highest `seq` below it that is present in the set**, not only `seq − 1`.
+   - **What `expected` is.** The expected previous hashes are the hashes at that `seq`, exactly as the loop builds `expected` today, forks included.
+   - **When it is reported.** If the record's `prev_hash` is not among them, report `ChainBroken` with the existing grammar (`expected previous <…>, found <…>`) and the existing location rules. An end-record line has no location.
+   - **What stays the same.** Where `seq`s are missing, the existing `SeqGap` is still reported. The loop is still the one place that compares `prev_hash`.
+2. **Resume openings follow the same rule.** An honest opening checkpoint links to the head the resume names (decision 5; amendment 8: "the call's opening checkpoint … links to the named `--head`"). So a valid resume whose head is the last present record links, and a cut or forged one does not. The resume rules (`SeqGap`, `Resumed … structural=…`) apply unchanged on top. No special case and no skip exist for resume lines or the end record.
+3. **The end record (13-V6-d4/d5).**
+   - The end checkpoint is checked by point 1 like any record, `e = 0` included, so the genesis check is kept.
+   - **One extra case.** When the files hold no record below `e` and `e > 0`, the end checkpoint is the lowest record and point 1 does not check it. Then report one `ChainBroken` at `e`, unlocated, with the detail exactly `end_before seq <e>: no record precedes the end`.
+   - The `seq is forked` detail of 13-V6-d5 is withdrawn. A fork at `p` is already `SeqConflict`, and the expected set covers both copies, as it does everywhere.
+4. **Existing rows.** Every existing row with a mid-trail `SeqGap` (no resume, or a resume whose head is not the last record) now also gets one `ChainBroken` at the first record after the gap. This is the intended change. The PR lists each changed row, its file, and the before and after lists, and cites this ruling. No row is deleted. Any change other than an added `ChainBroken` after a jump is a defect.
+
+
+---
+
+# [Comment #47]() by [gerchowl]()
+
+_Posted on November 20, 2026 at 04:10 PM_
+
+**Ruling 13-V6-d7 (#13 V6e): inputs above the end of an archive batch**
+
+This makes concrete 13-V6-d1 points 5 and 6 and 13-V6-d4 point 2, for decision 11 `end_before` "It ends the range" (ADR-0005 ~l.764) and the bullet "Inputs outside a batch" (~l.949).
+
+1. **The end of the range.** `E` is the `seq` of the end record's last line: the resume line if there is one, otherwise the checkpoint (13-V6-d4 point 2). An input whose `seq` is strictly above `E` is above the end.
+2. **The classifier.** The position classifier (13-V6-d3) gains the arm `AboveEnd { anchored }`. "Anchored" is 13-V6-d4 point 5: the end anchor was given, it is byte-equal to the record, and it matches. The classifier stays the one place that decides position, and `Classifier::set_aside` stays the one place that builds the finding.
+3. **What is set aside above the end.** Each of the following inputs above the end is replaced by one finding at the input's `seq`, with no location: `OutOfRange` (info) when the end is anchored, `UnanchoredEnd` (error) otherwise.
+   - **Anchors:** detail `anchor seq <a> hash <hex>: above end seq <E>`. An anchor from another trail is still `trail differs`. The end anchor itself is never above the end.
+   - **`through=` pins:** detail `key <64 hex> through=<b>: above end seq <E>`. This replaces the pin check.
+   - **A trust-file `end=<s>`** with `s > E`: detail `end=<s>:<hash>: above end seq <E>`. It replaces both `end=` conditions and grants nothing from 13-V5-d5 (13-V6-d1 point 6).
+4. **`RevocationUnconfirmed` is not reported at all in an end-bounded verification** (decision 11: "a confirming checkpoint may lie above the end"). The pinned check and the bounded check (`UntrustedKey` above a bound inside the batch) still run.
+5. **No end set aside.** With no `end_before`, nothing is above the end and nothing changes.
+6. **Documentation.** One amendment line in ADR-0005 decision 11 cites this ruling for point 3's `end=` case, because the ADR text lists only anchors, pins, receipts, waivers, `from`, `accept` and `accept-run`.
+
+
+---
+
+# [Comment #48]() by [gerchowl]()
+
+_Posted on November 20, 2026 at 05:36 PM_
+
+**Ruling 13-V6-d7, clarification of point 3 (#13 V6e)**
+
+"The end anchor itself is never above the end" means this: **the end anchor is never set aside.** It is always checked by the anchor rule (13-V6-d1 point 2), as 13-V6-d4 point 5 requires, even when its `seq` lies above `E`. That happens when the end anchor differs from the record (for example the record names P and the entry names S). So in the layout of the "Step 7 takes the end from the anchor store" bullet, S keeps `AnchorMismatch "… no record"` and is not reported as `UnanchoredEnd`. Ordinary `--anchor` inputs above `E` are set aside as point 3 says.
+
+Two related points stand unchanged:
+- **`end=` below a start.** 13-V6-d3 point 7 stands: a trust-file `end=` below an accepted start keeps its 13-V5-d5 behaviour. Only the above-end arm sets an `end=` aside.
+- **"Anchored".** "Anchored" (13-V6-d4 point 5) requires all three: the end anchor was given, it is byte-equal to the record, **and** it matches under 13-V6-d1 point 2. A fork at `e` therefore leaves the end unanchored.
+
+
+---
+
+# [Comment #49]() by [gerchowl]()
+
+_Posted on November 20, 2026 at 08:26 PM_
+
+**Ruling 13-V7-d1 (#13 V7): receipts, waivers, `from`, live mode and gap confirmation**
+
+A design check at dev `282fce6` found the following state:
+- `NoReceipt`, `ReceiptMismatch`, `ReceiptWaived`, `Unreconciled` and `LostRecord` are declared but never emitted.
+- No receipt builder exists.
+- The resume candidates are computed and then discarded.
+- An honest `AuditConfig::resume` gives `SeqGap` + `Resumed … lost_records=0` today, so plain verification fails.
+
+This ruling settles the readings that ADR-0005 decision 5 ("Receipt reconciliation", "Resume gaps", "Receipts lost with a resume") and decision 11 leave open.
+
+1. **Split.** V7 is five serial PRs, each about 200 non-test lines or fewer:
+   - **V7a:** `receipts`, `NoReceipt`, `ReceiptMismatch`.
+   - **V7b:** `waive` and `receipts_from`, `ReceiptWaived`, duplicate `InvalidConfig`.
+   - **V7c:** `receipts_live` and `Unreconciled`, plus the conflict with `end_before`.
+   - **V7d:** gap confirmation by a receipt. This adds the candidate trust filter (13-V5-d1 point 8) and the classifier's `Gap` arm, emits `LostRecord` for receipts, waivers and `from`, applies point 7 below, and fills in `lost_records`.
+   - **V7e:** anchors and `through=` pins inside a confirmed gap whose opening is anchored.
+
+   Confirmation by `accept Resumed` arrives with `accept` (#13). The receipts-file grammar and `--receipts-live` arrive with the `verify` subcommand (C1).
+2. **When reconciliation runs.** It runs when any of `receipts`, `waive`, `receipts_from` or `receipts_live` has been called, even with no items. Then `.receipts([])` reports every `audit.record` in range as `NoReceipt`. Without any of these calls, nothing is reconciled. This matches decision 5, "With no receipts at all, the whole range is `Unreconciled`" (live) or `NoReceipt` (stopped).
+3. **The checked range** runs from `seq 0`, or from the accepted start, through the last record **in the files**. The end record's lines (13-V6-d4) are not reconciled; their receipts are checked in the next batch, where they are in the files. A receipt that names an end-record line is still matched (point 4) and is not a mismatch. Receipts below the start or above `E` are set aside through `Classifier::set_aside` (13-V6-d3/d7), with subject `receipt seq <s> hash <hex>`.
+4. **Matching a receipt** (decision 5: "every receipt must match"). A receipt matches when the verified set holds exactly one record at its `seq` (a byte-identical copy counts as one) and that record has the receipt's hash. Otherwise it is one `ReceiptMismatch` (error) at the receipt's `seq`, with no location. Of these details, the first failing one applies:
+   1. `receipt seq <s> hash <hex>: no record`
+   2. `receipt seq <s> hash <hex>: seq is forked`
+   3. `receipt seq <s> hash <hex>: hash differs (record <hex>)`
+
+   Matching at a forked `seq` fails closed, as anchors do (13-V6-d1 point 2). Two receipts for one `seq` are allowed (decision 11), and identical receipts collapse.
+5. **`NoReceipt`** (error). It is reported for each in-range `audit.record` (not checkpoints; operator `vigil.audit.*` records included) that no matching receipt names. It is located at the record's first copy, with detail `no receipt for seq <s> hash <hex>`.
+6. **Waivers and `from`** (V7b).
+   - **The reason** is free text: non-empty and a single line. Otherwise it is `InvalidConfig`. vigil does not parse the amendment-8 operator-call form; it is a criterion for reviewers (decision 5 says vigil cannot apply it).
+   - **Duplicates.** A second `waive` for a `seq`, or a second `receipts_from`, is `InvalidConfig`.
+   - **Matching.** Waivers and `from` match like receipts (point 4), with the subjects `waive seq <s> hash <hex>` and `from seq <s> hash <hex>`.
+   - **`ReceiptWaived`** (info). For a matched waiver it is located at the record, with detail `waived seq <s> hash <hex>: <reason>`. For a matched `from`, it is reported once at that record, with detail `from seq <s> hash <hex>: <reason>`, and records at or below `s` are not reconciled.
+7. **A resume gap that passes rules 1–3 and has a trusted opening** (13-V5-d1 points 3 and 8) is a resume gap, and **no `SeqGap` is reported for it** (decision 5, l.402: "a resume gap only if all of these hold, and `SeqGap` … otherwise"). Its `Resumed` warning remains the reviewer's signal. **The exception is a genesis resume:** the `SeqGap` for `0..=lost_through` is suppressed only when the gap is confirmed (decision 5, genesis case; decision 11 l.757). An untrusted opening is not a candidate, so its jump stays `SeqGap`.
+8. **Confirmation and `LostRecord`.** A gap is confirmed when a receipt matches its resume record's `(seq, hash)` (point 4).
+   - **Inside a confirmed gap,** receipts, waivers and `from` lines become one `LostRecord` each (info, no location, detail `<subject>: lost in gap <a>..=<b>`). A `from` line keeps its exemption below it.
+   - **Inside an unconfirmed gap,** they are `ReceiptMismatch "no record"`.
+   - **`lost_records=<n>`** in the `Resumed` detail counts **every** `LostRecord` input of that gap, including anchors and pins set aside under V7e.
+9. **Shipped copies (#224).** A shipped-only opening is never a candidate (13-V4-d10), so a Collector copy cannot confirm a gap. V7d documents this limit in the rustdoc and points to #224.
+10. **Live mode** (V7c): decision 5 "Live trails", exactly as written. The `Unreconciled` detail is `records seq <a>..=<head> not reconciled`, located at the record at `a`. `receipts_live` returns `Result<Self, AuditError>`, and its conflict with `end_before` is raised by whichever call comes second (§19.2).
+
+
+---
+
+# [Comment #50]() by [gerchowl]()
+
+_Posted on November 20, 2026 at 09:23 PM_
+
+**Ruling 13-V7-d1, clarification (#13 V7a)**
+
+1. **Forked `seq` (points 4 and 5).** A receipt naming a forked `seq` never matches. It is `ReceiptMismatch "… seq is forked"`. So at a forked `seq` no record has a matching receipt, and **each distinct record there is `NoReceipt`**, located at its own first copy. This fails closed, like the anchor rule.
+2. **With `end_before` (point 3).** Decision 11 says the range ends at `E` ("It ends the range"). Records in the files at or above the end are already `TrailEnded` (13-V6-d4 point 3). They are not reconciled, so they get no `NoReceipt`. Without `end_before`, the range runs through the last record in the files, as point 3 says.
+
+
+---
+
+# [Comment #51]() by [gerchowl]()
+
+_Posted on November 21, 2026 at 01:50 AM_
+
+**Ruling 13-V7-d1, clarification of point 10 (#13 V7c): what bounds the live prefix**
+
+1. **"Never above the highest receipt" counts all reconciliation evidence.** Evidence means matched receipts, matched waivers and a matched `from`. The cut is `min(first unreconciled seq, highest evidence seq + 1)`, where a matched `from` at `s` counts as evidence at `s`. Without this, a deployment that adopted receipts late (`from` only) would see its exempted history reported as `Unreconciled`. That would contradict decision 5's late-adoption rule ("records up to and including that one are not reconciled"). With no evidence at all, the whole range is `Unreconciled`, as decision 5 says.
+2. **A checkpoint above the highest evidence is `Unreconciled`.** This applies in live mode. Checkpoints need no receipt, but the cut never rises above the evidence. So a running trail whose newest line is a checkpoint not yet given as a receipt is reported once as `Unreconciled` (info). The operator can include the checkpoint receipts that `close()` and `checkpoint()` return (decision 9). This is intended, and the `receipts_live` rustdoc must say so.
+3. **The cut is computed without overflow.** A receipt at `u64::MAX` must not wrap or panic. Compare with `seq <= highest` rather than `seq < highest + 1`.
 
 
