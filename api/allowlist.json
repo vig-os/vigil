@@ -404,6 +404,7 @@
       "vigil::audit::Verifier::new": "fn",
       "vigil::audit::Verifier::receipts": "fn",
       "vigil::audit::Verifier::receipts_from": "fn",
+      "vigil::audit::Verifier::receipts_live": "fn",
       "vigil::audit::Verifier::start_from": "fn",
       "vigil::audit::Verifier::waive": "fn",
       "vigil::audit::Verifier::trail": "fn",

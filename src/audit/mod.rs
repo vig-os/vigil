@@ -446,7 +446,18 @@ pub enum FindingKind {
     /// [`Verifier::end_before`](crate::audit::Verifier::end_before)
     /// for the rules.
     OutOfRange,
-    /// Info: Records follow the reconciled receipts prefix.
+    /// Info: In-flight records on a running trail under
+    /// [`Verifier::receipts_live`](crate::audit::Verifier::receipts_live)`(true)`
+    /// (ADR-0005 decision 5 "Live trails"; ruling 13-V7-d1 point 10).
+    /// Located at the first in-range record above the cut, with
+    /// detail `records seq <a>..=<head> not reconciled`: `<a>` is
+    /// that record's `seq`, and `<head>` is the highest `seq` in
+    /// the range. Records above the cut carry no `NoReceipt` and
+    /// `--strict` fails on `Unreconciled`, as on `UncoveredTail`.
+    /// See [`Verifier::receipts_live`](crate::audit::Verifier::receipts_live)
+    /// for the cut rule, the receipts-above-the-cut check and the
+    /// conflict with
+    /// [`end_before`](crate::audit::Verifier::end_before).
     Unreconciled,
     /// Info: A matched [`Verifier::waive`](crate::audit::Verifier::waive)
     /// or [`Verifier::receipts_from`](crate::audit::Verifier::receipts_from)
