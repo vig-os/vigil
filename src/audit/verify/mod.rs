@@ -292,6 +292,8 @@ mod end_link_tests;
 #[cfg(test)]
 mod end_tests;
 #[cfg(test)]
+mod live_tests;
+#[cfg(test)]
 mod mod_tests;
 #[cfg(test)]
 mod position_tests;
@@ -383,15 +385,19 @@ pub struct Verifier {
     anchors: Vec<Checkpoint>,
     start: Option<Checkpoint>,
     end_before: Option<EndBefore>,
-    /// Reconciliation runs when any of `receipts`, `waivers` or
-    /// `receipts_from` has been set (ruling 13-V7-d1 point 2); see
-    /// [`Self::receipts`], [`Self::waive`] and
-    /// [`Self::receipts_from`]. `waivers` holds at most one entry
+    /// Reconciliation runs when any of `receipts`, `waivers`,
+    /// `receipts_from` or `receipts_live` has been set (ruling
+    /// 13-V7-d1 points 2 and 10); see [`Self::receipts`],
+    /// [`Self::waive`], [`Self::receipts_from`] and
+    /// [`Self::receipts_live`]. `waivers` holds at most one entry
     /// per `seq` and `receipts_from` at most one value overall
-    /// (point 6).
+    /// (point 6). `receipts_live` carries the stored flag and
+    /// `Verifier::new` leaves it `false` (the stopped-mode default);
+    /// a second [`Self::receipts_live`] call replaces its value.
     receipts: Option<std::collections::BTreeSet<(u64, [u8; 32])>>,
     waivers: std::collections::BTreeMap<u64, ([u8; 32], String)>,
     receipts_from: Option<(u64, [u8; 32], String)>,
+    receipts_live: bool,
     #[cfg(test)]
     now_override: Option<SystemTime>,
 }
@@ -437,6 +443,7 @@ impl Verifier {
             receipts: None,
             waivers: std::collections::BTreeMap::new(),
             receipts_from: None,
+            receipts_live: false,
             #[cfg(test)]
             now_override: None,
         }
@@ -691,11 +698,13 @@ impl Verifier {
     ///
     /// # Errors
     /// Returns `InvalidConfig` when `archive_record` violates the
-    /// grammar above, or when [`Self::max_age`] was already called
-    /// on this verifier (ADR-0005 §19.2; ruling 13-V6-d4 point 7):
-    /// `max_age` and `end_before` are mutually exclusive, and the
+    /// grammar above, or when [`Self::max_age`] or
+    /// [`Self::receipts_live`]`(true)` was already called on this
+    /// verifier (ADR-0005 §19.2; ruling 13-V6-d4 point 7 and ruling
+    /// 13-V7-d1 point 10): each pair is mutually exclusive, and the
     /// error is raised by whichever call comes second. A second
-    /// `end_before` call replaces the first.
+    /// `end_before` call replaces the first. `receipts_live(false)`
+    /// is the stopped-mode default and does not conflict.
     pub fn end_before(
         mut self,
         archive_record: &str,
@@ -705,6 +714,12 @@ impl Verifier {
             return Err(AuditError::new(
                 AuditErrorKind::InvalidConfig,
                 "end_before conflicts with max_age",
+            ));
+        }
+        if self.receipts_live {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                "end_before conflicts with receipts_live",
             ));
         }
         let parsed = end_before::parse(archive_record)?;
@@ -741,10 +756,9 @@ impl Verifier {
     ///
     /// See [`FindingKind::NoReceipt`] and
     /// [`FindingKind::ReceiptMismatch`] for the detail grammars.
-    /// `receipts_live` and resume-gap confirmation
-    /// ([`LostRecord`](FindingKind::LostRecord),
-    /// [`Unreconciled`](FindingKind::Unreconciled)) land in later
-    /// #13 work.
+    /// For a running trail, see [`Self::receipts_live`]; resume-gap
+    /// confirmation ([`LostRecord`](FindingKind::LostRecord)) lands
+    /// in later #13 work.
     pub fn receipts(mut self, receipts: impl IntoIterator<Item = (u64, [u8; 32])>) -> Self {
         let set = self
             .receipts
@@ -847,6 +861,80 @@ impl Verifier {
         self.receipts_from = Some((seq, hash, reason));
         Ok(self)
     }
+    /// Reconciles against a running trail, so in-flight records --
+    /// returned from `record` but whose receipt is not stored yet --
+    /// do not fail verification (ADR-0005 decision 5 "Live trails";
+    /// ruling 13-V7-d1 point 10 and its clarification 13-V7-d1b).
+    /// The call also turns reconciliation on (point 2).
+    ///
+    /// **The cut.** The checked range ends at the longest fully
+    /// reconciled prefix: just before the first in-range
+    /// `audit.record` that is neither matched by a receipt
+    /// ([`Self::receipts`]), nor waived ([`Self::waive`]), nor
+    /// exempted by a matched [`Self::receipts_from`]. It never goes
+    /// above the highest matched evidence either --- matched
+    /// receipts, matched waivers and a matched `from` all count
+    /// toward the cap (clarification 13-V7-d1b point 1), so a
+    /// late-adoption deployment's exempted history and an
+    /// above-the-receipts waiver are not reported as `Unreconciled`.
+    /// The comparison is `seq <= highest evidence`, so a receipt at
+    /// `u64::MAX` cannot wrap or panic (point 3). With no matched
+    /// evidence, the first record of the range is the cut and the
+    /// whole range is one `Unreconciled`. Checkpoints need no
+    /// receipt, so they never break the prefix; a checkpoint above
+    /// the highest matched evidence is still `Unreconciled`, and
+    /// the operator can include the checkpoint receipts that
+    /// [`AuditTrail::close`] and [`AuditTrail::checkpoint`] return
+    /// to extend the cap through it (clarification 13-V7-d1b point
+    /// 2; ADR-0005 decision 9). One
+    /// [`Unreconciled`](FindingKind::Unreconciled) (info) is reported
+    /// at the first record above the cut; records above the cut get
+    /// no [`NoReceipt`](FindingKind::NoReceipt). Nothing above the
+    /// cut yields no `Unreconciled`.
+    ///
+    /// **Receipts above the cut are still checked.** A wrong hash
+    /// or a receipt above the head stays
+    /// [`ReceiptMismatch`](FindingKind::ReceiptMismatch).
+    ///
+    /// **Export order.** The receipts export must be taken BEFORE
+    /// the trail is read (ADR-0005 decision 5 "Live trails"), so
+    /// every honest receipt is in the files and a receipt above the
+    /// head still means a rollback. An honest hole closes once its
+    /// receipt is stored; a forged record is a hole that never
+    /// closes, so `Unreconciled` keeps starting at the same `seq`
+    /// across reviews and stopped-trail reconciliation reports it as
+    /// `NoReceipt`.
+    ///
+    /// [`AuditTrail::close`]: crate::audit::AuditTrail::close
+    /// [`AuditTrail::checkpoint`]: crate::audit::AuditTrail::checkpoint
+    ///
+    /// **Severity and exit.** [`FindingKind::Unreconciled`] is info,
+    /// so `is_valid()` is `true`; [`Report::is_strict_valid`] already
+    /// fails on it, so the exit is 0 without `--strict` and 1 with
+    /// it. The rotation procedure (ADR-0005 decision 9) and any
+    /// review of a stopped trail never call `receipts_live(true)`.
+    ///
+    /// A second `receipts_live` call replaces the first.
+    /// `receipts_live(false)` is the stopped-mode default.
+    ///
+    /// # Errors
+    /// Returns [`InvalidConfig`](AuditErrorKind::InvalidConfig) with
+    /// message `receipts_live conflicts with end_before` when `on`
+    /// is `true` and [`Self::end_before`] was already called on this
+    /// verifier (ADR-0005 §19.2; ruling 13-V7-d1 point 10):
+    /// `receipts_live(true)` and `end_before` are mutually
+    /// exclusive, and the error is raised by whichever call comes
+    /// second. `receipts_live(false)` with `end_before` is allowed.
+    pub fn receipts_live(mut self, on: bool) -> Result<Self, AuditError> {
+        if on && self.end_before.is_some() {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                "receipts_live conflicts with end_before",
+            ));
+        }
+        self.receipts_live = on;
+        Ok(self)
+    }
 
     /// Expands a directory's vigil files and verifies its confirmed snapshot.
     /// See [`verify`] for review limitations and error semantics.
@@ -906,12 +994,15 @@ impl Verifier {
         });
         let empty_receipts: std::collections::BTreeSet<(u64, [u8; 32])> =
             std::collections::BTreeSet::new();
-        let reconcile =
-            self.receipts.is_some() || !self.waivers.is_empty() || self.receipts_from.is_some();
+        let reconcile = self.receipts.is_some()
+            || !self.waivers.is_empty()
+            || self.receipts_from.is_some()
+            || self.receipts_live;
         let receipt_inputs = reconcile.then(|| receipts::Inputs {
             receipts: self.receipts.as_ref().unwrap_or(&empty_receipts),
             waivers: &self.waivers,
             receipts_from: self.receipts_from.as_ref(),
+            live: self.receipts_live,
         });
         Ok(engine::check(
             collection,
