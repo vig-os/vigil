@@ -74,13 +74,15 @@ const WRONG_HASH_66_DIGEST: &str =
 /// Five-record chain `[cp0, e1, e2, e3, cp4]`: an entry run after
 /// the genesis checkpoint closed by `cp4`. The closing checkpoint
 /// keeps `UncoveredTail` out of every row below without any extra
-/// knob.
+/// knob; `cp4` is exposed so a row can derive its archive-record
+/// line for an [`Verifier::end_before`] call.
 struct FiveRecord {
     _dir: Temp,
     path: PathBuf,
     e1: Record,
     e2: Record,
     e3: Record,
+    cp4: Record,
 }
 fn five_record() -> FiveRecord {
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
@@ -101,6 +103,7 @@ fn five_record() -> FiveRecord {
         e1,
         e2,
         e3,
+        cp4,
     }
 }
 
@@ -132,16 +135,17 @@ fn three_record() -> ThreeRecord {
 
 /// Four-record chain `[cp0, e1, e2, cp3]`: an entry run closed by
 /// `cp3`. Used by the "waiver above the highest receipt raises the
-/// cap" row (`n3`), where every `audit.record` is either receipted
+/// cap" scenario, where every `audit.record` is either receipted
 /// (`e1`) or waived (`e2`) so first-unreconciled is `None` and the
 /// cap is the only thing that places the cut (clarification
-/// 13-V7-d1b point 1).
+/// 13-V7-d1b point 1). Also used for the mismatched-waiver and
+/// mismatched-`from` scenarios where the closing `cp3` sits at the
+/// cap.
 struct FourRecord {
     _dir: Temp,
     path: PathBuf,
     e1: Record,
     e2: Record,
-    cp3: Record,
 }
 fn four_record() -> FourRecord {
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
@@ -159,7 +163,6 @@ fn four_record() -> FourRecord {
         path,
         e1,
         e2,
-        cp3,
     }
 }
 
@@ -198,17 +201,18 @@ fn receipted_chain() -> ReceiptedChain {
 }
 
 /// Six-record chain `[cp0, e1, e2, cp3, e4, cp5]` for the
-/// waiver-and-`from` row (L7). The intermediate `cp3` closes the
-/// run opened by cp0 so no `UncoveredTail` fires and so a mid-chain
-/// checkpoint sits above the waiver and below the closing one.
+/// waiver-and-`from` scenarios. The intermediate `cp3` closes the
+/// run opened by `cp0` so no `UncoveredTail` fires and so a
+/// mid-chain checkpoint sits above the waiver and below the closing
+/// one; the closing `cp5` provides a checkpoint above every matched
+/// `audit.record`, so a cap at the highest matched evidence places
+/// the cut at `cp5`.
 struct SixRecord {
     _dir: Temp,
     path: PathBuf,
     e1: Record,
     e2: Record,
-    cp3: Record,
     e4: Record,
-    cp5: Record,
 }
 fn six_record() -> SixRecord {
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
@@ -230,9 +234,7 @@ fn six_record() -> SixRecord {
         path,
         e1,
         e2,
-        cp3,
         e4,
-        cp5,
     }
 }
 
@@ -246,8 +248,6 @@ fn fixture_hashes_match_literals() {
     let e1 = entry_rec(1, cp0.hash());
     let mmr1 = pushed(&mmr0, &e1);
     let cp2 = signed_cp(2, e1.hash(), &mmr1);
-    let mmr2 = pushed(&mmr1, &e1);
-    let _ = mmr2;
     let e2 = entry_rec(2, e1.hash());
     let mmr2_e = pushed(&mmr1, &e2);
     let cp3 = signed_cp(3, e2.hash(), &mmr2_e);
@@ -343,10 +343,7 @@ fn l1b_records_after_export_live_mode_one_unreconciled() {
 // findings list is the one `Unreconciled`, `is_valid()` is `true`
 // (`Unreconciled` is info) and `is_strict_valid()` is `false`, so
 // `--strict` exits 1 and the default `verify` exits 0 (ADR-0005
-// decision 5 "Live trails"; ruling 13-V7-d1 point 10). On a base
-// without the cut, stopped-mode `NoReceipt` errors make
-// `is_valid()` false, so the tuple's `true` component is the first
-// failing one.
+// decision 5 "Live trails"; ruling 13-V7-d1 point 10).
 // =====================================================================
 #[test]
 fn l1c_live_mode_strict_outcome_pinned() {
@@ -540,10 +537,10 @@ fn l4_live_no_receipts_everything_unreconciled_from_first() {
 // and the intermediate `cp2` carrying NO receipt gives an empty
 // finding list: checkpoints need no receipt and never break the
 // prefix (ADR-0005 decision 5 "Live trails"; ruling 13-V7-d1
-// points 5 and 10). The highest matched evidence is `cp4`'s seq
-// 4 (also the head), so nothing sits above the cap and no
-// `Unreconciled` fires. Pins both "checkpoints never break the
-// prefix" and "no Unreconciled when nothing is above the cap".
+// points 5 and 10). `highest_evidence` is `cp4`'s seq 4 (also the
+// head), so nothing sits above the cap and no `Unreconciled`
+// fires. Pins both "checkpoints never break the prefix" and "no
+// `Unreconciled` when nothing is above the cap".
 // =====================================================================
 #[test]
 fn l5_live_all_records_receipted_middle_checkpoint_no_unreconciled() {
@@ -587,7 +584,6 @@ fn l6_live_checkpoint_just_above_highest_receipt_unreconciled_at_cp() {
         2,
         "records seq 2..=2 not reconciled".to_owned(),
     )];
-    let _ = fx.cp2;
     assert_findings(report.findings(), &expected, "l6 checkpoint above highest");
 }
 
@@ -636,8 +632,6 @@ fn l7_waived_and_matched_from_count_as_reconciled_for_prefix() {
             "records seq 5..=5 not reconciled".to_owned(),
         ),
     ];
-    let _ = fx.cp3;
-    let _ = fx.cp5;
     assert_findings(report.findings(), &expected, "l7 waived+from");
 }
 
@@ -677,8 +671,6 @@ fn l7b_waived_record_counts_as_reconciled_for_prefix() {
             "records seq 5..=5 not reconciled".to_owned(),
         ),
     ];
-    let _ = fx.cp3;
-    let _ = fx.cp5;
     assert_findings(report.findings(), &expected, "l7b waive alone");
 }
 
@@ -724,6 +716,20 @@ fn l8a_receipts_live_true_then_end_before_errors() {
     assert_invalid_config(err, "end_before conflicts with receipts_live", "l8a");
 }
 #[test]
+fn l8a2_receipts_live_true_then_end_before_other_record_errors() {
+    // Second honest layout for the `receipts_live(true)` -> `end_before`
+    // conflict: end_before parses the five-record chain's closing
+    // checkpoint `cp4` instead of the three-record chain's `cp2`.
+    let fx = five_record();
+    let cp4_line = line_without_lf(&fx.cp4);
+    let err = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts_live(true)
+        .unwrap()
+        .end_before(&cp4_line, None)
+        .expect_err("l8a2 expected InvalidConfig");
+    assert_invalid_config(err, "end_before conflicts with receipts_live", "l8a2");
+}
+#[test]
 fn l8b_end_before_then_receipts_live_true_errors() {
     let fx = three_record();
     let cp2_line = line_without_lf(&fx.cp2);
@@ -733,6 +739,22 @@ fn l8b_end_before_then_receipts_live_true_errors() {
         .receipts_live(true)
         .expect_err("l8b expected InvalidConfig");
     assert_invalid_config(err, "receipts_live conflicts with end_before", "l8b");
+}
+#[test]
+fn l8b2_end_before_then_receipts_then_receipts_live_true_errors() {
+    // Second honest layout for the `end_before` -> `receipts_live(true)`
+    // conflict: an intervening `.receipts(..)` call sits between the
+    // two, so the conflict is raised by `receipts_live` across the
+    // extra state (ADR-0005 §19.2; ruling 13-V7-d1 point 10).
+    let fx = three_record();
+    let cp2_line = line_without_lf(&fx.cp2);
+    let err = Verifier::new(trust_with_key(fixture_pubkey()))
+        .end_before(&cp2_line, None)
+        .unwrap()
+        .receipts([(1, fx.e1.hash())])
+        .receipts_live(true)
+        .expect_err("l8b2 expected InvalidConfig");
+    assert_invalid_config(err, "receipts_live conflicts with end_before", "l8b2");
 }
 #[test]
 fn l8c_receipts_live_false_with_end_before_both_orders_ok() {
@@ -752,6 +774,59 @@ fn l8c_receipts_live_false_with_end_before_both_orders_ok() {
         (after_live_false, after_end_before),
         (true, true),
         "l8c receipts_live(false) with end_before in both orders",
+    );
+}
+#[test]
+fn l8c2_end_before_then_receipts_live_false_verifies_stopped() {
+    // Opposite call order to L8c's first sub-check, as a separate
+    // row with a verify step so the "conflict reserved for
+    // conflicting values" rule (ADR-0005 §19.2; ruling 13-V7-d1
+    // point 10) pins the build AND that `receipts_live(false)`
+    // behind `end_before` is the stopped-mode default:
+    // reconciliation runs (because `.receipts(..)` is called) and
+    // reports `NoReceipt` for every unreceipted `audit.record` in
+    // range, not `Unreconciled`. `end_before(cp4)` closes the range
+    // above `cp4`'s `seq` (ruling 13-V6-d4), so in-range are
+    // `[cp0, e1, e2, e3]`, and the end record `cp4` fires
+    // `TrailEnded` at its own line because the files hold a
+    // byte-identical copy (ruling 13-V6-d4 point 3).
+    let fx = five_record();
+    let cp4_line = line_without_lf(&fx.cp4);
+    let end_anchor = parse_cp(&fx.cp4);
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .end_before(&cp4_line, Some(end_anchor))
+        .unwrap()
+        .receipts([(1, fx.e1.hash())])
+        .receipts_live(false)
+        .unwrap();
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let expected = vec![
+        located(
+            K::NoReceipt,
+            fx.path.clone(),
+            3,
+            2,
+            format!("no receipt for seq 2 hash {E2_HONEST_DIGEST}"),
+        ),
+        located(
+            K::NoReceipt,
+            fx.path.clone(),
+            4,
+            3,
+            format!("no receipt for seq 3 hash {E3_FROM_E2_DIGEST}"),
+        ),
+        located(
+            K::TrailEnded,
+            fx.path,
+            5,
+            4,
+            "end_before seq 4: records seq 4..=4 at or above the end".to_owned(),
+        ),
+    ];
+    assert_findings(
+        report.findings(),
+        &expected,
+        "l8c2 end_before then receipts_live(false) verifies stopped",
     );
 }
 
@@ -812,6 +887,50 @@ fn l9_second_receipts_live_false_then_true_runs_live_mode() {
     )];
     assert_findings(report.findings(), &expected, "l9 replace false then true");
 }
+// =====================================================================
+// L9c -- REGRESSION. The second-call-replaces rule holds across
+// three `receipts_live` calls: after
+// `receipts_live(false).receipts_live(true).receipts_live(false)`,
+// the stored flag is the last call's `false` and the verifier runs
+// in stopped mode (`NoReceipt` for every unreceipted `audit.record`)
+// (ruling 13-V7-d1 point 10). Pairs with L9's two-call rows so an
+// "earlier call wins" mutation is caught across more than one
+// transition.
+// =====================================================================
+#[test]
+fn l9c_third_receipts_live_call_replaces_prior_runs_stopped_mode() {
+    let fx = five_record();
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts([(1, fx.e1.hash())])
+        .receipts_live(false)
+        .unwrap()
+        .receipts_live(true)
+        .unwrap()
+        .receipts_live(false)
+        .unwrap();
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let expected = vec![
+        located(
+            K::NoReceipt,
+            fx.path.clone(),
+            3,
+            2,
+            format!("no receipt for seq 2 hash {E2_HONEST_DIGEST}"),
+        ),
+        located(
+            K::NoReceipt,
+            fx.path,
+            4,
+            3,
+            format!("no receipt for seq 3 hash {E3_FROM_E2_DIGEST}"),
+        ),
+    ];
+    assert_findings(
+        report.findings(),
+        &expected,
+        "l9c three calls false-true-false",
+    );
+}
 
 // =====================================================================
 // L10 -- ACCEPTANCE. An accepted `start_from` moves the first
@@ -853,19 +972,20 @@ fn l10_accepted_start_prefix_starts_at_start() {
         2,
         "records seq 2..=4 not reconciled".to_owned(),
     )];
-    let _ = cp4;
     assert_findings(report.findings(), &expected, "l10 accepted start");
 }
 
 // =====================================================================
 // L11 -- ACCEPTANCE. A receipt at `u64::MAX` must not wrap or panic
 // while bounding the cut (clarification 13-V7-d1b point 3). The
-// comparison is `seq <= highest evidence` with no `+ 1`, so the
-// receipt stays an above-head `ReceiptMismatch` ("no record"); the
-// u64::MAX receipt did not match, so no evidence is collected and
-// the cut follows from the real records of the five-record chain
-// (the first in-range record is the cut, the whole range is one
-// `Unreconciled`, as decision 5 requires with no matched evidence).
+// mismatch comes from `match_one`'s "no record" branch (the
+// verified set holds no record at `u64::MAX`), and the row checks
+// that the cut's comparison does not overflow: the cut is computed
+// as `seq <= highest_evidence` with no `+ 1`. Because the mismatch
+// collects no evidence, the cut follows from the real records of
+// the five-record chain -- the first in-range record is the cut
+// and the whole range is one `Unreconciled`, as decision 5
+// requires with no matched evidence.
 // =====================================================================
 #[test]
 fn l11_live_receipt_at_u64_max_cut_follows_the_real_records() {
@@ -934,6 +1054,43 @@ fn l12_live_from_only_prefix_reconciled_through_s_unreconciled_above() {
 }
 
 // =====================================================================
+// L12b -- ACCEPTANCE. A matched `receipts_from` higher in the chain
+// (at `s = 4`, with no receipts or waivers) also counts as evidence:
+// on the six-record chain `[cp0, e1, e2, cp3, e4, cp5]` the prefix
+// extends through `e4`, the cap sits at `s = 4`, and the closing
+// checkpoint `cp5` is the first in-range record above the cap
+// (ADR-0005 decision 5 "Late adoption"; clarification 13-V7-d1b
+// point 1). Second matched-`from`-only layout alongside L12.
+// =====================================================================
+#[test]
+fn l12b_live_from_only_higher_s_prefix_reconciled_through_s_unreconciled_above() {
+    let fx = six_record();
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts_from(4, fx.e4.hash(), "late adoption")
+        .unwrap()
+        .receipts_live(true)
+        .unwrap();
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let expected = vec![
+        located(
+            K::ReceiptWaived,
+            fx.path.clone(),
+            5,
+            4,
+            format!("from seq 4 hash {E4_FROM_CP3_DIGEST}: late adoption"),
+        ),
+        located(
+            K::Unreconciled,
+            fx.path,
+            6,
+            5,
+            "records seq 5..=5 not reconciled".to_owned(),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "l12b from only higher s");
+}
+
+// =====================================================================
 // L13 -- ACCEPTANCE. A matched waiver above the highest receipt
 // raises the cap to cover it (clarification 13-V7-d1b point 1):
 // on the four-record chain `[cp0, e1, e2, cp3]` with the receipt at
@@ -971,8 +1128,222 @@ fn l13_live_waiver_above_highest_receipt_raises_cap() {
             "records seq 3..=3 not reconciled".to_owned(),
         ),
     ];
-    let _ = fx.cp3;
     assert_findings(report.findings(), &expected, "l13 waiver raises cap");
+}
+
+// =====================================================================
+// L13b -- ACCEPTANCE. A matched waiver above the highest receipt
+// raises the cap, second layout: the six-record chain `[cp0, e1,
+// e2, cp3, e4, cp5]` with receipts at seqs 1 and 2 and a matched
+// waiver at seq 4 moves the cap from `highest receipt + 1 = 3`
+// up to `highest evidence + 1 = 5`, so the first in-range record
+// above the cap is the closing checkpoint `cp5`
+// (clarification 13-V7-d1b point 1). The intermediate `cp3`
+// (checkpoint) sits between the receipts and the waiver and does
+// not break the prefix.
+// =====================================================================
+#[test]
+fn l13b_live_waiver_above_highest_receipt_raises_cap_six_record() {
+    let fx = six_record();
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts([(1, fx.e1.hash()), (2, fx.e2.hash())])
+        .waive(4, fx.e4.hash(), "orphan")
+        .unwrap()
+        .receipts_live(true)
+        .unwrap();
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let expected = vec![
+        located(
+            K::ReceiptWaived,
+            fx.path.clone(),
+            5,
+            4,
+            format!("waived seq 4 hash {E4_FROM_CP3_DIGEST}: orphan"),
+        ),
+        located(
+            K::Unreconciled,
+            fx.path,
+            6,
+            5,
+            "records seq 5..=5 not reconciled".to_owned(),
+        ),
+    ];
+    assert_findings(
+        report.findings(),
+        &expected,
+        "l13b waiver raises cap six-record",
+    );
+}
+
+// =====================================================================
+// L14 -- ACCEPTANCE. A waiver whose hash does not match the record
+// at that `seq` is one `ReceiptMismatch` and does NOT count toward
+// the cap (ruling 13-V7-d1 point 4; clarification 13-V7-d1b point
+// 1). On the five-record chain `[cp0, e1, e2, e3, cp4]` with
+// receipts at seqs 1..=3 and a waiver at seq 4 carrying a wrong
+// hash, the match fails ("hash differs"), the cap stays at
+// `highest receipt + 1 = 4`, and the closing checkpoint `cp4`
+// lands as `Unreconciled`.
+// =====================================================================
+#[test]
+fn l14_live_mismatched_waiver_not_evidence_five_record() {
+    let fx = five_record();
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts([(1, fx.e1.hash()), (2, fx.e2.hash()), (3, fx.e3.hash())])
+        .waive(4, WRONG_HASH_5A, "orphan")
+        .unwrap()
+        .receipts_live(true)
+        .unwrap();
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let expected = vec![
+        unlocated(
+            K::ReceiptMismatch,
+            Some(4),
+            format!(
+                "waive seq 4 hash {WRONG_HASH_5A_DIGEST}: hash differs (record {CP4_FROM_E3_DIGEST})"
+            ),
+        ),
+        located(
+            K::Unreconciled,
+            fx.path,
+            5,
+            4,
+            "records seq 4..=4 not reconciled".to_owned(),
+        ),
+    ];
+    assert_findings(
+        report.findings(),
+        &expected,
+        "l14 mismatched waiver five-record",
+    );
+}
+
+// =====================================================================
+// L14b -- ACCEPTANCE. Second mismatched-waiver layout: on the
+// four-record chain `[cp0, e1, e2, cp3]` with receipts at seqs 1
+// and 2 and a wrong-hash waiver at seq 3, the mismatch at `cp3`
+// still leaves the cap at `highest receipt + 1 = 3`, so `cp3` is
+// `Unreconciled` (ruling 13-V7-d1 point 4; clarification
+// 13-V7-d1b point 1).
+// =====================================================================
+#[test]
+fn l14b_live_mismatched_waiver_not_evidence_four_record() {
+    let fx = four_record();
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts([(1, fx.e1.hash()), (2, fx.e2.hash())])
+        .waive(3, WRONG_HASH_66, "orphan")
+        .unwrap()
+        .receipts_live(true)
+        .unwrap();
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let expected = vec![
+        unlocated(
+            K::ReceiptMismatch,
+            Some(3),
+            format!(
+                "waive seq 3 hash {WRONG_HASH_66_DIGEST}: hash differs (record {CP3_FROM_E2_DIGEST})"
+            ),
+        ),
+        located(
+            K::Unreconciled,
+            fx.path,
+            4,
+            3,
+            "records seq 3..=3 not reconciled".to_owned(),
+        ),
+    ];
+    assert_findings(
+        report.findings(),
+        &expected,
+        "l14b mismatched waiver four-record",
+    );
+}
+
+// =====================================================================
+// L15 -- ACCEPTANCE. A `receipts_from` whose hash does not match
+// the record at that `seq` is one `ReceiptMismatch`, exempts
+// nothing, and does NOT count toward the cap (ruling 13-V7-d1
+// points 4 and 6; clarification 13-V7-d1b point 1). On the
+// five-record chain with no receipts, `from(3, <wrong>)` leaves
+// the cap unset: with no matched evidence the cut drops to the
+// first in-range record and the whole range is one `Unreconciled`
+// (decision 5). Nothing below the mismatched `from`'s `seq` is
+// exempted, so the loop still would have emitted `NoReceipt` for
+// `e1`..`e3`, but the live-mode filter discards them because they
+// sit at or above the cut.
+// =====================================================================
+#[test]
+fn l15_live_mismatched_from_not_evidence_five_record() {
+    let fx = five_record();
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts_from(3, WRONG_HASH_66, "late adoption")
+        .unwrap()
+        .receipts_live(true)
+        .unwrap();
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let expected = vec![
+        located(
+            K::Unreconciled,
+            fx.path,
+            1,
+            0,
+            "records seq 0..=4 not reconciled".to_owned(),
+        ),
+        unlocated(
+            K::ReceiptMismatch,
+            Some(3),
+            format!(
+                "from seq 3 hash {WRONG_HASH_66_DIGEST}: hash differs (record {E3_FROM_E2_DIGEST})"
+            ),
+        ),
+    ];
+    assert_findings(
+        report.findings(),
+        &expected,
+        "l15 mismatched from five-record",
+    );
+}
+
+// =====================================================================
+// L15b -- ACCEPTANCE. Second mismatched-`from` layout: on the
+// four-record chain `[cp0, e1, e2, cp3]` with receipts at seqs 1
+// and 2 and a wrong-hash `from` at seq 3, the real evidence ends
+// at seq 2 so the cap stays at `highest evidence + 1 = 3`, and
+// the closing checkpoint `cp3` lands as `Unreconciled`
+// (ruling 13-V7-d1 points 4 and 6; clarification 13-V7-d1b
+// point 1).
+// =====================================================================
+#[test]
+fn l15b_live_mismatched_from_not_evidence_four_record() {
+    let fx = four_record();
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts([(1, fx.e1.hash()), (2, fx.e2.hash())])
+        .receipts_from(3, WRONG_HASH_5A, "late adoption")
+        .unwrap()
+        .receipts_live(true)
+        .unwrap();
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let expected = vec![
+        unlocated(
+            K::ReceiptMismatch,
+            Some(3),
+            format!(
+                "from seq 3 hash {WRONG_HASH_5A_DIGEST}: hash differs (record {CP3_FROM_E2_DIGEST})"
+            ),
+        ),
+        located(
+            K::Unreconciled,
+            fx.path,
+            4,
+            3,
+            "records seq 3..=3 not reconciled".to_owned(),
+        ),
+    ];
+    assert_findings(
+        report.findings(),
+        &expected,
+        "l15b mismatched from four-record",
+    );
 }
 
 /// Strips a trailing LF from a record line, mirroring
