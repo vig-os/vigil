@@ -28,6 +28,9 @@
 //! record's hash --- from the `Receipt` the writer returned, with
 //! every other field pinned literally.
 
+use super::tests_common::{
+    assert_findings, located, parse_cp, report_of, trust_with_key, unlocated,
+};
 use crate::audit::{
     AuditConfig, Entry, FindingKind as K, KeyFileSigner, Mmr, Record, Signer, TrustPolicy,
     digest_string,
@@ -35,7 +38,7 @@ use crate::audit::{
         TRAIL, Temp, context, entry_rec, fixture_pubkey, line_bytes, pushed, put_segment, seeded,
         segment_path, signed_cp, signed_cp_explicit,
     },
-    verify::{Finding, Report, Verifier},
+    verify::Verifier,
 };
 use std::{path::PathBuf, sync::Arc};
 
@@ -114,35 +117,13 @@ const RESUME_DETAIL_END_HEAD_CP2: &str = "operator=operator reason=incident head
      gap=none lost_records=0 structural=invalid(no-opening)";
 
 // =====================================================================
-// Helpers.
+// Helpers. Shared `located`, `unlocated`, `assert_findings`,
+// `trust_with_key`, `report_of` and `parse_cp` come from
+// [`super::tests_common`].
 // =====================================================================
 
 const WRONG_HASH_5A: [u8; 32] = [0x5a; 32];
 const WRONG_HASH_66: [u8; 32] = [0x66; 32];
-
-fn located(kind: K, file: PathBuf, line: u64, seq: u64, detail: String) -> Finding {
-    Finding::new(kind, Some(file), Some(line), Some(seq), detail)
-}
-fn unlocated(kind: K, seq: Option<u64>, detail: String) -> Finding {
-    Finding::new(kind, None, None, seq, detail)
-}
-
-#[track_caller]
-fn assert_findings(actual: &[Finding], expected: &[Finding], label: &str) {
-    assert_eq!(actual, expected, "{label} literal finding list");
-}
-
-fn trust_with_key(key: [u8; 32]) -> TrustPolicy {
-    TrustPolicy::builder()
-        .trail(TRAIL)
-        .key(key)
-        .build()
-        .unwrap()
-}
-
-fn report_of(files: Vec<PathBuf>, verifier: Verifier) -> Report {
-    verifier.verify_files(files).unwrap()
-}
 
 /// Builds a `vigil.audit.resume` operator record at `seq` on the
 /// honest fixture clock. Mirrors `resume_decl` but takes arbitrary
@@ -194,16 +175,6 @@ fn three_record() -> ThreeRecord {
         e1,
         cp2,
     }
-}
-
-/// Shared helper: parse a `Record` into a `Checkpoint` by its native
-/// line bytes. Mirrors the same two-step the other verify-tests use.
-fn parse_cp(record: &Record) -> crate::audit::Checkpoint {
-    let mut bytes = line_bytes(record);
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
-    }
-    crate::audit::Checkpoint::parse(std::str::from_utf8(&bytes).unwrap()).unwrap()
 }
 
 // =====================================================================

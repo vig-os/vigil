@@ -26,6 +26,27 @@ pub(super) struct Inputs<'a> {
     pub(super) receipts_from: Option<&'a (u64, [u8; 32], String)>,
 }
 
+/// Which subject the one match rule is running for (ruling 13-V7-d1
+/// points 4 and 6): a `Receipt` runs the rule without emitting
+/// `ReceiptWaived`; a `Waive` or `From` emits one `ReceiptWaived` at
+/// the matched record and carries its reason for the detail. The
+/// subject prefix (`receipt`, `waive`, `from`) is the first word of
+/// the finding's `subject` text.
+enum Subject<'a> {
+    Receipt,
+    Waive(&'a str),
+    From(&'a str),
+}
+impl Subject<'_> {
+    fn prefix(&self) -> &'static str {
+        match self {
+            Subject::Receipt => "receipt",
+            Subject::Waive(_) => "waive",
+            Subject::From(_) => "from",
+        }
+    }
+}
+
 /// Evaluates receipts, waivers and `from` against the verified
 /// records and appends every `ReceiptMismatch`, in-range `NoReceipt`,
 /// `ReceiptWaived` and position set-aside the rules produce. Called
@@ -38,46 +59,34 @@ pub(super) fn check(
     position: &Classifier,
     findings: &mut Vec<Finding>,
 ) {
-    for &(seq, hash) in inputs.receipts {
-        let subject = format!("receipt seq {seq} hash {}", digest_string(&hash));
-        if let Some(finding) = position.set_aside(seq, &subject) {
-            findings.push(finding);
-            continue;
-        }
-        if let Some(tail) = mismatch(seq, hash, groups, conflicting_seqs) {
-            findings.push(Finding::new(
-                K::ReceiptMismatch,
-                None,
-                None,
-                Some(seq),
-                format!("{subject}: {tail}"),
-            ));
-        }
-    }
-    // Ruling 13-V7-d1 point 6: waivers and `from` match through the
-    // same rule; a matched one emits `ReceiptWaived` (info) at the
-    // record, a mismatched one is `ReceiptMismatch`, and a set-aside
-    // one goes through the shared position classifier. The `from`
-    // match also returns its `seq` so the loop below exempts records
-    // at or below it. A mismatched `from` exempts nothing.
     let ctx = Ctx {
         groups,
         conflicting_seqs,
         position,
     };
+    // One match path for every receipt, waiver and `from`
+    // (ruling 13-V7-d1 points 4 and 6): [`match_one`] runs the
+    // shared subject-format, [`Classifier::set_aside`], mismatch
+    // and (for a waiver or `from`) the `ReceiptWaived` emission,
+    // then returns `true` on a match so the `from` caller can mark
+    // its exemption.
+    for &(seq, hash) in inputs.receipts {
+        match_one(seq, hash, &Subject::Receipt, &ctx, findings);
+    }
+    // Ruling 13-V7-d1 point 6: a matched `from` exempts every
+    // record at or below its `seq` from `NoReceipt`, so the loop
+    // below reads back the matched `seq`. A mismatched `from`
+    // exempts nothing.
     let matched_from_seq = inputs.receipts_from.and_then(|(seq, hash, reason)| {
-        match_or_report(*seq, *hash, "from", "from", reason, &ctx, findings)
+        match_one(*seq, *hash, &Subject::From(reason), &ctx, findings).then_some(*seq)
     });
     for (&seq, (hash, reason)) in inputs.waivers {
-        match_or_report(seq, *hash, "waive", "waived", reason, &ctx, findings);
+        match_one(seq, *hash, &Subject::Waive(reason), &ctx, findings);
     }
     for (&seq, copies) in groups {
         if !position.is_in_range(seq) {
             continue;
         }
-        // Ruling 13-V7-d1 point 6: a matched `from` exempts every
-        // record at or below its `seq` from reconciliation, so no
-        // `NoReceipt` fires here.
         if matched_from_seq.is_some_and(|s| seq <= s) {
             continue;
         }
@@ -126,34 +135,36 @@ pub(super) fn check(
     }
 }
 
-/// Shared verifier state the waiver/`from` match rule reads
-/// (ruling 13-V7-d1 point 6). Owned by [`check`], passed into
-/// [`match_or_report`] by reference.
+/// Shared verifier state the one match rule reads (ruling 13-V7-d1
+/// points 4 and 6). Owned by [`check`], passed into [`match_one`]
+/// by reference.
 struct Ctx<'a, 'b> {
     groups: &'a BTreeMap<u64, Vec<Located<'b>>>,
     conflicting_seqs: &'a BTreeSet<u64>,
     position: &'a Classifier,
 }
 
-/// Runs the shared match rule for a waiver (subject verbs
-/// `waive`/`waived`) or `from` (both `from`) under ruling 13-V7-d1
-/// point 6. On set-aside or mismatch, pushes the finding and
-/// returns `None`; on a match, emits one `ReceiptWaived` at the
-/// record's first copy and returns `Some(seq)` so [`check`]'s
-/// `NoReceipt` loop can honour a `from` exemption.
-fn match_or_report(
+/// Runs the shared match rule once for a receipt, a waiver or a
+/// `from` (ruling 13-V7-d1 points 4 and 6). On set-aside or
+/// mismatch, pushes the finding and returns `false`; on a match,
+/// emits one `ReceiptWaived` at the record's first copy for a
+/// waiver or `from` (no finding for a receipt) and returns `true`
+/// so [`check`] can mark the `from` exemption.
+fn match_one(
     seq: u64,
     hash: [u8; 32],
-    subject_verb: &str,
-    matched_verb: &str,
-    reason: &str,
+    subject: &Subject<'_>,
     ctx: &Ctx<'_, '_>,
     findings: &mut Vec<Finding>,
-) -> Option<u64> {
-    let subject = format!("{subject_verb} seq {seq} hash {}", digest_string(&hash));
-    if let Some(finding) = ctx.position.set_aside(seq, &subject) {
+) -> bool {
+    let subject_text = format!(
+        "{} seq {seq} hash {}",
+        subject.prefix(),
+        digest_string(&hash)
+    );
+    if let Some(finding) = ctx.position.set_aside(seq, &subject_text) {
         findings.push(finding);
-        return None;
+        return false;
     }
     if let Some(tail) = mismatch(seq, hash, ctx.groups, ctx.conflicting_seqs) {
         findings.push(Finding::new(
@@ -161,26 +172,32 @@ fn match_or_report(
             None,
             None,
             Some(seq),
-            format!("{subject}: {tail}"),
+            format!("{subject_text}: {tail}"),
         ));
-        return None;
+        return false;
     }
-    let (path, record) = ctx
-        .groups
-        .get(&seq)
-        .and_then(|c| c.first().copied())
-        .expect("match implies groups holds one copy at seq");
-    findings.push(Finding::new(
-        K::ReceiptWaived,
-        Some(path.to_owned()),
-        Some(record.line),
-        Some(seq),
-        format!(
-            "{matched_verb} seq {seq} hash {}: {reason}",
-            digest_string(&hash)
-        ),
-    ));
-    Some(seq)
+    if let Some((matched_verb, reason)) = match subject {
+        Subject::Receipt => None,
+        Subject::Waive(reason) => Some(("waived", *reason)),
+        Subject::From(reason) => Some(("from", *reason)),
+    } {
+        let (path, record) = ctx
+            .groups
+            .get(&seq)
+            .and_then(|c| c.first().copied())
+            .expect("match implies groups holds one copy at seq");
+        findings.push(Finding::new(
+            K::ReceiptWaived,
+            Some(path.to_owned()),
+            Some(record.line),
+            Some(seq),
+            format!(
+                "{matched_verb} seq {seq} hash {}: {reason}",
+                digest_string(&hash)
+            ),
+        ));
+    }
+    true
 }
 
 /// Returns the first failing step of the match rule as the tail of

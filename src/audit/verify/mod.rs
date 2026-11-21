@@ -308,6 +308,8 @@ mod stale_tests;
 #[cfg(test)]
 mod start_tests;
 #[cfg(test)]
+mod tests_common;
+#[cfg(test)]
 mod waivers_tests;
 
 /// Verifies a directory using a cloned, validated trust policy.
@@ -759,13 +761,18 @@ impl Verifier {
     /// `NoReceipt`. The match rule is [`Self::receipts`]' rule under
     /// subject `waive seq <s> hash blake3:<64 hex>`: a match emits
     /// one [`ReceiptWaived`](FindingKind::ReceiptWaived) at the
-    /// record (detail `waived seq <s> hash blake3:<64 hex>: <reason>`)
-    /// and suppresses `NoReceipt` there; a mismatch is
-    /// `ReceiptMismatch` with that subject; a waiver below the start
-    /// or above the end is set aside. The hash pins the record, so a
-    /// waiver cannot be moved: if the record at `<seq>` differs, it
-    /// is `ReceiptMismatch` and still `NoReceipt`, never silently
-    /// applied to the replacement.
+    /// record (see that kind for the detail grammar) and suppresses
+    /// `NoReceipt` there; a mismatch is `ReceiptMismatch` with that
+    /// subject; a waiver below the start or above the end is set
+    /// aside. The hash pins the record, so a waiver cannot be moved:
+    /// if the record at `<seq>` differs, it is `ReceiptMismatch` and
+    /// still `NoReceipt`, never silently applied to the replacement.
+    ///
+    /// `reason` is accepted verbatim once it is non-empty and
+    /// single-line (no LF or CR); whitespace is not trimmed, so a
+    /// whitespace-only reason (for example `"   "`) is accepted and
+    /// appears verbatim in the `ReceiptWaived` or `ReceiptMismatch`
+    /// detail.
     ///
     /// **Review criterion** (ADR-0005 decision 5; vigil cannot apply
     /// it itself). A record may be waived only if its **full hashed
@@ -779,6 +786,9 @@ impl Verifier {
     /// Returns [`InvalidConfig`](AuditErrorKind::InvalidConfig) when
     /// `reason` is empty or contains LF/CR, or when a waiver for the
     /// same `seq` was already registered (ruling 13-V7-d1 point 6).
+    /// The error's message names the failed check: `waive reason must
+    /// be a non-empty single line (no LF or CR)` or `duplicate waive
+    /// for seq <s>`.
     pub fn waive(
         mut self,
         seq: u64,
@@ -802,16 +812,25 @@ impl Verifier {
     /// match rule is [`Self::receipts`]' rule under subject
     /// `from seq <s> hash blake3:<64 hex>`: a match emits one
     /// [`ReceiptWaived`](FindingKind::ReceiptWaived) at the record
-    /// (detail `from seq <s> hash blake3:<64 hex>: <reason>`) and
-    /// exempts every record at or below `s` from reconciliation; a
-    /// mismatch is `ReceiptMismatch` and exempts nothing, so a
-    /// mismatched `from` cannot silently cover a rewritten prefix; a
-    /// `from` below the start or above the end is set aside.
+    /// (see that kind for the detail grammar) and exempts every
+    /// record at or below `s` from reconciliation; a mismatch is
+    /// `ReceiptMismatch` and exempts nothing, so a mismatched `from`
+    /// cannot silently cover a rewritten prefix; a `from` below the
+    /// start or above the end is set aside.
+    ///
+    /// `reason` is accepted verbatim once it is non-empty and
+    /// single-line (no LF or CR); whitespace is not trimmed, so a
+    /// whitespace-only reason (for example `"   "`) is accepted and
+    /// appears verbatim in the `ReceiptWaived` or `ReceiptMismatch`
+    /// detail.
     ///
     /// # Errors
     /// Returns [`InvalidConfig`](AuditErrorKind::InvalidConfig) when
     /// `reason` is empty or contains LF/CR, or when `receipts_from`
     /// was already called on this verifier (ruling 13-V7-d1 point 6).
+    /// The error's message names the failed check:
+    /// `receipts_from reason must be a non-empty single line (no LF
+    /// or CR)` or `duplicate receipts_from`.
     pub fn receipts_from(
         mut self,
         seq: u64,
