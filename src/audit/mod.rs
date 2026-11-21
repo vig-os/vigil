@@ -448,7 +448,16 @@ pub enum FindingKind {
     OutOfRange,
     /// Info: Records follow the reconciled receipts prefix.
     Unreconciled,
-    /// Info: An operator waived a receipt or supplied a receipt prefix.
+    /// Info: A matched [`Verifier::waive`](crate::audit::Verifier::waive)
+    /// or [`Verifier::receipts_from`](crate::audit::Verifier::receipts_from)
+    /// at the record's first copy (ADR-0005 decision 5 "Waivers, for
+    /// an honest crash" and "Late adoption"; ruling 13-V7-d1 point 6).
+    /// Details: `waived seq <s> hash blake3:<64 hex>: <reason>` (the
+    /// record carries no `NoReceipt`) or
+    /// `from seq <s> hash blake3:<64 hex>: <reason>` (records at or
+    /// below `s` are not reconciled). See those builders for the
+    /// match rule, the `InvalidConfig` cases and the review
+    /// criterion.
     ReceiptWaived,
     /// Info: A fragment gap attested by a record of the verified
     /// trail with no other record at its `seq` whose `seq` is at or

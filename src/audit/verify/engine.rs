@@ -359,10 +359,9 @@ pub(super) struct Policy<'a> {
     pub(super) start: Option<&'a Checkpoint>,
     pub(super) end_ctx: Option<&'a end_before::Context<'a>>,
     /// `None` leaves reconciliation off (ruling 13-V7-d1 point 2);
-    /// `Some(set)` turns it on, so an empty set still reports every
-    /// in-range `audit.record` as `NoReceipt`. Carries raw blake3
+    /// `Some(inputs)` turns it on. Every bundle carries raw blake3
     /// bytes so no hex parsing lives in `engine::check`.
-    pub(super) receipts: Option<&'a BTreeSet<(u64, [u8; 32])>>,
+    pub(super) receipts: Option<&'a receipts::Inputs<'a>>,
     pub(super) now: SystemTime,
 }
 
@@ -685,18 +684,14 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         end_anchor_identity,
         &mut findings,
     );
-    // Ruling 13-V7-d1 points 2-5: reconcile receipts against the
-    // already-merged `groups` and the shared position classifier.
-    // Runs iff `Verifier::receipts` turned reconciliation on (point
-    // 2), so a verifier without the call sees no receipts work.
-    if let Some(receipts) = receipt_set {
-        receipts::check(
-            receipts,
-            &groups,
-            &conflicting_seqs,
-            &position,
-            &mut findings,
-        );
+    // Rulings 13-V7-d1 points 2-6: reconcile receipts, waivers and
+    // the `from` input against the already-merged `groups` and the
+    // shared position classifier. Runs iff one of `Verifier::receipts`,
+    // `Verifier::waive` or `Verifier::receipts_from` turned
+    // reconciliation on (point 2), so a verifier without the calls
+    // sees no receipts work.
+    if let Some(inputs) = receipt_set {
+        receipts::check(inputs, &groups, &conflicting_seqs, &position, &mut findings);
     }
     // Compute the per-declaration structural outcome once (ruling
     // 13-V3-d5 point 10, #195): both the `Resumed` detail suffix and the
