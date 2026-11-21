@@ -381,6 +381,35 @@ fn g2b_wrong_hash_receipt_at_resume_seq_does_not_confirm() {
 }
 
 // =====================================================================
+// G2c - ACCEPTANCE. Second probe of the full `(seq, hash)` match
+// rule for confirmation (ruling 13-V7-d1 point 8): a wrong-hash
+// receipt at the resume `seq` plus a waiver inside the gap. Base:
+// gap unconfirmed, waiver is `ReceiptMismatch "no record"`. Pairs
+// with G2b to pin both receipt and waiver subjects. First failing
+// line on base: the `!any(LostRecord)` assertion below.
+// =====================================================================
+#[test]
+fn g2c_wrong_hash_resume_receipt_with_waiver_stays_unconfirmed() {
+    let fx = non_genesis(GAP_HIGH, None);
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts([(1, fx.e1.hash()), (RESUME_SEQ, WRONG_HASH_55)])
+        .waive(4, WRONG_HASH_55, "orphan")
+        .unwrap();
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let findings = report.findings();
+    assert!(
+        !findings.iter().any(|f| f.kind() == K::LostRecord),
+        "G2c waiver in unconfirmed gap must not become `LostRecord`; got {findings:?}"
+    );
+    assert!(
+        findings.iter().any(|f| f.kind() == K::ReceiptMismatch
+            && f.seq() == Some(4)
+            && f.detail().starts_with("waive seq 4")),
+        "G2c in-gap waiver must stay `ReceiptMismatch`; got {findings:?}"
+    );
+}
+
+// =====================================================================
 // G3 - ACCEPTANCE. ADR-0005 decision 11 l.989: a gap opened with an
 // **untrusted** key is not a candidate (ruling 13-V5-d1 point 8;
 // 13-V7-d1 point 7), so its jump keeps its ordinary `SeqGap` and
@@ -568,6 +597,35 @@ fn g5c_from_at_top_of_gap_still_exempts_below() {
             .iter()
             .any(|f| f.kind() == K::LostRecord && f.seq() == Some(GAP_HIGH)),
         "G5c: from must be `LostRecord`; got {findings:?}"
+    );
+}
+
+// =====================================================================
+// G5d - ACCEPTANCE. Third probe of the `from` exemption through a
+// confirmed gap (ruling 13-V7-d1 point 6): the `from` at the LOWEST
+// in-range gap `seq` (seq 3) still exempts seqs 1 and 2 below it,
+// plus seq 3 itself. Pairs with G5 (from at seq 3 with waiver) and
+// G5c (from at top) so a mutant that drops exemption on the gap
+// path fails on both low and high ends.
+// =====================================================================
+#[test]
+fn g5d_from_at_low_of_gap_still_exempts_everything_below() {
+    let fx = non_genesis(GAP_HIGH, None);
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts([(RESUME_SEQ, fx.resume.hash())])
+        .receipts_from(GAP_LOW, WRONG_HASH_55, "late adoption")
+        .unwrap();
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let findings = report.findings();
+    assert!(
+        !findings.iter().any(|f| f.kind() == K::NoReceipt),
+        "G5d: from at low of gap must exempt e1; got {findings:?}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.kind() == K::LostRecord && f.seq() == Some(GAP_LOW)),
+        "G5d: from must be `LostRecord`; got {findings:?}"
     );
 }
 
