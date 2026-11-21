@@ -412,7 +412,17 @@ pub enum FindingKind {
     /// `trailing gap lines {first}..={last} ({N} bytes), digest {D}`
     /// with an optional `; no crash outcome` suffix for a trailing gap.
     TornWrite,
-    /// Warning: An operator resumed the trail after a loss.
+    /// Warning: An operator resumed the trail after a loss. One
+    /// finding per distinct `(resume_seq, resume_hash)` on the
+    /// verified trail, attributed to the native copy when present
+    /// (ADR-0005 decision 5; rulings 13-V3-d4, 13-V3-d5 and
+    /// 13-V7-d1). A parseable declaration yields detail
+    /// `operator=<a> reason=<r> head=<seq>:<hex> gap=<range|none>
+    /// lost_records=<n> structural=<outcome>`, where `<n>` counts
+    /// every [`LostRecord`](FindingKind::LostRecord) whose `seq`
+    /// lies in this gap (`0` when no candidate was kept by the
+    /// trust and fold filters); a malformed one yields
+    /// `malformed declaration` and no suffix.
     Resumed,
     /// Warning: Record time moved backwards.
     ClockWentBackwards,
@@ -485,7 +495,20 @@ pub enum FindingKind {
     Accepted,
     /// Info: A review matched no warning.
     AcceptUnused,
-    /// Info: An input names a sequence inside a confirmed resume gap.
+    /// Info: A receipt, waiver or
+    /// [`receipts_from`](crate::audit::Verifier::receipts_from)
+    /// naming a `seq` inside a **confirmed** resume gap (ADR-0005
+    /// decision 5 "Receipts lost with a resume"; ruling 13-V7-d1
+    /// points 8-9). The rule, the confirmation and the #224 limit
+    /// are on
+    /// [`Verifier::receipts`](crate::audit::Verifier::receipts).
+    /// The detail is exactly `<subject>: lost in gap <a>..=<b>`,
+    /// unlocated, where `<subject>` is the input's V7a/V7b subject
+    /// (`receipt seq <s> hash blake3:<64 hex>`, `waive seq <s>
+    /// hash blake3:<64 hex>` or `from seq <s> hash blake3:<64
+    /// hex>`). Inside an unconfirmed gap the same inputs stay
+    /// [`ReceiptMismatch`](FindingKind::ReceiptMismatch) `… no
+    /// record`.
     LostRecord,
 }
 

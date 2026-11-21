@@ -462,14 +462,9 @@ fn r2_a3_two_loss_points_literal() {
             "missing seq 6..=6".to_owned(),
             None,
         ),
-        (
-            K::SeqGap,
-            Some(live.clone()),
-            Some(1),
-            Some(10),
-            "missing seq 9..=9".to_owned(),
-            None,
-        ),
+        // Ruling 13-V7-d1 point 7: the jump `9..=9` is the gap of the
+        // A3 resume candidate (trusted opening, fold-matched), so no
+        // `SeqGap` is reported for it.
         (
             K::Resumed,
             Some(live.clone()),
@@ -1643,28 +1638,16 @@ fn r15_d9_p01_closer_span_in_second_run_only() {
             run2_detail,
             Some(digest_string(&run2_digest)),
         ),
-        (
-            K::SeqGap,
-            Some(s2.clone()),
-            Some(1),
-            Some(7),
-            "missing seq 4..=6".to_owned(),
-            None,
-        ),
+        // Ruling 13-V7-d1 point 7: both `4..=6` (resume 1) and
+        // `9..=11` (resume 2) are the exact gaps of trusted-opening,
+        // fold-matched resume candidates, so no `SeqGap` fires for
+        // either jump.
         (
             K::Resumed,
             Some(s2.clone()),
             Some(2),
             Some(8),
             resume1_detail,
-            None,
-        ),
-        (
-            K::SeqGap,
-            Some(live.clone()),
-            Some(1),
-            Some(12),
-            "missing seq 9..=11".to_owned(),
             None,
         ),
         (
@@ -2124,14 +2107,8 @@ fn r19_m11_a3_torn_live_no_run_finding() {
             "missing seq 6..=6".to_owned(),
             None,
         ),
-        (
-            K::SeqGap,
-            Some(live.clone()),
-            Some(1),
-            Some(10),
-            "missing seq 9..=9".to_owned(),
-            None,
-        ),
+        // Ruling 13-V7-d1 point 7: `9..=9` is the A3 resume
+        // candidate's gap, so no `SeqGap` is reported for it.
         (
             K::Resumed,
             Some(live.clone()),
@@ -2311,14 +2288,8 @@ fn r20_227_cross_dir_a3_archive_plus_trail_dir_one_classify() {
             "missing seq 6..=6".to_owned(),
             None,
         ),
-        (
-            K::SeqGap,
-            Some(common.join(live)),
-            Some(1),
-            Some(10),
-            "missing seq 9..=9".to_owned(),
-            None,
-        ),
+        // Ruling 13-V7-d1 point 7: `9..=9` is the A3 resume
+        // candidate's gap, so no `SeqGap` is reported for it.
         (
             K::Resumed,
             Some(common.join(live)),

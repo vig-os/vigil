@@ -292,6 +292,8 @@ mod end_link_tests;
 #[cfg(test)]
 mod end_tests;
 #[cfg(test)]
+mod gaps_tests;
+#[cfg(test)]
 mod live_tests;
 #[cfg(test)]
 mod mod_tests;
@@ -756,9 +758,26 @@ impl Verifier {
     ///
     /// See [`FindingKind::NoReceipt`] and
     /// [`FindingKind::ReceiptMismatch`] for the detail grammars.
-    /// For a running trail, see [`Self::receipts_live`]; resume-gap
-    /// confirmation ([`LostRecord`](FindingKind::LostRecord)) lands
-    /// in later #13 work.
+    /// For a running trail, see [`Self::receipts_live`].
+    ///
+    /// **Resume-gap confirmation.** A receipt that names a resume
+    /// record's `(seq, hash)` **confirms** that resume's gap under
+    /// the shared match rule (ADR-0005 decision 5 "Receipts lost
+    /// with a resume"; ruling 13-V7-d1 points 8-9). Inside a
+    /// confirmed gap each receipt, waiver and [`Self::receipts_from`]
+    /// becomes one [`LostRecord`](FindingKind::LostRecord) (info)
+    /// instead of a mismatch; the number of such findings in a gap
+    /// is reported as `lost_records=<n>` in the gap's
+    /// [`Resumed`](FindingKind::Resumed) detail. The rule applies
+    /// only to candidates whose opening checkpoint passes the trust
+    /// filter ([`BadSignature`](FindingKind::BadSignature) /
+    /// [`UntrustedKey`](FindingKind::UntrustedKey) predicate) and
+    /// the fail-closed fold filter (ruling 13-V4-d10 point 4). A
+    /// shipped-only opening is never fold-matched (owner decision
+    /// 13-V4-d7; spike #224), so a Collector copy of the opening
+    /// cannot confirm a gap. Anchors and `through=` pins inside a
+    /// confirmed gap keep their ordinary findings here; their
+    /// set-aside under an anchored opening is V7e.
     pub fn receipts(mut self, receipts: impl IntoIterator<Item = (u64, [u8; 32])>) -> Self {
         let set = self
             .receipts

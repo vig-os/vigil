@@ -1,24 +1,48 @@
-//! Position classifier for inputs during verify (rulings 13-V6-d3
-//! and 13-V6-d7; ADR-0005 decision 11). Built once per verify call
-//! from the accepted start (if any), the anchors and the end-record
-//! context (if any); consumed by [`super::anchors`],
-//! [`super::revocation`] and [`super::end`] through
-//! [`Classifier::set_aside`] to replace the ordinary mismatch finding
-//! with one unlocated set-aside finding when the input is below an
-//! accepted start or above the end of a bounded batch. See
-//! [`crate::audit::Verifier::start_from`] and
-//! [`crate::audit::Verifier::end_before`] for the rules.
+//! Position classifier for inputs during verify (rulings 13-V6-d3,
+//! 13-V6-d7 and 13-V7-d1 points 7-9; ADR-0005 decision 11 and
+//! decision 5 "Receipts lost with a resume"). Built once per verify
+//! call from the accepted start, the anchors, the end-record
+//! context and every trust-and-fold-kept resume candidate; consumed
+//! by [`super::anchors`], [`super::revocation`] and [`super::end`]
+//! through [`Classifier::set_aside`] (below-start / above-end) and
+//! by [`super::receipts`] through [`Classifier::lost_record`]
+//! (inside a confirmed resume gap). See
+//! [`crate::audit::Verifier::start_from`],
+//! [`crate::audit::Verifier::end_before`] and
+//! [`crate::audit::Verifier::receipts`] for the rules.
 
 use super::{Finding, end_before};
 use crate::audit::{Checkpoint, FindingKind as K};
 use std::fmt::Display;
 
-/// Sorted location of a `seq` versus the accepted start and the
-/// end record.
+/// Trust-and-fold-kept resume candidate (rulings 13-V4-d10 point 4,
+/// 13-V5-d1 point 8 and 13-V7-d1 points 7-9). `low..=high` is the
+/// gap: `head_seq+1..=lost_through`, or `0..=lost_through` on a
+/// genesis resume (ADR-0005 decision 5 "Resume gaps", l.407).
+/// `confirmed` is `true` when a receipt matches the resume's
+/// `(seq, hash)` under the shared match rule (13-V7-d1 point 8);
+/// it gates `LostRecord` emission and the genesis-gap suppression
+/// (point 7 exception). `opening_anchored` is `true` when an input
+/// anchor's `(trail, seq, hash)` equals the opening checkpoint
+/// (ruling 13-V6-d1 point 2); V7e will consume it to demote anchors
+/// and pins inside a gap -- V7d anchors and pins keep their
+/// current findings.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Gap {
+    pub(super) low: u64,
+    pub(super) high: u64,
+    pub(super) is_genesis: bool,
+    pub(super) confirmed: bool,
+    pub(super) opening_anchored: bool,
+}
+
+/// Sorted location of a `seq` versus the accepted start, the end
+/// record and every resume candidate gap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Position {
     /// `seq >= start_seq` (or no accepted start) and `seq <= E` (or
-    /// no `end_before`). Nothing is set aside.
+    /// no `end_before`) and not inside any resume candidate gap.
+    /// Nothing is set aside.
     InRange,
     /// `seq < start_seq` under an accepted start. `start_seq` is the
     /// accepted start's `seq` (carried so the finding detail can name
@@ -33,13 +57,28 @@ enum Position {
     /// the shared anchor rule matched it (ruling 13-V6-d4 point 5;
     /// ruling 13-V6-d7 clarification 13-V6-d7a).
     AboveEnd { end_seq: u64, anchored: bool },
+    /// `seq` is inside a resume candidate gap (ruling 13-V7-d1
+    /// points 7-9). An input below the start or above the end
+    /// follows that rule first, so only an in-range `seq` lands
+    /// here. See [`Gap`] for the field semantics.
+    Gap {
+        confirmed: bool,
+        opening_anchored: bool,
+        low: u64,
+        high: u64,
+    },
 }
 
 /// Built once per verify call from the accepted start (if any), the
-/// anchor list and the end-record context (if any).
+/// anchor list, the end-record context (if any) and every structurally
+/// valid resume candidate the trust and fold filters kept.
 pub(super) struct Classifier {
     accepted: Option<(u64, bool)>,
     end_before: Option<EndBounds>,
+    /// Resume candidate gaps, in `low` order; consumed by
+    /// [`Self::classify`], [`Self::lost_record`] and
+    /// [`Self::candidate_gap`] (ruling 13-V7-d1 points 7-9).
+    gaps: Vec<Gap>,
 }
 
 /// The two end-of-range bounds the classifier carries under
@@ -69,6 +108,7 @@ impl Classifier {
         trail: [u8; 16],
         anchors: &[Checkpoint],
         end_ctx: Option<&end_before::Context<'_>>,
+        gaps: Vec<Gap>,
     ) -> Self {
         let accepted = accepted.map(|start| {
             let anchored = anchors
@@ -84,6 +124,7 @@ impl Classifier {
         Self {
             accepted,
             end_before,
+            gaps,
         }
     }
 
@@ -137,7 +178,51 @@ impl Classifier {
                 anchored,
             };
         }
+        // Ruling 13-V7-d1 point 7: an input below the start follows
+        // the start rule first and one above the end follows the end
+        // rule; only an in-range `seq` can be inside a candidate gap.
+        if let Some(g) = self.gaps.iter().find(|g| seq >= g.low && seq <= g.high) {
+            return Position::Gap {
+                confirmed: g.confirmed,
+                opening_anchored: g.opening_anchored,
+                low: g.low,
+                high: g.high,
+            };
+        }
         Position::InRange
+    }
+
+    /// One unlocated [`K::LostRecord`] finding when `seq` is inside a
+    /// confirmed resume candidate gap (ruling 13-V7-d1 points 8-9);
+    /// `None` outside one or inside an unconfirmed gap. `subject` is
+    /// the caller's `<prefix> seq <s> hash <hex>` text (V7a/V7b
+    /// subjects); the detail completes as `<subject>: lost in gap
+    /// <a>..=<b>`. Consumed by [`super::receipts::match_one`].
+    pub(super) fn lost_record(&self, seq: u64, subject: impl Display) -> Option<Finding> {
+        match self.classify(seq) {
+            Position::Gap {
+                confirmed: true,
+                low,
+                high,
+                ..
+            } => Some(Finding::new(
+                K::LostRecord,
+                None,
+                None,
+                Some(seq),
+                format!("{subject}: lost in gap {low}..={high}"),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Returns the matching candidate gap when the range `low..=high`
+    /// is **exactly** a candidate gap's range (ruling 13-V7-d1 point
+    /// 7): the main seq-loop reads this to suppress its `SeqGap`.
+    /// Returns `None` for any other `(low, high)`, so an unrelated
+    /// jump keeps its `SeqGap`.
+    pub(super) fn candidate_gap(&self, low: u64, high: u64) -> Option<&Gap> {
+        self.gaps.iter().find(|g| g.low == low && g.high == high)
     }
 
     /// Returns the one unlocated set-aside finding when `seq` is
@@ -152,7 +237,7 @@ impl Classifier {
     /// (rulings 13-V6-d3 points 4-5 and 13-V6-d7 points 2-3).
     pub(super) fn set_aside(&self, seq: u64, subject: impl Display) -> Option<Finding> {
         match self.classify(seq) {
-            Position::InRange => None,
+            Position::InRange | Position::Gap { .. } => None,
             Position::BelowStart {
                 start_seq,
                 anchored,
@@ -186,7 +271,7 @@ impl Classifier {
             Position::AboveEnd { end_seq, anchored } => {
                 Some(above_end_finding(seq, end_seq, anchored, subject))
             }
-            Position::InRange | Position::BelowStart { .. } => None,
+            Position::InRange | Position::BelowStart { .. } | Position::Gap { .. } => None,
         }
     }
 }

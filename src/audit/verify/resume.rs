@@ -54,29 +54,24 @@ impl fmt::Display for Reason {
 
 /// Validated `(resume, opening, head)` triple consumed by #13 V4/V6/V7
 /// (ruling 13-V3-d5 point 5). Deduped by `(resume_seq, resume_hash)`
-/// native-first (d5 point 10, ADR amendment 8).
+/// native-first (d5 point 10, ADR amendment 8). V7d reads every
+/// field: `resume_seq`/`resume_hash` key the gap's confirmation and
+/// its `lost_records` count; `opening_seq`/`opening_hash` feed the
+/// fold filter (13-V4-d10 point 4) and the trust filter (13-V5-d1
+/// point 8); `head_seq`/`head_hash` set the gap's low bound;
+/// `lost_through` sets its high bound; `is_genesis` picks the gap's
+/// low (`0` or `head_seq+1`) and gates the genesis exception
+/// (13-V7-d1 point 7).
 #[derive(Debug, Clone)]
 pub(super) struct ResumeCandidate {
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by #13 V7"))]
     pub(super) resume_seq: u64,
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by #13 V7"))]
     pub(super) resume_hash: [u8; 32],
-    // Consumed in non-test builds by `verify::engine::filter_candidates`
-    // (#13 V4b, ruling 13-V4-d10 point 4): the fail-closed candidate
-    // filter reads these fields to drop any opening the classifier
-    // did not positively record as compared and matched on the
-    // full `(seq, hash)` pair, so a forged opening whose hash
-    // collides on `seq` with an honest Matched opening on the
-    // same trail is dropped.
     pub(super) opening_seq: u64,
     pub(super) opening_hash: [u8; 32],
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by #13 V7"))]
     pub(super) head_seq: u64,
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by #13 V7"))]
+    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by #13 V8"))]
     pub(super) head_hash: [u8; 32],
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by #13 V7"))]
     pub(super) lost_through: u64,
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by #13 V7"))]
     pub(super) is_genesis: bool,
 }
 
