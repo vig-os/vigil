@@ -15,7 +15,7 @@ use super::tests_common::{
     assert_findings, located, parse_cp, report_of, trust_with_key, unlocated,
 };
 use crate::audit::{
-    AuditErrorKind, FindingKind as K, Mmr, Record, digest_string,
+    AuditError, AuditErrorKind, FindingKind as K, Mmr, Record, digest_string,
     runs_v4a_fixtures::{
         TRAIL, Temp, entry_rec, fixture_pubkey, pushed, put_segment, seeded, segment_path,
         signed_cp,
@@ -130,12 +130,44 @@ fn three_record() -> ThreeRecord {
     }
 }
 
-/// Four-record chain `[cp0, e1, cp2, e2]` where the entry at seq=2
-/// forks against the checkpoint at seq=2... no, better: the
-/// receipted-two-checkpoints chain `[cp0, e1, cp2, e3, cp4]` with
-/// two closing checkpoints. Used by L5 (every audit.record
-/// receipted) to exercise the "checkpoints never break the prefix"
-/// rule through a mid-chain checkpoint.
+/// Four-record chain `[cp0, e1, e2, cp3]`: an entry run closed by
+/// `cp3`. Used by the "waiver above the highest receipt raises the
+/// cap" row (`n3`), where every `audit.record` is either receipted
+/// (`e1`) or waived (`e2`) so first-unreconciled is `None` and the
+/// cap is the only thing that places the cut (clarification
+/// 13-V7-d1b point 1).
+struct FourRecord {
+    _dir: Temp,
+    path: PathBuf,
+    e1: Record,
+    e2: Record,
+    cp3: Record,
+}
+fn four_record() -> FourRecord {
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let e2 = entry_rec(2, e1.hash());
+    let mmr2 = pushed(&mmr1, &e2);
+    let cp3 = signed_cp(3, e2.hash(), &mmr2);
+    let d = Temp::new();
+    put_segment(&d.0, 0, &[&cp0, &e1, &e2, &cp3], &[]);
+    let path = segment_path(&d.0, 0);
+    FourRecord {
+        _dir: d,
+        path,
+        e1,
+        e2,
+        cp3,
+    }
+}
+
+/// Five-record chain `[cp0, e1, cp2, e3, cp4]`: an entry run with a
+/// mid-chain checkpoint `cp2` and a closing checkpoint `cp4`. Used
+/// by the every-record-receipted row to exercise the "checkpoints
+/// never break the prefix" rule through a mid-chain checkpoint
+/// (ADR-0005 decision 5 "Live trails"; ruling 13-V7-d1 point 10).
 struct ReceiptedChain {
     _dir: Temp,
     path: PathBuf,
@@ -248,11 +280,12 @@ fn fixture_hashes_match_literals() {
 }
 
 // =====================================================================
-// L1a -- ACCEPTANCE. Stopped-mode baseline: the five-record chain
+// L1a -- REGRESSION. Stopped-mode baseline: the five-record chain
 // `[cp0, e1, e2, e3, cp4]` with the application having stored only
 // `e1`'s receipt reports `NoReceipt` for every unreceipted record
-// (ADR-0005 decision 5 l.925; ruling 13-V7-d1 point 3). This row is
-// the base against which every live-mode row below is measured.
+// (ADR-0005 decision 5 l.925; ruling 13-V7-d1 point 3). Pins the
+// receipted-record and checkpoint suppressions of `NoReceipt` from
+// the stopped-mode path that the live-mode rows below extend.
 // =====================================================================
 #[test]
 fn l1a_records_after_export_stopped_mode_each_no_receipt() {
@@ -305,10 +338,15 @@ fn l1b_records_after_export_live_mode_one_unreconciled() {
 }
 
 // =====================================================================
-// L1c -- ACCEPTANCE. The strict-mode outcome of L1b: `is_valid()`
-// stays `true` (Unreconciled is info) but `is_strict_valid()` is
-// `false`, so `--strict` exits 1 and the default `verify` exits 0
-// (ADR-0005 decision 5 "Live trails"; ruling 13-V7-d1 point 10).
+// L1c -- ACCEPTANCE. The full strict-mode outcome of L1b asserted
+// as one whole tuple so no partial state hides on failure: the
+// findings list is the one `Unreconciled`, `is_valid()` is `true`
+// (`Unreconciled` is info) and `is_strict_valid()` is `false`, so
+// `--strict` exits 1 and the default `verify` exits 0 (ADR-0005
+// decision 5 "Live trails"; ruling 13-V7-d1 point 10). On a base
+// without the cut, stopped-mode `NoReceipt` errors make
+// `is_valid()` false, so the tuple's `true` component is the first
+// failing one.
 // =====================================================================
 #[test]
 fn l1c_live_mode_strict_outcome_pinned() {
@@ -317,9 +355,23 @@ fn l1c_live_mode_strict_outcome_pinned() {
         .receipts([(1, fx.e1.hash())])
         .receipts_live(true)
         .unwrap();
-    let report = report_of(vec![fx.path], verifier);
-    assert!(report.is_valid(), "l1c is_valid");
-    assert!(!report.is_strict_valid(), "l1c !is_strict_valid");
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let expected = vec![located(
+        K::Unreconciled,
+        fx.path,
+        3,
+        2,
+        "records seq 2..=4 not reconciled".to_owned(),
+    )];
+    assert_eq!(
+        (
+            report.findings(),
+            report.is_valid(),
+            report.is_strict_valid()
+        ),
+        (expected.as_slice(), true, false),
+        "l1c live strict outcome",
+    );
 }
 
 // =====================================================================
@@ -416,13 +468,15 @@ fn l2_inflight_below_highest_receipt_unreconciled_from_a() {
 }
 
 // =====================================================================
-// L3 -- ACCEPTANCE (two sub-rows). A hole that stays open across
-// later receipts: the receipts for `e2` and `e3` are stored but
-// `e1`'s is not. Without live mode, `e1` is `NoReceipt`; with live
-// mode, one `Unreconciled` keeps starting at `e1`'s `seq` (ADR-0005
-// decision 5 l.926; ruling 13-V7-d1 point 10). The live-mode row
-// also pins that the record list collapses to ONE `Unreconciled`
-// no matter how many records sit above the cut.
+// L3 -- REGRESSION (stopped sub-row) and ACCEPTANCE (live sub-row).
+// A hole that stays open across later receipts: the receipts for
+// `e2` and `e3` are stored but `e1`'s is not. The stopped sub-row
+// pins that `e1` is `NoReceipt` (one finding, at `e1`'s `seq`), so
+// a reader can see the hole without live mode. The live sub-row
+// pins the same hole as one `Unreconciled` starting at `e1`'s
+// `seq` across every receipt above it (ADR-0005 decision 5 l.926;
+// ruling 13-V7-d1 point 10), and that the record list collapses to
+// ONE `Unreconciled` no matter how many records sit above the cut.
 // =====================================================================
 #[test]
 fn l3_stopped_hole_persists_as_no_receipt() {
@@ -482,12 +536,14 @@ fn l4_live_no_receipts_everything_unreconciled_from_first() {
 }
 
 // =====================================================================
-// L5 -- ACCEPTANCE. Live mode with every `audit.record` receipted
+// L5 -- REGRESSION. Live mode with every `audit.record` receipted
 // and the intermediate `cp2` carrying NO receipt gives an empty
 // finding list: checkpoints need no receipt and never break the
 // prefix (ADR-0005 decision 5 "Live trails"; ruling 13-V7-d1
-// points 5 and 10). The cut caps at `highest receipt + 1 = 4`, the
-// head is 4, so nothing sits above the cut.
+// points 5 and 10). The highest matched evidence is `cp4`'s seq
+// 4 (also the head), so nothing sits above the cap and no
+// `Unreconciled` fires. Pins both "checkpoints never break the
+// prefix" and "no Unreconciled when nothing is above the cap".
 // =====================================================================
 #[test]
 fn l5_live_all_records_receipted_middle_checkpoint_no_unreconciled() {
@@ -531,7 +587,7 @@ fn l6_live_checkpoint_just_above_highest_receipt_unreconciled_at_cp() {
         2,
         "records seq 2..=2 not reconciled".to_owned(),
     )];
-    let _cp2 = fx.cp2; // silence unused if the path/line already pin it.
+    let _ = fx.cp2;
     assert_findings(report.findings(), &expected, "l6 checkpoint above highest");
 }
 
@@ -627,79 +683,81 @@ fn l7b_waived_record_counts_as_reconciled_for_prefix() {
 }
 
 // =====================================================================
-// L8 -- ACCEPTANCE. The conflict between `receipts_live(true)` and
-// `end_before` in both call orders, raised by whichever call comes
-// second (ADR-0005 §19.2; ruling 13-V7-d1 point 10). Exact wording
-// mirrors the `max_age` pattern (ruling 13-V6-d4 point 7): each
-// side spells its own name first, then "conflicts with" and the
-// other side's name.
+// L8 -- REGRESSION (L8a, L8b, L8c). The conflict between
+// `receipts_live(true)` and `end_before` in both call orders,
+// raised by whichever call comes second (ADR-0005 §19.2; ruling
+// 13-V7-d1 point 10); and the stopped-mode default's acceptance of
+// either call order. Exact wording mirrors the `max_age` pattern
+// (ruling 13-V6-d4 point 7): each side spells its own name first,
+// then "conflicts with" and the other side's name. The three rows
+// pin `InvalidConfig`'s kind AND the FULL rendered message, so
+// dropping the check or changing its wording fails the row.
+// `receipts_live(false)` is the stopped-mode default; under ADR
+// §19.2, a conflict is reserved for values that are themselves
+// invalid or conflicting (as `max_age` conflicts with `end_before`
+// irrespective of a scalar), and "live mode off" conflicts with
+// nothing.
 // =====================================================================
+/// Asserts that `err` is `InvalidConfig` with the exact `Display`
+/// message `format!("InvalidConfig: {expected_detail}")`. `AuditError`
+/// does not implement `PartialEq`, so the kind and the rendered
+/// message are compared as whole strings/values separately with
+/// `assert_eq!`.
+#[track_caller]
+fn assert_invalid_config(err: AuditError, expected_detail: &str, label: &str) {
+    assert_eq!(err.kind(), AuditErrorKind::InvalidConfig, "{label} kind");
+    assert_eq!(
+        err.to_string(),
+        format!("InvalidConfig: {expected_detail}"),
+        "{label} message",
+    );
+}
 #[test]
 fn l8a_receipts_live_true_then_end_before_errors() {
     let fx = three_record();
     let cp2_line = line_without_lf(&fx.cp2);
-    let v = Verifier::new(trust_with_key(fixture_pubkey()))
+    let err = Verifier::new(trust_with_key(fixture_pubkey()))
         .receipts_live(true)
-        .unwrap();
-    match v.end_before(&cp2_line, None) {
-        Ok(_) => panic!("l8a expected InvalidConfig, got Ok"),
-        Err(e) => {
-            assert_eq!(e.kind(), AuditErrorKind::InvalidConfig, "l8a kind");
-            assert!(
-                e.to_string()
-                    .contains("end_before conflicts with receipts_live"),
-                "l8a message: {e}",
-            );
-        }
-    }
+        .unwrap()
+        .end_before(&cp2_line, None)
+        .expect_err("l8a expected InvalidConfig");
+    assert_invalid_config(err, "end_before conflicts with receipts_live", "l8a");
 }
 #[test]
 fn l8b_end_before_then_receipts_live_true_errors() {
     let fx = three_record();
     let cp2_line = line_without_lf(&fx.cp2);
-    let v = Verifier::new(trust_with_key(fixture_pubkey()))
+    let err = Verifier::new(trust_with_key(fixture_pubkey()))
         .end_before(&cp2_line, None)
-        .unwrap();
-    match v.receipts_live(true) {
-        Ok(_) => panic!("l8b expected InvalidConfig, got Ok"),
-        Err(e) => {
-            assert_eq!(e.kind(), AuditErrorKind::InvalidConfig, "l8b kind");
-            assert!(
-                e.to_string()
-                    .contains("receipts_live conflicts with end_before"),
-                "l8b message: {e}",
-            );
-        }
-    }
+        .unwrap()
+        .receipts_live(true)
+        .expect_err("l8b expected InvalidConfig");
+    assert_invalid_config(err, "receipts_live conflicts with end_before", "l8b");
 }
-// ADR-0005 §19.2 and ruling 13-V7-d1 point 10 single out
-// `receipts_live(true)` in the conflict; the stopped-mode default
-// `receipts_live(false)` is not a conflict, so the builder accepts
-// both call orders.
 #[test]
 fn l8c_receipts_live_false_with_end_before_both_orders_ok() {
     let fx = three_record();
     let cp2_line = line_without_lf(&fx.cp2);
-    assert!(
-        Verifier::new(trust_with_key(fixture_pubkey()))
-            .receipts_live(false)
-            .unwrap()
-            .end_before(&cp2_line, None)
-            .is_ok(),
-        "l8c receipts_live(false) then end_before",
-    );
-    assert!(
-        Verifier::new(trust_with_key(fixture_pubkey()))
-            .end_before(&cp2_line, None)
-            .unwrap()
-            .receipts_live(false)
-            .is_ok(),
-        "l8c end_before then receipts_live(false)",
+    let after_live_false = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts_live(false)
+        .unwrap()
+        .end_before(&cp2_line, None)
+        .is_ok();
+    let after_end_before = Verifier::new(trust_with_key(fixture_pubkey()))
+        .end_before(&cp2_line, None)
+        .unwrap()
+        .receipts_live(false)
+        .is_ok();
+    assert_eq!(
+        (after_live_false, after_end_before),
+        (true, true),
+        "l8c receipts_live(false) with end_before in both orders",
     );
 }
 
 // =====================================================================
-// L9 -- ACCEPTANCE (two sub-rows). A second `receipts_live` call
+// L9 -- REGRESSION (true-then-false sub-row) and ACCEPTANCE
+// (false-then-true sub-row). A second `receipts_live` call
 // replaces the first's stored flag (ruling 13-V7-d1 point 10). The
 // row verifies both directions end-to-end: after
 // `receipts_live(true).receipts_live(false)` the verifier runs in
@@ -797,6 +855,124 @@ fn l10_accepted_start_prefix_starts_at_start() {
     )];
     let _ = cp4;
     assert_findings(report.findings(), &expected, "l10 accepted start");
+}
+
+// =====================================================================
+// L11 -- ACCEPTANCE. A receipt at `u64::MAX` must not wrap or panic
+// while bounding the cut (clarification 13-V7-d1b point 3). The
+// comparison is `seq <= highest evidence` with no `+ 1`, so the
+// receipt stays an above-head `ReceiptMismatch` ("no record"); the
+// u64::MAX receipt did not match, so no evidence is collected and
+// the cut follows from the real records of the five-record chain
+// (the first in-range record is the cut, the whole range is one
+// `Unreconciled`, as decision 5 requires with no matched evidence).
+// =====================================================================
+#[test]
+fn l11_live_receipt_at_u64_max_cut_follows_the_real_records() {
+    let fx = five_record();
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts([(u64::MAX, WRONG_HASH_5A)])
+        .receipts_live(true)
+        .unwrap();
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let expected = vec![
+        located(
+            K::Unreconciled,
+            fx.path,
+            1,
+            0,
+            "records seq 0..=4 not reconciled".to_owned(),
+        ),
+        unlocated(
+            K::ReceiptMismatch,
+            Some(u64::MAX),
+            format!(
+                "receipt seq {} hash {WRONG_HASH_5A_DIGEST}: no record",
+                u64::MAX
+            ),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "l11 u64::MAX receipt");
+}
+
+// =====================================================================
+// L12 -- ACCEPTANCE. A matched `receipts_from` at `s` alone (no
+// receipts, no waivers) counts as evidence: records at or below `s`
+// are reconciled AND the cap sits at `s`, so `Unreconciled` starts
+// at the first in-range record above `s` (ADR-0005 decision 5
+// "Late adoption"; clarification 13-V7-d1b point 1 -- without this,
+// `from` alone would see its exempted history reported as
+// `Unreconciled`). `head_in_range = 4`; the `Unreconciled` detail
+// names `3..=4`.
+// =====================================================================
+#[test]
+fn l12_live_from_only_prefix_reconciled_through_s_unreconciled_above() {
+    let fx = five_record();
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts_from(2, fx.e2.hash(), "late adoption")
+        .unwrap()
+        .receipts_live(true)
+        .unwrap();
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let expected = vec![
+        located(
+            K::ReceiptWaived,
+            fx.path.clone(),
+            3,
+            2,
+            format!("from seq 2 hash {E2_HONEST_DIGEST}: late adoption"),
+        ),
+        located(
+            K::Unreconciled,
+            fx.path,
+            4,
+            3,
+            "records seq 3..=4 not reconciled".to_owned(),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "l12 from only");
+}
+
+// =====================================================================
+// L13 -- ACCEPTANCE. A matched waiver above the highest receipt
+// raises the cap to cover it (clarification 13-V7-d1b point 1):
+// on the four-record chain `[cp0, e1, e2, cp3]` with the receipt at
+// `seq = 1` and the waiver at `seq = 2`, every `audit.record` is
+// evidence (`first_unreconciled = None`), the cap is at `seq = 2`,
+// and the first in-range record above the cap is the closing
+// checkpoint `cp3`; one `Unreconciled` is reported there. Without
+// the matched-waiver cap, the cut would sit at `highest receipt +
+// 1 = 2` and locate the `Unreconciled` on the waived `e2`,
+// contradicting decision 5's "waivers suppress `NoReceipt`" rule.
+// =====================================================================
+#[test]
+fn l13_live_waiver_above_highest_receipt_raises_cap() {
+    let fx = four_record();
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts([(1, fx.e1.hash())])
+        .waive(2, fx.e2.hash(), "orphan")
+        .unwrap()
+        .receipts_live(true)
+        .unwrap();
+    let report = report_of(vec![fx.path.clone()], verifier);
+    let expected = vec![
+        located(
+            K::ReceiptWaived,
+            fx.path.clone(),
+            3,
+            2,
+            format!("waived seq 2 hash {E2_HONEST_DIGEST}: orphan"),
+        ),
+        located(
+            K::Unreconciled,
+            fx.path,
+            4,
+            3,
+            "records seq 3..=3 not reconciled".to_owned(),
+        ),
+    ];
+    let _ = fx.cp3;
+    assert_findings(report.findings(), &expected, "l13 waiver raises cap");
 }
 
 /// Strips a trailing LF from a record line, mirroring

@@ -864,19 +864,29 @@ impl Verifier {
     /// Reconciles against a running trail, so in-flight records --
     /// returned from `record` but whose receipt is not stored yet --
     /// do not fail verification (ADR-0005 decision 5 "Live trails";
-    /// ruling 13-V7-d1 point 10). The call also turns reconciliation
-    /// on (point 2).
+    /// ruling 13-V7-d1 point 10 and its clarification 13-V7-d1b).
+    /// The call also turns reconciliation on (point 2).
     ///
     /// **The cut.** The checked range ends at the longest fully
     /// reconciled prefix: just before the first in-range
     /// `audit.record` that is neither matched by a receipt
     /// ([`Self::receipts`]), nor waived ([`Self::waive`]), nor
     /// exempted by a matched [`Self::receipts_from`]. It never goes
-    /// above the highest receipt, so the cut is `min(first
-    /// unreconciled seq, highest receipt seq + 1)`, and with no
-    /// receipts at all it is the first record of the range (the
-    /// whole range is `Unreconciled`). Checkpoints need no receipt,
-    /// so they never break the prefix. One
+    /// above the highest matched evidence either --- matched
+    /// receipts, matched waivers and a matched `from` all count
+    /// toward the cap (clarification 13-V7-d1b point 1), so a
+    /// late-adoption deployment's exempted history and an
+    /// above-the-receipts waiver are not reported as `Unreconciled`.
+    /// The comparison is `seq <= highest evidence`, so a receipt at
+    /// `u64::MAX` cannot wrap or panic (point 3). With no matched
+    /// evidence, the first record of the range is the cut and the
+    /// whole range is one `Unreconciled`. Checkpoints need no
+    /// receipt, so they never break the prefix; a checkpoint above
+    /// the highest matched evidence is still `Unreconciled`, and
+    /// the operator can include the checkpoint receipts that
+    /// [`AuditTrail::close`] and [`AuditTrail::checkpoint`] return
+    /// to extend the cap through it (clarification 13-V7-d1b point
+    /// 2; ADR-0005 decision 9). One
     /// [`Unreconciled`](FindingKind::Unreconciled) (info) is reported
     /// at the first record above the cut; records above the cut get
     /// no [`NoReceipt`](FindingKind::NoReceipt). Nothing above the
@@ -894,6 +904,9 @@ impl Verifier {
     /// closes, so `Unreconciled` keeps starting at the same `seq`
     /// across reviews and stopped-trail reconciliation reports it as
     /// `NoReceipt`.
+    ///
+    /// [`AuditTrail::close`]: crate::audit::AuditTrail::close
+    /// [`AuditTrail::checkpoint`]: crate::audit::AuditTrail::checkpoint
     ///
     /// **Severity and exit.** [`FindingKind::Unreconciled`] is info,
     /// so `is_valid()` is `true`; [`Report::is_strict_valid`] already

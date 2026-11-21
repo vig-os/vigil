@@ -1,7 +1,7 @@
 //! Receipt reconciliation (ADR-0005 decision 5 "Receipt
 //! reconciliation", "Waivers, for an honest crash", "Late adoption"
 //! and "Live trails"; ruling 13-V7-d1 points 2-6 and 10 and its
-//! clarification 13-V7-d1a). The range, match rule, `ReceiptMismatch`
+//! clarification 13-V7-d1b). The range, match rule, `ReceiptMismatch`
 //! precedence and the `NoReceipt` / `ReceiptWaived` / `Unreconciled`
 //! detail grammars live on [`crate::audit::Verifier::receipts`],
 //! [`crate::audit::Verifier::waive`],
@@ -70,24 +70,45 @@ pub(super) fn check(
         conflicting_seqs,
         position,
     };
+    // Highest `seq` whose receipt, waiver or `from` matched the
+    // verified set (ruling 13-V7-d1 clarification 13-V7-d1b point
+    // 1): the live-mode cap counts all matched reconciliation
+    // evidence, so a late-adoption deployment's exempted history
+    // ("records up to and including that one are not reconciled")
+    // is not reported as `Unreconciled`. `None` means no evidence
+    // matched, and the live loop then puts the whole range above
+    // the cut. Receipts whose check produced `ReceiptMismatch` or
+    // a position set-aside do not count as evidence.
+    let mut highest_evidence: Option<u64> = None;
     // One match path for every receipt, waiver and `from`
     // (ruling 13-V7-d1 points 4 and 6): [`match_one`] runs the
     // shared subject-format, [`Classifier::set_aside`], mismatch
     // and (for a waiver or `from`) the `ReceiptWaived` emission,
-    // then returns `true` on a match so the `from` caller can mark
-    // its exemption.
+    // then returns `true` on a match so the caller can mark its
+    // `seq` as evidence (and the `from` caller can mark its
+    // exemption).
     for &(seq, hash) in inputs.receipts {
-        match_one(seq, hash, &Subject::Receipt, &ctx, findings);
+        if match_one(seq, hash, &Subject::Receipt, &ctx, findings) {
+            raise_high(&mut highest_evidence, seq);
+        }
     }
     // Ruling 13-V7-d1 point 6: a matched `from` exempts every
     // record at or below its `seq` from `NoReceipt`, so the loop
     // below reads back the matched `seq`. A mismatched `from`
-    // exempts nothing.
+    // exempts nothing. Clarification 13-V7-d1b point 1: the matched
+    // `from`'s `seq` also counts toward the live-mode cap.
     let matched_from_seq = inputs.receipts_from.and_then(|(seq, hash, reason)| {
-        match_one(*seq, *hash, &Subject::From(reason), &ctx, findings).then_some(*seq)
+        if match_one(*seq, *hash, &Subject::From(reason), &ctx, findings) {
+            raise_high(&mut highest_evidence, *seq);
+            Some(*seq)
+        } else {
+            None
+        }
     });
     for (&seq, (hash, reason)) in inputs.waivers {
-        match_one(seq, *hash, &Subject::Waive(reason), &ctx, findings);
+        if match_one(seq, *hash, &Subject::Waive(reason), &ctx, findings) {
+            raise_high(&mut highest_evidence, seq);
+        }
     }
     // One pass over the in-range groups (ruling 13-V7-d1 points 3
     // and 10): it emits (or defers under `live`) one `NoReceipt`
@@ -168,33 +189,39 @@ pub(super) fn check(
         }
         return;
     }
-    // Ruling 13-V7-d1 point 10: `cut = min(first unreconciled seq,
-    // highest receipt seq + 1)`, and with no receipts it drops to
-    // the first in-range record. A matched `from` or waiver extends
-    // the reconciled prefix through its record (both leave
-    // `first_unreconciled` unchanged there), while the "never above
-    // the highest receipt" cap keeps the cut in the exported history
-    // so an honest hole above the receipts is still `Unreconciled`
-    // (L6).
+    // Ruling 13-V7-d1 point 10 and clarification 13-V7-d1b: the
+    // reconciled prefix is bounded by both the first unreconciled
+    // record AND the highest matched evidence (receipts, waivers
+    // or `from`). A `seq` is above the evidence cap when
+    // `seq > highest_evidence`, which is computed without ever
+    // taking `highest_evidence + 1`, so a receipt at `u64::MAX`
+    // cannot wrap or panic (point 3). With no matched evidence,
+    // every in-range `seq` is treated as "above the cap", so the
+    // first in-range record is the cut and the whole range is one
+    // `Unreconciled`, as decision 5 requires. The cut is `None`
+    // exactly when nothing in range ends the prefix.
     let Some(head) = head_in_range else {
         return;
     };
-    let cut = match inputs.receipts.iter().map(|(s, _)| *s).max() {
-        Some(hr) => first_unreconciled.map_or(hr + 1, |f| f.min(hr + 1)),
-        None => first_record_in_range(groups, position).unwrap_or(head),
-    };
+    let cut = groups
+        .iter()
+        .filter(|&(&s, _)| position.is_in_range(s))
+        .find_map(|(&s, _)| {
+            (Some(s) == first_unreconciled || highest_evidence.is_none_or(|h| s > h)).then_some(s)
+        });
     for (seq, items) in pending {
-        if seq < cut {
+        if cut.is_none_or(|c| seq < c) {
             findings.extend(items);
         }
     }
     // One `Unreconciled` (info) located at the first in-range record
-    // whose `seq >= cut` (ruling 13-V7-d1 point 10). Nothing above
-    // the cut yields no finding; checkpoints above the cut are
-    // eligible locations, so "never above the highest receipt"
-    // places the locator on a checkpoint when the next record is one
-    // (L6).
-    if let Some((&first_seq, copies)) = groups.range(cut..).find(|&(&s, _)| position.is_in_range(s))
+    // whose `seq >= cut` (ruling 13-V7-d1 point 10). With no `cut`,
+    // nothing above the prefix and no finding; checkpoints are
+    // eligible locations, so a checkpoint above the highest matched
+    // evidence lands here (clarification 13-V7-d1b point 2).
+    if let Some(c) = cut
+        && let Some((&first_seq, copies)) =
+            groups.range(c..).find(|&(&s, _)| position.is_in_range(s))
         && let Some((path, record)) = first_copy(copies.iter())
     {
         findings.push(Finding::new(
@@ -207,17 +234,11 @@ pub(super) fn check(
     }
 }
 
-/// Lowest in-range `seq` with a record in `groups`, read off the
-/// ascending `BTreeMap` iteration once (ruling 13-V7-d1 point 10's
-/// "with no receipts at all it is the first record of the range").
-fn first_record_in_range(
-    groups: &BTreeMap<u64, Vec<Located<'_>>>,
-    position: &Classifier,
-) -> Option<u64> {
-    groups
-        .keys()
-        .copied()
-        .find(|&seq| position.is_in_range(seq))
+/// Raises `high` to `seq` when `seq` is greater or `high` is unset,
+/// so the caller can thread the running maximum through several
+/// evidence sources without re-reading them.
+fn raise_high(high: &mut Option<u64>, seq: u64) {
+    *high = Some(high.map_or(seq, |h| h.max(seq)));
 }
 
 /// Shared verifier state the one match rule reads (ruling 13-V7-d1
@@ -234,7 +255,8 @@ struct Ctx<'a, 'b> {
 /// mismatch, pushes the finding and returns `false`; on a match,
 /// emits one `ReceiptWaived` at the record's first copy for a
 /// waiver or `from` (no finding for a receipt) and returns `true`
-/// so [`check`] can mark the `from` exemption.
+/// so [`check`] can mark the `seq` as evidence and the `from`
+/// exemption.
 fn match_one(
     seq: u64,
     hash: [u8; 32],
