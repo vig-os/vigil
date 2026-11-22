@@ -286,6 +286,28 @@ impl Classifier {
         }
     }
 
+    /// Returns the below-start set-aside finding for an
+    /// `accept-run` line whose run lies below the accepted start
+    /// (ruling 13-V8-d1 point 8), with the start's own `(start_seq,
+    /// anchored)` so [`K::OutOfRange`] / [`K::UnanchoredStart`] stay
+    /// consistent with [`Self::set_aside`]. Returns `None` when no
+    /// start was accepted. The caller decides whether the override
+    /// applies; this helper only builds the finding.
+    pub(super) fn below_start_finding(&self, seq: u64, subject: impl Display) -> Option<Finding> {
+        self.accepted.map(|(start_seq, anchored)| {
+            Finding::new(
+                if anchored {
+                    K::OutOfRange
+                } else {
+                    K::UnanchoredStart
+                },
+                None,
+                None,
+                Some(seq),
+                format!("{subject}: below start seq {start_seq}"),
+            )
+        })
+    }
     /// Returns the one unlocated above-end set-aside finding when
     /// `seq` is strictly above the end of a bounded batch, or `None`
     /// otherwise. Unlike [`Self::set_aside`], a `seq` below an

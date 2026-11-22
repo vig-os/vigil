@@ -1239,18 +1239,12 @@ pub(crate) struct RunReport {
     /// 13-V4-d8 point 5) through `Collection::native_segments()`,
     /// whose parallel order is guaranteed by construction.
     pub(crate) first_segment: usize,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by #13 V4b's opening/rule-2 compare")
-    )]
     pub(crate) last_segment: usize,
     /// `Some(head)` of the closer's opening checkpoint (ADR (i));
     /// `None` only on partially populated reports under
     /// [`Reaction::Collect`] when the trail never reached a closer.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by #13 V4b's opening/rule-2 compare")
-    )]
+    /// Consumed by [`super::verify::fold::check_runs`] (#13) to
+    /// key `accept-run` lookups on the closing resume record.
     pub(crate) closing_opening: Option<Head>,
     /// Loss points in run-walk order. Each `(first, count)` pair feeds
     /// `verify::lines::run_digest`'s ranges. Consumed by

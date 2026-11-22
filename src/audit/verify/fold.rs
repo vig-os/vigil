@@ -86,6 +86,42 @@ use crate::audit::{
     storage::SegmentSource,
 };
 
+/// Run-level index for `accept-run` matching (ADR-0005 decision 11;
+/// ruling 13-V8-d1). One entry per closed run that carries a
+/// `vigil.audit.resume` record immediately after its closing opening
+/// checkpoint: the resume's `(seq, hash)` key the engine's review
+/// pass looks up, plus every field items 1-3 need to replace the
+/// run's findings with [`FindingKind::Accepted`] without re-walking
+/// the records or re-folding the spans. Built inside
+/// [`check_runs`] from the one classification already performed.
+#[derive(Clone)]
+pub(super) struct RunIndexEntry {
+    /// `seq` and `hash` of the `vigil.audit.resume` record that
+    /// closes the run (the record at `closing_opening.seq + 1` on
+    /// the verified trail in the closer segment's input).
+    pub(super) resume_seq: u64,
+    pub(super) resume_hash: [u8; 32],
+    /// `seq` of the closing opening checkpoint. The closing
+    /// opening's own `MmrMismatch` is never accepted (ADR-0005
+    /// decision 11).
+    pub(super) closing_opening_seq: u64,
+    /// Native segment paths of the run (inclusive
+    /// `first_segment..=last_segment`): used to scope items 1 and 3
+    /// to findings whose file is one of these.
+    pub(super) segment_paths: Vec<std::path::PathBuf>,
+    /// Lowest loss-point `loss_seq`, or `None` for a lossless run.
+    /// Items 3 scope `MmrMismatch` to `seq >= first_loss_seq`.
+    pub(super) first_loss_seq: Option<u64>,
+    /// Loss points in run-walk order: `(loss_seq, first, count)`
+    /// (ruling 13-V4-d2 point 3; 13-V4-d8 point 1 grammar). Items 2
+    /// scope `ChainBroken` and `SeqGap` to these ranges.
+    pub(super) loss_ranges: Vec<(u64, u64, u64)>,
+    /// The run digest reported in the run's `SegmentStructure`
+    /// detail; the `accept-run` line must carry this exact digest
+    /// for a match (ADR-0005 decision 11 `accept-run`).
+    pub(super) digest: [u8; 32],
+}
+
 /// Emits one `SegmentStructure` finding per closed run and one
 /// `MmrMismatch` per differing fold-compare entry that
 /// `runs::classify` returns under `Reaction::Collect` on the
@@ -116,6 +152,7 @@ pub(super) fn check_runs(
     collection: &Collection,
     trail: [u8; 16],
     findings: &mut Vec<Finding>,
+    runs_out: &mut Vec<RunIndexEntry>,
 ) -> BTreeSet<(u64, [u8; 32])> {
     let natives = collection.native_segments();
     // Ruling 13-V4-d6 point 1: build a crate-private, portable
@@ -166,9 +203,63 @@ pub(super) fn check_runs(
          are infallible on an in-memory cursor.",
     );
     for run in &out.runs {
-        emit_run_finding(&natives, collection, trail, run, findings);
+        let digest = emit_run_finding(&natives, collection, trail, run, findings);
+        if let Some(entry) = build_run_index_entry(&natives, collection, trail, run, digest) {
+            runs_out.push(entry);
+        }
     }
     emit_fold_findings(&natives, collection, trail, &out, findings)
+}
+
+/// Builds one [`RunIndexEntry`] for a run whose closer segment
+/// carries a `vigil.audit.resume` record on the verified trail at
+/// `closing_opening.seq + 1`. Returns `None` for a run that cannot
+/// be referenced from an `accept-run` line (no closing opening head
+/// or no resume record following it): `accept-run` reaches such a
+/// run only through `AcceptMismatch` "no record" / "not a resume
+/// record", so no index entry is needed. Reads the already-decoded
+/// records in `input.data.records` filtered by trail; no re-walk.
+fn build_run_index_entry(
+    natives: &[NativeSegment],
+    collection: &Collection,
+    trail: [u8; 16],
+    run: &RunReport,
+    digest: [u8; 32],
+) -> Option<RunIndexEntry> {
+    let closing = run.closing_opening?;
+    let closer_seg = natives.get(run.last_segment)?;
+    let closer_input = &collection.inputs[closer_seg.input_index];
+    let mut on_trail = closer_input
+        .data
+        .records
+        .iter()
+        .filter(|r| r.trail == trail);
+    let _opening = on_trail.next()?;
+    let resume = on_trail.next().filter(|r| {
+        r.operator
+            .as_ref()
+            .is_some_and(|(action, ..)| action == "vigil.audit.resume")
+    })?;
+    let segment_paths: Vec<std::path::PathBuf> = natives
+        .get(run.first_segment..=run.last_segment)?
+        .iter()
+        .map(|seg| seg.path.clone())
+        .collect();
+    let loss_ranges: Vec<(u64, u64, u64)> = run
+        .loss_points
+        .iter()
+        .map(|lp| (lp.loss_seq, lp.first, lp.count))
+        .collect();
+    let first_loss_seq = run.loss_points.iter().map(|lp| lp.loss_seq).min();
+    Some(RunIndexEntry {
+        resume_seq: resume.seq,
+        resume_hash: resume.hash,
+        closing_opening_seq: closing.seq,
+        segment_paths,
+        first_loss_seq,
+        loss_ranges,
+        digest,
+    })
 }
 
 /// #13 V4b (ruling 13-V4-d10 points 2-3): emit one `MmrMismatch`
@@ -280,7 +371,7 @@ fn emit_run_finding(
     trail: [u8; 16],
     run: &RunReport,
     findings: &mut Vec<Finding>,
-) {
+) -> [u8; 32] {
     // Ruling 13-V4-d5 (a): the classifier's per-segment index is
     // parallel to `collection.native_segments()` by construction --
     // both are driven by the same `Collection::inputs` order -- so
@@ -322,6 +413,7 @@ fn emit_run_finding(
         )
         .with_run_digest(digest),
     );
+    digest
 }
 
 /// Ruling 13-V4-d8 point 1 grammar: ranges (loss points) in `seq`

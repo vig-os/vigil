@@ -399,6 +399,7 @@
       "vigil::audit::verify": "fn",
       "vigil::audit::Verifier": "struct",
       "vigil::audit::Verifier::accept": "fn",
+      "vigil::audit::Verifier::accept_run": "fn",
       "vigil::audit::Verifier::anchor": "fn",
       "vigil::audit::Verifier::end_before": "fn",
       "vigil::audit::Verifier::max_age": "fn",

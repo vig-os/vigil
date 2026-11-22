@@ -398,6 +398,9 @@ pub(super) struct Policy<'a> {
     /// Review-file `accept` lines; see
     /// [`crate::audit::Verifier::accept`].
     pub(super) accepts: &'a super::AcceptMap,
+    /// Review-file `accept-run` lines; see
+    /// [`crate::audit::Verifier::accept_run`].
+    pub(super) accepts_run: &'a super::AcceptRunMap,
     pub(super) now: SystemTime,
 }
 
@@ -410,6 +413,7 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         end_ctx,
         receipts: receipt_set,
         accepts,
+        accepts_run,
         now,
     } = policy;
     let mut findings = Vec::new();
@@ -512,7 +516,8 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // and the later `emit_resumed`, so they are computed once.
     let declarations = resume::declarations(&collection, trail);
     let mut fold_findings: Vec<Finding> = Vec::new();
-    let matched_openings = fold::check_runs(&collection, trail, &mut fold_findings);
+    let mut run_index: Vec<fold::RunIndexEntry> = Vec::new();
+    let matched_openings = fold::check_runs(&collection, trail, &mut fold_findings, &mut run_index);
     let pending_resumes = filter_candidates(resume::candidates(&declarations), &matched_openings);
     // Ruling 13-V7-d1 point 8 and ADR-0005 decision 11: a receipt
     // or an `accept Resumed` line confirms a gap only when
@@ -819,6 +824,12 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // so an `accept` inside a confirmed resume gap is counted by
     // that gap's `lost_records=<n>` (decision 5).
     let remaining_accepts = review::classify_positions(accepts, &position, &mut findings);
+    // ADR-0005 decision 11 `accept-run`; ruling 13-V8-d1 points 2,
+    // 7 and 8: phase 1 for `accept-run` runs the same position
+    // classifier as `accept`, plus the point-8 override for a line
+    // whose run's closing opening checkpoint IS the accepted start.
+    let remaining_runs =
+        review::classify_run_positions(accepts_run, start, &position, &mut findings);
     // Ruling 13-V7-d1 point 8: for each gap in the classifier's
     // list, count the `LostRecord` findings whose `seq` lies in
     // that gap's range, keyed by the gap's resume `(seq, hash)`.
@@ -835,6 +846,17 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         &groups,
         &conflicting_seqs,
         &torn_write_pins,
+        &mut findings,
+    );
+    // Phase 2 for `accept-run`: match each remaining line against
+    // the resume record at its `seq` and the run it closes, and
+    // replace items 1-3 with `Accepted` on a match (ADR-0005
+    // decision 11 `accept-run`; ruling 13-V8-d1).
+    review::match_runs(
+        &remaining_runs,
+        &groups,
+        &conflicting_seqs,
+        &run_index,
         &mut findings,
     );
     let first_seq = groups.first_key_value().map(|(&s, _)| s);
@@ -962,7 +984,8 @@ pub(super) fn filter_candidates_for_test(collection: &Collection, trail: [u8; 16
     let declarations = resume::declarations(collection, trail);
     let candidates = resume::candidates(&declarations);
     let mut findings = Vec::new();
-    let matched_openings = fold::check_runs(collection, trail, &mut findings);
+    let mut run_index: Vec<fold::RunIndexEntry> = Vec::new();
+    let matched_openings = fold::check_runs(collection, trail, &mut findings, &mut run_index);
     filter_candidates(candidates, &matched_openings)
         .into_iter()
         .map(|c| c.opening_seq)
