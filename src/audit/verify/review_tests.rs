@@ -50,8 +50,8 @@ const fn nibble(c: u8) -> u8 {
         _ => panic!("hex"),
     }
 }
-const FRAG_DIGEST_BYTES: [u8; 32] = {
-    let s = FRAG_DIGEST_HEX.as_bytes();
+const fn hex_to_bytes(hex: &str) -> [u8; 32] {
+    let s = hex.as_bytes();
     let mut out = [0u8; 32];
     let mut i = 0;
     while i < 32 {
@@ -59,7 +59,24 @@ const FRAG_DIGEST_BYTES: [u8; 32] = {
         i += 1;
     }
     out
-};
+}
+const FRAG_DIGEST_BYTES: [u8; 32] = hex_to_bytes(FRAG_DIGEST_HEX);
+
+/// `gap_hasher().update(b"{\n").finalize()` -- the gap digest the
+/// `open`-driven repair prepends (fragment + LF) in r2.
+const REPAIR_LF_DIGEST_HEX: &str =
+    "38248ab7321962bbd336f61fda853759e20457cba575b3857046f3057de76add";
+const REPAIR_LF_DIGEST: &str =
+    "blake3:38248ab7321962bbd336f61fda853759e20457cba575b3857046f3057de76add";
+const REPAIR_LF_DIGEST_BYTES: [u8; 32] = hex_to_bytes(REPAIR_LF_DIGEST_HEX);
+
+/// `gap_hasher().update(b"not json\n{").finalize()` -- the gap
+/// digest for the `Unparsable` + trailing fragment layout in r15b.
+const UNPARSABLE_GAP_DIGEST_HEX: &str =
+    "2d1c223259971411c7c7c9b9f4dee83cb9ea7e6ee56e478e60d44159bd460058";
+const UNPARSABLE_GAP_DIGEST: &str =
+    "blake3:2d1c223259971411c7c7c9b9f4dee83cb9ea7e6ee56e478e60d44159bd460058";
+const UNPARSABLE_GAP_DIGEST_BYTES: [u8; 32] = hex_to_bytes(UNPARSABLE_GAP_DIGEST_HEX);
 
 fn frag_digest_bytes() -> [u8; 32] {
     let mut h = gap_hasher();
@@ -76,6 +93,27 @@ fn fixture_hashes_match_literals() {
     assert_eq!(digest_string(&WRONG_HASH_A5), WRONG_HASH_A5_DIGEST, "wrong");
     assert_eq!(digest_string(&frag_digest_bytes()), FRAG_DIGEST, "frag");
     assert_eq!(FRAG_DIGEST_BYTES, frag_digest_bytes(), "frag const bytes");
+    let repair_lf = {
+        let mut h = gap_hasher();
+        h.update(b"{\n");
+        *h.finalize().as_bytes()
+    };
+    assert_eq!(digest_string(&repair_lf), REPAIR_LF_DIGEST, "repair_lf");
+    assert_eq!(REPAIR_LF_DIGEST_BYTES, repair_lf, "repair_lf const bytes");
+    let unparsable_gap = {
+        let mut h = gap_hasher();
+        h.update(b"not json\n{");
+        *h.finalize().as_bytes()
+    };
+    assert_eq!(
+        digest_string(&unparsable_gap),
+        UNPARSABLE_GAP_DIGEST,
+        "unparsable_gap",
+    );
+    assert_eq!(
+        UNPARSABLE_GAP_DIGEST_BYTES, unparsable_gap,
+        "unparsable_gap const bytes",
+    );
 }
 
 fn verifier() -> Verifier {
@@ -221,33 +259,28 @@ fn r2_repaired_fragment_leaves_accept_unused_strict_passes() {
         .write_all(b"{")
         .unwrap();
     // open -> close. `open` prepends a repair LF, then writes the
-    // opening checkpoint with `repaired = gap_hasher(&`{\n`)`.
+    // opening checkpoint with `repaired = gap_hasher(&`{\n`)` =
+    // `REPAIR_LF_DIGEST_BYTES`.
     AuditConfig::new("svc")
         .dir(&d.0)
         .open(signer())
         .unwrap()
         .close()
         .unwrap();
-    let gap_digest = {
-        let mut h = gap_hasher();
-        h.update(b"{\n");
-        *h.finalize().as_bytes()
-    };
-    let gap_digest_text = digest_string(&gap_digest);
     let trust = TrustPolicy::builder()
         .trail(trail_id)
         .key(fixture_pubkey())
         .build()
         .unwrap();
     let v = Verifier::new(trust)
-        .accept(K::TornWrite, 2, gap_digest, "alice", "reviewed")
+        .accept(K::TornWrite, 2, REPAIR_LF_DIGEST_BYTES, "alice", "reviewed")
         .unwrap();
     let report = report_of(vec![d.0.clone()], v);
     let expected = vec![
         unlocated(
             K::AcceptUnused,
             Some(2),
-            format!("accept TornWrite seq 2 hash {gap_digest_text}: no matching warning"),
+            format!("accept TornWrite seq 2 hash {REPAIR_LF_DIGEST}: no matching warning"),
         ),
         Finding::new(
             K::TornWriteRepaired,
@@ -264,7 +297,7 @@ fn r2_repaired_fragment_leaves_accept_unused_strict_passes() {
 // =====================================================================
 // (ADR-0005 decision 11 l.977-983): two rows so each pin case
 // passes `--strict` on its own clean scenario (no incidental error
-// findings). R3a: an `accept ClockWentBackwards` matching a warning
+// findings). An `accept ClockWentBackwards` matching a warning
 // record promotes it to `Accepted` and `--strict` passes.
 // =====================================================================
 #[test]
@@ -296,7 +329,7 @@ fn r3a_clock_backwards_accept_match_gives_accepted_strict_passes() {
     assert!(report.is_strict_valid(), "r3a strict passes");
 }
 
-// R3b: an `accept Resumed` matching a writer-built resume line
+// An `accept Resumed` matching a writer-built resume line
 // promotes it to `Accepted` and `--strict` passes.
 fn resume_fixture() -> ResumeFx {
     let d = Temp::new();
@@ -892,30 +925,38 @@ fn r11_torn_write_with_no_record_before_gap_cannot_be_accepted() {
 // location and `seq`. Pins a kind whose warning carries a non-`None`
 // `seq` (`ClockWentBackwards`), so the assertion covers file, line
 // AND `seq` -- the fields r1a cannot pin because a `TornWrite`'s
-// `seq` is `None`.
+// `seq` is `None`. The layout places the warning in a second
+// segment, so the preserved file is segment 1 (not 0) and the line
+// is 2 (not the first line of the trail).
 // =====================================================================
 #[test]
 fn r12_accepted_finding_keeps_non_none_seq_file_and_line() {
     let d = Temp::new();
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
-    let e1_clock = Record::new(
-        RecordContext::new(TRAIL, 1, 50, "test", cp0.hash()),
+    let cp1 = signed_cp(1, cp0.hash(), &seeded(&cp0));
+    let mmr_01 = pushed(&seeded(&cp0), &cp1);
+    put_segment(&d.0, 0, &[&cp0, &cp1], &[]);
+    let cp2 = signed_cp(2, cp1.hash(), &mmr_01);
+    // ClockWentBackwards at seq 3 (second line of segment 1):
+    // time 50 < cp2.time 102.
+    let e3_clock = Record::new(
+        RecordContext::new(TRAIL, 3, 50, "test", cp2.hash()),
         Entry::new("actor", "change", "object"),
     )
     .unwrap();
-    let mmr1 = pushed(&seeded(&cp0), &e1_clock);
-    let cp2 = signed_cp(2, e1_clock.hash(), &mmr1);
-    put_segment(&d.0, 0, &[&cp0, &e1_clock, &cp2], &[]);
-    let seg = segment_path(&d.0, 0);
+    let mmr_0123 = pushed(&pushed(&mmr_01, &cp2), &e3_clock);
+    let cp4 = signed_cp(4, e3_clock.hash(), &mmr_0123);
+    put_segment(&d.0, 1, &[&cp2, &e3_clock, &cp4], &[]);
+    let seg1 = segment_path(&d.0, 1);
     let v = verifier()
-        .accept(K::ClockWentBackwards, 1, e1_clock.hash(), "alice", "ok")
+        .accept(K::ClockWentBackwards, 3, e3_clock.hash(), "alice", "ok")
         .unwrap();
     let report = report_of(vec![d.0.clone()], v);
     let expected = vec![literal_accepted(
-        Some(seg.clone()),
+        Some(seg1.clone()),
         Some(2),
-        Some(1),
-        "accepted by alice: ok; was: expected time >= 100, found 50".to_owned(),
+        Some(3),
+        "accepted by alice: ok; was: expected time >= 102, found 50".to_owned(),
         K::ClockWentBackwards,
     )];
     assert_findings(report.findings(), &expected, "r12");
@@ -924,9 +965,9 @@ fn r12_accepted_finding_keeps_non_none_seq_file_and_line() {
     let a = &report.findings()[0];
     assert_eq!(a.kind(), K::Accepted);
     assert_eq!(a.accepted_kind(), Some(K::ClockWentBackwards));
-    assert_eq!(a.file(), Some(seg.as_path()));
+    assert_eq!(a.file(), Some(seg1.as_path()));
     assert_eq!(a.line(), Some(2));
-    assert_eq!(a.seq(), Some(1));
+    assert_eq!(a.seq(), Some(3));
 }
 
 // =====================================================================
@@ -1029,13 +1070,6 @@ fn r13b_accept_clock_inside_confirmed_gap_gives_lost_record_counted() {
 // lines -- one pinned at the record before the gap (`s.after`) and
 // one pinned at the attester's `seq` -- each stay `AcceptUnused`.
 // =====================================================================
-/// `gap_hasher().update(gap_bytes).finalize()`.
-fn gap_digest_of(gap_bytes: &[u8]) -> [u8; 32] {
-    let mut h = gap_hasher();
-    h.update(gap_bytes);
-    *h.finalize().as_bytes()
-}
-
 /// Entry record on `TRAIL` with a `repaired` digest. The gap is
 /// attested but `e.seq` is beyond `covered_through`, so promotion
 /// stays off the honest crash d11 shape without any fork.
@@ -1052,8 +1086,7 @@ fn r14_accept_torn_write_on_non_trailing_gap_at_record_before_and_attester_stays
     let d = Temp::new();
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
     let gap_bytes: &[u8] = b"{\n";
-    let gap_digest = gap_digest_of(gap_bytes);
-    let gap_digest_text = digest_string(&gap_digest);
+    let gap_digest = REPAIR_LF_DIGEST_BYTES;
     let e1 = entry_rec_with_repaired(1, cp0.hash(), gap_digest);
     let mut seg = line_bytes(&cp0);
     seg.extend_from_slice(gap_bytes);
@@ -1070,12 +1103,12 @@ fn r14_accept_torn_write_on_non_trailing_gap_at_record_before_and_attester_stays
         unlocated(
             K::AcceptUnused,
             Some(0),
-            format!("accept TornWrite seq 0 hash {gap_digest_text}: no matching warning"),
+            format!("accept TornWrite seq 0 hash {REPAIR_LF_DIGEST}: no matching warning"),
         ),
         unlocated(
             K::AcceptUnused,
             Some(1),
-            format!("accept TornWrite seq 1 hash {gap_digest_text}: no matching warning"),
+            format!("accept TornWrite seq 1 hash {REPAIR_LF_DIGEST}: no matching warning"),
         ),
         Finding::new(
             K::TornWrite,
@@ -1097,8 +1130,7 @@ fn r14b_accept_torn_write_on_non_trailing_gap_second_position_stays_unused() {
     let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
     let cp1 = signed_cp(1, cp0.hash(), &seeded(&cp0));
     let gap_bytes: &[u8] = b"{\n";
-    let gap_digest = gap_digest_of(gap_bytes);
-    let gap_digest_text = digest_string(&gap_digest);
+    let gap_digest = REPAIR_LF_DIGEST_BYTES;
     let e2 = entry_rec_with_repaired(2, cp1.hash(), gap_digest);
     let mut seg = line_bytes(&cp0);
     seg.extend(line_bytes(&cp1));
@@ -1116,12 +1148,12 @@ fn r14b_accept_torn_write_on_non_trailing_gap_second_position_stays_unused() {
         unlocated(
             K::AcceptUnused,
             Some(1),
-            format!("accept TornWrite seq 1 hash {gap_digest_text}: no matching warning"),
+            format!("accept TornWrite seq 1 hash {REPAIR_LF_DIGEST}: no matching warning"),
         ),
         unlocated(
             K::AcceptUnused,
             Some(2),
-            format!("accept TornWrite seq 2 hash {gap_digest_text}: no matching warning"),
+            format!("accept TornWrite seq 2 hash {REPAIR_LF_DIGEST}: no matching warning"),
         ),
         Finding::new(
             K::TornWrite,
@@ -1210,8 +1242,7 @@ fn r15b_accept_promotes_trailing_torn_write_past_an_earlier_finding() {
     seg.extend_from_slice(&gap_bytes);
     let seg_path = segment_path(&d.0, 0);
     std::fs::write(&seg_path, seg).unwrap();
-    let gap_digest = gap_digest_of(&gap_bytes);
-    let gap_digest_text = digest_string(&gap_digest);
+    let gap_digest = UNPARSABLE_GAP_DIGEST_BYTES;
     let v = verifier()
         .accept(K::TornWrite, 1, gap_digest, "alice", "reviewed")
         .unwrap();
@@ -1224,7 +1255,7 @@ fn r15b_accept_promotes_trailing_torn_write_past_an_earlier_finding() {
             None,
             format!(
                 "accepted by alice: reviewed; was: \
-                 trailing gap lines 3..=4 ({} bytes), digest {gap_digest_text}",
+                 trailing gap lines 3..=4 ({} bytes), digest {UNPARSABLE_GAP_DIGEST}",
                 gap_bytes.len()
             ),
             K::TornWrite,
