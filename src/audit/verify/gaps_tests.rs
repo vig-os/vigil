@@ -379,10 +379,10 @@ fn g2b_wrong_hash_receipt_at_resume_seq_does_not_confirm() {
 // =====================================================================
 // G2c - ACCEPTANCE. Second probe of the full `(seq, hash)` match
 // rule for confirmation (ruling 13-V7-d1 point 8): a wrong-hash
-// receipt at the resume `seq` plus a waiver inside the gap. Base:
-// gap unconfirmed, waiver is `ReceiptMismatch "no record"`. Pairs
-// with G2b to pin both receipt and waiver subjects. First failing
-// line on base: the `!any(LostRecord)` assertion below.
+// receipt at the resume `seq` plus a waiver inside the gap. The
+// gap stays unconfirmed, so the waiver is `ReceiptMismatch "no
+// record"`. Pairs with G2b to pin both receipt and waiver
+// subjects.
 // =====================================================================
 #[test]
 fn g2c_wrong_hash_resume_receipt_with_waiver_stays_unconfirmed() {
@@ -459,8 +459,7 @@ fn g3_untrusted_opening_is_not_a_candidate_seq_gap_stays() {
 // `ReceiptMismatch "no record"` (not `LostRecord`) because the
 // candidate is dropped by the trust filter (ruling 13-V5-d1 point 8,
 // 13-V7-d1 point 7 "An untrusted opening is not a candidate"). Pairs
-// with G3 as the receipt-side of the untrusted-opening case. First
-// failing line on base: the `assert_findings` call below.
+// with G3 as the receipt-side of the untrusted-opening case.
 // =====================================================================
 #[test]
 fn g3b_untrusted_opening_receipt_in_gap_stays_receipt_mismatch() {
@@ -528,13 +527,10 @@ fn g4_signed_jump_without_resume_record_keeps_seq_gap() {
 
 // =====================================================================
 // G5 - ACCEPTANCE. ADR-0005 decision 11 l.993: a waiver and a `from`
-// line inside a **confirmed** gap are each one `LostRecord`; the
+// line inside a confirmed gap are each one `LostRecord`; the
 // `from` line still exempts every record at or below its `seq` from
 // `NoReceipt` (point 6). Pairs with G5b as the confirmed vs.
-// unconfirmed split for waivers and `from`. First failing line on
-// base: the `assert_findings` call below (base reports `SeqGap` and
-// `ReceiptMismatch` for the waiver and `from`, without the
-// exemption).
+// unconfirmed split for waivers and `from`.
 // =====================================================================
 #[test]
 fn g5_waiver_and_from_inside_confirmed_gap_are_lost_record() {
@@ -732,10 +728,7 @@ fn g6_unanchored_opening_keeps_anchor_and_pin_mismatches() {
 // resume's opening checkpoint. Inputs in the gap are below the
 // start and follow the start rule first (ruling 13-V7-d1 point 7
 // "Order"). A receipt in the gap is set aside as `OutOfRange` (info)
-// when the start is anchored, not `LostRecord`. First failing line
-// on base: the `assert_findings` call below (base reports
-// `StartMismatch` because the base tree does not set up the gap
-// correctly yet).
+// when the start is anchored, not `LostRecord`.
 // =====================================================================
 #[test]
 fn g7_start_at_opening_below_start_wins_over_gap() {
@@ -830,8 +823,7 @@ fn g8_lost_through_below_held_receipt_gives_receipt_mismatch() {
 // confirmed, so both gaps' inputs are `LostRecord`. The pair exists
 // in one layout so the per-gap `LostRecord` counts in the two
 // `Resumed` details are both pinned (ruling 13-V7-d1 point 8). The
-// separate "lost_through=head gives no gap" row is G9b below. First
-// failing line on base: the `assert_findings` call below.
+// separate "lost_through=head gives no gap" row is G9b below.
 // =====================================================================
 #[test]
 fn g9_two_confirmed_resumes_each_gap_has_lost_records() {
