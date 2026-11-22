@@ -847,13 +847,10 @@ fn a10_in_run_bad_signature_on_a3_style_closing_checkpoint() {
         ),
         located(K::SeqGap, s2.clone(), 1, 7, "missing seq 6..=6".to_owned()),
         located(K::BadSignature, s2, 2, 8, format!("key {FIXTURE_KEY_HEX}")),
-        located(
-            K::SeqGap,
-            live.clone(),
-            1,
-            10,
-            "missing seq 9..=9".to_owned(),
-        ),
+        // Ruling 13-V7-d1 point 7: `9..=9` is the A10 resume
+        // candidate's gap (trusted opening cp10, fold-matched), so
+        // no `SeqGap` is reported for it; the cp8 bad signature
+        // stays an independent finding.
         located(
             K::Resumed,
             live,

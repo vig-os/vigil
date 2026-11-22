@@ -1245,11 +1245,13 @@ fn l13_resume_broken_link_no_jump_has_chain_broken() {
 // `cp5-forged + resume(head=(2, e2.hash), lost_through=4)`. The
 // opening at seq 5 links to `e2.hash` (the resume names seq 2 as
 // the head and `cp5.previous = e2.hash`), so the chain rule at
-// seq 5 LINKS and no `ChainBroken` fires. `SeqGap missing seq
-// 3..=4` is the real gap, and `Resumed ... structural=valid`
-// fires. Hand-built because the resume opening at seq 5 is a
-// forged checkpoint (its `previous` must equal `e2.hash` to
-// model an honest resume that lost seqs 3..=4).
+// seq 5 LINKS and no `ChainBroken` fires. The jump `3..=4` is a
+// resume gap (ADR-0005 decision 5, "Resume gaps"; ruling
+// 13-V7-d1 point 7: a trusted-opening candidate's jump reports
+// no `SeqGap`), so the row carries `Resumed ... structural=valid`
+// and nothing else. Hand-built because the resume opening at
+// seq 5 is a forged checkpoint (its `previous` must equal
+// `e2.hash` to model an honest resume that lost seqs 3..=4).
 // =====================================================================
 #[test]
 fn l14_honest_valid_resume_with_real_gap_has_no_chain_broken() {
@@ -1274,7 +1276,6 @@ fn l14_honest_valid_resume_with_real_gap_has_no_chain_broken() {
         "operator=op reason=a head=2:{E2_HONEST_DIGEST} gap=3..=4 lost_records=0 structural=valid",
     );
     let expected = vec![
-        unlocated(K::SeqGap, Some(5), "missing seq 3..=4".into()),
         unlocated(K::Resumed, Some(6), resumed_detail),
         unlocated(K::UncoveredTail, None, "records seq 6..=6".into()),
     ];

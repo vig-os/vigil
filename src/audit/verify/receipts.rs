@@ -273,6 +273,17 @@ fn match_one(
         findings.push(finding);
         return false;
     }
+    // Ruling 13-V7-d1 points 8-9 (ADR-0005 decision 5 "Receipts lost
+    // with a resume"): inside a confirmed gap a receipt, waiver or
+    // `from` is one `LostRecord` (info) instead of
+    // `ReceiptMismatch`; the hash check is replaced. A `from` still
+    // exempts below its `seq` and (clarification 13-V7-d1b point 1)
+    // still counts toward the live-mode cap, so `true` is returned.
+    // No `ReceiptWaived` fires for a waiver or `from` here (point 8).
+    if let Some(finding) = ctx.position.lost_record(seq, &subject_text) {
+        findings.push(finding);
+        return true;
+    }
     if let Some(tail) = mismatch(seq, hash, ctx.groups, ctx.conflicting_seqs) {
         findings.push(Finding::new(
             K::ReceiptMismatch,
@@ -310,7 +321,9 @@ fn match_one(
 /// Returns the first failing step of the match rule as the tail of
 /// the `ReceiptMismatch` detail, or `None` when the verified set
 /// holds exactly one record at `seq` and its hash equals the
-/// receipt's hash (ruling 13-V7-d1 point 4).
+/// receipt's hash (ruling 13-V7-d1 point 4). The crate-private
+/// visibility is reused by [`matches`] so the match rule lives in
+/// one place.
 fn mismatch(
     seq: u64,
     hash: [u8; 32],
@@ -325,4 +338,21 @@ fn mismatch(
     }
     let record_hash = copies[0].1.hash;
     (record_hash != hash).then(|| format!("hash differs (record {})", digest_string(&record_hash)))
+}
+
+/// `true` iff the shared match rule accepts `(seq, hash)` against
+/// the verified set (ruling 13-V7-d1 point 4): one unforked record
+/// at `seq` whose hash equals `hash`. Mirrors [`mismatch`] (the
+/// private helper [`match_one`] consults for its first-failing
+/// `ReceiptMismatch` detail), so [`super::engine::check`] can fold
+/// the same match rule into its matched-receipts pre-pass for
+/// resume-gap confirmation (point 8) without drifting from the
+/// real receipts loop.
+pub(super) fn matches(
+    seq: u64,
+    hash: [u8; 32],
+    groups: &BTreeMap<u64, Vec<Located<'_>>>,
+    conflicting_seqs: &BTreeSet<u64>,
+) -> bool {
+    mismatch(seq, hash, groups, conflicting_seqs).is_none()
 }
