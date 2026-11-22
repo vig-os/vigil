@@ -447,7 +447,10 @@ pub enum FindingKind {
     /// every [`LostRecord`](FindingKind::LostRecord) whose `seq`
     /// lies in this gap (`0` when no candidate was kept by the
     /// trust and fold filters); a malformed one yields
-    /// `malformed declaration` and no suffix.
+    /// `malformed declaration` and no suffix. An `accept Resumed`
+    /// line that matches the resume record under the shared match
+    /// rule also confirms this gap (ADR-0005 decision 11; see
+    /// [`Verifier::accept`](crate::audit::Verifier::accept)).
     Resumed,
     /// Warning: Record time moved backwards.
     ClockWentBackwards,
