@@ -101,6 +101,15 @@ impl Finding {
         self.run_digest = Some(digest);
         self
     }
+    /// Test-only builder that sets [`Self::accepted_kind`] on a
+    /// pre-built `Accepted` finding so rows can write the expected
+    /// value literally, without funnelling through the `accepted()`
+    /// promotion path they exercise.
+    #[cfg(test)]
+    pub(crate) fn with_accepted_kind(mut self, kind: FindingKind) -> Self {
+        self.accepted_kind = Some(kind);
+        self
+    }
     /// Clears the finding's file and line (ruling 13-V6-d4
     /// point 6): a finding that sits on an end-record line has no
     /// file and no line, and its `seq` identifies it. Called once
@@ -1025,6 +1034,13 @@ impl Verifier {
     /// `AcceptMismatch`. See the three [`FindingKind`] variants
     /// for detail grammars. No error finding can be cleared
     /// through this route.
+    ///
+    /// **Not detectable** (ADR-0005 decision 11): a reviewer who
+    /// accepts tampering. Every acceptance is reported as
+    /// [`FindingKind::Accepted`] with the reviewer token and the
+    /// reason, so the decision stays attributable; anyone who can
+    /// write the review file can accept warnings, but no other
+    /// error.
     ///
     /// # Errors
     /// `InvalidConfig` when `kind` is not acceptable, `by` is
