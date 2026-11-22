@@ -324,7 +324,7 @@ fn match_one(
 /// receipt's hash (ruling 13-V7-d1 point 4). The crate-private
 /// visibility is reused by [`matches`] so the match rule lives in
 /// one place.
-fn mismatch(
+pub(super) fn mismatch(
     seq: u64,
     hash: [u8; 32],
     groups: &BTreeMap<u64, Vec<Located<'_>>>,
