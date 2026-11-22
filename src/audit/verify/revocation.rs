@@ -51,14 +51,11 @@
 //! set-aside helper and replaces the pin check (point 3).
 //!
 //! Ruling 13-V7-d1 point 8 (ADR-0005 decision 5 "Receipts lost with
-//! a resume"): a pin at `b` inside a confirmed resume gap WHOSE
-//! OPENING CHECKPOINT IS ANCHORED replaces the pin check with one
-//! `LostRecord` (info), routed through the shared
-//! [`super::position::Classifier::lost_record_anchored`] helper. The
-//! confirmation check still runs, and the bounded check
-//! (`UntrustedKey` above the bound) still fires from `signatures`,
-//! so the bound still limits the key; only the hash check, which
-//! needs the record, is replaced.
+//! a resume"): a pin inside a confirmed resume gap whose opening
+//! checkpoint is anchored under the shared anchor rule replaces the
+//! pin check with one `LostRecord` (info). Routed through
+//! [`super::position::Classifier::lost_record_anchored`]; the
+//! authoritative rule is on [`crate::audit::Verifier::anchor`].
 
 use super::{Finding, input::Summary, position::Classifier, signatures};
 use crate::audit::{FindingKind as K, TrustPolicy, digest_string, hex};

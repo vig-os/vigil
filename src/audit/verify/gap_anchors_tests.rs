@@ -25,7 +25,7 @@ use crate::audit::{
     hex,
     runs_v4a_fixtures::{
         TRAIL, Temp, entry_rec, fixture_pubkey, line_bytes, pushed, put_segment, resume_decl,
-        seeded, signed_cp, write_bytes,
+        seeded, segment_path, signed_cp, signed_cp_explicit, write_bytes,
     },
     verify::{Finding, Verifier},
 };
@@ -64,6 +64,26 @@ const WRONG_HASH_55_DIGEST: &str =
 /// digest.
 const ANCHOR_SEQ_4_DIGEST: &str =
     "blake3:bd5ecd0d74a95fd880720aaf151a5c751ff1ffeefd2817d89fb1528630927e3f";
+
+/// Trusted-signed checkpoints at seqs 3, 4, 5 built from the honest
+/// chain above `cp2` (previous links and MMR folds advance one step
+/// per seq). A1 l.990 anchored-opening and stolen-key cut rows use
+/// these so each anchor inside the gap names a real `(trail, seq,
+/// hash)` triple instead of a synthetic one.
+const CP3_HONEST_DIGEST: &str =
+    "blake3:dfbf4e5a7173125e6d43847fa1c1b05420adc1c09022566ebbb292b72cf0203c";
+const CP4_HONEST_DIGEST: &str =
+    "blake3:3fec32417882015ede12060ea10c7f50c6e74038cb2f706e5f9b69eb172c6520";
+const CP5_HONEST_DIGEST: &str =
+    "blake3:9325fbabb9ce7a94cb7d90db41983d0626c7315cbcb5f56f38d23d8769948709";
+
+/// Trusted twin of the opening at `seq 6` built with a fixed MMR
+/// (`size=1`, root/peaks `[0x6a; 32]`); its hash is deterministic
+/// and differs from the writer's live opening (which uses the wall
+/// clock), so dropping it alongside the native opening forks seq 6.
+/// Pins A9 / A9b's twin so the row literals never change per run.
+const TWIN_AT_OPENING_DIGEST: &str =
+    "blake3:0080dce1a3a76f656ae167b121cf727c77939797506183f93e9f280d255a35f3";
 
 const OTHER_TRAIL: [u8; 16] = [0x01; 16];
 
@@ -224,10 +244,9 @@ fn sign_as(
 }
 
 /// Builds and signs an other-trail checkpoint record under the
-/// fixture key, at `seq` on `OTHER_TRAIL`. Used by rows that need an
-/// other-trail anchor (A5b, A6, A6b): the anchor only has to carry a
-/// valid `(trail, seq, hash)` triple, so its MMR holds one synthetic
-/// leaf to satisfy the checkpoint-count invariant.
+/// fixture key, at `seq` on `OTHER_TRAIL`. The anchor only has to
+/// carry a valid `(trail, seq, hash)` triple, so its MMR holds one
+/// synthetic leaf to satisfy the checkpoint-count invariant.
 fn other_trail_cp(seq: u64, leaf: [u8; 32]) -> Record {
     let key = KeyFileSigner::from_hex(&"27".repeat(32)).unwrap();
     let previous = if seq == 0 {
@@ -276,7 +295,41 @@ fn fixture_hashes_match_literals() {
         ANCHOR_SEQ_4_DIGEST,
         "anchor_seq_4"
     );
+    let (cp3, cp4, cp5) = honest_cp345(&cp2, &mmr1);
+    assert_eq!(digest_string(&cp3.hash()), CP3_HONEST_DIGEST, "cp3");
+    assert_eq!(digest_string(&cp4.hash()), CP4_HONEST_DIGEST, "cp4");
+    assert_eq!(digest_string(&cp5.hash()), CP5_HONEST_DIGEST, "cp5");
+    let twin = twin_at_opening(cp2.hash());
+    assert_eq!(
+        digest_string(&twin.hash()),
+        TWIN_AT_OPENING_DIGEST,
+        "twin_at_opening"
+    );
     assert_eq!(hex(&TRAIL), "11111111111111111111111111111111", "trail_hex");
+}
+
+/// Honest-chain checkpoints at seqs 3, 4 and 5 above `cp2` (previous
+/// links and MMR folds advance one step per seq). Shared by the
+/// stolen-key row so each anchor inside the gap names a real
+/// `(trail, seq, hash)` triple.
+fn honest_cp345(cp2: &Record, mmr1: &Mmr) -> (Record, Record, Record) {
+    let mmr2 = pushed(mmr1, cp2);
+    let cp3 = signed_cp(3, cp2.hash(), &mmr2);
+    let mmr3 = pushed(&mmr2, &cp3);
+    let cp4 = signed_cp(4, cp3.hash(), &mmr3);
+    let mmr4 = pushed(&mmr3, &cp4);
+    let cp5 = signed_cp(5, cp4.hash(), &mmr4);
+    (cp3, cp4, cp5)
+}
+
+/// Trusted-signed twin checkpoint at `seq 6` on `TRAIL` with the
+/// fixture's deterministic clock. Its `previous` chains to `cp2_hash`
+/// so a trusted twin dropped into a shipped file alongside the live
+/// opening forks seq 6 without breaking the chain rule; the MMR
+/// fields differ enough that its hash never coincides with the
+/// writer's wall-clock opening.
+fn twin_at_opening(cp2_hash: [u8; 32]) -> Record {
+    signed_cp_explicit(OPENING_SEQ, cp2_hash, 1, [0x6a; 32], vec![[0x6a; 32]])
 }
 
 // =====================================================================
@@ -373,84 +426,61 @@ fn a2_unanchored_opening_keeps_anchor_and_pin_mismatches() {
 }
 
 // =====================================================================
-// A3 - REGRESSION. ADR-0005 decision 11 ~l.990 stolen-key case: a
-// cut back over an anchored checkpoint, a forged opening and resume
-// signed with the trusted key, and the resume's receipt do not
-// anchor the opening (no anchor matches the forged opening's
-// `(trail, seq, hash)`), so every anchor inside the gap stays
-// `AnchorMismatch` and the report is invalid: a text line never
-// anchors an opening on its own. Hand-built because the writer
-// never signs a stolen-key cut.
+// A3 - REGRESSION. ADR-0005 decision 11 ~l.990 stolen-key case (receipt
+// form): the writer's `AuditConfig::resume` cuts back from head=(2,cp2)
+// with `lost_through=5`, signing the opening and the resume record;
+// the resume's receipt confirms the gap but does NOT anchor the
+// opening -- a text line is not an anchor. Anchors for real honest
+// checkpoints at seqs 3, 4, 5 (the ones a cut operator would have
+// anchored before the attacker rewrote the trail) therefore stay
+// `AnchorMismatch` inside the gap and the report is invalid.
 // =====================================================================
 #[test]
 fn a3_stolen_key_receipt_does_not_anchor_opening_so_anchors_stay() {
-    let d = Temp::new();
-    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
-    let mmr0 = seeded(&cp0);
-    let e1 = entry_rec(1, cp0.hash());
-    let mmr1 = pushed(&mmr0, &e1);
-    let cp2 = signed_cp(2, e1.hash(), &mmr1);
-    let mmr2 = pushed(&mmr1, &cp2);
-    put_segment(&d.0, 0, &[&cp0, &e1, &cp2], &[]);
-    // Forged opening at seq 6 signed with the trusted key: the chain
-    // links to cp2, mmr_size = 3 so the fold matches, trust passes.
-    // The declared `lost_through = 5` cuts back over the anchor
-    // operator keeps for seq 5. No anchor is given for the opening
-    // itself.
-    let opening = signed_cp(OPENING_SEQ, cp2.hash(), &mmr2);
-    let resume = resume_decl(&opening, 2, cp2.hash(), GAP_HIGH);
-    std::fs::write(
-        d.0.join("audit.jsonl"),
-        [opening.clone(), resume.clone()]
-            .iter()
-            .flat_map(line_bytes)
-            .collect::<Vec<u8>>(),
-    )
-    .unwrap();
-    // Outside anchor at seq 5 (inside the cut gap `3..=5`), signed
-    // with a synthetic mmr leaf, whose record was cut from the trail
-    // at verify time; the anchor rule reports `no record`.
-    let mut synth = Mmr::new();
-    synth.push([0xcc; 32]).unwrap();
-    let anchor_at_5 = signed_cp(5, cp2.hash(), &synth);
-    let anchor_at_5_digest = digest_string(&anchor_at_5.hash());
-    let anchor_cp = parse_cp(&anchor_at_5);
-    // A receipt inside the gap (at seq 4, wrong hash) becomes
-    // `LostRecord` because the gap is confirmed (receipts-side
-    // demotion needs only confirmed, ruling 13-V7-d1 point 8). The
-    // stolen-key probe is the anchor row that stays `AnchorMismatch`
-    // because the opening is not anchored.
+    let fx = non_genesis();
+    let live = fx.dir.join("audit.jsonl");
+    // Honest-chain cp3, cp4, cp5 are the "real anchored checkpoints"
+    // the attacker's cut removed from disk; their hashes chain from
+    // cp2 one step per seq. `mmr_before_cp2` is the honest fold
+    // through `[cp0, e1]`, rebuilt from the fixture's trail-genesis
+    // because the writer dropped the handle.
+    let mmr_before_cp2 = {
+        let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        pushed(&seeded(&cp0), &fx.e1)
+    };
+    let (cp3, cp4, cp5) = honest_cp345(&fx.cp2, &mmr_before_cp2);
     let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
-        .anchor(anchor_cp)
-        .receipts([
-            (1, e1.hash()),
-            (RESUME_SEQ, resume.hash()),
-            (4, WRONG_HASH_55),
-        ]);
-    let report = report_of(vec![d.0.clone()], verifier);
-    let live = d.0.join("audit.jsonl");
+        .anchor(parse_cp(&cp3))
+        .anchor(parse_cp(&cp4))
+        .anchor(parse_cp(&cp5))
+        .receipts([(1, fx.e1.hash()), (RESUME_SEQ, fx.resume_hash)]);
+    let report = report_of(vec![fx.dir.clone()], verifier);
     let expected = vec![
-        lost(4, "receipt", WRONG_HASH_55_DIGEST, GAP_LOW, GAP_HIGH),
+        unlocated(
+            K::AnchorMismatch,
+            Some(3),
+            format!("anchor seq 3 hash {CP3_HONEST_DIGEST}: no record"),
+        ),
+        unlocated(
+            K::AnchorMismatch,
+            Some(4),
+            format!("anchor seq 4 hash {CP4_HONEST_DIGEST}: no record"),
+        ),
         unlocated(
             K::AnchorMismatch,
             Some(5),
-            format!("anchor seq 5 hash {anchor_at_5_digest}: no record"),
+            format!("anchor seq 5 hash {CP5_HONEST_DIGEST}: no record"),
         ),
         located(
             K::Resumed,
             live,
             2,
             RESUME_SEQ,
-            format!(
-                "operator=operator reason=incident head=2:{CP2_DIGEST} \
-                 gap=3..=5 lost_records=1 structural=valid"
-            ),
+            resumed_detail(2, CP2_DIGEST, "3..=5", 0),
         ),
-        unlocated(K::UncoveredTail, None, "records seq 7..=7".to_owned()),
     ];
     assert_findings(report.findings(), &expected, "A3");
     assert!(!report.is_valid(), "A3 report must be invalid");
-    drop(d);
 }
 
 // =====================================================================
@@ -812,7 +842,7 @@ fn a7_anchored_opening_demotes_pin_and_anchor_but_keeps_untrusted_key_above_boun
 }
 
 // =====================================================================
-// A7b - REGRESSION. Second layout for the pin half (ruling 13-V7-d1
+// A7b - ACCEPTANCE. Second layout for the pin half (ruling 13-V7-d1
 // point 8): the pin alone inside a confirmed resume gap whose
 // opening is anchored. The pin's hash check is replaced by
 // `LostRecord`, and a bounded-key checkpoint ABOVE the bound in the
@@ -937,4 +967,253 @@ fn a8_start_at_opening_below_start_wins_over_gap() {
         ),
     ];
     assert_findings(report.findings(), &expected, "A8");
+}
+
+// =====================================================================
+// A9 - ACCEPTANCE. Ruling 13-V6-d1 point 2's fork half: a forked
+// opening is never anchored. A shipped `collector.jsonl` carrying a
+// trusted twin at the opening's `seq` forks seq 6; the opening
+// anchor therefore gives `AnchorMismatch … seq is forked` (fail-
+// closed) with a `SeqConflict` alongside, and the gap is no longer
+// anchored even when the gap is confirmed by the resume's receipt --
+// the in-gap anchor and pin keep their ordinary mismatches, and
+// `lost_records=<n>` counts only receipts, waivers and `from`.
+// =====================================================================
+#[test]
+fn a9_forked_opening_is_not_anchored() {
+    let fx = non_genesis();
+    let live = fx.dir.join("audit.jsonl");
+    let collector = fx.dir.join("collector.jsonl");
+    let twin = twin_at_opening(fx.cp2.hash());
+    write_bytes(&collector, &line_bytes(&twin));
+    let opening_digest = digest_string(&fx.opening_hash);
+    let mut conflict_digests = [opening_digest.clone(), TWIN_AT_OPENING_DIGEST.to_owned()];
+    conflict_digests.sort();
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key(fixture_pubkey())
+        .key_through(other_signer().public_key(), 4, WRONG_HASH_55)
+        .build()
+        .unwrap();
+    let anchor_record = anchor_record_seq_4(fx.cp2.hash());
+    let anchor_cp = parse_cp(&anchor_record);
+    let live_text = std::fs::read_to_string(&live).unwrap();
+    let opening_cp = Checkpoint::parse(live_text.lines().next().unwrap()).unwrap();
+    let verifier = Verifier::new(trust)
+        .anchor(opening_cp)
+        .anchor(anchor_cp)
+        .receipts([(1, fx.e1.hash()), (RESUME_SEQ, fx.resume_hash)]);
+    let report = report_of(vec![fx.dir.clone(), collector.clone()], verifier);
+    let expected = vec![
+        unlocated(
+            K::AnchorMismatch,
+            Some(4),
+            format!("anchor seq 4 hash {ANCHOR_SEQ_4_DIGEST}: no record"),
+        ),
+        unlocated(
+            K::RevocationMismatch,
+            Some(4),
+            format!("key {OTHER_KEY_HEX} through=4:{WRONG_HASH_55_DIGEST}: no record at seq 4"),
+        ),
+        located(
+            K::AnchorMismatch,
+            live.clone(),
+            1,
+            OPENING_SEQ,
+            format!("anchor seq 6 hash {opening_digest}: seq is forked"),
+        ),
+        located(
+            K::SeqConflict,
+            live.clone(),
+            1,
+            OPENING_SEQ,
+            format!(
+                "conflicting hashes: {}, {}",
+                conflict_digests[0], conflict_digests[1],
+            ),
+        ),
+        located(
+            K::Resumed,
+            live,
+            2,
+            RESUME_SEQ,
+            resumed_detail(2, CP2_DIGEST, "3..=5", 0),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "A9");
+}
+
+// =====================================================================
+// A9b - ACCEPTANCE. Second layout for the forked-opening half
+// (ruling 13-V6-d1 point 2): the writer-built genesis fixture with a
+// trusted twin dropped alongside. The genesis gap `0..=5` is
+// confirmed by the resume receipt but the opening at `seq 6` is
+// forked, so the opening anchor gives `AnchorMismatch … seq is
+// forked` and the in-gap anchor keeps its `AnchorMismatch`. Pairs
+// with A9 on the genesis / non-genesis split.
+// =====================================================================
+#[test]
+fn a9b_forked_genesis_opening_is_not_anchored() {
+    let g = genesis_fixture(GAP_HIGH);
+    let live = g.dir.join("audit.jsonl");
+    let collector = g.dir.join("collector.jsonl");
+    // Pin cp2.hash locally so the twin's `previous` is deterministic;
+    // the genesis fixture never writes cp2, but the twin only needs
+    // a valid `(trail, seq, hash)` triple and the checkpoint rule
+    // compares `previous` against the record at the previous seq in
+    // files (none here), so chain checks never fire for it.
+    let cp2_hash = {
+        let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+        let mmr0 = seeded(&cp0);
+        let e1 = entry_rec(1, cp0.hash());
+        let mmr1 = pushed(&mmr0, &e1);
+        signed_cp(2, e1.hash(), &mmr1).hash()
+    };
+    let twin = twin_at_opening(cp2_hash);
+    write_bytes(&collector, &line_bytes(&twin));
+    let live_text = std::fs::read_to_string(&live).unwrap();
+    let opening_cp = Checkpoint::parse(live_text.lines().next().unwrap()).unwrap();
+    let opening_digest = digest_string(&opening_cp.hash());
+    let mut conflict_digests = [opening_digest.clone(), TWIN_AT_OPENING_DIGEST.to_owned()];
+    conflict_digests.sort();
+    let anchor_record = anchor_record_seq_4(cp2_hash);
+    let anchor_cp = parse_cp(&anchor_record);
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .anchor(opening_cp)
+        .anchor(anchor_cp)
+        .receipts([(RESUME_SEQ, g.resume_hash)]);
+    let report = report_of(vec![g.dir.clone(), collector.clone()], verifier);
+    let expected = vec![
+        unlocated(
+            K::AnchorMismatch,
+            Some(4),
+            format!("anchor seq 4 hash {ANCHOR_SEQ_4_DIGEST}: no record"),
+        ),
+        located(
+            K::AnchorMismatch,
+            live.clone(),
+            1,
+            OPENING_SEQ,
+            format!("anchor seq 6 hash {opening_digest}: seq is forked"),
+        ),
+        located(
+            K::SeqConflict,
+            live.clone(),
+            1,
+            OPENING_SEQ,
+            format!(
+                "conflicting hashes: {}, {}",
+                conflict_digests[0], conflict_digests[1],
+            ),
+        ),
+        located(
+            K::Resumed,
+            live,
+            2,
+            RESUME_SEQ,
+            resumed_detail(0, TRAIL_GENESIS_DIGEST, "0..=5", 0),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "A9b");
+}
+
+// =====================================================================
+// A10 - REGRESSION. Ruling 13-V7-d1 point 7 (order): an input whose
+// `seq` sits strictly above `E` (the end record's last line's seq)
+// AND inside a candidate resume gap follows the end rule first.
+// With `end_before(cp2)` pinning `E = 2`, the whole writer-built
+// gap `3..=5` sits above `E`; an anchor at `seq 4` is set aside as
+// `OutOfRange` (info) through `Classifier::set_aside` rather than
+// falling through to the gap-demotion path, pinning the above-end-
+// before-gap order (classify's AboveEnd arm runs before its Gap
+// arm). Pairs with A10b on the anchor / pin split.
+// =====================================================================
+#[test]
+fn a10_anchor_above_end_wins_over_gap() {
+    let fx = non_genesis();
+    let sealed = segment_path(&fx.dir, 0);
+    let cp2_line = line_without_lf(&fx.cp2);
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .end_before(&cp2_line, Some(parse_cp(&fx.cp2)))
+        .unwrap()
+        .anchor(parse_cp(&anchor_record_seq_4(fx.cp2.hash())));
+    let report = report_of(vec![fx.dir.clone()], verifier);
+    let expected = vec![
+        located(
+            K::TrailEnded,
+            sealed,
+            3,
+            2,
+            "end_before seq 2: records seq 2..=8 at or above the end".to_owned(),
+        ),
+        unlocated(
+            K::OutOfRange,
+            Some(4),
+            format!("anchor seq 4 hash {ANCHOR_SEQ_4_DIGEST}: above end seq 2"),
+        ),
+        located(
+            K::Resumed,
+            fx.dir.join("audit.jsonl"),
+            2,
+            RESUME_SEQ,
+            resumed_detail(2, CP2_DIGEST, "3..=5", 0),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "A10");
+}
+
+// =====================================================================
+// A10b - REGRESSION. Second layout for the above-end-before-gap
+// order (ruling 13-V7-d1 point 7): a `through=` pin whose `seq`
+// sits above `E` and inside a candidate gap is set aside as
+// `OutOfRange` via `Classifier::set_aside`, not the fall-through
+// pin finding. `RevocationUnconfirmed` is suppressed under
+// `end_before` (ruling 13-V6-d7 point 4). Pairs with A10 on the
+// anchor / pin split for the same order check.
+// =====================================================================
+#[test]
+fn a10b_pin_above_end_wins_over_gap() {
+    let fx = non_genesis();
+    let sealed = segment_path(&fx.dir, 0);
+    let cp2_line = line_without_lf(&fx.cp2);
+    let trust = TrustPolicy::builder()
+        .trail(TRAIL)
+        .key(fixture_pubkey())
+        .key_through(other_signer().public_key(), 4, WRONG_HASH_55)
+        .build()
+        .unwrap();
+    let verifier = Verifier::new(trust)
+        .end_before(&cp2_line, Some(parse_cp(&fx.cp2)))
+        .unwrap();
+    let report = report_of(vec![fx.dir.clone()], verifier);
+    let expected = vec![
+        located(
+            K::TrailEnded,
+            sealed,
+            3,
+            2,
+            "end_before seq 2: records seq 2..=8 at or above the end".to_owned(),
+        ),
+        unlocated(
+            K::OutOfRange,
+            Some(4),
+            format!("key {OTHER_KEY_HEX} through=4: above end seq 2"),
+        ),
+        located(
+            K::Resumed,
+            fx.dir.join("audit.jsonl"),
+            2,
+            RESUME_SEQ,
+            resumed_detail(2, CP2_DIGEST, "3..=5", 0),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "A10b");
+}
+
+/// Builds the end-record line string from a `Record` by stripping
+/// the trailing newline from `line_bytes`. Shared by A10 / A10b.
+fn line_without_lf(record: &Record) -> String {
+    let bytes = line_bytes(record);
+    let text = std::str::from_utf8(&bytes).unwrap();
+    text.strip_suffix('\n').unwrap().to_owned()
 }

@@ -117,13 +117,10 @@ fn evaluate(
     {
         return Some(finding);
     }
-    // Ruling 13-V7-d1 point 8 (ADR-0005 decision 5 "Receipts lost
-    // with a resume"): inside a confirmed gap WHOSE OPENING IS
-    // ANCHORED the anchor's ordinary mismatch check is replaced by
-    // one `LostRecord` (info); a receipt or an `accept` line is a
-    // text line, not an anchor, and never anchors an opening on its
-    // own. In any other gap state the anchor keeps its ordinary
-    // finding below.
+    // Ruling 13-V7-d1 point 8: inside a confirmed gap whose opening
+    // is anchored under the shared anchor rule, the anchor's
+    // ordinary mismatch check is replaced by one `LostRecord`
+    // (info). Authoritative rule on `Verifier::anchor`.
     if let Some(p) = position
         && let Some(finding) = p.lost_record_anchored(anchor.seq(), &prefix)
     {

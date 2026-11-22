@@ -24,17 +24,18 @@ use std::fmt::Display;
 /// `confirmed` is `true` when a receipt matches the resume's
 /// `(seq, hash)` under the shared match rule (13-V7-d1 point 8);
 /// it gates `LostRecord` emission and the genesis-gap suppression
-/// (point 7 exception). `opening_anchored` is `true` when an input
-/// anchor's `(trail, seq, hash)` equals the opening checkpoint
-/// (ruling 13-V6-d1 point 2); together with `confirmed` it gates
-/// the anchor-and-pin `LostRecord` demotion inside a gap (ADR-0005
-/// decision 5 "Receipts lost with a resume"; ruling 13-V7-d1 point
-/// 8). `resume_seq` and `resume_hash` identify the gap's resume
-/// record for the `lost_records=<n>` counter (ruling 13-V7-d1
-/// point 8): the count is keyed by the resume `(seq, hash)` on the
-/// gap itself, so a candidate the trust or fold filter dropped
-/// (absent here) keeps its `lost_records=0` without the two
-/// consumers risking a zip alignment.
+/// (point 7 exception). `opening_anchored` is `true` when the
+/// opening checkpoint is anchored under the shared
+/// [`crate::audit::Verifier::anchor`] rule (ruling 13-V6-d1
+/// point 2): an input anchor's `(trail, seq, hash)` equals the
+/// opening's and the anchor itself matches, so a forked opening is
+/// never anchored. Together with `confirmed` it gates the anchor-
+/// and-pin `LostRecord` demotion inside a gap. `resume_seq` and
+/// `resume_hash` identify the gap's resume record for the
+/// `lost_records=<n>` counter: the count is keyed by the resume
+/// `(seq, hash)` on the gap itself, so a candidate the trust or
+/// fold filter dropped (absent here) keeps its `lost_records=0`
+/// without the two consumers risking a zip alignment.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Gap {
     pub(super) low: u64,
@@ -222,20 +223,15 @@ impl Classifier {
     }
 
     /// One unlocated [`K::LostRecord`] finding when `seq` is inside a
-    /// confirmed resume candidate gap WHOSE OPENING CHECKPOINT IS
-    /// ALSO ANCHORED (ADR-0005 decision 5 "Receipts lost with a
-    /// resume"; ruling 13-V7-d1 point 8). Consumed by
+    /// confirmed resume candidate gap whose opening checkpoint is
+    /// also anchored under the shared anchor rule; `None` otherwise.
+    /// The rule and its reason are on
+    /// [`crate::audit::Verifier::anchor`]. Consumed by
     /// [`super::anchors::evaluate`] and [`super::revocation::check`]
-    /// for anchors and `through=` pins inside a gap, which are
-    /// demoted to `LostRecord` only when, in addition to the gap
-    /// being confirmed, an input anchor's full `(trail, seq, hash)`
-    /// equals the opening checkpoint. A receipt or an `accept` line
-    /// is a text line, not an anchor, and never anchors an opening:
-    /// otherwise a stolen key could cut back over anchored
-    /// checkpoints, sign a gap, and turn every `AnchorMismatch` into
-    /// info. The detail grammar matches [`Self::lost_record`]'s
-    /// (`<subject>: lost in gap <a>..=<b>`), with subjects
-    /// `anchor seq <a> hash <hex>` and `key <64 hex> through=<b>`.
+    /// for anchors and `through=` pins. Detail grammar matches
+    /// [`Self::lost_record`]'s (`<subject>: lost in gap <a>..=<b>`),
+    /// with subjects `anchor seq <a> hash <hex>` and
+    /// `key <64 hex> through=<b>`.
     pub(super) fn lost_record_anchored(&self, seq: u64, subject: impl Display) -> Option<Finding> {
         match self.classify(seq) {
             Position::Gap {

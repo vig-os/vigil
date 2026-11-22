@@ -526,6 +526,7 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         anchors,
         &confirmed_receipts,
         &groups,
+        &conflicting_seqs,
     );
     let position = position::Classifier::new(
         accepted_start.and(start),
@@ -776,8 +777,7 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // Reading the bounds and the key from the gap itself keeps the
     // two consumers aligned: a candidate the trust or fold filter
     // dropped is absent from the gap list and from the count map,
-    // and its `Resumed` detail keeps `lost_records=0`. Anchors and
-    // pins arrive with later work in #13.
+    // and its `Resumed` detail keeps `lost_records=0`.
     let lost_counts = count_lost_records(&findings, &gaps);
     emit_resumed(&declarations, &lost_counts, &mut findings);
     let first_seq = groups.first_key_value().map(|(&s, _)| s);
@@ -920,11 +920,13 @@ pub(super) fn filter_candidates_for_test(collection: &Collection, trail: [u8; 16
 /// names) is dropped, so a trusted record with a different hash at
 /// the opening's `seq` never rescues a forged opening; its jump
 /// keeps its ordinary `SeqGap` and nothing inside can be
-/// `LostRecord`. `opening_anchored` applies ruling 13-V6-d1 point 2:
-/// an input anchor on the verified trail at the opening's
-/// `(seq, hash)` anchors the gap for a later #13 step. Confirmation
-/// (point 8) uses the shared matched-receipts set the caller built
-/// through [`receipts::matches`] and [`position::Classifier::set_aside`],
+/// `LostRecord`. `opening_anchored` goes through the same
+/// [`anchors::match_only`] the anchor rule itself uses (ruling
+/// 13-V6-d1 point 2: a forked `seq` never matches, so a forked
+/// opening is never anchored even when an input anchor equals its
+/// `(trail, seq, hash)`). Confirmation (point 8) uses the shared
+/// matched-receipts set the caller built through
+/// [`receipts::matches`] and [`position::Classifier::set_aside`],
 /// so a receipt above the end or below an accepted start never
 /// confirms a gap and never drifts from the real receipts pass.
 /// A shipped-only opening is never a candidate (13-V4-d7; spike
@@ -937,6 +939,7 @@ fn build_gaps(
     anchors: &[Checkpoint],
     confirmed_receipts: &BTreeSet<(u64, [u8; 32])>,
     groups: &BTreeMap<u64, Vec<Located<'_>>>,
+    conflicting_seqs: &BTreeSet<u64>,
 ) -> Vec<position::Gap> {
     let mut out = Vec::new();
     for c in candidates {
@@ -957,9 +960,19 @@ fn build_gaps(
         if !opening_trusted {
             continue;
         }
-        let opening_anchored = anchors
-            .iter()
-            .any(|a| a.trail() == trail && a.seq() == c.opening_seq && a.hash() == c.opening_hash);
+        // Ruling 13-V6-d1 point 2: "anchored" is the full anchor
+        // match, so a forked opening is never anchored (fail-closed,
+        // the same rule the anchor finding uses). Running the
+        // shared `anchors::match_only` here keeps the one rule in
+        // one place: the anchor emits `AnchorMismatch ... seq is
+        // forked` at a forked opening, and `opening_anchored` is
+        // false.
+        let opening_anchored = anchors.iter().any(|a| {
+            a.trail() == trail
+                && a.seq() == c.opening_seq
+                && a.hash() == c.opening_hash
+                && anchors::match_only(a, trail, groups, conflicting_seqs).is_none()
+        });
         let confirmed = confirmed_receipts.contains(&(c.resume_seq, c.resume_hash));
         let low = if c.is_genesis { 0 } else { c.head_seq + 1 };
         out.push(position::Gap {
