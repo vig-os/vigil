@@ -83,13 +83,18 @@ impl Finding {
         }
     }
     /// Promotes the warning to [`FindingKind::Accepted`] in place
-    /// (see [`Verifier::accept`](crate::audit::Verifier::accept)).
+    /// (see [`Verifier::accept`](crate::audit::Verifier::accept) and
+    /// [`Verifier::accept_run`](crate::audit::Verifier::accept_run)).
+    /// Clears [`Self::run_digest`] (ruling 13-V8-d1 point 4: an
+    /// accepted run's digest is `None` on the finding; the digest
+    /// survives inside the `was:` tail of the detail).
     pub(crate) fn accepted(mut self, by: &str, reason: &str) -> Self {
         assert!(self.accepted_kind.is_none());
         let original_kind = self.kind;
         let original_detail = std::mem::take(&mut self.detail);
         self.kind = FindingKind::Accepted;
         self.accepted_kind = Some(original_kind);
+        self.run_digest = None;
         self.detail = format!("accepted by {by}: {reason}; was: {original_detail}");
         self
     }
@@ -299,6 +304,8 @@ mod above_end_tests;
 #[cfg(test)]
 mod accept_resumed_tests;
 #[cfg(test)]
+mod accept_run_tests;
+#[cfg(test)]
 mod anchors_tests;
 #[cfg(test)]
 mod coverage_tests;
@@ -425,6 +432,9 @@ pub struct Verifier {
     /// review pass runs in order; the inner vec holds the at-most
     /// four acceptable kinds at that `seq` (see [`Self::accept`]).
     accepts: AcceptMap,
+    /// Review-file `accept-run` lines keyed by resume `seq` (see
+    /// [`Self::accept_run`]).
+    accepts_run: AcceptRunMap,
     #[cfg(test)]
     now_override: Option<SystemTime>,
 }
@@ -433,6 +443,11 @@ pub struct Verifier {
 /// See [`Verifier::accept`].
 pub(crate) type AcceptEntry = (FindingKind, [u8; 32], String, String);
 pub(crate) type AcceptMap = std::collections::BTreeMap<u64, Vec<AcceptEntry>>;
+/// Review-file `accept-run` set: one `(resume_hash, run_digest, by,
+/// reason)` per `seq` (ruling 13-V8-d1 point 2; a duplicate `seq` is
+/// `InvalidConfig`). See [`Verifier::accept_run`].
+pub(crate) type AcceptRunEntry = ([u8; 32], [u8; 32], String, String);
+pub(crate) type AcceptRunMap = std::collections::BTreeMap<u64, AcceptRunEntry>;
 
 /// Non-empty, single-line reason check for waivers and the `from`
 /// input (ruling 13-V7-d1 point 6). Otherwise `InvalidConfig` with
@@ -445,6 +460,25 @@ fn validate_reason(reason: String, label: &str) -> Result<String, AuditError> {
         ));
     }
     Ok(reason)
+}
+
+/// Reviewer token check for [`Verifier::accept`] and
+/// [`Verifier::accept_run`] (ruling 13-V8-d1 point 2): non-empty
+/// with no ASCII whitespace and no ASCII control bytes. `label`
+/// names the field in the `InvalidConfig` message so callers keep
+/// their stable error wording.
+fn validate_reviewer(by: String, label: &str) -> Result<String, AuditError> {
+    if by.is_empty()
+        || by
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(AuditError::new(
+            AuditErrorKind::InvalidConfig,
+            format!("{label} must be a single token (no whitespace or control bytes)"),
+        ));
+    }
+    Ok(by)
 }
 
 /// Parsed archive record and its end anchor, retained between the
@@ -477,6 +511,7 @@ impl Verifier {
             receipts_from: None,
             receipts_live: false,
             accepts: AcceptMap::new(),
+            accepts_run: AcceptRunMap::new(),
             #[cfg(test)]
             now_override: None,
         }
@@ -1077,17 +1112,7 @@ impl Verifier {
                 format!("accept kind {kind:?} is not acceptable"),
             ));
         }
-        let by = by.into();
-        if by.is_empty()
-            || by
-                .bytes()
-                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
-        {
-            return Err(AuditError::new(
-                AuditErrorKind::InvalidConfig,
-                "accept by must be a single token (no whitespace or control bytes)",
-            ));
-        }
+        let by = validate_reviewer(by.into(), "accept by")?;
         let reason = validate_reason(reason.into(), "accept reason")?;
         let entries = self.accepts.entry(seq).or_default();
         if entries.iter().any(|(k, _, _, _)| *k == kind) {
@@ -1097,6 +1122,66 @@ impl Verifier {
             ));
         }
         entries.push((kind, hash, by, reason));
+        Ok(self)
+    }
+    /// Accepts one closed run through its pinned closing resume
+    /// record and run digest (ADR-0005 decision 11 "Review file",
+    /// `accept-run`; ruling 13-V8-d1).
+    ///
+    /// `seq` and `hash` pin the `vigil.audit.resume` record that
+    /// closes the run; `run_digest` is that run's own digest from
+    /// its [`FindingKind::SegmentStructure`] finding
+    /// ([`Finding::run_digest`]). Subject in every outcome text:
+    /// `accept-run seq <s> hash blake3:<64 hex>`.
+    ///
+    /// **On a match** the line replaces exactly these findings, and
+    /// no others, with [`FindingKind::Accepted`] (items 1-3; items
+    /// 4-5 follow in #13): the run's `SegmentStructure` findings
+    /// (the run finding with the digest, and every per-segment one
+    /// on a native segment of the run); at each loss point its
+    /// [`FindingKind::ChainBroken`] and, when the range has `count
+    /// > 0`, its [`FindingKind::SeqGap`]; [`FindingKind::MmrMismatch`]
+    /// on every checkpoint in a segment of the run at or after the
+    /// run's first loss point, excluding the closing opening
+    /// checkpoint. The [`FindingKind::Resumed`] warning, the gap
+    /// itself and every other finding keep their severity; receipts
+    /// in range stay [`FindingKind::NoReceipt`] until item 4.
+    ///
+    /// **Mismatches.** No record, forked `seq`, hash-differs, "not
+    /// a resume record" and "run digest differs" each give
+    /// [`FindingKind::AcceptMismatch`]. A line whose resume closes
+    /// no run (the run digest is then the digest of nothing) is
+    /// [`FindingKind::AcceptUnused`] when the line carries that
+    /// digest and `AcceptMismatch` otherwise. A line below an
+    /// accepted [`Self::start_from`] start or above
+    /// [`Self::end_before`]'s end is set aside; when a run's
+    /// closing opening is itself the start, the line is set aside
+    /// under the start rule even though the resume `seq` is in
+    /// range (ruling 13-V8-d1 point 8). A line inside a confirmed
+    /// resume gap is one [`FindingKind::LostRecord`].
+    ///
+    /// # Errors
+    /// [`InvalidConfig`](AuditErrorKind::InvalidConfig) when
+    /// `reviewer` is empty or contains ASCII whitespace or a control
+    /// byte, `reason` is empty or contains LF or CR, or a second
+    /// `accept_run` for the same `seq` is registered.
+    pub fn accept_run(
+        mut self,
+        seq: u64,
+        hash: [u8; 32],
+        run_digest: [u8; 32],
+        reviewer: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<Self, AuditError> {
+        let by = validate_reviewer(reviewer.into(), "accept-run reviewer")?;
+        let reason = validate_reason(reason.into(), "accept-run reason")?;
+        if self.accepts_run.contains_key(&seq) {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                format!("duplicate accept-run for seq {seq}"),
+            ));
+        }
+        self.accepts_run.insert(seq, (hash, run_digest, by, reason));
         Ok(self)
     }
 
@@ -1179,6 +1264,7 @@ impl Verifier {
                 end_ctx: end_ctx.as_ref(),
                 receipts: receipt_inputs.as_ref(),
                 accepts: &self.accepts,
+                accepts_run: &self.accepts_run,
                 now: self.now(),
             },
         ))

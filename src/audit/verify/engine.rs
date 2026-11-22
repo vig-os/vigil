@@ -280,12 +280,7 @@ fn mark_no_crash(collection: &Collection, idx: usize) -> bool {
         return false;
     }
     // Successor's second complete record must not be a resume entry.
-    let second = next.data.records.get(1);
-    !second.is_some_and(|r| {
-        r.operator
-            .as_ref()
-            .is_some_and(|(action, ..)| action == "vigil.audit.resume")
-    })
+    !next.data.records.get(1).is_some_and(Summary::is_resume)
 }
 
 /// Validates a resume `audit.details` block per ruling 13-V3-d4 addendum 9.
@@ -398,6 +393,9 @@ pub(super) struct Policy<'a> {
     /// Review-file `accept` lines; see
     /// [`crate::audit::Verifier::accept`].
     pub(super) accepts: &'a super::AcceptMap,
+    /// Review-file `accept-run` lines; see
+    /// [`crate::audit::Verifier::accept_run`].
+    pub(super) accepts_run: &'a super::AcceptRunMap,
     pub(super) now: SystemTime,
 }
 
@@ -410,6 +408,7 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         end_ctx,
         receipts: receipt_set,
         accepts,
+        accepts_run,
         now,
     } = policy;
     let mut findings = Vec::new();
@@ -512,7 +511,8 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // and the later `emit_resumed`, so they are computed once.
     let declarations = resume::declarations(&collection, trail);
     let mut fold_findings: Vec<Finding> = Vec::new();
-    let matched_openings = fold::check_runs(&collection, trail, &mut fold_findings);
+    let mut run_index: Vec<fold::RunIndexEntry> = Vec::new();
+    let matched_openings = fold::check_runs(&collection, trail, &mut fold_findings, &mut run_index);
     let pending_resumes = filter_candidates(resume::candidates(&declarations), &matched_openings);
     // Ruling 13-V7-d1 point 8 and ADR-0005 decision 11: a receipt
     // or an `accept Resumed` line confirms a gap only when
@@ -525,12 +525,24 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // is the one match rule, and a gap for a candidate the trust or
     // fold filter dropped is absent from the gap list below, so
     // nothing keys off a dropped candidate.
+    // Ruling 13-V8-d1 point 8, clarification 13-V8-d1a: an
+    // `accept-run` line whose `seq` is the accepted start's `seq +
+    // 1` is set aside under the start rule iff the verified set
+    // holds at that `seq` one unforked `vigil.audit.resume` record
+    // whose previous equals the start. The run such a line closes
+    // lies wholly below the start, so it is never in the run
+    // index: this decision reads the merged `groups` and the
+    // shared fork set once and hands the classifier the resume's
+    // hash to compare against the line's.
+    let start_resume_hash =
+        start_resume_hash_at(accepted_start.and(start), &groups, &conflicting_seqs);
     let bare_position = position::Classifier::new(
         accepted_start.and(start),
         trail,
         anchors,
         end_ctx,
         Vec::new(),
+        start_resume_hash,
     );
     // ADR-0005 decision 5 and decision 11: a gap is confirmed by a
     // receipt OR an `accept Resumed` line matching the resume
@@ -574,6 +586,7 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         anchors,
         end_ctx,
         gaps.clone(),
+        start_resume_hash,
     );
     // Ruling 13-V5-d5: evaluate the section's `end=` once. A match
     // grants the tail exemption, confirms bounds at or below `s`,
@@ -819,6 +832,17 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // so an `accept` inside a confirmed resume gap is counted by
     // that gap's `lost_records=<n>` (decision 5).
     let remaining_accepts = review::classify_positions(accepts, &position, &mut findings);
+    // ADR-0005 decision 11 `accept-run`; ruling 13-V8-d1 points 2,
+    // 7 and 8, clarification 13-V8-d1a: phase 1 for `accept-run`
+    // runs the same position classifier as `accept`, with the
+    // point-8 override driven by the record at `start + 1` --
+    // a line is set aside under the start rule only when an
+    // accepted start exists, the line's `seq` is start + 1, and
+    // the verified set holds there one unforked
+    // `vigil.audit.resume` record whose hash equals the line's
+    // and whose opening is the start. The run such a line closes
+    // lies wholly below the start and is never in the run index.
+    let remaining_runs = review::classify_run_positions(accepts_run, &position, &mut findings);
     // Ruling 13-V7-d1 point 8: for each gap in the classifier's
     // list, count the `LostRecord` findings whose `seq` lies in
     // that gap's range, keyed by the gap's resume `(seq, hash)`.
@@ -835,6 +859,17 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         &groups,
         &conflicting_seqs,
         &torn_write_pins,
+        &mut findings,
+    );
+    // Phase 2 for `accept-run`: match each remaining line against
+    // the resume record at its `seq` and the run it closes, and
+    // replace items 1-3 with `Accepted` on a match (ADR-0005
+    // decision 11 `accept-run`; ruling 13-V8-d1).
+    review::match_runs(
+        &remaining_runs,
+        &groups,
+        &conflicting_seqs,
+        &run_index,
         &mut findings,
     );
     let first_seq = groups.first_key_value().map(|(&s, _)| s);
@@ -895,6 +930,35 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     });
     Report::new(trail, count, first_seq, last_seq, covered_through, findings)
         .with_tail_exempt(matched_end.is_some())
+}
+
+/// Resume hash at `start.seq + 1` for the ruling 13-V8-d1a `accept-
+/// run` start-override check, or `None` when the record there is
+/// absent, forked, not a `vigil.audit.resume`, or does not open
+/// from the start. One place reads `groups` and the shared fork
+/// set to decide "the run closes at this start" without consulting
+/// the run index (which, by construction, never holds a run whose
+/// segments all lie below the start).
+fn start_resume_hash_at(
+    start: Option<&Checkpoint>,
+    groups: &BTreeMap<u64, Vec<Located<'_>>>,
+    conflicting_seqs: &BTreeSet<u64>,
+) -> Option<[u8; 32]> {
+    let start = start?;
+    let after = start.seq().checked_add(1)?;
+    if conflicting_seqs.contains(&after) {
+        return None;
+    }
+    let copies = groups.get(&after)?;
+    let hashes: BTreeSet<[u8; 32]> = copies.iter().map(|(_, r)| r.hash).collect();
+    if hashes.len() != 1 {
+        return None;
+    }
+    let (_, record) = copies[0];
+    if !record.is_resume() || record.previous != start.hash() {
+        return None;
+    }
+    Some(record.hash)
 }
 
 /// Shared fork predicate (ruling 13-V5-d2): `true` iff the records at
@@ -962,7 +1026,8 @@ pub(super) fn filter_candidates_for_test(collection: &Collection, trail: [u8; 16
     let declarations = resume::declarations(collection, trail);
     let candidates = resume::candidates(&declarations);
     let mut findings = Vec::new();
-    let matched_openings = fold::check_runs(collection, trail, &mut findings);
+    let mut run_index: Vec<fold::RunIndexEntry> = Vec::new();
+    let matched_openings = fold::check_runs(collection, trail, &mut findings, &mut run_index);
     filter_candidates(candidates, &matched_openings)
         .into_iter()
         .map(|c| c.opening_seq)

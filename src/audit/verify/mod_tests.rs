@@ -252,6 +252,7 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
         .build()
         .unwrap();
     let accepts = super::AcceptMap::new();
+    let accepts_run = super::AcceptRunMap::new();
     let report = super::engine::check(
         collection,
         TRAIL,
@@ -263,6 +264,7 @@ fn first_broken_link_returns_first_error_in_ruled_order() {
             end_ctx: None,
             receipts: None,
             accepts: &accepts,
+            accepts_run: &accepts_run,
             now: std::time::SystemTime::now(),
         },
     );

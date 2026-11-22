@@ -90,6 +90,16 @@ pub(super) struct Classifier {
     /// [`Self::classify`], [`Self::lost_record`] and
     /// [`Self::candidate_gap`] (ruling 13-V7-d1 points 7-9).
     gaps: Vec<Gap>,
+    /// `Some(h)` iff the verified set holds, at `start.seq + 1`, one
+    /// unforked `vigil.audit.resume` record whose `previous` equals
+    /// the accepted start (its opening is the start) and whose own
+    /// hash is `h` (ruling 13-V8-d1 point 8, clarification
+    /// 13-V8-d1a). Pre-computed by the caller from the merged
+    /// `groups` and the shared fork set, so
+    /// [`Self::set_aside_for_accept_run`] never consults the run
+    /// index: the run a line of that shape closes lies wholly below
+    /// the start and is never in the index.
+    start_resume_hash: Option<[u8; 32]>,
 }
 
 /// The two end-of-range bounds the classifier carries under
@@ -120,6 +130,7 @@ impl Classifier {
         anchors: &[Checkpoint],
         end_ctx: Option<&end_before::Context<'_>>,
         gaps: Vec<Gap>,
+        start_resume_hash: Option<[u8; 32]>,
     ) -> Self {
         let accepted = accepted.map(|start| {
             let anchored = anchors
@@ -136,6 +147,7 @@ impl Classifier {
             accepted,
             end_before,
             gaps,
+            start_resume_hash,
         }
     }
 
@@ -269,23 +281,44 @@ impl Classifier {
             Position::BelowStart {
                 start_seq,
                 anchored,
-            } => Some(Finding::new(
-                if anchored {
-                    K::OutOfRange
-                } else {
-                    K::UnanchoredStart
-                },
-                None,
-                None,
-                Some(seq),
-                format!("{subject}: below start seq {start_seq}"),
-            )),
+            } => Some(below_start_finding(seq, start_seq, anchored, subject)),
             Position::AboveEnd { end_seq, anchored } => {
                 Some(above_end_finding(seq, end_seq, anchored, subject))
             }
         }
     }
 
+    /// Returns the set-aside finding for an `accept-run` line,
+    /// applying the ruling 13-V8-d1 point 8 override, clarified in
+    /// 13-V8-d1a: the line is set aside under the start rule
+    /// exactly when an accepted start exists, `seq` is the start's
+    /// `seq + 1`, and the verified set holds at that `seq` one
+    /// unforked `vigil.audit.resume` record whose hash equals `hash`
+    /// and whose opening (previous) is the start. The run that line
+    /// closes then lies wholly below the start and is never in the
+    /// run index -- so this decision reads `start_resume_hash`
+    /// alone, pre-computed in [`Self::new`], and never consults the
+    /// index. Every other line (including a plain `start+1` whose
+    /// record is not a resume, has another hash, or is absent)
+    /// falls through to normal matching through
+    /// [`Self::set_aside`]'s above-end and below-start arms, so a
+    /// bogus line never clears an error.
+    pub(super) fn set_aside_for_accept_run(
+        &self,
+        seq: u64,
+        hash: [u8; 32],
+        subject: impl Display,
+    ) -> Option<Finding> {
+        if let Some(f) = self.set_aside(seq, &subject) {
+            return Some(f);
+        }
+        let (start_seq, anchored) = self.accepted?;
+        let resume_hash = self.start_resume_hash?;
+        if seq != start_seq.checked_add(1)? || hash != resume_hash {
+            return None;
+        }
+        Some(below_start_finding(seq, start_seq, anchored, subject))
+    }
     /// Returns the one unlocated above-end set-aside finding when
     /// `seq` is strictly above the end of a bounded batch, or `None`
     /// otherwise. Unlike [`Self::set_aside`], a `seq` below an
@@ -317,6 +350,25 @@ fn lost_record_finding(seq: u64, low: u64, high: u64, subject: impl Display) -> 
         None,
         Some(seq),
         format!("{subject}: lost in gap {low}..={high}"),
+    )
+}
+
+/// Builds the one unlocated below-start finding, shared by
+/// [`Classifier::set_aside`] (normal below-start) and
+/// [`Classifier::set_aside_for_accept_run`] (ruling 13-V8-d1
+/// point 8 override) so the kind choice and detail grammar live in
+/// one place (rulings 13-V6-d3 points 4-5, 13-V8-d1 point 8).
+fn below_start_finding(seq: u64, start_seq: u64, anchored: bool, subject: impl Display) -> Finding {
+    Finding::new(
+        if anchored {
+            K::OutOfRange
+        } else {
+            K::UnanchoredStart
+        },
+        None,
+        None,
+        Some(seq),
+        format!("{subject}: below start seq {start_seq}"),
     )
 }
 
