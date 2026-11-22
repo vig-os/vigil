@@ -514,12 +514,13 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     let mut fold_findings: Vec<Finding> = Vec::new();
     let matched_openings = fold::check_runs(&collection, trail, &mut fold_findings);
     let pending_resumes = filter_candidates(resume::candidates(&declarations), &matched_openings);
-    // Ruling 13-V7-d1 point 8: a receipt confirms a gap only when
+    // Ruling 13-V7-d1 point 8 and ADR-0005 decision 11: a receipt
+    // or an `accept Resumed` line confirms a gap only when
     // `receipts::match_one`'s outcome for it would be Matched --
     // both in range and matching the record under the shared match
     // rule. A bare classifier built from the start and end bounds
     // (no gaps yet) runs the same `set_aside` the real pass will,
-    // so a receipt above `end_before`'s last-line `seq` or below
+    // so a line above `end_before`'s last-line `seq` or below
     // an accepted start never confirms. The shared `receipts::matches`
     // is the one match rule, and a gap for a candidate the trust or
     // fold filter dropped is absent from the gap list below, so
@@ -531,23 +532,39 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         end_ctx,
         Vec::new(),
     );
-    let confirmed_receipts: BTreeSet<(u64, [u8; 32])> =
+    // ADR-0005 decision 5 and decision 11: a gap is confirmed by a
+    // receipt OR an `accept Resumed` line matching the resume
+    // record's `(seq, hash)` under the shared match rule. Both
+    // sources run through the same `set_aside` + `receipts::matches`
+    // pair the real receipts and accept passes use, so a line above
+    // the end, below an accepted start, at a forked `seq` or with a
+    // wrong hash confirms nothing, and the two confirmation sources
+    // feed one set.
+    let is_matched_in_range = |seq, hash| {
+        bare_position.set_aside(seq, "").is_none()
+            && receipts::matches(seq, hash, &groups, &conflicting_seqs)
+    };
+    let mut confirmations: BTreeSet<(u64, [u8; 32])> =
         receipt_set.map_or_else(BTreeSet::new, |rs| {
             rs.receipts
                 .iter()
-                .filter(|&&(seq, hash)| {
-                    bare_position.set_aside(seq, "").is_none()
-                        && receipts::matches(seq, hash, &groups, &conflicting_seqs)
-                })
+                .filter(|&&(seq, hash)| is_matched_in_range(seq, hash))
                 .copied()
                 .collect()
         });
+    for (&seq, entries) in accepts {
+        for entry in entries {
+            if entry.0 == K::Resumed && is_matched_in_range(seq, entry.1) {
+                confirmations.insert((seq, entry.1));
+            }
+        }
+    }
     let gaps = build_gaps(
         &pending_resumes,
         trail,
         trust,
         anchors,
-        &confirmed_receipts,
+        &confirmations,
         &groups,
         &conflicting_seqs,
     );
@@ -964,11 +981,12 @@ pub(super) fn filter_candidates_for_test(collection: &Collection, trail: [u8; 16
 /// [`anchors::match_only`] the anchor rule itself uses (ruling
 /// 13-V6-d1 point 2: a forked `seq` never matches, so a forked
 /// opening is never anchored even when an input anchor equals its
-/// `(trail, seq, hash)`). Confirmation (point 8) uses the shared
-/// matched-receipts set the caller built through
-/// [`receipts::matches`] and [`position::Classifier::set_aside`],
-/// so a receipt above the end or below an accepted start never
-/// confirms a gap and never drifts from the real receipts pass.
+/// `(trail, seq, hash)`). Confirmation (point 8; ADR-0005 decision
+/// 11) uses the shared matched set the caller built through
+/// [`receipts::matches`] and [`position::Classifier::set_aside`]
+/// from both the receipts and the `accept Resumed` lines, so a
+/// mismatched, set-aside or forked line never confirms a gap and
+/// never drifts from the real receipts and accept passes.
 /// A shipped-only opening is never a candidate (13-V4-d7; spike
 /// #224), so a Collector copy cannot confirm a gap through this
 /// filter.
@@ -977,7 +995,7 @@ fn build_gaps(
     trail: [u8; 16],
     trust: &TrustPolicy,
     anchors: &[Checkpoint],
-    confirmed_receipts: &BTreeSet<(u64, [u8; 32])>,
+    confirmations: &BTreeSet<(u64, [u8; 32])>,
     groups: &BTreeMap<u64, Vec<Located<'_>>>,
     conflicting_seqs: &BTreeSet<u64>,
 ) -> Vec<position::Gap> {
@@ -1013,7 +1031,7 @@ fn build_gaps(
                 && a.hash() == c.opening_hash
                 && anchors::match_only(a, trail, groups, conflicting_seqs).is_none()
         });
-        let confirmed = confirmed_receipts.contains(&(c.resume_seq, c.resume_hash));
+        let confirmed = confirmations.contains(&(c.resume_seq, c.resume_hash));
         let low = if c.is_genesis { 0 } else { c.head_seq + 1 };
         out.push(position::Gap {
             low,

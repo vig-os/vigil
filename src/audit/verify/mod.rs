@@ -297,6 +297,8 @@ fn severity(kind: FindingKind) -> Severity {
 #[cfg(test)]
 mod above_end_tests;
 #[cfg(test)]
+mod accept_resumed_tests;
+#[cfg(test)]
 mod anchors_tests;
 #[cfg(test)]
 mod coverage_tests;
@@ -1023,10 +1025,20 @@ impl Verifier {
     /// the gap can be accepted (ruling 13-V8-d1 point 5).
     ///
     /// On a match the warning becomes [`FindingKind::Accepted`]
-    /// in place. A line below an accepted start or above a bounded
-    /// end is set aside through the position classifier; a line
-    /// inside a confirmed resume gap is one
-    /// [`FindingKind::LostRecord`] counted by `lost_records=<n>`.
+    /// in place. A matched, in-range `accept Resumed` line also
+    /// **confirms** that resume's gap under the same match rule
+    /// (ADR-0005 decision 5 "Receipts lost with a resume" and
+    /// decision 11), so every receipt, waiver,
+    /// [`Self::receipts_from`] and `accept` line inside the gap
+    /// becomes one [`FindingKind::LostRecord`] (never anchors or
+    /// `through=` pins, which need the gap's opening checkpoint
+    /// anchored under [`Self::anchor`]); the count is reported as
+    /// `lost_records=<n>` in the gap's
+    /// [`FindingKind::Resumed`] detail, which the `Accepted`
+    /// finding's `was:` tail then carries. A line below an accepted
+    /// start or above a bounded end is set aside through the
+    /// position classifier; a line inside a confirmed resume gap is
+    /// one [`FindingKind::LostRecord`] counted by `lost_records=<n>`.
     /// A mismatch under the shared receipt match rule is
     /// [`FindingKind::AcceptMismatch`]; a match that finds no
     /// warning is [`FindingKind::AcceptUnused`]; a trailing
