@@ -105,17 +105,22 @@ pub(super) struct RunIndexEntry {
     /// opening's own `MmrMismatch` is never accepted (ADR-0005
     /// decision 11).
     pub(super) closing_opening_seq: u64,
-    /// Native segment paths of the run (inclusive
-    /// `first_segment..=last_segment`): used to scope items 1 and 3
-    /// to findings whose file is one of these.
+    /// Native segment paths of the run's own segments
+    /// (`first_segment..last_segment`, EXCLUDING the closer, which
+    /// is the next run's first segment: ruling 13-V4-d9). Items 1
+    /// and 3 scope findings whose file is one of these; the closer
+    /// segment's findings belong to the next run.
     pub(super) segment_paths: Vec<std::path::PathBuf>,
     /// Lowest loss-point `loss_seq`, or `None` for a lossless run.
     /// Items 3 scope `MmrMismatch` to `seq >= first_loss_seq`.
     pub(super) first_loss_seq: Option<u64>,
-    /// Loss points in run-walk order: `(loss_seq, first, count)`
-    /// (ruling 13-V4-d2 point 3; 13-V4-d8 point 1 grammar). Items 2
-    /// scope `ChainBroken` and `SeqGap` to these ranges.
-    pub(super) loss_ranges: Vec<(u64, u64, u64)>,
+    /// Loss points in run-walk order: `(loss_seq, first, count,
+    /// path)` (ruling 13-V4-d2 point 3; 13-V4-d8 point 1 grammar).
+    /// Items 2 scope `ChainBroken` and `SeqGap` to a `(file, seq)`
+    /// pair so a `ChainBroken` or `SeqGap` at the same `seq` on a
+    /// different file (a shipped copy, or a closer segment where the
+    /// loss did not fire) is not promoted here.
+    pub(super) loss_ranges: Vec<(u64, u64, u64, std::path::PathBuf)>,
     /// The run digest reported in the run's `SegmentStructure`
     /// detail; the `accept-run` line must carry this exact digest
     /// for a match (ADR-0005 decision 11 `accept-run`).
@@ -213,12 +218,20 @@ pub(super) fn check_runs(
 
 /// Builds one [`RunIndexEntry`] for a run whose closer segment
 /// carries a `vigil.audit.resume` record on the verified trail at
-/// `closing_opening.seq + 1`. Returns `None` for a run that cannot
-/// be referenced from an `accept-run` line (no closing opening head
-/// or no resume record following it): `accept-run` reaches such a
-/// run only through `AcceptMismatch` "no record" / "not a resume
-/// record", so no index entry is needed. Reads the already-decoded
-/// records in `input.data.records` filtered by trail; no re-walk.
+/// `closing_opening.seq + 1` (ADR-0005 decision 11 `accept-run`;
+/// ruling 13-V8-d1). Returns `None` for a run that cannot be
+/// referenced from an `accept-run` line (no closing opening head or
+/// no resume record at `closing_opening.seq + 1`): `accept-run`
+/// reaches such a run only through `AcceptMismatch` "no record" /
+/// "not a resume record", so no index entry is needed. Reads the
+/// already-decoded records in `input.data.records` filtered by
+/// trail; no re-walk.
+///
+/// The run's segment paths are `first_segment..last_segment`
+/// (EXCLUDING the closer; ruling 13-V4-d9). The closer segment is
+/// the next run's first segment, so a `SegmentStructure`,
+/// `MmrMismatch` or `ChainBroken` on the closer belongs to the next
+/// run and is never accepted by this run's `accept-run` line.
 fn build_run_index_entry(
     natives: &[NativeSegment],
     collection: &Collection,
@@ -229,26 +242,44 @@ fn build_run_index_entry(
     let closing = run.closing_opening?;
     let closer_seg = natives.get(run.last_segment)?;
     let closer_input = &collection.inputs[closer_seg.input_index];
-    let mut on_trail = closer_input
+    // Ruling 13-V8-d1: the resume record is identified by
+    // `seq == closing_opening.seq + 1`, not by position in the
+    // closer segment's record list. A segment with no record at
+    // that seq on the trail is not an `accept-run` subject.
+    let resume_seq = closing.seq.checked_add(1)?;
+    let resume = closer_input
         .data
         .records
         .iter()
-        .filter(|r| r.trail == trail);
-    let _opening = on_trail.next()?;
-    let resume = on_trail.next().filter(|r| {
-        r.operator
-            .as_ref()
-            .is_some_and(|(action, ..)| action == "vigil.audit.resume")
-    })?;
+        .find(|r| r.trail == trail && r.seq == resume_seq && r.is_resume())?;
     let segment_paths: Vec<std::path::PathBuf> = natives
-        .get(run.first_segment..=run.last_segment)?
+        .get(run.first_segment..run.last_segment)?
         .iter()
         .map(|seg| seg.path.clone())
         .collect();
-    let loss_ranges: Vec<(u64, u64, u64)> = run
+    // Attribute each loss point to its segment's path so
+    // `review::run_includes` can match `ChainBroken` and `SeqGap`
+    // on `(file, seq)`. Loss points fire at a segment's first
+    // record (`first_rec.previous != prev_complete.hash`), so the
+    // owning segment is the one whose first record on the trail
+    // has `seq == loss_seq`.
+    let loss_ranges: Vec<(u64, u64, u64, std::path::PathBuf)> = run
         .loss_points
         .iter()
-        .map(|lp| (lp.loss_seq, lp.first, lp.count))
+        .filter_map(|lp| {
+            natives
+                .get(run.first_segment..=run.last_segment)?
+                .iter()
+                .find(|seg| {
+                    collection.inputs[seg.input_index]
+                        .data
+                        .records
+                        .iter()
+                        .find(|r| r.trail == trail)
+                        .is_some_and(|r| r.seq == lp.loss_seq)
+                })
+                .map(|seg| (lp.loss_seq, lp.first, lp.count, seg.path.clone()))
+        })
         .collect();
     let first_loss_seq = run.loss_points.iter().map(|lp| lp.loss_seq).min();
     Some(RunIndexEntry {

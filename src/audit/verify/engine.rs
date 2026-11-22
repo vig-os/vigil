@@ -280,12 +280,7 @@ fn mark_no_crash(collection: &Collection, idx: usize) -> bool {
         return false;
     }
     // Successor's second complete record must not be a resume entry.
-    let second = next.data.records.get(1);
-    !second.is_some_and(|r| {
-        r.operator
-            .as_ref()
-            .is_some_and(|(action, ..)| action == "vigil.audit.resume")
-    })
+    !next.data.records.get(1).is_some_and(Summary::is_resume)
 }
 
 /// Validates a resume `audit.details` block per ruling 13-V3-d4 addendum 9.
@@ -826,10 +821,12 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     let remaining_accepts = review::classify_positions(accepts, &position, &mut findings);
     // ADR-0005 decision 11 `accept-run`; ruling 13-V8-d1 points 2,
     // 7 and 8: phase 1 for `accept-run` runs the same position
-    // classifier as `accept`, plus the point-8 override for a line
-    // whose run's closing opening checkpoint IS the accepted start.
+    // classifier as `accept`, with the point-8 override driven by
+    // the run index -- a line is set aside under the start rule
+    // only when a run in the index closes at the accepted start
+    // and the line pins that run's resume record.
     let remaining_runs =
-        review::classify_run_positions(accepts_run, start, &position, &mut findings);
+        review::classify_run_positions(accepts_run, start, &run_index, &position, &mut findings);
     // Ruling 13-V7-d1 point 8: for each gap in the classifier's
     // list, count the `LostRecord` findings whose `seq` lies in
     // that gap's range, keyed by the gap's resume `(seq, hash)`.

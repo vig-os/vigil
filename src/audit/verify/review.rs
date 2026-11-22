@@ -158,15 +158,20 @@ fn run_subject(seq: u64, hash: &[u8; 32]) -> String {
 
 /// Phase 1 for `accept-run` (pre-count): set aside each line
 /// through the position classifier, with the ruling 13-V8-d1
-/// point 8 override -- when the accepted start's `seq` is exactly
-/// `line.seq - 1` (so the start is the resume's predecessor, i.e.
-/// the run's closing opening), the run lies below the start and
-/// the line is set aside under the start rule, even though the
-/// resume record's `seq` is in range. The remaining `(seq, entry)`
-/// pairs go to [`match_runs`].
+/// point 8 override -- an `accept-run` line is set aside under the
+/// start rule when a run in the index closes at the accepted
+/// start, the line's `seq` is that run's resume record, and its
+/// hash matches that resume. The whole run then lies below the
+/// start, so the resume record's own in-range `seq` does not save
+/// the line. No other line uses the override: a plain `start+1`
+/// line whose run does not close at the start (or where the hash
+/// differs) falls through to normal matching, where it either
+/// matches a run above the start or reports `AcceptMismatch`. The
+/// remaining `(seq, entry)` pairs go to [`match_runs`].
 pub(super) fn classify_run_positions<'a>(
     accepts_run: &'a AcceptRunMap,
     start: Option<&Checkpoint>,
+    runs: &[RunIndexEntry],
     position: &Classifier,
     findings: &mut Vec<Finding>,
 ) -> RemainingRuns<'a> {
@@ -174,24 +179,12 @@ pub(super) fn classify_run_positions<'a>(
     for (&seq, entry) in accepts_run {
         let (hash, _, _, _) = entry;
         let subject = run_subject(seq, hash);
-        // Ruling 13-V8-d1 point 8: the accepted start's `seq` is
-        // `line.seq - 1` iff the start sits at the resume's
-        // predecessor, i.e. at the run's closing opening
-        // checkpoint. Reading `start.seq() + 1 == line.seq`
-        // triggers the override whether or not the run's own
-        // records are still in the files (an archive keeps only
-        // the opening and the resume, so the run index may be
-        // empty). The classifier's `below_start_finding` picks
-        // OutOfRange vs. UnanchoredStart in one place.
-        let normal = position.set_aside(seq, &subject);
-        let override_below_start =
-            normal.is_none() && start.is_some_and(|s| s.seq().checked_add(1) == Some(seq));
-        let set_aside = if override_below_start {
-            position.below_start_finding(seq, &subject)
-        } else {
-            normal
-        };
-        if let Some(f) = set_aside {
+        let run_closes_at_start = start.is_some_and(|s| {
+            runs.iter().any(|r| {
+                r.closing_opening_seq == s.seq() && r.resume_seq == seq && r.resume_hash == *hash
+            })
+        });
+        if let Some(f) = position.set_aside_for_accept_run(seq, &subject, run_closes_at_start) {
             findings.push(f);
         } else if let Some(f) = position.lost_record(seq, &subject) {
             findings.push(f);
@@ -233,12 +226,7 @@ pub(super) fn match_runs(
         // ADR-0005 decision 11: the record at `<seq>` must be a
         // `vigil.audit.resume` record, else `AcceptMismatch`.
         let copies = groups.get(seq).expect("matched implies groups has seq");
-        let is_resume = copies.iter().any(|(_, r)| {
-            r.operator
-                .as_ref()
-                .is_some_and(|(action, ..)| action == "vigil.audit.resume")
-        });
-        if !is_resume {
+        if !copies.iter().any(|(_, r)| r.is_resume()) {
             emit(
                 K::AcceptMismatch,
                 *seq,
@@ -291,31 +279,35 @@ fn promote_run(findings: &mut [Finding], run: &RunIndexEntry, by: &str, reason: 
 
 /// `true` iff `finding` is one of the run's items 1-3 and must be
 /// replaced with [`K::Accepted`] (ADR-0005 decision 11 `accept-run`;
-/// the closing opening checkpoint's `MmrMismatch` is excluded).
-/// A per-segment `SegmentStructure` with no first record (empty
-/// segment) carries `seq = None` but still lies on a run segment,
-/// so item 1 is keyed on the finding's file alone for that kind.
+/// ruling 13-V4-d9: the closer segment belongs to the next run, so
+/// its `SegmentStructure` and `MmrMismatch` are never accepted here,
+/// including the closing opening checkpoint's `MmrMismatch`). Each
+/// loss point's `ChainBroken` and `SeqGap` are matched on the loss
+/// point's own `(file, seq)`, so a same-`seq` finding on a different
+/// file (a shipped copy; a `ChainBroken` on the closer for a loss
+/// that did not fire there) is never promoted. A per-segment
+/// `SegmentStructure` with no first record (empty segment) carries
+/// `seq = None` but still lies on a run segment, so item 1 is keyed
+/// on the finding's file alone for that kind.
 fn run_includes(run: &RunIndexEntry, finding: &Finding) -> bool {
-    let on_run_segment = finding
-        .file()
-        .is_some_and(|p| run.segment_paths.iter().any(|q| q.as_path() == p));
+    let file = finding.file();
+    let on_run_segment = file.is_some_and(|p| run.segment_paths.iter().any(|q| q.as_path() == p));
+    let at_loss_point = |pred: &dyn Fn(u64, u64) -> bool| {
+        finding.seq().is_some_and(|s| {
+            run.loss_ranges.iter().any(|(loss, first, count, path)| {
+                *loss == s && file == Some(path.as_path()) && pred(*first, *count)
+            })
+        })
+    };
     match finding.kind() {
         K::SegmentStructure => on_run_segment,
-        K::ChainBroken => finding
+        K::ChainBroken => at_loss_point(&|_, _| true),
+        K::SeqGap => at_loss_point(&|first, count| {
+            count > 0 && finding.detail() == format!("missing seq {first}..={}", first + count - 1)
+        }),
+        K::MmrMismatch => finding
             .seq()
-            .is_some_and(|s| run.loss_ranges.iter().any(|(loss, _, _)| *loss == s)),
-        K::SeqGap => finding.seq().is_some_and(|s| {
-            run.loss_ranges.iter().any(|(loss, first, count)| {
-                *count > 0
-                    && *loss == s
-                    && finding.detail() == format!("missing seq {first}..={}", first + count - 1)
-            })
-        }),
-        K::MmrMismatch => finding.seq().is_some_and(|s| {
-            on_run_segment
-                && run.first_loss_seq.is_some_and(|f| s >= f)
-                && s != run.closing_opening_seq
-        }),
+            .is_some_and(|s| on_run_segment && run.first_loss_seq.is_some_and(|f| s >= f)),
         _ => false,
     }
 }

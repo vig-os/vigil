@@ -55,6 +55,18 @@ pub(super) struct Summary {
     pub(super) is_end_record: bool,
 }
 impl Summary {
+    /// `true` iff this record's operator action is
+    /// `vigil.audit.resume` (ADR-0005 decision 11 `accept-run`;
+    /// ruling 13-V8-d1). Shared predicate for the review pass
+    /// ([`super::review`], [`super::fold::check_runs`]), the
+    /// no-crash mark (`super::engine::mark_no_crash`) and resume
+    /// declaration collection ([`super::resume`]), so a mutation
+    /// of the action string fails every caller together.
+    pub(super) fn is_resume(&self) -> bool {
+        self.operator
+            .as_ref()
+            .is_some_and(|(action, ..)| action == "vigil.audit.resume")
+    }
     fn new(record: Record, line: u64) -> Self {
         let hash = record.hash();
         let signing_message = record.signing_message();

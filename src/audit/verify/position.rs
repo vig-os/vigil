@@ -269,44 +269,40 @@ impl Classifier {
             Position::BelowStart {
                 start_seq,
                 anchored,
-            } => Some(Finding::new(
-                if anchored {
-                    K::OutOfRange
-                } else {
-                    K::UnanchoredStart
-                },
-                None,
-                None,
-                Some(seq),
-                format!("{subject}: below start seq {start_seq}"),
-            )),
+            } => Some(below_start_finding(seq, start_seq, anchored, subject)),
             Position::AboveEnd { end_seq, anchored } => {
                 Some(above_end_finding(seq, end_seq, anchored, subject))
             }
         }
     }
 
-    /// Returns the below-start set-aside finding for an
-    /// `accept-run` line whose run lies below the accepted start
-    /// (ruling 13-V8-d1 point 8), with the start's own `(start_seq,
-    /// anchored)` so [`K::OutOfRange`] / [`K::UnanchoredStart`] stay
-    /// consistent with [`Self::set_aside`]. Returns `None` when no
-    /// start was accepted. The caller decides whether the override
-    /// applies; this helper only builds the finding.
-    pub(super) fn below_start_finding(&self, seq: u64, subject: impl Display) -> Option<Finding> {
-        self.accepted.map(|(start_seq, anchored)| {
-            Finding::new(
-                if anchored {
-                    K::OutOfRange
-                } else {
-                    K::UnanchoredStart
-                },
-                None,
-                None,
-                Some(seq),
-                format!("{subject}: below start seq {start_seq}"),
-            )
-        })
+    /// Returns the set-aside finding for an `accept-run` line,
+    /// applying the ruling 13-V8-d1 point 8 override: when the
+    /// caller decides the run closes at the accepted start, the run
+    /// lies below the start, so the line is set aside under the
+    /// start rule even though the resume record's `seq` is in
+    /// range. The decision is the caller's (it holds the run
+    /// index); this helper shares [`Self::set_aside`]'s above-end
+    /// branch and [`below_start_finding`] for the below-start
+    /// branch. Returns `None` when `seq` is in range and the
+    /// override does not apply, and `None` when the override does
+    /// apply but no start was accepted (unreachable in practice,
+    /// since the caller passes `applies = true` only through an
+    /// accepted start).
+    pub(super) fn set_aside_for_accept_run(
+        &self,
+        seq: u64,
+        subject: impl Display,
+        applies: bool,
+    ) -> Option<Finding> {
+        if let Some(f) = self.set_aside(seq, &subject) {
+            return Some(f);
+        }
+        if !applies {
+            return None;
+        }
+        self.accepted
+            .map(|(start_seq, anchored)| below_start_finding(seq, start_seq, anchored, subject))
     }
     /// Returns the one unlocated above-end set-aside finding when
     /// `seq` is strictly above the end of a bounded batch, or `None`
@@ -339,6 +335,25 @@ fn lost_record_finding(seq: u64, low: u64, high: u64, subject: impl Display) -> 
         None,
         Some(seq),
         format!("{subject}: lost in gap {low}..={high}"),
+    )
+}
+
+/// Builds the one unlocated below-start finding, shared by
+/// [`Classifier::set_aside`] (normal below-start) and
+/// [`Classifier::set_aside_for_accept_run`] (ruling 13-V8-d1
+/// point 8 override) so the kind choice and detail grammar live in
+/// one place (rulings 13-V6-d3 points 4-5, 13-V8-d1 point 8).
+fn below_start_finding(seq: u64, start_seq: u64, anchored: bool, subject: impl Display) -> Finding {
+    Finding::new(
+        if anchored {
+            K::OutOfRange
+        } else {
+            K::UnanchoredStart
+        },
+        None,
+        None,
+        Some(seq),
+        format!("{subject}: below start seq {start_seq}"),
     )
 }
 

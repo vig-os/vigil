@@ -462,6 +462,25 @@ fn validate_reason(reason: String, label: &str) -> Result<String, AuditError> {
     Ok(reason)
 }
 
+/// Reviewer token check for [`Verifier::accept`] and
+/// [`Verifier::accept_run`] (ruling 13-V8-d1 point 2): non-empty
+/// with no ASCII whitespace and no ASCII control bytes. `label`
+/// names the field in the `InvalidConfig` message so callers keep
+/// their stable error wording.
+fn validate_reviewer(by: String, label: &str) -> Result<String, AuditError> {
+    if by.is_empty()
+        || by
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(AuditError::new(
+            AuditErrorKind::InvalidConfig,
+            format!("{label} must be a single token (no whitespace or control bytes)"),
+        ));
+    }
+    Ok(by)
+}
+
 /// Parsed archive record and its end anchor, retained between the
 /// `end_before` call and the verify call (ADR-0005 decision 11
 /// `.end_before`; ruling 13-V6-d4). Private; the verifier's one
@@ -1093,17 +1112,7 @@ impl Verifier {
                 format!("accept kind {kind:?} is not acceptable"),
             ));
         }
-        let by = by.into();
-        if by.is_empty()
-            || by
-                .bytes()
-                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
-        {
-            return Err(AuditError::new(
-                AuditErrorKind::InvalidConfig,
-                "accept by must be a single token (no whitespace or control bytes)",
-            ));
-        }
+        let by = validate_reviewer(by.into(), "accept by")?;
         let reason = validate_reason(reason.into(), "accept reason")?;
         let entries = self.accepts.entry(seq).or_default();
         if entries.iter().any(|(k, _, _, _)| *k == kind) {
@@ -1164,17 +1173,7 @@ impl Verifier {
         reviewer: impl Into<String>,
         reason: impl Into<String>,
     ) -> Result<Self, AuditError> {
-        let by = reviewer.into();
-        if by.is_empty()
-            || by
-                .bytes()
-                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
-        {
-            return Err(AuditError::new(
-                AuditErrorKind::InvalidConfig,
-                "accept-run reviewer must be a single token (no whitespace or control bytes)",
-            ));
-        }
+        let by = validate_reviewer(reviewer.into(), "accept-run reviewer")?;
         let reason = validate_reason(reason.into(), "accept-run reason")?;
         if self.accepts_run.contains_key(&seq) {
             return Err(AuditError::new(

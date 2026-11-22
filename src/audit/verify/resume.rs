@@ -200,12 +200,7 @@ pub(super) fn declarations<'a>(
 ) -> Vec<Declaration<'a>> {
     let mut seen = BTreeSet::new();
     let mut out: Vec<Declaration<'a>> = Vec::new();
-    let is_resume = |r: &Summary| {
-        r.trail == trail
-            && r.operator
-                .as_ref()
-                .is_some_and(|(action, ..)| action == "vigil.audit.resume")
-    };
+    let is_resume = |r: &Summary| r.trail == trail && r.is_resume();
     let mut emit = |path: &'a Path, r: &'a Summary| {
         if !seen.insert((r.seq, r.hash)) {
             return;
