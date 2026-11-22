@@ -783,23 +783,17 @@ fn r3_acceptance_trailing_gap_under_coverage_stays_torn_write() {
     let path = segment_path(&d.0, 0);
     write_bytes(&path, &bytes);
     let report = report_of(vec![path.clone()], trust_fixture());
-    // The trailing TornWrite has `seq: None` (no attesting record)
-    // and its internal pin is `(seq 0, gap digest)` for the
-    // `accept TornWrite` line (ruling 13-V8-d1 point 5; ADR-0005
-    // decision 11 "What pins each kind").
-    let expected = vec![
-        Finding::new(
-            K::TornWrite,
-            Some(path),
-            Some(2),
-            None,
-            format!(
-                "trailing gap lines 2..=2 ({len} bytes), digest {REPAIR_DIGEST_TORN}",
-                len = fragment.len(),
-            ),
-        )
-        .with_pin(Some(0), repair_digest(fragment)),
-    ];
+    // The trailing TornWrite has `seq: None` (no attesting record).
+    let expected = vec![Finding::new(
+        K::TornWrite,
+        Some(path),
+        Some(2),
+        None,
+        format!(
+            "trailing gap lines 2..=2 ({len} bytes), digest {REPAIR_DIGEST_TORN}",
+            len = fragment.len(),
+        ),
+    )];
     assert_findings(report.findings(), &expected, "R3 acceptance");
     assert_eq!(report.covered_through(), Some(0));
 }
@@ -827,19 +821,16 @@ fn r3b_acceptance_trailing_gap_after_higher_coverage_stays_torn_write() {
     let path = segment_path(&d.0, 0);
     write_bytes(&path, &bytes);
     let report = report_of(vec![path.clone()], trust_fixture());
-    let expected = vec![
-        Finding::new(
-            K::TornWrite,
-            Some(path),
-            Some(4),
-            None,
-            format!(
-                "trailing gap lines 4..=4 ({len} bytes), digest {REPAIR_DIGEST_TORN}",
-                len = fragment.len(),
-            ),
-        )
-        .with_pin(Some(2), repair_digest(fragment)),
-    ];
+    let expected = vec![Finding::new(
+        K::TornWrite,
+        Some(path),
+        Some(4),
+        None,
+        format!(
+            "trailing gap lines 4..=4 ({len} bytes), digest {REPAIR_DIGEST_TORN}",
+            len = fragment.len(),
+        ),
+    )];
     assert_findings(report.findings(), &expected, "R3b acceptance");
     assert_eq!(report.covered_through(), Some(2));
 }

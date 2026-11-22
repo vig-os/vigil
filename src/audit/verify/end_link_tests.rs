@@ -159,9 +159,6 @@ const MMR_SIZE3_CP3_DECL_ROOT: &str =
 /// L10b's archive segment (pure `blake3` of the fragment bytes).
 /// Deterministic from the literal bytes.
 const FRAG_DIGEST: &str = "blake3:daa66297760aa0b9be67217331423472d1a024221fa3ca757297891a741866ff";
-/// Hex-only form of [`FRAG_DIGEST`], used with `hex_to_bytes_32`
-/// to build the trailing `TornWrite`'s internal `with_pin` input.
-const FRAG_DIGEST_HEX: &str = "daa66297760aa0b9be67217331423472d1a024221fa3ca757297891a741866ff";
 /// Hex of the run digest emitted on the L10b `SegmentStructure`
 /// finding at the archive segment -- the classifier's accumulated
 /// digest over the sealed archive plus the trailing fragment, with
@@ -1030,8 +1027,7 @@ fn l10_torn_write_before_end_opening_carries_no_crash_outcome() {
             Some(4),
             None,
             format!("trailing gap lines 4..=4 (4 bytes), digest {FRAG_DIGEST}; no crash outcome"),
-        )
-        .with_pin(Some(2), hex_to_bytes_32(FRAG_DIGEST_HEX)),
+        ),
         Finding::new(
             K::Unparsable,
             Some(segment),
@@ -1095,8 +1091,7 @@ fn l10b_torn_write_before_end_with_resume_line_has_no_mark() {
             Some(4),
             None,
             format!("trailing gap lines 4..=4 (4 bytes), digest {FRAG_DIGEST}"),
-        )
-        .with_pin(Some(2), hex_to_bytes_32(FRAG_DIGEST_HEX)),
+        ),
         Finding::new(
             K::Unparsable,
             Some(segment),

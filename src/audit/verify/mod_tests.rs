@@ -18,8 +18,13 @@ fn report_and_finding_accessors() {
     assert_eq!(f.detail(), "expected versus found");
     assert_eq!(f.accepted_kind(), None);
     assert_eq!(f.run_digest(), None);
-    let f = finding(FindingKind::Accepted).accepted(FindingKind::TornWrite);
+    let f = finding(FindingKind::TornWrite).accepted("alice", "reviewed");
+    assert_eq!(f.kind(), FindingKind::Accepted);
     assert_eq!(f.accepted_kind(), Some(FindingKind::TornWrite));
+    assert_eq!(
+        f.detail(),
+        "accepted by alice: reviewed; was: expected versus found"
+    );
     assert_eq!(f.run_digest(), None);
     let f = finding(FindingKind::SegmentStructure).with_run_digest([7; 32]);
     assert_eq!(f.run_digest(), Some([7; 32]));
@@ -40,8 +45,10 @@ fn report_and_finding_accessors() {
 }
 #[test]
 #[should_panic]
-fn accepted_requires_correct_kind() {
-    finding(FindingKind::TornWrite).accepted(FindingKind::TornWrite);
+fn accepted_refuses_double_promotion() {
+    finding(FindingKind::TornWrite)
+        .accepted("alice", "once")
+        .accepted("bob", "twice");
 }
 #[test]
 #[should_panic]
@@ -169,7 +176,10 @@ fn is_strict_valid_rejects_errors_warnings_uncovered_tail_and_unreconciled() {
         None,
         None,
         None,
-        vec![finding(Accepted).accepted(TornWrite), finding(TornWrite)],
+        vec![
+            finding(TornWrite).accepted("alice", "r"),
+            finding(TornWrite),
+        ],
     );
     assert!(!r.is_strict_valid());
 }

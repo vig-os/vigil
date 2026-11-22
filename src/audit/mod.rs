@@ -410,7 +410,13 @@ pub enum FindingKind {
     ReceiptMismatch,
     /// Error: The following record does not attest the fragment gap.
     RepairMismatch,
-    /// Error: A review does not match its record, gap or run digest.
+    /// Error: A review does not match its record or gap (see
+    /// [`Verifier::accept`](crate::audit::Verifier::accept)).
+    /// Unlocated at `seq`. Detail:
+    /// `accept <Kind> seq <s> hash blake3:<64 hex>: <tail>`,
+    /// where `<tail>` is `no record`, `seq is forked`,
+    /// `hash differs (record blake3:<64 hex>)` or
+    /// `no crash outcome`.
     AcceptMismatch,
     /// Warning: A fragment gap whose attesting record is not a record
     /// of the verified trail, is at a `seq` carrying a `SeqConflict`
@@ -426,6 +432,10 @@ pub enum FindingKind {
     /// for an attested-but-uncovered gap, or
     /// `trailing gap lines {first}..={last} ({N} bytes), digest {D}`
     /// with an optional `; no crash outcome` suffix for a trailing gap.
+    /// Only a trailing gap with at least one complete record
+    /// before it can be accepted by
+    /// [`Verifier::accept`](crate::audit::Verifier::accept)
+    /// (ruling 13-V8-d1 point 5).
     TornWrite,
     /// Warning: An operator resumed the trail after a loss. One
     /// finding per distinct `(resume_seq, resume_hash)` on the
@@ -506,9 +516,15 @@ pub enum FindingKind {
     /// native or shipped `audit.repaired` record with no preceding
     /// fragment carries the `fragment not present` detail.
     TornWriteRepaired,
-    /// Info: A reviewer accepted a warning or a run finding.
+    /// Info: One honest warning cleared by a recorded human
+    /// sign-off (see [`Verifier::accept`](crate::audit::Verifier::accept)).
+    /// The finding keeps the original location and `seq`;
+    /// [`Finding::accepted_kind`] returns the original kind.
+    /// Detail: `accepted by <by>: <reason>; was: <original detail>`.
     Accepted,
-    /// Info: A review matched no warning.
+    /// Info: An `accept` line matched the record but no warning.
+    /// Unlocated at `seq`. Detail:
+    /// `accept <Kind> seq <s> hash blake3:<64 hex>: no matching warning`.
     AcceptUnused,
     /// Info: A receipt, waiver,
     /// [`receipts_from`](crate::audit::Verifier::receipts_from),

@@ -94,6 +94,10 @@ fn failed_fragment_lines(input: &Input) -> BTreeSet<u64> {
 /// covered_through` or a matching `end=` covers it (its `seq <=
 /// matched_end`). A trailing gap with no attesting record and
 /// `RepairMismatch` are never promoted.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "engine-side state needs review::TornWritePins alongside the five scalars"
+)]
 fn file_findings(
     input: &Input,
     no_crash: bool,
@@ -102,6 +106,7 @@ fn file_findings(
     trail: [u8; 16],
     conflicting_seqs: &BTreeSet<u64>,
     findings: &mut Vec<Finding>,
+    pins: &mut review::TornWritePins,
 ) {
     let data = &input.data;
     let path = input.path.as_path();
@@ -209,15 +214,21 @@ fn file_findings(
             s.len,
             digest_string(&s.digest)
         );
-        // Ruling 13-V8-d1 points 2 and 5 (ADR-0005 decision 11
-        // "What pins each kind"): the pin is the `seq` of the last
-        // complete record before the gap in its file plus the gap
-        // digest; `u64::MAX` marks a file-start gap with no record
-        // before it (FORK 3), so the pin's `seq` is `None` and no
-        // `accept TornWrite` line can match it.
-        let pin_seq = (s.after != u64::MAX).then_some(s.after);
-        findings
-            .push(finding(K::TornWrite, path, Some(first), None, d).with_pin(pin_seq, s.digest));
+        // ADR-0005 decision 11 "What pins each kind"; ruling
+        // 13-V8-d1 points 2 and 5: pin the trailing gap for the
+        // review pass in a side map keyed by this finding's index.
+        // `u64::MAX` marks a file-start gap (FORK 3), so `seq` is
+        // `None` and no `accept TornWrite` can match it.
+        let idx = findings.len();
+        findings.push(finding(K::TornWrite, path, Some(first), None, d));
+        pins.insert(
+            idx,
+            review::TornWritePin {
+                seq: (s.after != u64::MAX).then_some(s.after),
+                hash: s.digest,
+                no_crash,
+            },
+        );
     }
 }
 
@@ -384,12 +395,8 @@ pub(super) struct Policy<'a> {
     /// `Some(inputs)` turns it on. Every bundle carries raw blake3
     /// bytes so no hex parsing lives in `engine::check`.
     pub(super) receipts: Option<&'a receipts::Inputs<'a>>,
-    /// Review-file `accept` lines (ADR-0005 decision 11 "Review
-    /// file"; ruling 13-V8-d1). Grouped by `seq` so the review pass
-    /// runs in `seq` order; each inner vec holds one entry per
-    /// kind at that `seq` and the registration check refuses two
-    /// lines for one `(kind, seq)`. See
-    /// [`crate::audit::Verifier::accept`] for the pin semantics.
+    /// Review-file `accept` lines; see
+    /// [`crate::audit::Verifier::accept`].
     pub(super) accepts: &'a super::AcceptMap,
     pub(super) now: SystemTime,
 }
@@ -565,6 +572,7 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         &position,
         &mut findings,
     );
+    let mut torn_write_pins = review::TornWritePins::new();
     for (idx, input) in collection.inputs.iter().enumerate() {
         let no_crash = mark_no_crash(&collection, idx);
         file_findings(
@@ -575,6 +583,7 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
             trail,
             &conflicting_seqs,
             &mut findings,
+            &mut torn_write_pins,
         );
         if input.native
             && input
@@ -787,6 +796,12 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // `Resumed`) so same-key tie-break order is preserved across
     // moves of `fold::check_runs`.
     findings.append(&mut fold_findings);
+    // ADR-0005 decision 11 "Review file"; ruling 13-V8-d1 points
+    // 2, 6 and 8: phase 1 classifies each `accept` line through
+    // the position classifier, before `count_lost_records` runs,
+    // so an `accept` inside a confirmed resume gap is counted by
+    // that gap's `lost_records=<n>` (decision 5).
+    let remaining_accepts = review::classify_positions(accepts, &position, &mut findings);
     // Ruling 13-V7-d1 point 8: for each gap in the classifier's
     // list, count the `LostRecord` findings whose `seq` lies in
     // that gap's range, keyed by the gap's resume `(seq, hash)`.
@@ -796,17 +811,13 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // and its `Resumed` detail keeps `lost_records=0`.
     let lost_counts = count_lost_records(&findings, &gaps);
     emit_resumed(&declarations, &lost_counts, &mut findings);
-    // ADR-0005 decision 11 "Review file"; ruling 13-V8-d1: match
-    // each `accept` line against the reported warnings once every
-    // warning is in `findings` (TornWrite, Resumed, ClockWentBackwards
-    // and DuplicateRecord). The shared classifier and the receipt
-    // match rule stay the single owners of set-aside, LostRecord,
-    // no-record and forked-seq (ruling 13-V8-d1 points 2, 6 and 8).
-    review::check(
-        accepts,
+    // Phase 2: match each remaining `accept` against the reported
+    // warnings and the record at its `seq` (ruling 13-V8-d1).
+    review::match_warnings(
+        &remaining_accepts,
         &groups,
         &conflicting_seqs,
-        &position,
+        &torn_write_pins,
         &mut findings,
     );
     let first_seq = groups.first_key_value().map(|(&s, _)| s);
