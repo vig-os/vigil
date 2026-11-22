@@ -7,7 +7,7 @@ use super::{
     AcceptEntry, AcceptMap, AcceptRunEntry, AcceptRunMap, Finding, fold::RunIndexEntry,
     position::Classifier, receipts,
 };
-use crate::audit::{Checkpoint, FindingKind as K, digest_string};
+use crate::audit::{FindingKind as K, digest_string};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -157,21 +157,19 @@ fn run_subject(seq: u64, hash: &[u8; 32]) -> String {
 }
 
 /// Phase 1 for `accept-run` (pre-count): set aside each line
-/// through the position classifier, with the ruling 13-V8-d1
-/// point 8 override -- an `accept-run` line is set aside under the
-/// start rule when a run in the index closes at the accepted
-/// start, the line's `seq` is that run's resume record, and its
-/// hash matches that resume. The whole run then lies below the
-/// start, so the resume record's own in-range `seq` does not save
-/// the line. No other line uses the override: a plain `start+1`
-/// line whose run does not close at the start (or where the hash
-/// differs) falls through to normal matching, where it either
-/// matches a run above the start or reports `AcceptMismatch`. The
+/// through the position classifier. The ruling 13-V8-d1 point 8
+/// override (clarification 13-V8-d1a) lives on the classifier: it
+/// fires exactly when an accepted start exists, the line's `seq`
+/// is the start's `seq + 1`, and the verified set holds at that
+/// `seq` one unforked `vigil.audit.resume` record whose hash
+/// matches the line's and whose opening is the start. The run
+/// that line closes then lies wholly below the start and is never
+/// in the run index, so the decision never touches it. Every other
+/// line falls through to normal matching, where it either matches
+/// a run above the start or reports `AcceptMismatch`. The
 /// remaining `(seq, entry)` pairs go to [`match_runs`].
 pub(super) fn classify_run_positions<'a>(
     accepts_run: &'a AcceptRunMap,
-    start: Option<&Checkpoint>,
-    runs: &[RunIndexEntry],
     position: &Classifier,
     findings: &mut Vec<Finding>,
 ) -> RemainingRuns<'a> {
@@ -179,12 +177,7 @@ pub(super) fn classify_run_positions<'a>(
     for (&seq, entry) in accepts_run {
         let (hash, _, _, _) = entry;
         let subject = run_subject(seq, hash);
-        let run_closes_at_start = start.is_some_and(|s| {
-            runs.iter().any(|r| {
-                r.closing_opening_seq == s.seq() && r.resume_seq == seq && r.resume_hash == *hash
-            })
-        });
-        if let Some(f) = position.set_aside_for_accept_run(seq, &subject, run_closes_at_start) {
+        if let Some(f) = position.set_aside_for_accept_run(seq, *hash, &subject) {
             findings.push(f);
         } else if let Some(f) = position.lost_record(seq, &subject) {
             findings.push(f);

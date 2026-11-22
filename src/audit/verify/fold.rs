@@ -101,10 +101,6 @@ pub(super) struct RunIndexEntry {
     /// the verified trail in the closer segment's input).
     pub(super) resume_seq: u64,
     pub(super) resume_hash: [u8; 32],
-    /// `seq` of the closing opening checkpoint. The closing
-    /// opening's own `MmrMismatch` is never accepted (ADR-0005
-    /// decision 11).
-    pub(super) closing_opening_seq: u64,
     /// Native segment paths of the run's own segments
     /// (`first_segment..last_segment`, EXCLUDING the closer, which
     /// is the next run's first segment: ruling 13-V4-d9). Items 1
@@ -285,7 +281,6 @@ fn build_run_index_entry(
     Some(RunIndexEntry {
         resume_seq: resume.seq,
         resume_hash: resume.hash,
-        closing_opening_seq: closing.seq,
         segment_paths,
         first_loss_seq,
         loss_ranges,

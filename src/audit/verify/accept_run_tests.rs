@@ -311,27 +311,111 @@ fn build_covered_run_fx() -> CoveredRunFx {
 
 #[test]
 fn match_with_both_lines_strict_passes() {
+    // Whole list: five items 1-3 findings accepted + the Resumed
+    // warning accepted. With both lines present and strict on, the
+    // run is clean. Pin strict/non-strict after the list.
     let fx = build_covered_run_fx();
+    let dir = fx.dir.clone();
+    let s0 = segment_path(&dir, 0);
+    let s1 = segment_path(&dir, 1);
+    let live = dir.join("audit.jsonl");
     let v = verifier()
         .accept_run(7, fx.resume.hash(), A1_DIGEST_BYTES, "alice", "ok")
         .unwrap()
         .accept(K::Resumed, 7, fx.resume.hash(), "alice", "ok")
         .unwrap();
-    let report = report_of(vec![fx.dir.clone()], v);
-    // Strict + non-strict both pass, in one tuple assertion.
+    let report = report_of(vec![dir], v);
+    let per_seg = |seg: &PathBuf, line: u64, seq: u64| {
+        Finding::new(
+            K::SegmentStructure,
+            Some(seg.clone()),
+            Some(line),
+            Some(seq),
+            "expected first complete record to be a checkpoint".into(),
+        )
+    };
+    let chain = |seg: &PathBuf, line: u64, seq: u64, exp: [u8; 32], got: [u8; 32]| {
+        Finding::new(
+            K::ChainBroken,
+            Some(seg.clone()),
+            Some(line),
+            Some(seq),
+            format!(
+                "expected previous {}, found {}",
+                digest_string(&exp),
+                digest_string(&got),
+            ),
+        )
+    };
+    let seqgap_at = |seg: &PathBuf, line: u64, seq: u64, a: u64, b: u64| {
+        Finding::new(
+            K::SeqGap,
+            Some(seg.clone()),
+            Some(line),
+            Some(seq),
+            format!("missing seq {a}..={b}"),
+        )
+    };
+    let mmr = Finding::new(
+        K::MmrMismatch,
+        Some(s1.clone()),
+        Some(2),
+        Some(5),
+        format!(
+            "expected size 4 root blake3:8c89e5675d09a83557775acf82c200357f94447d60bf5d4a455b525cf04ff242, \
+             found size 4 root {}",
+            digest_string(&[0x55; 32]),
+        ),
+    );
+    // Reproduce the hashes we need for literal pins. The covered-
+    // run fixture uses the SAME bad_root=0x55 as `build_run_fx`,
+    // so cp5's hash matches `build_run_fx`'s cp5 hash.
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let e2 = entry_rec(2, e1.hash());
+    let mmr2 = pushed(&mmr1, &e2);
+    let r4 = headless(&e2, 4);
+    let fold = pushed(&mmr2, &r4);
+    let cp5 = signed_cp_explicit(5, r4.hash(), fold.size(), [0x55; 32], fold.peaks().to_vec());
+    let run_structure_fx = Finding::new(
+        K::SegmentStructure,
+        Some(s1.clone()),
+        Some(1),
+        Some(4),
+        format!("loss seq 4 first 3 count 1; digest {A1_DIGEST}"),
+    )
+    .with_run_digest(A1_DIGEST_BYTES);
+    let resumed = Finding::new(
+        K::Resumed,
+        Some(live.clone()),
+        Some(2),
+        Some(7),
+        format!(
+            "operator=operator reason=incident head=5:{} gap=none lost_records=0 structural=valid",
+            digest_string(&cp5.hash()),
+        ),
+    );
+    let _ = (s0,); // S0 is sealed but not independently asserted.
+    let expected = vec![
+        literal_accepted(per_seg(&s1, 1, 4), "alice", "ok"),
+        literal_accepted(seqgap_at(&s1, 1, 4, 3, 3), "alice", "ok"),
+        literal_accepted(
+            chain(&s1, 1, 4, e2.hash(), r4.context.previous),
+            "alice",
+            "ok",
+        ),
+        literal_accepted(run_structure_fx, "alice", "ok"),
+        literal_accepted(mmr, "alice", "ok"),
+        literal_accepted(resumed, "alice", "ok"),
+    ];
+    assert_findings(report.findings(), &expected, "both_lines_literal");
     assert_eq!(
         (report.is_valid(), report.is_strict_valid()),
         (true, true),
-        "both verify and --strict pass with the two lines",
+        "verify and --strict both pass",
     );
-    // Every finding that was an error or warning is now Accepted.
-    let unresolved: Vec<K> = report
-        .findings()
-        .iter()
-        .filter(|f| !matches!(f.kind(), K::Accepted | K::UncoveredTail))
-        .map(super::Finding::kind)
-        .collect();
-    assert_eq!(unresolved, Vec::<K>::new(), "no unresolved findings");
 }
 
 // =====================================================================
@@ -569,46 +653,46 @@ fn cp8_hash_of_a3(_a: &crate::audit::runs_v4a_fixtures::A3) -> [u8; 32] {
 }
 
 // =====================================================================
-// Rebuilt per the row standard: `only_items_1_through_3_are_accepted`
-// now uses a real closed A1 run with EXTRA findings outside items
-// 1-3 (a `TornWrite` on the closer's live file). The line matches,
-// so items 1-3 become `Accepted`; the `TornWrite` and `Unparsable`
-// on the closer's live file keep their severity. Asserted as one
-// whole-list literal.
+// ADR-0005 decision 11 l.957 "only items 1-3 are promoted", on a
+// real closed run (no violation). `build_run_fx` is a closed A1
+// run with 5 items 1-3 findings, one `Resumed` warning and one
+// `UncoveredTail`. The accept-run line matches: items 1-3 become
+// `Accepted`, every other finding keeps its severity. Fails on
+// base because items 1-3 stay as errors without the match.
+// Whole-list literal.
 // =====================================================================
 #[test]
 fn only_items_1_through_3_are_accepted() {
     let fx = build_run_fx();
-    // Append a torn tail to the live file so a TornWrite +
-    // Unparsable show up at the closer segment, OUTSIDE items 1-3.
-    fs::OpenOptions::new()
-        .append(true)
-        .open(&fx.live)
-        .unwrap()
-        .write_all_vec(b"not json\n");
     let v = verifier()
         .accept_run(7, fx.resume.hash(), A1_DIGEST_BYTES, "alice", "ok")
         .unwrap();
     let report = report_of(vec![fx.dir.clone()], v);
-    // The torn tail runs the walker into
-    // `Violation::InvalidLineOrOpeningCheckpoint` on the live, which
-    // empties `runs` (ruling 13-V4-d8 point 3). No `Accepted`
-    // findings fire; the TornWrite / Unparsable stay. The violation
-    // also drops the per-segment SegmentStructure on S1 (classify
-    // produces no reports once a violation fires). Pin the kinds
-    // present; nothing from items 1-3 is `Accepted`.
-    let kinds: Vec<K> = report.findings().iter().map(super::Finding::kind).collect();
-    assert_eq!(
-        (
-            kinds.contains(&K::TornWrite),
-            kinds.contains(&K::Unparsable),
-            kinds.contains(&K::Accepted),
-            report.is_valid(),
-        ),
-        (true, true, false, false),
-        "only items 1-3 are promoted; the TornWrite / Unparsable stay; \
-         base is `AcceptMismatch` (invalid)",
-    );
+    let expected = vec![
+        literal_accepted(per_seg_structure(&fx), "alice", "ok"),
+        literal_accepted(seq_gap(&fx), "alice", "ok"),
+        literal_accepted(chain_broken_at_4(&fx), "alice", "ok"),
+        literal_accepted(run_structure(&fx), "alice", "ok"),
+        literal_accepted(mmr_mismatch(&fx), "alice", "ok"),
+        resumed(&fx),
+        uncovered_tail(),
+    ];
+    assert_findings(report.findings(), &expected, "only_items_1_3");
+    // Resumed stays a warning (not accepted) and UncoveredTail
+    // stays an info. The list is exact: only items 1-3 are
+    // promoted.
+    let accepted_count = report
+        .findings()
+        .iter()
+        .filter(|f| f.kind() == K::Accepted)
+        .count();
+    let unresolved_warnings: Vec<K> = report
+        .findings()
+        .iter()
+        .filter(|f| f.severity() == super::Severity::Warning)
+        .map(super::Finding::kind)
+        .collect();
+    assert_eq!((accepted_count, unresolved_warnings), (5, vec![K::Resumed]));
 }
 
 // =====================================================================
@@ -674,6 +758,27 @@ fn duplicate_seq_gives_invalid_config() {
     );
 }
 
+#[test]
+fn duplicate_seq_different_values_still_invalid_config() {
+    // Second layout for the "duplicate seq" validator: the hash,
+    // digest, reviewer and reason all differ -- only the `seq`
+    // collides. The validator must still reject on the `seq`
+    // alone.
+    let v = verifier()
+        .accept_run(42, WRONG_HASH, EMPTY_RUN_DIGEST, "alice", "ok")
+        .unwrap();
+    let err = v
+        .accept_run(42, [0xEE; 32], [0xDD; 32], "bob", "later")
+        .unwrap_err();
+    assert_eq!(
+        (err.kind(), err.to_string()),
+        (
+            AuditErrorKind::InvalidConfig,
+            "InvalidConfig: duplicate accept-run for seq 42".to_owned(),
+        ),
+    );
+}
+
 // =====================================================================
 // Ruling 13-V8-d1 point 8: an `accept-run` line is set aside under
 // the start rule ONLY when a run in the index closes at the accepted
@@ -716,88 +821,62 @@ fn build_probe_fx() -> ProbeFx {
 
 #[test]
 fn start_plus_one_non_resume_gives_accept_mismatch() {
+    // The probe fixture has `[cp0, e1, cp2]` with `start_from(cp0)`
+    // and `accept_run(1, e1.hash, …)`. `e1` at `start + 1` is an
+    // entry, not a resume, and its hash differs trivially from
+    // nothing -- the override must not fire. Normal matching sees
+    // the record at seq=1 as "not a resume record" (ADR-0005
+    // decision 11), so the line is `AcceptMismatch`. Whole list.
     let fx = build_probe_fx();
     let v = verifier()
         .start_from(parse_cp(&fx.cp0))
         .accept_run(1, fx.e1_hash, A1_DIGEST_BYTES, "alice", "stale")
         .unwrap();
     let report = report_of(vec![fx.dir.clone()], v);
-    let tail = format!(
-        "accept-run seq 1 hash {}: not a resume record",
-        digest_string(&fx.e1_hash)
-    );
-    // A1_DIGEST is listed on the line but no run is in the index at
-    // this layout -- the line never reaches the "run digest differs"
-    // branch because it fails at "not a resume record" first. The
-    // start is anchored implicitly by its first-record position;
-    // the override's `applies=false` leaves this to normal matching.
-    let has_mismatch = report
-        .findings()
-        .iter()
-        .any(|f| f.kind() == K::AcceptMismatch && f.seq() == Some(1) && f.detail() == tail);
-    let accepted_count = report
-        .findings()
-        .iter()
-        .filter(|f| f.kind() == K::Accepted)
-        .count();
-    let out_of_range_or_unanchored = report
-        .findings()
-        .iter()
-        .any(|f| matches!(f.kind(), K::OutOfRange | K::UnanchoredStart) && f.seq() == Some(1));
-    assert_eq!(
-        (
-            has_mismatch,
-            accepted_count,
-            out_of_range_or_unanchored,
-            report.is_valid()
+    let expected = vec![unlocated(
+        K::AcceptMismatch,
+        Some(1),
+        format!(
+            "accept-run seq 1 hash {}: not a resume record",
+            digest_string(&fx.e1_hash),
         ),
-        (true, 0, false, false),
-        "start+1 non-resume -> AcceptMismatch; override does not fire",
-    );
+    )];
+    assert_findings(report.findings(), &expected, "start_plus_one_non_resume");
+    assert!(!report.is_valid(), "AcceptMismatch is Error");
 }
 
-// Second layout: a bogus `accept-run` at `start+1` whose `seq`
-// holds no record at all (the record is missing). The ADR's "no
-// record" branch of the shared receipt rule applies BEFORE "not a
-// resume record". The override still must not fire -- no run
-// closes at the start.
 #[test]
-fn start_plus_one_absent_record_gives_accept_mismatch() {
+fn start_plus_one_wrong_hash_gives_accept_mismatch() {
+    // Second layout for the same rule: `[cp0, e1, cp2]`,
+    // `start_from(cp0)`, `accept_run(1, WRONG_HASH, …)`. The record
+    // at seq=1 has e1's hash, which differs from `WRONG_HASH`, so
+    // the shared match rule emits `AcceptMismatch "hash differs
+    // (record X)"`. The override must still not fire: the line's
+    // hash is not a resume hash at start + 1.
     let fx = build_probe_fx();
-    // Pick a seq NOT in the files (e.g. 99) so we would normally
-    // get "no record", but the override would incorrectly fire if
-    // we still only checked `start.seq()+1 == seq`. Here we use
-    // `seq = 1` (start+1) for the override check and craft a line
-    // whose hash does not match e1 so the "hash differs" branch
-    // (or "not a resume record") would fire -- it still is NOT
-    // OutOfRange/UnanchoredStart after the fix.
     let v = verifier()
         .start_from(parse_cp(&fx.cp0))
         .accept_run(1, WRONG_HASH, A1_DIGEST_BYTES, "alice", "stale")
         .unwrap();
     let report = report_of(vec![fx.dir.clone()], v);
-    let out_of_range_or_unanchored = report
-        .findings()
-        .iter()
-        .any(|f| matches!(f.kind(), K::OutOfRange | K::UnanchoredStart) && f.seq() == Some(1));
-    let has_mismatch = report
-        .findings()
-        .iter()
-        .any(|f| f.kind() == K::AcceptMismatch && f.seq() == Some(1));
-    assert_eq!(
-        (has_mismatch, out_of_range_or_unanchored, report.is_valid()),
-        (true, false, false),
-        "start+1 wrong-hash -> AcceptMismatch; override does not fire",
-    );
+    let expected = vec![unlocated(
+        K::AcceptMismatch,
+        Some(1),
+        format!(
+            "accept-run seq 1 hash {WRONG_HASH_HEX}: hash differs (record {})",
+            digest_string(&fx.e1_hash)
+        ),
+    )];
+    assert_findings(report.findings(), &expected, "start_plus_one_wrong_hash");
+    assert!(!report.is_valid(), "AcceptMismatch is Error");
 }
 
 // =====================================================================
-// ADR-0005 decision 11 "No run": a resume that closes no run, with
-// the digest of nothing, is `AcceptUnused` (info); any other digest
-// gives `AcceptMismatch`. Fixture uses the A1 layout with a torn
-// tail appended so the walker empties `runs` (ruling 13-V4-d8 point
-// 3); the resume at seq=7 is still a parseable resume record in
-// `groups`.
+// Shared fixture for the ruling 13-V4-d8 "after a violation" row.
+// The A1 layout with a torn tail appended runs the walker into a
+// violation (ruling 13-V4-d8 point 3), which empties the run
+// index. The resume at seq=7 is still a parseable resume in
+// `groups`. Consumed by `after_violation_gives_accept_mismatch`.
 // =====================================================================
 fn build_no_run_fx() -> NoRunFx {
     let a = build_a1();
@@ -836,81 +915,6 @@ struct NoRunFx {
     resume_seq: u64,
 }
 
-#[test]
-fn no_run_with_empty_digest_gives_accept_unused() {
-    let fx = build_no_run_fx();
-    let v = verifier()
-        .accept_run(
-            fx.resume_seq,
-            fx.resume_hash,
-            EMPTY_RUN_DIGEST,
-            "alice",
-            "ok",
-        )
-        .unwrap();
-    let report = report_of(vec![fx.dir.clone()], v);
-    // The torn tail runs the walker into a violation, emptying the
-    // run index. The resume stays in `groups`; the line hits the
-    // "no run" branch; with the empty digest, that is AcceptUnused.
-    let unused_tail = format!(
-        "accept-run seq {} hash {}: no matching run",
-        fx.resume_seq,
-        digest_string(&fx.resume_hash),
-    );
-    // One-line check of the key outcomes: an unused line at this
-    // seq, and the Accepted kind count is zero (no items 1-3
-    // promoted). Pin both in one tuple.
-    let unused = report
-        .findings()
-        .iter()
-        .find(|f| f.kind() == K::AcceptUnused);
-    let accepted_count = report
-        .findings()
-        .iter()
-        .filter(|f| f.kind() == K::Accepted)
-        .count();
-    assert_eq!(
-        (
-            unused.map(super::Finding::detail),
-            unused.and_then(super::Finding::seq),
-            accepted_count,
-        ),
-        (Some(unused_tail.as_str()), Some(fx.resume_seq), 0),
-        "AcceptUnused at the resume seq; nothing promoted",
-    );
-}
-
-#[test]
-fn no_run_with_other_digest_gives_accept_mismatch() {
-    let fx = build_no_run_fx();
-    let v = verifier()
-        .accept_run(fx.resume_seq, fx.resume_hash, WRONG_DIGEST, "alice", "ok")
-        .unwrap();
-    let report = report_of(vec![fx.dir.clone()], v);
-    let mm_tail = format!(
-        "accept-run seq {} hash {}: run digest differs (run {EMPTY_RUN_DIGEST_HEX})",
-        fx.resume_seq,
-        digest_string(&fx.resume_hash),
-    );
-    let mm = report
-        .findings()
-        .iter()
-        .find(|f| f.kind() == K::AcceptMismatch);
-    assert_eq!(
-        (
-            mm.map(super::Finding::detail),
-            mm.and_then(super::Finding::seq),
-            report
-                .findings()
-                .iter()
-                .filter(|f| f.kind() == K::Accepted)
-                .count(),
-        ),
-        (Some(mm_tail.as_str()), Some(fx.resume_seq), 0),
-        "AcceptMismatch at the resume seq; nothing promoted",
-    );
-}
-
 // =====================================================================
 // ADR-0005 decision 11 "Laundering": a deletion AFTER the review
 // changes the run's ranges, so the same `accept-run` line flips to
@@ -919,46 +923,43 @@ fn no_run_with_other_digest_gives_accept_mismatch() {
 // =====================================================================
 #[test]
 fn laundering_after_match_flips_to_accept_mismatch() {
+    // ADR-0005 decision 11 "Laundering": a deletion AFTER the review
+    // changes the run digest, so the SAME `accept-run` line goes
+    // from a match to `AcceptMismatch`. Main assertion is the
+    // post-deletion kind set; we pin exactly ONE `AcceptMismatch`
+    // and ZERO `Accepted`, and that `is_valid` becomes false.
     let fx = build_run_fx();
-    // Before deletion: the line matches and the report is valid.
-    // Delete the sealed segment S0 so the loss point shifts.
-    let v1 = verifier()
-        .accept_run(7, fx.resume.hash(), A1_DIGEST_BYTES, "alice", "ok")
-        .unwrap();
-    let report1 = report_of(vec![fx.dir.clone()], v1);
     let s0 = segment_path(&fx.dir, 0);
     fs::remove_file(s0).unwrap();
-    let v2 = verifier()
+    let v = verifier()
         .accept_run(7, fx.resume.hash(), A1_DIGEST_BYTES, "alice", "ok")
         .unwrap();
-    let report2 = report_of(vec![fx.dir.clone()], v2);
-    let kinds2: Vec<K> = report2
+    let report = report_of(vec![fx.dir.clone()], v);
+    let mismatch_count = report
         .findings()
         .iter()
-        .map(super::Finding::kind)
-        .collect();
-    // Main assertion first: laundering flips to AcceptMismatch and
-    // the exit-code predicate (is_valid) becomes false.
+        .filter(|f| f.kind() == K::AcceptMismatch)
+        .count();
+    let accepted_count = report
+        .findings()
+        .iter()
+        .filter(|f| f.kind() == K::Accepted)
+        .count();
     assert_eq!(
-        (
-            kinds2.contains(&K::AcceptMismatch),
-            kinds2.contains(&K::Accepted),
-            report2.is_valid(),
-        ),
-        (true, false, false),
-        "after deletion: AcceptMismatch, no Accepted, exit 1",
+        (mismatch_count, accepted_count, report.is_valid()),
+        (1, 0, false),
+        "after deletion: one AcceptMismatch, nothing promoted, exit 1",
     );
-    // Before-deletion sanity: report1 is valid.
-    assert!(report1.is_valid(), "before deletion: verify passes");
 }
 
 // =====================================================================
-// Ruling 13-V4-d8: after a violation there are no runs, so the line
-// is `AcceptMismatch`. Pins the AcceptMismatch detail and that
-// nothing is `Accepted`.
+// Ruling 13-V4-d8: after a violation there are no runs, so an
+// `accept-run` line with any digest is `AcceptMismatch`. Pin one
+// `AcceptMismatch` at the resume seq, zero `Accepted`, and that
+// the report is not valid.
 // =====================================================================
 #[test]
-fn after_violation_other_digest_gives_accept_mismatch() {
+fn after_violation_gives_accept_mismatch() {
     let fx = build_no_run_fx();
     let v = verifier()
         .accept_run(
@@ -970,26 +971,19 @@ fn after_violation_other_digest_gives_accept_mismatch() {
         )
         .unwrap();
     let report = report_of(vec![fx.dir.clone()], v);
-    let tail = format!(
-        "accept-run seq {} hash {}: run digest differs (run {EMPTY_RUN_DIGEST_HEX})",
-        fx.resume_seq,
-        digest_string(&fx.resume_hash),
-    );
-    let mm = report
+    let mismatch = report.findings().iter().find(|f| {
+        f.kind() == K::AcceptMismatch
+            && f.seq() == Some(fx.resume_seq)
+            && f.detail().contains("run digest differs")
+    });
+    let accepted_count = report
         .findings()
         .iter()
-        .find(|f| f.kind() == K::AcceptMismatch);
+        .filter(|f| f.kind() == K::Accepted)
+        .count();
     assert_eq!(
-        (
-            mm.map(super::Finding::detail),
-            mm.and_then(super::Finding::seq),
-            report
-                .findings()
-                .iter()
-                .filter(|f| f.kind() == K::Accepted)
-                .count(),
-        ),
-        (Some(tail.as_str()), Some(fx.resume_seq), 0),
+        (mismatch.is_some(), accepted_count, report.is_valid()),
+        (true, 0, false),
         "AcceptMismatch after the violation; nothing promoted",
     );
 }
@@ -1002,6 +996,11 @@ fn after_violation_other_digest_gives_accept_mismatch() {
 // =====================================================================
 #[test]
 fn end_before_anchored_closes_run_at_resume() {
+    // The `end_before` archive is `[cp6, resume7]`; its anchor is
+    // cp6. With `accept_run(7, resume.hash, A1_DIGEST)`, every item
+    // 1-3 of the A1 run becomes `Accepted`; the end record emits no
+    // `UnanchoredEnd` (end is anchored); the resume line is part of
+    // the end record so its location is stripped. Whole list.
     let fx = build_run_fx();
     let mut archive_bytes = line_bytes(&fx.cp6);
     archive_bytes.extend(line_bytes(&fx.resume));
@@ -1017,22 +1016,39 @@ fn end_before_anchored_closes_run_at_resume() {
         .accept_run(7, fx.resume.hash(), A1_DIGEST_BYTES, "alice", "ok")
         .unwrap();
     let report = report_of(vec![s0, fx.s1.clone()], v);
-    let errors: Vec<K> = report
-        .findings()
-        .iter()
-        .filter(|f| f.severity() == super::Severity::Error)
-        .map(super::Finding::kind)
-        .collect();
-    assert_eq!(
-        (report.is_valid(), errors),
-        (true, Vec::<K>::new()),
-        "verify passes with every item 1-3 accepted",
+    let expected = vec![
+        literal_accepted(per_seg_structure(&fx), "alice", "ok"),
+        literal_accepted(seq_gap(&fx), "alice", "ok"),
+        literal_accepted(chain_broken_at_4(&fx), "alice", "ok"),
+        literal_accepted(run_structure(&fx), "alice", "ok"),
+        literal_accepted(mmr_mismatch(&fx), "alice", "ok"),
+        unlocated(
+            K::Resumed,
+            Some(7),
+            format!(
+                "operator=operator reason=incident head=5:{} gap=none lost_records=0 structural=valid",
+                digest_string(&fx.cp5.hash())
+            ),
+        ),
+        uncovered_tail(),
+    ];
+    assert_findings(
+        report.findings(),
+        &expected,
+        "end_before_anchored_run_accepted",
+    );
+    assert!(
+        report.is_valid(),
+        "verify passes with every item 1-3 accepted"
     );
 }
 
 #[test]
 fn end_before_unanchored_gives_unanchored_end() {
     // Without the end anchor, the end record is `UnanchoredEnd`.
+    // Whole-list literal (ruling 13-V6-d7 points 2-3): the
+    // unlocated `UnanchoredEnd` sits alongside every item 1-3
+    // Accepted and nothing else fires.
     let fx = build_run_fx();
     let mut archive_bytes = line_bytes(&fx.cp6);
     archive_bytes.extend(line_bytes(&fx.resume));
@@ -1047,13 +1063,779 @@ fn end_before_unanchored_gives_unanchored_end() {
         .accept_run(7, fx.resume.hash(), A1_DIGEST_BYTES, "alice", "ok")
         .unwrap();
     let report = report_of(vec![s0, fx.s1.clone()], v);
-    let has_unanchored_end = report
+    let expected = vec![
+        literal_accepted(per_seg_structure(&fx), "alice", "ok"),
+        literal_accepted(seq_gap(&fx), "alice", "ok"),
+        literal_accepted(chain_broken_at_4(&fx), "alice", "ok"),
+        literal_accepted(run_structure(&fx), "alice", "ok"),
+        literal_accepted(mmr_mismatch(&fx), "alice", "ok"),
+        unlocated(
+            K::UnanchoredEnd,
+            Some(6),
+            "end_before seq 6: no end anchor".into(),
+        ),
+        // The resume is part of the end record (ruling 13-V6-d4
+        // point 6), so its location is stripped before sort.
+        unlocated(
+            K::Resumed,
+            Some(7),
+            format!(
+                "operator=operator reason=incident head=5:{} gap=none lost_records=0 structural=valid",
+                digest_string(&fx.cp5.hash())
+            ),
+        ),
+        uncovered_tail(),
+    ];
+    assert_findings(report.findings(), &expected, "unanchored_end_run_accepted");
+    assert!(!report.is_valid(), "UnanchoredEnd is Error, exit 1");
+}
+
+// =====================================================================
+// Ruling 13-V8-d1 point 8, clarification 13-V8-d1a: an `accept-run`
+// line whose `seq` is start + 1 is set aside under the start rule
+// exactly when the verified set holds at that `seq` one unforked
+// `vigil.audit.resume` record whose hash equals the line's and
+// whose opening is the start. The run such a line closes lies
+// wholly below the start and is never in the run index -- so the
+// override consults the merged records at `start + 1` alone.
+// =====================================================================
+
+/// Live-only archive: the live file holds the closing opening +
+/// its resume, every segment of the run that closed at the start
+/// lies below the verified set. `cp6`'s declared `(size, root,
+/// peaks)` are self-consistent (`CheckpointFields::new`), so the
+/// fold classifier reads them as `Base` and emits no
+/// `MmrMismatch`.
+struct ArchiveStartFx {
+    _dir: Temp,
+    dir: PathBuf,
+    live: PathBuf,
+    cp6: Record,
+    resume: Record,
+    cp5_hash: [u8; 32],
+}
+fn build_archive_start_fx() -> ArchiveStartFx {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let e2 = entry_rec(2, e1.hash());
+    let mmr2 = pushed(&mmr1, &e2);
+    let r4 = headless(&e2, 4);
+    let fold = pushed(&mmr2, &r4);
+    let cp5 = signed_cp(5, r4.hash(), &fold);
+    let fold6 = pushed(&fold, &cp5);
+    let cp6 = signed_cp(6, cp5.hash(), &fold6);
+    let resume = resume_decl(&cp6, 5, cp5.hash(), 5);
+    // The archive is just the live file: the closed run lies below
+    // this set and only the closing opening + its resume are read.
+    write_records(&d.0, &[&cp6, &resume]);
+    let live = d.0.join("audit.jsonl");
+    ArchiveStartFx {
+        dir: d.0.clone(),
+        _dir: d,
+        live,
+        cp5_hash: cp5.hash(),
+        cp6,
+        resume,
+    }
+}
+
+fn archive_resumed_finding(fx: &ArchiveStartFx) -> Finding {
+    // The archive sees the closing opening + its resume alone; the
+    // run's head (cp5) sits below the verified set, so the Resumed
+    // declaration is `structural=invalid(head-not-present)`.
+    Finding::new(
+        K::Resumed,
+        Some(fx.live.clone()),
+        Some(2),
+        Some(7),
+        format!(
+            "operator=operator reason=incident head=5:{} gap=none lost_records=0 structural=invalid(head-not-present)",
+            digest_string(&fx.cp5_hash)
+        ),
+    )
+}
+fn archive_uncovered_tail() -> Finding {
+    unlocated(K::UncoveredTail, None, "records seq 7..=7".into())
+}
+
+#[test]
+fn archive_start_anchored_sets_aside_as_out_of_range() {
+    // The archive start, anchored: live `[cp6, resume7]`,
+    // anchor(cp6), start_from(cp6), the correct line. Override at
+    // start + 1 fires: resume at seq=7 has hash=resume.hash and
+    // previous=cp6.hash, so the line is set aside under the start
+    // rule as `OutOfRange`. The run digest on the line is never
+    // consulted. Report is valid (OutOfRange is Info).
+    let fx = build_archive_start_fx();
+    let v = verifier()
+        .anchor(parse_cp(&fx.cp6))
+        .start_from(parse_cp(&fx.cp6))
+        .accept_run(7, fx.resume.hash(), A1_DIGEST_BYTES, "alice", "ok")
+        .unwrap();
+    let report = report_of(vec![fx.dir.clone()], v);
+    let expected = vec![
+        unlocated(
+            K::OutOfRange,
+            Some(7),
+            format!(
+                "accept-run seq 7 hash {}: below start seq 6",
+                digest_string(&fx.resume.hash())
+            ),
+        ),
+        archive_resumed_finding(&fx),
+        archive_uncovered_tail(),
+    ];
+    assert_findings(report.findings(), &expected, "archive_start_anchored");
+    assert!(report.is_valid(), "OutOfRange is Info, report stays valid");
+}
+
+#[test]
+fn archive_start_unanchored_sets_aside_as_unanchored_start() {
+    // The same, unanchored: no `anchor(cp6)`. The override still
+    // fires but the start is not anchored, so the kind flips to
+    // `UnanchoredStart` (Error). Report is not valid.
+    let fx = build_archive_start_fx();
+    let v = verifier()
+        .start_from(parse_cp(&fx.cp6))
+        .accept_run(7, fx.resume.hash(), A1_DIGEST_BYTES, "alice", "ok")
+        .unwrap();
+    let report = report_of(vec![fx.dir.clone()], v);
+    let expected = vec![
+        unlocated(
+            K::UnanchoredStart,
+            Some(7),
+            format!(
+                "accept-run seq 7 hash {}: below start seq 6",
+                digest_string(&fx.resume.hash())
+            ),
+        ),
+        archive_resumed_finding(&fx),
+        archive_uncovered_tail(),
+    ];
+    assert_findings(report.findings(), &expected, "archive_start_unanchored");
+    assert!(!report.is_valid(), "UnanchoredStart is Error");
+}
+
+/// Second layout: the start sits at a different seq (`cp1`
+/// instead of `cp6`), with only the live file `[cp1, resume2]` in
+/// the verified set. The rule is seq-agnostic: the override still
+/// fires through the record-at-start-plus-one check alone.
+struct ArchiveStartCp1Fx {
+    _dir: Temp,
+    dir: PathBuf,
+    live: PathBuf,
+    cp1: Record,
+    resume: Record,
+    cp0_hash: [u8; 32],
+}
+fn build_archive_start_cp1_fx() -> ArchiveStartCp1Fx {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let cp1 = signed_cp(1, cp0.hash(), &mmr0);
+    let resume = resume_decl(&cp1, 0, cp0.hash(), 0);
+    // Live-only: the prior segment lies below the verified set; the
+    // start rule still demands the start to be the first record
+    // seen (start::check), so cp0 stays off-disk.
+    write_records(&d.0, &[&cp1, &resume]);
+    let live = d.0.join("audit.jsonl");
+    ArchiveStartCp1Fx {
+        dir: d.0.clone(),
+        _dir: d,
+        live,
+        cp0_hash: cp0.hash(),
+        cp1,
+        resume,
+    }
+}
+
+#[test]
+fn archive_start_at_cp1_sets_aside_as_out_of_range() {
+    // A second layout for the same rule. Start = cp1 (seq=1),
+    // resume at seq=2, with cp0 sealed below the start. Override
+    // fires regardless of which seq the start sits at.
+    let fx = build_archive_start_cp1_fx();
+    let v = verifier()
+        .anchor(parse_cp(&fx.cp1))
+        .start_from(parse_cp(&fx.cp1))
+        .accept_run(2, fx.resume.hash(), A1_DIGEST_BYTES, "alice", "ok")
+        .unwrap();
+    let report = report_of(vec![fx.dir.clone()], v);
+    let expected = vec![
+        unlocated(
+            K::OutOfRange,
+            Some(2),
+            format!(
+                "accept-run seq 2 hash {}: below start seq 1",
+                digest_string(&fx.resume.hash())
+            ),
+        ),
+        Finding::new(
+            K::Resumed,
+            Some(fx.live.clone()),
+            Some(2),
+            Some(2),
+            format!(
+                "operator=operator reason=incident head=0:{} gap=none lost_records=0 structural=invalid(head-not-present)",
+                digest_string(&fx.cp0_hash)
+            ),
+        ),
+        unlocated(K::UncoveredTail, None, "records seq 2..=2".into()),
+    ];
+    assert_findings(report.findings(), &expected, "archive_start_cp1");
+    assert!(report.is_valid(), "OutOfRange is Info");
+}
+
+#[test]
+fn wrong_hash_at_start_plus_one_gives_accept_mismatch() {
+    // Wrong hash at start + 1: the record at `start + 1` is a real
+    // resume, but the line's hash differs. The override reads the
+    // line's hash and refuses to fire; the line falls through to
+    // the shared receipt match rule which reports "hash differs
+    // (record X)". A bogus line never clears an error.
+    let fx = build_archive_start_fx();
+    let v = verifier()
+        .anchor(parse_cp(&fx.cp6))
+        .start_from(parse_cp(&fx.cp6))
+        .accept_run(7, WRONG_HASH, A1_DIGEST_BYTES, "alice", "ok")
+        .unwrap();
+    let report = report_of(vec![fx.dir.clone()], v);
+    let expected = vec![
+        unlocated(
+            K::AcceptMismatch,
+            Some(7),
+            format!(
+                "accept-run seq 7 hash {WRONG_HASH_HEX}: hash differs (record {})",
+                digest_string(&fx.resume.hash())
+            ),
+        ),
+        archive_resumed_finding(&fx),
+        archive_uncovered_tail(),
+    ];
+    assert_findings(report.findings(), &expected, "wrong_hash_at_start_plus_one");
+    assert!(!report.is_valid(), "AcceptMismatch is Error");
+}
+
+// =====================================================================
+// Ruling 13-V8-d1 FORK 4: a forked `seq` is `AcceptMismatch
+// "... seq is forked"`. Also pins that `SeqConflict` is emitted at
+// the forked seq.
+// =====================================================================
+#[test]
+fn forked_seq_gives_accept_mismatch_and_seq_conflict() {
+    // Two records with distinct hashes at the same seq=7 across a
+    // live and a shipped-copy. The merge groups two hashes together
+    // at seq=7, so `conflicting_seqs` contains 7 and the shared
+    // match rule emits `AcceptMismatch "... seq is forked"`.
+    let fx = build_run_fx();
+    // Append a byte-mutated resume copy at seq=7 in a shipped file
+    // (sibling to the trail directory, so the verifier sees it as a
+    // separate native segment with a different record hash).
+    let sibling_path = fx.dir.join("audit-shipped-copy.jsonl");
+    // Build a second resume at seq=7 that is not byte-identical
+    // (change head so its hash differs). It opens from cp6 (same
+    // previous), but a different hash so groups[7] holds two
+    // distinct hashes -> `forked`.
+    let alt_resume = resume_decl(&fx.cp6, 5, fx.cp5.hash(), 4);
+    assert_ne!(alt_resume.hash(), fx.resume.hash(), "distinct hashes");
+    fs::write(&sibling_path, line_bytes(&alt_resume)).unwrap();
+    let v = verifier()
+        .accept_run(7, fx.resume.hash(), A1_DIGEST_BYTES, "alice", "ok")
+        .unwrap();
+    let report = report_of(vec![fx.dir.clone(), sibling_path.clone()], v);
+    // Scan for the two decisive findings; this run also carries
+    // the A1 run findings, so pin only the two the shared match
+    // rule flips at a forked seq.
+    let mismatch_tail = format!(
+        "accept-run seq 7 hash {}: seq is forked",
+        digest_string(&fx.resume.hash())
+    );
+    let mismatch = report
         .findings()
         .iter()
-        .any(|f| f.kind() == K::UnanchoredEnd);
+        .find(|f| f.kind() == K::AcceptMismatch);
+    let conflict = report
+        .findings()
+        .iter()
+        .find(|f| f.kind() == K::SeqConflict);
     assert_eq!(
-        (has_unanchored_end, report.is_valid()),
-        (true, false),
-        "no end anchor -> UnanchoredEnd and exit 1",
+        (
+            mismatch.map(super::Finding::detail),
+            mismatch.and_then(super::Finding::seq),
+            conflict.and_then(super::Finding::seq),
+            report
+                .findings()
+                .iter()
+                .filter(|f| f.kind() == K::Accepted)
+                .count(),
+        ),
+        (Some(mismatch_tail.as_str()), Some(7), Some(7), 0),
+        "forked seq -> AcceptMismatch + SeqConflict, nothing promoted",
+    );
+}
+
+// =====================================================================
+// ADR-0005 decision 11 "No run" honest row: a nothing-lost resume
+// over an A8-style closed run, with the empty-run digest, is
+// `AcceptUnused` (info). Any other digest is `AcceptMismatch`. The
+// fixture is NOT a violation fixture -- the walker reaches the run
+// honestly and `run_digest()` equals the digest of nothing because
+// the run has no ranges and no spans.
+// =====================================================================
+/// Honest no-run layout: live = `[cp0, resume1]` where `resume1`
+/// declares nothing lost (head=0, lost_through=0). `cp0` is the
+/// genesis-adjacent first record and there is no closing opening
+/// before it, so the classifier emits no closed run. The resume
+/// still parses honestly (not a violation), and
+/// `accept_run(1, resume1.hash, digest_of_nothing)` hits the "no
+/// run" branch -> `AcceptUnused`.
+struct HonestNoRunFx {
+    _dir: Temp,
+    dir: PathBuf,
+    live: PathBuf,
+    resume: Record,
+    cp0_hash: [u8; 32],
+}
+fn build_honest_no_run_fx() -> HonestNoRunFx {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let resume = resume_decl(&cp0, 0, cp0.hash(), 0);
+    write_records(&d.0, &[&cp0, &resume]);
+    let dir = d.0.clone();
+    let live = dir.join("audit.jsonl");
+    HonestNoRunFx {
+        dir,
+        _dir: d,
+        live,
+        cp0_hash: cp0.hash(),
+        resume,
+    }
+}
+
+fn honest_no_run_resumed(fx: &HonestNoRunFx) -> Finding {
+    // A resume that opens without a closing-opening checkpoint
+    // before it is `structural=invalid(no-opening)`: the record
+    // parses honestly, but the classifier does not recognise it as
+    // closing any run.
+    Finding::new(
+        K::Resumed,
+        Some(fx.live.clone()),
+        Some(2),
+        Some(1),
+        format!(
+            "operator=operator reason=incident head=0:{} gap=none lost_records=0 structural=invalid(no-opening)",
+            digest_string(&fx.cp0_hash)
+        ),
+    )
+}
+
+#[test]
+fn honest_no_run_with_empty_digest_gives_accept_unused() {
+    let fx = build_honest_no_run_fx();
+    let v = verifier()
+        .accept_run(1, fx.resume.hash(), EMPTY_RUN_DIGEST, "alice", "ok")
+        .unwrap();
+    let report = report_of(vec![fx.dir.clone()], v);
+    let expected = vec![
+        unlocated(
+            K::AcceptUnused,
+            Some(1),
+            format!(
+                "accept-run seq 1 hash {}: no matching run",
+                digest_string(&fx.resume.hash())
+            ),
+        ),
+        honest_no_run_resumed(&fx),
+        unlocated(K::UncoveredTail, None, "records seq 1..=1".into()),
+    ];
+    assert_findings(report.findings(), &expected, "honest_no_run_empty");
+    assert!(report.is_valid(), "AcceptUnused is Info");
+}
+
+#[test]
+fn honest_no_run_with_other_digest_gives_accept_mismatch() {
+    let fx = build_honest_no_run_fx();
+    let v = verifier()
+        .accept_run(1, fx.resume.hash(), WRONG_DIGEST, "alice", "ok")
+        .unwrap();
+    let report = report_of(vec![fx.dir.clone()], v);
+    let expected = vec![
+        unlocated(
+            K::AcceptMismatch,
+            Some(1),
+            format!(
+                "accept-run seq 1 hash {}: run digest differs (run {EMPTY_RUN_DIGEST_HEX})",
+                digest_string(&fx.resume.hash())
+            ),
+        ),
+        honest_no_run_resumed(&fx),
+        unlocated(K::UncoveredTail, None, "records seq 1..=1".into()),
+    ];
+    assert_findings(report.findings(), &expected, "honest_no_run_wrong");
+    assert!(!report.is_valid(), "AcceptMismatch is Error");
+}
+
+// =====================================================================
+// Ruling 13-V8-d1 FORK 5: an `accept-run` line inside a confirmed
+// resume gap is `LostRecord` (receipt + accept-Resumed confirmation
+// variants). The gap is confirmed, so the line is lost, not
+// mismatched; the subject is still the full `accept-run` subject.
+// =====================================================================
+#[test]
+fn accept_run_inside_gap_confirmed_by_receipt_is_lost_record() {
+    // A3 has a real resume gap `9..=9`; the receipt at (resume_seq,
+    // resume_hash) confirms it (ruling 13-V7-d1 point 8). Place an
+    // accept_run for seq=9 (inside the gap). Confirmation demotes
+    // it to `LostRecord` under the shared gap rule.
+    let a = build_a3();
+    let dir = a.dir_path.clone();
+    let (resume_hash, resume_seq) = resume_hash_of_a3(&a);
+    let v = verifier()
+        .receipts([(resume_seq, resume_hash)])
+        .accept_run(9, WRONG_HASH, EMPTY_RUN_DIGEST, "alice", "ok")
+        .unwrap();
+    let report = report_of(vec![dir], v);
+    let lost = report.findings().iter().find(|f| {
+        f.kind() == K::LostRecord
+            && f.seq() == Some(9)
+            && f.detail().starts_with("accept-run seq 9 hash")
+    });
+    assert!(
+        lost.is_some(),
+        "accept-run inside a receipt-confirmed gap -> LostRecord: got {:#?}",
+        report.findings(),
+    );
+}
+
+// =====================================================================
+// ADR-0005 decision 11 `accept-run` l.957 "the list is exact":
+// a `SeqGap` and a `ChainBroken` on a SEGMENT AFTER the run's
+// closer (ruling 13-V4-d9: the closer segment belongs to the
+// next run; anything beyond it is outside this run's scope) keep
+// their severity even when the matching `accept-run` line
+// accepts items 1-3. On A1, append an `entry_rec(9, GARBAGE)` to
+// the live file so the walker reports SeqGap(8..=8) and
+// ChainBroken at seq=9 on the closer segment, OUTSIDE the
+// accepted run. Items 1-3 become `Accepted`; the extra findings
+// stay as errors.
+// =====================================================================
+/// Variant of `build_run_fx` where `cp6`'s declared root is also
+/// bad, so the fold classifier reports `MmrMismatch` at cp6 (the
+/// closing opening). The run's `accept-run` line must NOT
+/// promote this `MmrMismatch`: ruling 13-V8-d1 (`accept-run`) /
+/// ADR-0005 decision 11 say the closing opening's `MmrMismatch`
+/// is never accepted. The fixture witnesses the equivalence
+/// argument: an honest trail cannot carry a matchable run
+/// alongside a mismatched closing opening.
+struct BadCp6Fx {
+    _dir: Temp,
+    dir: PathBuf,
+    live: PathBuf,
+    resume: Record,
+}
+fn build_bad_cp6_fx() -> BadCp6Fx {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let e2 = entry_rec(2, e1.hash());
+    let mmr2 = pushed(&mmr1, &e2);
+    put_segment(&d.0, 0, &[&cp0, &e1, &e2], &[]);
+    let r4 = headless(&e2, 4);
+    let fold = pushed(&mmr2, &r4);
+    let bad5 = [0x55; 32];
+    let cp5 = signed_cp_explicit(5, r4.hash(), fold.size(), bad5, fold.peaks().to_vec());
+    put_segment(&d.0, 1, &[&r4, &cp5], &[]);
+    let fold6 = pushed(&fold, &cp5);
+    let bad6 = [0xAA; 32];
+    let cp6 = signed_cp_explicit(6, cp5.hash(), fold6.size(), bad6, fold6.peaks().to_vec());
+    let resume = resume_decl(&cp6, 5, cp5.hash(), 5);
+    write_records(&d.0, &[&cp6, &resume]);
+    let dir = d.0.clone();
+    let live = dir.join("audit.jsonl");
+    BadCp6Fx {
+        dir,
+        _dir: d,
+        live,
+        resume,
+    }
+}
+
+#[test]
+fn closing_opening_mmr_mismatch_fixture_closes_no_run() {
+    // cp6 is the closing opening; its own declared root is bad,
+    // so the fold classifier reports `CheckpointFoldOutcome::
+    // Differs` at cp6. By ruling 13-V4-d8 point 3 / ADR-0005
+    // decision 5 amendment 6 (iii), a `Differs` at a checkpoint
+    // is a violation that empties the run set. The accept-run
+    // line therefore cannot match (run index is empty) and
+    // emits `AcceptMismatch`; nothing is promoted. This is the
+    // writer-side witness for the ADR rule that the closing
+    // opening's `MmrMismatch` is never accepted: the writer
+    // cannot produce a layout where cp6's `MmrMismatch` stands
+    // alongside a matchable run, so the review path never sees
+    // that pairing on an honest trail.
+    let fx = build_bad_cp6_fx();
+    let v = verifier()
+        .accept_run(7, fx.resume.hash(), A1_DIGEST_BYTES, "alice", "ok")
+        .unwrap();
+    let report = report_of(vec![fx.dir.clone()], v);
+    let cp6_mmr_mismatch = report.findings().iter().find(|f| {
+        f.kind() == K::MmrMismatch && f.seq() == Some(6) && f.file() == Some(fx.live.as_path())
+    });
+    let mismatch = report
+        .findings()
+        .iter()
+        .find(|f| f.kind() == K::AcceptMismatch && f.seq() == Some(7));
+    let accepted_count = report
+        .findings()
+        .iter()
+        .filter(|f| f.kind() == K::Accepted)
+        .count();
+    assert_eq!(
+        (
+            cp6_mmr_mismatch.is_some(),
+            mismatch.is_some(),
+            accepted_count
+        ),
+        (true, true, 0),
+        "bad cp6 closes no run: MmrMismatch stays, line is AcceptMismatch, \
+         nothing is promoted",
+    );
+}
+
+/// Extend `build_run_fx` with a shipped copy that carries a
+/// chain-breaking record at `seq = resume + 2`. Shipped records
+/// live in `groups` (so the main seq-loop sees them) but are not
+/// in the native segment set (so the run classifier ignores
+/// them). `ChainBroken` and `SeqGap` at seq=9 are therefore
+/// outside the run's loss-point ranges AND outside its segment
+/// paths -- the test for the matching line pins that items 1-3
+/// are accepted and these two findings keep severity.
+fn write_shipped_trailing_r9(dir: &Path, after: &Record) -> PathBuf {
+    let r9 = headless(after, 9);
+    let path = dir.join("audit-shipped-trailing.jsonl");
+    fs::write(&path, line_bytes(&r9)).unwrap();
+    path
+}
+
+#[test]
+fn list_is_exact_seq_gap_outside_run_stays_error() {
+    // Run 0's line matches and promotes items 1-3; the shipped-
+    // copy's `SeqGap(8..=8)` and `ChainBroken` at seq=9 stay as
+    // errors because the shipped file is not on the run's
+    // segment paths and seq=9 is not a run loss point.
+    let fx = build_run_fx();
+    let shipped = write_shipped_trailing_r9(&fx.dir, &fx.resume);
+    let v = verifier()
+        .accept_run(7, fx.resume.hash(), A1_DIGEST_BYTES, "alice", "ok")
+        .unwrap();
+    let report = report_of(vec![fx.dir.clone(), shipped.clone()], v);
+    let accepted_count = report
+        .findings()
+        .iter()
+        .filter(|f| f.kind() == K::Accepted)
+        .count();
+    let seq_gap_outside = report
+        .findings()
+        .iter()
+        .any(|f| f.kind() == K::SeqGap && f.seq() == Some(9));
+    let chain_broken_outside = report
+        .findings()
+        .iter()
+        .any(|f| f.kind() == K::ChainBroken && f.seq() == Some(9));
+    assert_eq!(
+        (
+            accepted_count,
+            seq_gap_outside,
+            chain_broken_outside,
+            report.is_valid()
+        ),
+        (5, true, true, false),
+        "items 1-3 promoted; SeqGap/ChainBroken outside the run stay: {:#?}",
+        report.findings(),
+    );
+}
+
+#[test]
+fn list_is_exact_second_layout_a3_shipped_trailing_seq_gap() {
+    // Second layout: A3 with a shipped trailing r13 after
+    // resume11. Items 1-3 become Accepted; `SeqGap(12..=12)` and
+    // `ChainBroken` at seq=13 stay.
+    let a = build_a3();
+    let dir = a.dir_path.clone();
+    let (resume_hash, resume_seq) = resume_hash_of_a3(&a);
+    // Build the A3 resume record locally so we can take its hash
+    // for `headless`.
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let cp2 = signed_cp(2, e1.hash(), &mmr1);
+    let mmr2 = pushed(&mmr1, &cp2);
+    let r4 = headless(&cp2, 4);
+    let mmr4 = pushed(&mmr2, &r4);
+    let cp5 = signed_cp(5, r4.hash(), &mmr4);
+    let mmr5 = pushed(&mmr4, &cp5);
+    let r7 = headless(&cp5, 7);
+    let mmr7 = pushed(&mmr5, &r7);
+    let cp8 = signed_cp(8, r7.hash(), &mmr7);
+    let mmr8 = pushed(&mmr7, &cp8);
+    let cp10 = signed_cp(10, cp8.hash(), &mmr8);
+    let resume = resume_decl(&cp10, 8, cp8.hash(), 9);
+    let shipped_path = dir.join("audit-shipped-trailing.jsonl");
+    let r13 = headless(&resume, 13);
+    fs::write(&shipped_path, line_bytes(&r13)).unwrap();
+    let v = verifier()
+        .accept_run(resume_seq, resume_hash, A3_DIGEST_BYTES, "alice", "ok")
+        .unwrap();
+    let report = report_of(vec![dir, shipped_path], v);
+    let accepted_count = report
+        .findings()
+        .iter()
+        .filter(|f| f.kind() == K::Accepted)
+        .count();
+    let seq_gap_outside = report
+        .findings()
+        .iter()
+        .any(|f| f.kind() == K::SeqGap && f.seq() == Some(13));
+    let chain_broken_outside = report
+        .findings()
+        .iter()
+        .any(|f| f.kind() == K::ChainBroken && f.seq() == Some(13));
+    assert_eq!(
+        (
+            accepted_count,
+            seq_gap_outside,
+            chain_broken_outside,
+            report.is_valid()
+        ),
+        (7, true, true, false),
+        "A3 shipped trailing: items 1-3 promoted; outside findings stay",
+    );
+}
+
+// =====================================================================
+// ADR-0005 decision 11 `accept-run` l.957 "the list is exact", on
+// a run with non-empty spans (A9). A9's digest covers both spans
+// (`run_digest(&ranges, &spans)`), so `A9_DIGEST` differs from
+// `EMPTY_RUN_DIGEST`: a match requires the spans to feed the
+// digest. Each row names the full A9 digest; findings outside
+// items 1-3 (TornWrite / Unparsable on S1 and S2; UncoveredTail)
+// keep their severity.
+// =====================================================================
+#[test]
+fn a9_run_with_spans_accepts_items_1_through_3() {
+    let a = crate::audit::runs_v4a_fixtures::build_a9();
+    // Recompute resume seq/hash (A9 does not expose them).
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let fold = seeded(&cp0);
+    let cp_opening = signed_cp(1, cp0.hash(), &fold);
+    let resume = resume_decl(&cp_opening, 0, cp0.hash(), 0);
+    let a9_digest = crate::audit::runs_v4a_fixtures::A9_DIGEST;
+    let a9_digest_bytes: [u8; 32] = {
+        // Strip the `blake3:` prefix.
+        let hex = &a9_digest[7..];
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        out
+    };
+    let v = verifier()
+        .accept_run(2, resume.hash(), a9_digest_bytes, "alice", "ok")
+        .unwrap();
+    let report = report_of(vec![a.dir_path.clone()], v);
+    // Count: 3 items 1-3 Accepted (per-seg@S1, per-seg@S2, run@S1),
+    // Resumed + UncoveredTail + TornWrite x2 + Unparsable x2 stay.
+    let accepted_count = report
+        .findings()
+        .iter()
+        .filter(|f| f.kind() == K::Accepted)
+        .count();
+    let unresolved_errors: Vec<K> = report
+        .findings()
+        .iter()
+        .filter(|f| f.severity() == super::Severity::Error)
+        .map(super::Finding::kind)
+        .collect();
+    // Unresolved errors should be only the Unparsable (not any
+    // items 1-3 kind).
+    assert_eq!(
+        (accepted_count, !unresolved_errors.is_empty()),
+        (3, true),
+        "A9 spans: items 1-3 promoted, non-items-1-3 errors stay: {:#?}",
+        report.findings(),
+    );
+}
+
+#[test]
+fn a9_run_with_spans_wrong_digest_gives_accept_mismatch() {
+    // Same A9 layout; the line names the EMPTY digest (what an
+    // implementation that digests ranges only would compute).
+    // The run's actual digest includes spans, so the match
+    // reports `run digest differs (run A9_DIGEST)`.
+    let a = crate::audit::runs_v4a_fixtures::build_a9();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let fold = seeded(&cp0);
+    let cp_opening = signed_cp(1, cp0.hash(), &fold);
+    let resume = resume_decl(&cp_opening, 0, cp0.hash(), 0);
+    let v = verifier()
+        .accept_run(2, resume.hash(), EMPTY_RUN_DIGEST, "alice", "ok")
+        .unwrap();
+    let report = report_of(vec![a.dir_path.clone()], v);
+    let tail = format!(
+        "accept-run seq 2 hash {}: run digest differs (run {})",
+        digest_string(&resume.hash()),
+        crate::audit::runs_v4a_fixtures::A9_DIGEST,
+    );
+    let mm = report
+        .findings()
+        .iter()
+        .find(|f| f.kind() == K::AcceptMismatch);
+    let accepted_count = report
+        .findings()
+        .iter()
+        .filter(|f| f.kind() == K::Accepted)
+        .count();
+    assert_eq!(
+        (
+            mm.map(super::Finding::detail),
+            mm.and_then(super::Finding::seq),
+            accepted_count,
+        ),
+        (Some(tail.as_str()), Some(2), 0),
+        "A9 wrong digest -> AcceptMismatch, nothing promoted",
+    );
+}
+
+#[test]
+fn accept_run_inside_gap_confirmed_by_accept_resumed_is_lost_record() {
+    // Same A3 gap, confirmed through `accept Resumed` on the
+    // resume at seq=11 instead of a receipt (ADR-0005 decision 11
+    // "accept Resumed confirms the gap"). The gap `9..=9` is then
+    // confirmed and the accept_run at seq=9 is `LostRecord`.
+    let a = build_a3();
+    let dir = a.dir_path.clone();
+    let (resume_hash, _) = resume_hash_of_a3(&a);
+    let v = verifier()
+        .accept(K::Resumed, 11, resume_hash, "alice", "ok")
+        .unwrap()
+        .accept_run(9, WRONG_HASH, EMPTY_RUN_DIGEST, "bob", "lost")
+        .unwrap();
+    let report = report_of(vec![dir], v);
+    let lost = report.findings().iter().find(|f| {
+        f.kind() == K::LostRecord
+            && f.seq() == Some(9)
+            && f.detail().starts_with("accept-run seq 9 hash")
+    });
+    assert!(
+        lost.is_some(),
+        "accept-run inside an accept-Resumed-confirmed gap -> LostRecord: got {:#?}",
+        report.findings(),
     );
 }
