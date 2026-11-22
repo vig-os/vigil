@@ -69,10 +69,7 @@ pub(super) struct ResumeCandidate {
     pub(super) opening_seq: u64,
     pub(super) opening_hash: [u8; 32],
     pub(super) head_seq: u64,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the next #13 slice")
-    )]
+    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by the next #13 step"))]
     pub(super) head_hash: [u8; 32],
     pub(super) lost_through: u64,
     pub(super) is_genesis: bool,

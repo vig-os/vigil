@@ -24,7 +24,7 @@ use std::fmt::Display;
 /// it gates `LostRecord` emission and the genesis-gap suppression
 /// (point 7 exception). `opening_anchored` is `true` when an input
 /// anchor's `(trail, seq, hash)` equals the opening checkpoint
-/// (ruling 13-V6-d1 point 2); the next #13 slice will consume it
+/// (ruling 13-V6-d1 point 2); the next #13 step will consume it
 /// to demote anchors and pins inside a gap -- here anchors and
 /// pins keep their current findings.
 #[derive(Clone, Copy, Debug)]

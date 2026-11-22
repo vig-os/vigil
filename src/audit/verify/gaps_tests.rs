@@ -277,9 +277,8 @@ fn g1_honest_resume_lost_receipts_become_lost_records() {
 
 // =====================================================================
 // G1b - REGRESSION. Pins `is_strict_valid()` = false on G1's report
-// because `Resumed` is a warning (ADR-0005 decision 5; decision 11
-// "--strict fails until a reviewer accepts it"). Pairs with G1 as
-// the `--strict` half of l.986.
+// because `Resumed` is a warning (ADR-0005 decision 5; decision 11).
+// Pairs with G1 as the `--strict` half of l.986.
 // =====================================================================
 #[test]
 fn g1b_honest_resume_fails_strict_on_resumed_warning() {
@@ -675,7 +674,7 @@ fn g5b_waiver_and_from_inside_unconfirmed_gap_are_receipt_mismatch() {
 // the `through=` pin inside the gap keep `AnchorMismatch` and
 // `RevocationMismatch` (errors), while the waiver inside the gap
 // is `LostRecord` (ruling 13-V7-d1 points 8-9). The anchored-opening
-// demotion of anchors and pins lands in a later #13 slice.
+// demotion of anchors and pins lands in a later #13 step.
 // =====================================================================
 #[test]
 fn g6_unanchored_opening_keeps_anchor_and_pin_mismatches() {
