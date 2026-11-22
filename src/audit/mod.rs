@@ -213,6 +213,21 @@ pub enum FindingKind {
     /// engine's merge order when duplicates are present (ruling
     /// 13-V5-d4 point 4). Independent of `RevocationUnconfirmed`: one
     /// bound can carry both findings; neither suppresses the other.
+    ///
+    /// A bound at `b` inside a **confirmed** resume gap whose opening
+    /// checkpoint is itself **anchored** (an input anchor on the
+    /// verified trail with the opening's full `(trail, seq, hash)`)
+    /// is **set aside** as one unlocated `LostRecord` (info) at `b`
+    /// with detail `key <64 hex> through=<b>: lost in gap <a>..=<b>`
+    /// (ADR-0005 decision 5 "Receipts lost with a resume"; ruling
+    /// 13-V7-d1 point 8). Only the pin's hash check, which needs the
+    /// record, is replaced: the bound still limits the key
+    /// (`UntrustedKey` above the bound still fires from the signature
+    /// and trust check, which never consults the gap), and the
+    /// confirmation check still runs. The demoted pin is counted by
+    /// the gap's `lost_records=<n>` in the `Resumed` detail. In any
+    /// other gap state (unconfirmed, or confirmed with an unanchored
+    /// opening), the pin inside the gap keeps `RevocationMismatch`.
     RevocationMismatch,
     /// Error: A `through=<s>:<h>` revocation bound is not confirmed
     /// by a trusted checkpoint strictly above `s` signed by another
@@ -495,20 +510,32 @@ pub enum FindingKind {
     Accepted,
     /// Info: A review matched no warning.
     AcceptUnused,
-    /// Info: A receipt, waiver or
-    /// [`receipts_from`](crate::audit::Verifier::receipts_from)
-    /// naming a `seq` inside a **confirmed** resume gap (ADR-0005
-    /// decision 5 "Receipts lost with a resume"; ruling 13-V7-d1
-    /// points 8-9). The rule, the confirmation and the #224 limit
-    /// are on
-    /// [`Verifier::receipts`](crate::audit::Verifier::receipts).
-    /// The detail is exactly `<subject>: lost in gap <a>..=<b>`,
-    /// unlocated, where `<subject>` is the input's subject text:
-    /// `receipt seq <s> hash blake3:<64 hex>`, `waive seq <s> hash
-    /// blake3:<64 hex>` or `from seq <s> hash blake3:<64 hex>`.
-    /// Inside an unconfirmed gap the same inputs stay
-    /// [`ReceiptMismatch`](FindingKind::ReceiptMismatch) `… no
-    /// record`.
+    /// Info: A receipt, waiver,
+    /// [`receipts_from`](crate::audit::Verifier::receipts_from),
+    /// anchor or `through=<b>:<h>` revocation pin naming a `seq`
+    /// inside a **confirmed** resume gap (ADR-0005 decision 5
+    /// "Receipts lost with a resume"; ruling 13-V7-d1 point 8). The
+    /// rule, the confirmation and the #224 limit for receipts,
+    /// waivers and `from` are on
+    /// [`Verifier::receipts`](crate::audit::Verifier::receipts); the
+    /// anchor and pin half (also requires the gap's opening
+    /// checkpoint to be itself anchored) is on
+    /// [`Verifier::anchor`](crate::audit::Verifier::anchor) and
+    /// [`FindingKind::RevocationMismatch`]. The detail is exactly
+    /// `<subject>: lost in gap <a>..=<b>`, unlocated, where
+    /// `<subject>` is the input's subject text:
+    /// `receipt seq <s> hash blake3:<64 hex>`,
+    /// `waive seq <s> hash blake3:<64 hex>`,
+    /// `from seq <s> hash blake3:<64 hex>`,
+    /// `anchor seq <a> hash blake3:<64 hex>` or
+    /// `key <64 hex> through=<b>`. Inside an unconfirmed gap each
+    /// input keeps its ordinary mismatch finding
+    /// ([`ReceiptMismatch`](FindingKind::ReceiptMismatch) `… no
+    /// record`, [`AnchorMismatch`](FindingKind::AnchorMismatch),
+    /// [`RevocationMismatch`](FindingKind::RevocationMismatch)); the
+    /// anchor-and-pin half additionally needs the opening to be
+    /// anchored, since a text line like a receipt or an `accept`
+    /// must never override an anchor.
     LostRecord,
 }
 

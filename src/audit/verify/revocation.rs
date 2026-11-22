@@ -49,6 +49,16 @@
 //! the bounded check (`UntrustedKey` above the bound inside the
 //! batch) still run. A pin above `E` is routed through the shared
 //! set-aside helper and replaces the pin check (point 3).
+//!
+//! Ruling 13-V7-d1 point 8 (ADR-0005 decision 5 "Receipts lost with
+//! a resume"): a pin at `b` inside a confirmed resume gap WHOSE
+//! OPENING CHECKPOINT IS ANCHORED replaces the pin check with one
+//! `LostRecord` (info), routed through the shared
+//! [`super::position::Classifier::lost_record_anchored`] helper. The
+//! confirmation check still runs, and the bounded check
+//! (`UntrustedKey` above the bound) still fires from `signatures`,
+//! so the bound still limits the key; only the hash check, which
+//! needs the record, is replaced.
 
 use super::{Finding, input::Summary, position::Classifier, signatures};
 use crate::audit::{FindingKind as K, TrustPolicy, digest_string, hex};
@@ -88,18 +98,24 @@ pub(super) fn check(
     };
     for (key, (s, h)) in trust.bounds_in(&trail) {
         let key_hex = hex(&key);
-        // Rulings 13-V6-d3 point 5 and 13-V6-d7 point 3: a pin below
-        // an accepted start or strictly above the end replaces the
-        // pin finding through the shared set-aside helper; the
-        // confirmation check is unchanged for below-start and skipped
-        // entirely under `end_bounded` (point 4, below).
-        let pin_location = if let Some(finding) =
-            position.set_aside(s, format_args!("key {key_hex} through={s}"))
-        {
+        // Rulings 13-V6-d3 point 5, 13-V6-d7 point 3 and 13-V7-d1
+        // point 8: a pin below an accepted start, strictly above the
+        // end, or inside a confirmed gap whose opening is anchored
+        // replaces the pin finding through the shared classifier
+        // helpers. The confirmation check is unchanged for below-
+        // start and lost-in-gap (the bound still limits the key: its
+        // confirmation uses only records above the bound; see the
+        // module rustdoc), and is skipped entirely under
+        // `end_bounded` (point 4, below).
+        let subject = format!("key {key_hex} through={s}");
+        let pin_location = if let Some(finding) = position.set_aside(s, &subject) {
+            findings.push(finding);
+            None
+        } else if let Some(finding) = position.lost_record_anchored(s, &subject) {
             findings.push(finding);
             None
         } else {
-            let bound_prefix = format!("key {key_hex} through={s}:{}", digest_string(&h));
+            let bound_prefix = format!("{subject}:{}", digest_string(&h));
             pin(&ctx, s, h, &key, &bound_prefix, findings)
         };
         confirmation(&ctx, s, &key, &key_hex, pin_location, findings);

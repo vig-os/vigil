@@ -292,6 +292,8 @@ mod end_link_tests;
 #[cfg(test)]
 mod end_tests;
 #[cfg(test)]
+mod gap_anchors_tests;
+#[cfg(test)]
 mod gaps_tests;
 #[cfg(test)]
 mod live_tests;
@@ -546,6 +548,26 @@ impl Verifier {
     /// and key-trust findings are raised by the ordinary signature
     /// and trust checks against the verified records.
     ///
+    /// An anchor whose `seq` lies inside a **confirmed** resume gap
+    /// whose opening checkpoint is itself **anchored** (an input
+    /// anchor on the verified trail with the opening's full `(trail,
+    /// seq, hash)`) is **set aside** as one unlocated
+    /// [`FindingKind::LostRecord`] (info) at the anchor's `seq`, with
+    /// detail `anchor seq <a> hash blake3:<64 hex>: lost in gap
+    /// <a>..=<b>` (ADR-0005 decision 5 "Receipts lost with a
+    /// resume"; ruling 13-V7-d1 point 8). The ordinary mismatch
+    /// check is replaced, and the demoted anchor is counted by the
+    /// gap's `lost_records=<n>` in the [`FindingKind::Resumed`]
+    /// detail. Another trail's anchor is never set aside here, by
+    /// the precedence above, so it still gives `AnchorMismatch …
+    /// trail differs`. An anchor at the opening's `seq` with another
+    /// hash does not anchor the opening: the match rule is the full
+    /// `(trail, seq, hash)` triple (ruling 13-V6-d1 point 2), and a
+    /// receipt or an `accept` line is a text line, not an anchor,
+    /// and never anchors an opening. In any other gap state
+    /// (unconfirmed, or confirmed with an unanchored opening), an
+    /// anchor inside the gap keeps `AnchorMismatch`.
+    ///
     /// [`AuditTrail::checkpoint`]: crate::audit::AuditTrail::checkpoint
     /// [`AuditTrail::close`]: crate::audit::AuditTrail::close
     /// [`AuditConfig::resume`]: crate::audit::AuditConfig::resume
@@ -776,8 +798,12 @@ impl Verifier {
     /// shipped-only opening is never fold-matched (owner decision
     /// 13-V4-d7; spike #224), so a Collector copy of the opening
     /// cannot confirm a gap. Anchors and `through=` pins inside a
-    /// confirmed gap keep their ordinary findings here; their
-    /// set-aside under an anchored opening lands in a later #13 step.
+    /// confirmed gap are demoted to `LostRecord` only when the gap's
+    /// opening checkpoint is itself anchored (ruling 13-V7-d1 point
+    /// 8): see [`Self::anchor`] and
+    /// [`FindingKind::RevocationMismatch`] for that half; a receipt
+    /// or an `accept` line is a text line, not an anchor, and never
+    /// anchors an opening.
     pub fn receipts(mut self, receipts: impl IntoIterator<Item = (u64, [u8; 32])>) -> Self {
         let set = self
             .receipts
