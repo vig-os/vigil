@@ -24,9 +24,9 @@ use std::fmt::Display;
 /// it gates `LostRecord` emission and the genesis-gap suppression
 /// (point 7 exception). `opening_anchored` is `true` when an input
 /// anchor's `(trail, seq, hash)` equals the opening checkpoint
-/// (ruling 13-V6-d1 point 2); V7e will consume it to demote anchors
-/// and pins inside a gap -- V7d anchors and pins keep their
-/// current findings.
+/// (ruling 13-V6-d1 point 2); the next #13 slice will consume it
+/// to demote anchors and pins inside a gap -- here anchors and
+/// pins keep their current findings.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Gap {
     pub(super) low: u64,
@@ -195,9 +195,10 @@ impl Classifier {
     /// One unlocated [`K::LostRecord`] finding when `seq` is inside a
     /// confirmed resume candidate gap (ruling 13-V7-d1 points 8-9);
     /// `None` outside one or inside an unconfirmed gap. `subject` is
-    /// the caller's `<prefix> seq <s> hash <hex>` text (V7a/V7b
-    /// subjects); the detail completes as `<subject>: lost in gap
-    /// <a>..=<b>`. Consumed by [`super::receipts::match_one`].
+    /// the caller's `<prefix> seq <s> hash <hex>` text (the shared
+    /// receipt-side subjects: `receipt`, `waive`, `from`); the detail
+    /// completes as `<subject>: lost in gap <a>..=<b>`. Consumed by
+    /// [`super::receipts::match_one`].
     pub(super) fn lost_record(&self, seq: u64, subject: impl Display) -> Option<Finding> {
         match self.classify(seq) {
             Position::Gap {

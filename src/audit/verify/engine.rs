@@ -744,7 +744,7 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // detail (`lost_records=<n>`). Resume declarations whose
     // candidate was dropped by the trust or fold filter, and
     // malformed declarations, keep `lost_records=0`. Anchors and
-    // pins arrive with V7e.
+    // pins arrive with the later #13 slice tracked on the issue.
     let lost_counts = count_lost_records(&findings, &pending_resumes);
     emit_resumed(&declarations, &lost_counts, &mut findings);
     let first_seq = groups.first_key_value().map(|(&s, _)| s);
@@ -887,7 +887,7 @@ pub(super) fn filter_candidates_for_test(collection: &Collection, trail: [u8; 16
 /// `SeqGap` and nothing inside it can be `LostRecord`.
 /// `opening_anchored` applies ruling 13-V6-d1 point 2: an input
 /// anchor on the verified trail at the opening's `(seq, hash)`
-/// anchors the gap for V7e. Confirmation (point 8) matches the
+/// anchors the gap for a later #13 slice. Confirmation (point 8) matches the
 /// gap's resume `(seq, hash)` against the receipt set under the
 /// shared match rule: the record exists in the verified set, the
 /// `seq` is not forked, and the receipt's hash equals the record's.

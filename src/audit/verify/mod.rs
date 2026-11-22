@@ -777,7 +777,7 @@ impl Verifier {
     /// 13-V4-d7; spike #224), so a Collector copy of the opening
     /// cannot confirm a gap. Anchors and `through=` pins inside a
     /// confirmed gap keep their ordinary findings here; their
-    /// set-aside under an anchored opening is V7e.
+    /// set-aside under an anchored opening lands in a later #13 slice.
     pub fn receipts(mut self, receipts: impl IntoIterator<Item = (u64, [u8; 32])>) -> Self {
         let set = self
             .receipts

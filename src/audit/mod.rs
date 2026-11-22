@@ -503,10 +503,10 @@ pub enum FindingKind {
     /// are on
     /// [`Verifier::receipts`](crate::audit::Verifier::receipts).
     /// The detail is exactly `<subject>: lost in gap <a>..=<b>`,
-    /// unlocated, where `<subject>` is the input's V7a/V7b subject
-    /// (`receipt seq <s> hash blake3:<64 hex>`, `waive seq <s>
-    /// hash blake3:<64 hex>` or `from seq <s> hash blake3:<64
-    /// hex>`). Inside an unconfirmed gap the same inputs stay
+    /// unlocated, where `<subject>` is the input's subject text:
+    /// `receipt seq <s> hash blake3:<64 hex>`, `waive seq <s> hash
+    /// blake3:<64 hex>` or `from seq <s> hash blake3:<64 hex>`.
+    /// Inside an unconfirmed gap the same inputs stay
     /// [`ReceiptMismatch`](FindingKind::ReceiptMismatch) `… no
     /// record`.
     LostRecord,
