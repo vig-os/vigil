@@ -26,7 +26,13 @@ use std::fmt::Display;
 /// anchor's `(trail, seq, hash)` equals the opening checkpoint
 /// (ruling 13-V6-d1 point 2); the next #13 step will consume it
 /// to demote anchors and pins inside a gap -- here anchors and
-/// pins keep their current findings.
+/// pins keep their current findings. `resume_seq` and `resume_hash`
+/// identify the gap's resume record for the `lost_records=<n>`
+/// counter (ruling 13-V7-d1 point 8): the count is keyed by the
+/// resume `(seq, hash)` on the gap itself, so a candidate the
+/// trust or fold filter dropped (absent here) keeps its
+/// `lost_records=0` without the two consumers risking a zip
+/// alignment.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Gap {
     pub(super) low: u64,
@@ -34,6 +40,8 @@ pub(super) struct Gap {
     pub(super) is_genesis: bool,
     pub(super) confirmed: bool,
     pub(super) opening_anchored: bool,
+    pub(super) resume_seq: u64,
+    pub(super) resume_hash: [u8; 32],
 }
 
 /// Sorted location of a `seq` versus the accepted start, the end

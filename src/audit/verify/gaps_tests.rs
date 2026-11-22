@@ -1,11 +1,12 @@
 //! Rows for resume-gap confirmation and `LostRecord` (ADR-0005
 //! decision 5 "Resume gaps" / "Receipts lost with a resume"; ruling
 //! 13-V7-d1 points 7-9). Every row ends in one whole-list
-//! `assert_findings` (G1b is the exception: one tuple of the list
-//! plus `is_strict_valid()`). Every digest in an expected detail is
-//! either a `const` pinned by `fixture_hashes_match_literals` or a
-//! value the writer returns from this run. Each row is labelled
-//! ACCEPTANCE or REGRESSION in its doc comment.
+//! `assert_findings`, with G1b using one `assert_eq!` over the
+//! `(findings, is_valid, is_strict_valid)` tuple. Every digest in
+//! an expected detail is either a `const` pinned by
+//! `fixture_hashes_match_literals` or a value the writer returns
+//! from this run. Each row is labelled ACCEPTANCE or REGRESSION in
+//! its doc comment.
 //!
 //! Fixture style: a resume gap is produced through the real writer
 //! (`AuditConfig::resume`, pre-seeding `audit.trail` with TRAIL so
@@ -15,11 +16,15 @@
 //! are read from `Checkpoint::hash` / `Receipt::hash` on the
 //! returned values. Hand-built sealed bytes (seqs 0..=2) model the
 //! trail's pre-resume history: the writer cannot run `create` on a
-//! pre-seeded marker (TrailExists), and sealed segments on the
+//! pre-seeded marker (`TrailExists`), and sealed segments on the
 //! fixture clock pin their hashes as `const`. Hand-built records in
-//! the live file are kept only for forged (G4), untrusted (G3) and
-//! shipped-only (G11) cases that the writer never produces, and
-//! each row says why.
+//! the live file are kept only for forged (G4), untrusted (G3),
+//! shipped-only (G11), chained-double-resume (G9) and trusted-decoy
+//! fork (G14) cases the writer never produces, and each row says
+//! why. A chained double resume cannot be writer-built: a second
+//! `AuditConfig::resume` would refuse the directory's existing head
+//! through the resume loss-bound / `HeadMismatch` checks on the
+//! drop-on-close checkpoint the first call leaves behind.
 
 use super::tests_common::{
     assert_findings, located, parse_cp, report_of, trust_with_key, unlocated,
@@ -54,6 +59,10 @@ const TRAIL_GENESIS_DIGEST: &str =
 /// Non-fixture signer (seed 0x44): listed in no trust policy here, so
 /// a checkpoint signed by it fails [`signatures::trusted`].
 const UNTRUSTED_KEY_HEX: &str = "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48";
+/// Second trusted signer (seed 0x77) consumed by G6's `through=` pin.
+/// Its public key is pinned here so the expected-detail format
+/// string reads the literal rather than recomputing from the fixture.
+const OTHER_KEY_HEX: &str = "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7";
 
 const GAP_LOW: u64 = 3;
 const GAP_HIGH: u64 = 5;
@@ -62,6 +71,23 @@ const RESUME_SEQ: u64 = 7;
 const WRONG_HASH_55: [u8; 32] = [0x55; 32];
 const WRONG_HASH_55_DIGEST: &str =
     "blake3:5555555555555555555555555555555555555555555555555555555555555555";
+
+/// `pushed(&mmr1, &cp2).root()`: the honest MMR root at size=3 after
+/// cp0, e1, cp2 on `TRAIL`. Consumed by G4d's `MmrMismatch` detail
+/// (expected side). Pinned so the row reads the literal digest
+/// rather than recomputing it from the fold.
+const MMR_AT_CP2_ROOT_DIGEST: &str =
+    "blake3:3e3070dd2dba8c267662fb89cbeb5b88848d5146895bc4bb1258bf87aa510160";
+/// `mmr0.root()`: the honest MMR root at size=1 after only cp0.
+/// Consumed by G4d's `MmrMismatch` detail (found side).
+const MMR_AT_CP0_ROOT_DIGEST: &str =
+    "blake3:e3a0ca91e171d05a5877b1352376e6e54fc54312c7d9295d4e7643bdba23f723";
+/// G6's `through=4:WRONG` anchor record: seq 4, previous = cp2,
+/// synthetic single-leaf MMR with hash `[0xcc; 32]`, signed by the
+/// fixture key. The row asserts against this literal digest instead
+/// of recomputing it from the record builder.
+const G6_ANCHOR_DIGEST: &str =
+    "blake3:bd5ecd0d74a95fd880720aaf151a5c751ff1ffeefd2817d89fb1528630927e3f";
 
 // =====================================================================
 // Shared helpers.
@@ -148,13 +174,11 @@ fn genesis(lost_through: u64) -> Genesis {
         )
         .unwrap();
     drop(trail_b);
-    let opening_hash = opening.hash();
-    let resume_hash = resume.hash();
     Genesis {
         dir: d.0.clone(),
         _dir: d,
-        opening_hash,
-        resume_hash,
+        opening_hash: opening.hash(),
+        resume_hash: resume.hash(),
     }
 }
 
@@ -182,6 +206,14 @@ fn lost(seq: u64, prefix: &str, hash_digest: &str, low: u64, high: u64) -> Findi
 /// `trust_with_key(fixture_pubkey())` lists only the fixture key.
 fn untrusted_signer() -> KeyFileSigner {
     KeyFileSigner::from_hex(&"44".repeat(32)).unwrap()
+}
+
+/// Second trusted signer (seed `0x77`) whose public key is
+/// `OTHER_KEY_HEX`. Carries G6's `through=4:WRONG` pin so the
+/// `RevocationMismatch` detail reads a `const` key rather than
+/// recomputing it from the signer at test time.
+fn other_signer() -> KeyFileSigner {
+    KeyFileSigner::from_hex(&"77".repeat(32)).unwrap()
 }
 
 fn sign_as(signer: &KeyFileSigner, seq: u64, previous: [u8; 32], mmr: &Mmr) -> Record {
@@ -217,6 +249,7 @@ fn fixture_hashes_match_literals() {
     let e1 = entry_rec(1, cp0.hash());
     let mmr1 = pushed(&mmr0, &e1);
     let cp2 = signed_cp(2, e1.hash(), &mmr1);
+    let mmr_at_cp2 = pushed(&mmr1, &cp2);
     assert_eq!(digest_string(&cp0.hash()), CP0_DIGEST, "cp0");
     assert_eq!(digest_string(&e1.hash()), E1_DIGEST, "e1");
     assert_eq!(digest_string(&cp2.hash()), CP2_DIGEST, "cp2");
@@ -229,6 +262,29 @@ fn fixture_hashes_match_literals() {
         crate::audit::hex(&untrusted_signer().public_key()),
         UNTRUSTED_KEY_HEX,
         "untrusted_key"
+    );
+    assert_eq!(
+        digest_string(&mmr0.root()),
+        MMR_AT_CP0_ROOT_DIGEST,
+        "mmr_at_cp0_root"
+    );
+    assert_eq!(
+        digest_string(&mmr_at_cp2.root()),
+        MMR_AT_CP2_ROOT_DIGEST,
+        "mmr_at_cp2_root"
+    );
+    assert_eq!(
+        crate::audit::hex(&other_signer().public_key()),
+        OTHER_KEY_HEX,
+        "other_key"
+    );
+    let mut synth_mmr = Mmr::new();
+    synth_mmr.push([0xcc; 32]).unwrap();
+    let anchor_record = signed_cp(4, cp2.hash(), &synth_mmr);
+    assert_eq!(
+        digest_string(&anchor_record.hash()),
+        G6_ANCHOR_DIGEST,
+        "g6_anchor"
     );
 }
 
@@ -265,30 +321,44 @@ fn g1_honest_resume_lost_receipts_become_lost_records() {
         ),
     ];
     assert_findings(report.findings(), &expected, "G1");
-    assert!(report.is_valid(), "G1 plain verify must pass");
 }
 
 // =====================================================================
-// G1b - ACCEPTANCE. Pins `is_strict_valid()` = false on G1's
-// confirmed report because `Resumed` is a warning (ADR-0005
-// decision 5; decision 11). Pairs with G1 as the `--strict` half
-// of l.986. Asserts one tuple of the finding list and
-// `is_strict_valid()`.
+// G1b - REGRESSION. Pins `is_valid()` = true and
+// `is_strict_valid()` = false on G1's confirmed report in one
+// `assert_eq!` tuple (`findings`, `is_valid`, `is_strict_valid`),
+// covering ADR-0005 decision 5 and decision 11's `--strict` half of
+// l.986. The lost receipts become `LostRecord`, `is_valid` stays
+// true, and the `Resumed` warning fails `--strict`.
 // =====================================================================
 #[test]
 fn g1b_honest_resume_fails_strict_on_resumed_warning() {
     let fx = non_genesis();
+    let live = fx.dir.join("audit.jsonl");
     let verifier = Verifier::new(trust_with_key(fixture_pubkey())).receipts([
         (1, fx.e1.hash()),
         (RESUME_SEQ, fx.resume_hash),
         (3, WRONG_HASH_55),
     ]);
-    let report = report_of(vec![fx.dir], verifier);
-    assert!(report.is_valid(), "G1b plain verify must pass");
-    assert!(
-        !report.is_strict_valid(),
-        "Resumed warning fails --strict; got findings {:?}",
-        report.findings()
+    let report = report_of(vec![fx.dir.clone()], verifier);
+    let expected_findings = vec![
+        lost(3, "receipt", WRONG_HASH_55_DIGEST, GAP_LOW, GAP_HIGH),
+        located(
+            K::Resumed,
+            live,
+            2,
+            RESUME_SEQ,
+            resumed_detail(2, CP2_DIGEST, "3..=5", 1),
+        ),
+    ];
+    assert_eq!(
+        (
+            report.findings().to_vec(),
+            report.is_valid(),
+            report.is_strict_valid(),
+        ),
+        (expected_findings, true, false),
+        "G1b literal (findings, is_valid, is_strict_valid)"
     );
 }
 
@@ -532,7 +602,6 @@ fn g3b_untrusted_opening_receipt_in_gap_stays_receipt_mismatch() {
     let opening = sign_as(&other, 6, cp2.hash(), &mmr2);
     let resume = resume_decl(&opening, 2, cp2.hash(), GAP_HIGH);
     let resume_hash = resume.hash();
-    let resume_digest = digest_string(&resume_hash);
     std::fs::write(
         d.0.join("audit.jsonl"),
         [opening.clone(), resume.clone()]
@@ -588,7 +657,6 @@ fn g3b_untrusted_opening_receipt_in_gap_stays_receipt_mismatch() {
         unlocated(K::UncoveredTail, None, "records seq 3..=7".to_owned()),
     ];
     assert_findings(report.findings(), &expected, "G3b");
-    let _ = resume_digest;
     drop(d);
 }
 
@@ -682,10 +750,10 @@ fn g4b_resume_names_other_head_keeps_seq_gap() {
 }
 
 /// G4c: resume details name another `lost_through` (6 instead of 5).
-/// The structural check fails `resume-not-at-k+1` (the resume
-/// record is at seq 7 but `lost_through+1 = 7` so k=7; the
-/// opening is at seq 6 not 7). The candidate is dropped and
-/// `SeqGap` fires.
+/// With `lost_through = 6`, `k = lost_through + 1 = 7`, and the
+/// record at seq 7 is the resume itself, not a checkpoint; the
+/// structural check fails `no-opening`. The candidate is dropped
+/// and `SeqGap` fires.
 #[test]
 fn g4c_resume_names_other_lost_through_keeps_seq_gap() {
     let d = Temp::new();
@@ -768,9 +836,8 @@ fn g4d_wrong_mmr_size_opening_keeps_seq_gap_with_mmr_mismatch() {
             1,
             6,
             format!(
-                "expected size 3 root {}, found size 1 root {}",
-                digest_string(&pushed(&mmr1, &cp2).root()),
-                digest_string(&mmr0.root()),
+                "expected size 3 root {MMR_AT_CP2_ROOT_DIGEST}, \
+                 found size 1 root {MMR_AT_CP0_ROOT_DIGEST}"
             ),
         ),
         located(
@@ -946,11 +1013,10 @@ fn g6_unanchored_opening_keeps_anchor_and_pin_mismatches() {
     // A second trusted key carries a `through=4:WRONG` pin: the pin
     // names a hash no record at seq 4 carries, so `RevocationMismatch`
     // fires with the unlocated "no record at seq 4" form (13-V5-d4).
-    let other = KeyFileSigner::from_hex(&"77".repeat(32)).unwrap();
     let trust = TrustPolicy::builder()
         .trail(TRAIL)
         .key(fixture_pubkey())
-        .key_through(other.public_key(), 4, WRONG_HASH_55)
+        .key_through(other_signer().public_key(), 4, WRONG_HASH_55)
         .build()
         .unwrap();
     // A trusted-signed anchor at seq 4 whose `(trail, seq, hash)` is
@@ -961,7 +1027,6 @@ fn g6_unanchored_opening_keeps_anchor_and_pin_mismatches() {
     synth_mmr.push([0xcc; 32]).unwrap();
     let anchor_record = signed_cp(4, fx.cp2.hash(), &synth_mmr);
     let anchor_cp = parse_cp(&anchor_record);
-    let anchor_digest = digest_string(&anchor_record.hash());
     let verifier = Verifier::new(trust)
         .anchor(anchor_cp)
         .receipts([(1, fx.e1.hash()), (RESUME_SEQ, fx.resume_hash)])
@@ -972,16 +1037,13 @@ fn g6_unanchored_opening_keeps_anchor_and_pin_mismatches() {
         unlocated(
             K::AnchorMismatch,
             Some(4),
-            format!("anchor seq 4 hash {anchor_digest}: no record"),
+            format!("anchor seq 4 hash {G6_ANCHOR_DIGEST}: no record"),
         ),
         lost(4, "waive", WRONG_HASH_55_DIGEST, GAP_LOW, GAP_HIGH),
         unlocated(
             K::RevocationMismatch,
             Some(4),
-            format!(
-                "key {other_key} through=4:{WRONG_HASH_55_DIGEST}: no record at seq 4",
-                other_key = hex(&other.public_key())
-            ),
+            format!("key {OTHER_KEY_HEX} through=4:{WRONG_HASH_55_DIGEST}: no record at seq 4"),
         ),
         located(
             K::Resumed,
@@ -1021,7 +1083,6 @@ fn g7_start_at_opening_below_start_wins_over_gap() {
     )
     .unwrap();
     let opening_cp = parse_cp(&opening);
-    let opening_digest = digest_string(&opening.hash());
     let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
         .anchor(opening_cp.clone())
         .start_from(opening_cp)
@@ -1052,7 +1113,6 @@ fn g7_start_at_opening_below_start_wins_over_gap() {
         unlocated(K::UncoveredTail, None, "records seq 7..=7".to_owned()),
     ];
     assert_findings(report.findings(), &expected, "G7");
-    let _ = opening_digest;
     drop(d);
 }
 
@@ -1101,7 +1161,6 @@ fn g7b_genesis_anchored_start_below_inputs_are_out_of_range() {
         ),
     ];
     assert_findings(report.findings(), &expected, "G7b");
-    let _ = g.opening_hash;
 }
 
 // =====================================================================
@@ -1145,11 +1204,6 @@ fn g7c_genesis_unanchored_start_below_inputs_are_unanchored_start() {
         ),
     ];
     assert_findings(report.findings(), &expected, "G7c");
-    assert!(
-        !report.is_valid(),
-        "G7c UnanchoredStart makes report invalid"
-    );
-    let _ = g.opening_hash;
 }
 
 // =====================================================================
@@ -1227,7 +1281,6 @@ fn g9_two_confirmed_resumes_each_gap_has_lost_records() {
     )
     .unwrap();
     let res1_digest = digest_string(&res1.hash());
-    let res2_digest = digest_string(&res2.hash());
     let verifier = Verifier::new(trust_with_key(fixture_pubkey())).receipts([
         (1, e1.hash()),
         (RESUME_SEQ, res1.hash()),
@@ -1263,63 +1316,18 @@ fn g9_two_confirmed_resumes_each_gap_has_lost_records() {
         unlocated(K::UncoveredTail, None, "records seq 12..=12".to_owned()),
     ];
     assert_findings(report.findings(), &expected, "G9");
-    let _ = res2_digest;
     drop(d);
 }
 
 // =====================================================================
-// G9b - REGRESSION. ADR-0005 decision 11 l.993 "A resume with
-// `lost_through` = head: no gap, no `LostRecord`". The `Resumed`
-// detail carries `gap=none lost_records=0`.
-// =====================================================================
-#[test]
-fn g9b_lost_through_equal_to_head_has_no_gap() {
-    let d = Temp::new();
-    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
-    let mmr0 = seeded(&cp0);
-    let e1 = entry_rec(1, cp0.hash());
-    let mmr1 = pushed(&mmr0, &e1);
-    let cp2 = signed_cp(2, e1.hash(), &mmr1);
-    let mmr2 = pushed(&mmr1, &cp2);
-    let opening = signed_cp(3, cp2.hash(), &mmr2);
-    let resume = resume_decl(&opening, 2, cp2.hash(), 2);
-    put_segment(&d.0, 0, &[&cp0, &e1, &cp2], &[]);
-    std::fs::write(
-        d.0.join("audit.jsonl"),
-        [opening.clone(), resume.clone()]
-            .iter()
-            .flat_map(line_bytes)
-            .collect::<Vec<u8>>(),
-    )
-    .unwrap();
-    let verifier = Verifier::new(trust_with_key(fixture_pubkey()));
-    let report = report_of(vec![d.0.clone()], verifier);
-    let live = d.0.join("audit.jsonl");
-    let expected = vec![
-        located(
-            K::Resumed,
-            live,
-            2,
-            4,
-            format!(
-                "operator=operator reason=incident head=2:{CP2_DIGEST} \
-                 gap=none lost_records=0 structural=valid"
-            ),
-        ),
-        unlocated(K::UncoveredTail, None, "records seq 4..=4".to_owned()),
-    ];
-    assert_findings(report.findings(), &expected, "G9b");
-    let _ = opening;
-    let _ = resume;
-    drop(d);
-}
-
-// =====================================================================
-// G9c - ACCEPTANCE. Second pin of the per-gap `lost_records` count
-// (ruling 13-V7-d1 point 8): two confirmed gaps with ASYMMETRIC
-// counts (3 vs 0), so an implementation that sums across gaps
-// (every `Resumed` showing a cross-gap total) differs from the
-// per-gap count.
+// G9c - ACCEPTANCE. Per-gap `lost_records` count (ruling 13-V7-d1
+// point 8) under two confirmed resumes with ASYMMETRIC counts (3 vs
+// 0), plus the ADR-0005 decision 11 l.993 "`lost_through` = head:
+// no gap, no `LostRecord`" bullet on the second resume (`gap=none
+// lost_records=0`). Hand-built because chaining two writer resumes
+// requires two separate `AuditConfig::resume` calls that the
+// directory state after the first does not accept; the two openings
+// and two resume records are chained hand-built records.
 // =====================================================================
 #[test]
 fn g9c_two_gaps_with_asymmetric_lost_record_counts() {
@@ -1333,8 +1341,12 @@ fn g9c_two_gaps_with_asymmetric_lost_record_counts() {
     let open1 = signed_cp(6, cp2.hash(), &mmr2);
     let res1 = resume_decl(&open1, 2, cp2.hash(), GAP_HIGH);
     let mmr_after_r1 = pushed(&pushed(&mmr2, &open1), &res1);
-    let open2 = signed_cp(11, res1.hash(), &mmr_after_r1);
-    let res2 = resume_decl(&open2, RESUME_SEQ, res1.hash(), 10);
+    // Second resume with `lost_through = head_seq` on the first
+    // resume's head (seq 7): the gap is empty, `Resumed` reads
+    // `gap=none lost_records=0`, and no `LostRecord` can fall in
+    // the (empty) range (ADR-0005 decision 11 l.993).
+    let open2 = signed_cp(8, res1.hash(), &mmr_after_r1);
+    let res2 = resume_decl(&open2, RESUME_SEQ, res1.hash(), RESUME_SEQ);
     put_segment(&d.0, 0, &[&cp0, &e1, &cp2], &[]);
     std::fs::write(
         d.0.join("audit.jsonl"),
@@ -1348,7 +1360,7 @@ fn g9c_two_gaps_with_asymmetric_lost_record_counts() {
     let verifier = Verifier::new(trust_with_key(fixture_pubkey())).receipts([
         (1, e1.hash()),
         (RESUME_SEQ, res1.hash()),
-        (12, res2.hash()),
+        (9, res2.hash()),
         (3, WRONG_HASH_55),
         (4, WRONG_HASH_55),
         (5, WRONG_HASH_55),
@@ -1373,13 +1385,13 @@ fn g9c_two_gaps_with_asymmetric_lost_record_counts() {
             K::Resumed,
             live.clone(),
             4,
-            12,
+            9,
             format!(
                 "operator=operator reason=incident head=7:{res1_digest} \
-                 gap=8..=10 lost_records=0 structural=valid"
+                 gap=none lost_records=0 structural=valid"
             ),
         ),
-        unlocated(K::UncoveredTail, None, "records seq 12..=12".to_owned()),
+        unlocated(K::UncoveredTail, None, "records seq 9..=9".to_owned()),
     ];
     assert_findings(report.findings(), &expected, "G9c");
     drop(d);
@@ -1395,7 +1407,6 @@ fn g9c_two_gaps_with_asymmetric_lost_record_counts() {
 fn g9_above_receipt_at_lost_through_plus_one_is_not_lost() {
     let fx = non_genesis();
     let live = fx.dir.join("audit.jsonl");
-    let resume_digest = digest_string(&fx.resume_hash);
     let opening_digest = digest_string(&fx.opening_hash);
     // Supply the resume receipt (so the gap IS confirmed) plus a
     // wrong-hash receipt at seq 6 (= lost_through + 1 = opening
@@ -1425,24 +1436,21 @@ fn g9_above_receipt_at_lost_through_plus_one_is_not_lost() {
         ),
     ];
     assert_findings(report.findings(), &expected, "G9_above");
-    let _ = resume_digest;
 }
 
 // =====================================================================
 // G10 - ACCEPTANCE. ADR-0005 decision 5 "The genesis case" (ADR
-// amendment 12; ruling 13-V7-d1 point 7 exception): a genesis
-// resume with no receipt keeps the `SeqGap` for `0..=lost_through`
-// (unconfirmed); a confirmed genesis resume suppresses it.
+// amendment 12; ruling 13-V7-d1 point 7 exception), unconfirmed
+// half: a genesis resume with no resume receipt keeps the `SeqGap`
+// for `0..=lost_through`. Pairs with G10b (confirmed half).
 // =====================================================================
 #[test]
-fn g10_genesis_gap_suppressed_only_when_confirmed() {
-    // Unconfirmed: SeqGap 0..=5 stays.
+fn g10_genesis_gap_unconfirmed_keeps_seq_gap() {
     let g = genesis(GAP_HIGH);
     let live = g.dir.join("audit.jsonl");
-    let resume_digest = digest_string(&g.resume_hash);
     let verifier = Verifier::new(trust_with_key(fixture_pubkey()));
     let report = report_of(vec![g.dir.clone()], verifier);
-    let expected_unconfirmed = vec![
+    let expected = vec![
         located(
             K::SeqGap,
             live.clone(),
@@ -1452,26 +1460,36 @@ fn g10_genesis_gap_suppressed_only_when_confirmed() {
         ),
         located(
             K::Resumed,
-            live.clone(),
+            live,
             2,
             RESUME_SEQ,
             resumed_detail(0, TRAIL_GENESIS_DIGEST, "0..=5", 0),
         ),
     ];
-    assert_findings(report.findings(), &expected_unconfirmed, "G10 unconfirmed");
-    // Confirmed: SeqGap 0..=5 is suppressed.
+    assert_findings(report.findings(), &expected, "G10");
+}
+
+// =====================================================================
+// G10b - ACCEPTANCE. Confirmed half of ADR-0005 decision 5 "The
+// genesis case" (ruling 13-V7-d1 point 7 exception): once a receipt
+// matches the genesis resume's `(seq, hash)`, `SeqGap 0..=lt` is
+// suppressed. Pairs with G10 (unconfirmed half).
+// =====================================================================
+#[test]
+fn g10b_genesis_gap_confirmed_suppresses_seq_gap() {
+    let g = genesis(GAP_HIGH);
+    let live = g.dir.join("audit.jsonl");
     let verifier =
         Verifier::new(trust_with_key(fixture_pubkey())).receipts([(RESUME_SEQ, g.resume_hash)]);
     let report = report_of(vec![g.dir.clone()], verifier);
-    let expected_confirmed = vec![located(
+    let expected = vec![located(
         K::Resumed,
         live,
         2,
         RESUME_SEQ,
         resumed_detail(0, TRAIL_GENESIS_DIGEST, "0..=5", 0),
     )];
-    assert_findings(report.findings(), &expected_confirmed, "G10 confirmed");
-    let _ = (resume_digest, g.opening_hash);
+    assert_findings(report.findings(), &expected, "G10b");
 }
 
 // =====================================================================
@@ -1497,7 +1515,41 @@ fn g10_low_genesis_gap_includes_seq_zero() {
         ),
     ];
     assert_findings(report.findings(), &expected, "G10_low");
-    let _ = g.opening_hash;
+}
+
+// =====================================================================
+// G10_above - ACCEPTANCE. Second kill for the `high+1` boundary of
+// a confirmed genesis gap: a receipt at `seq 6` (= `lost_through +
+// 1` = opening seq) is NOT in the gap (`0..=5`); it is checked
+// against the opening record and emits `ReceiptMismatch "hash
+// differs"`. Pairs with G9_above (non-genesis) to pin the upper
+// boundary across both gap kinds.
+// =====================================================================
+#[test]
+fn g10_above_receipt_at_lost_through_plus_one_is_not_lost_genesis() {
+    let g = genesis(GAP_HIGH);
+    let live = g.dir.join("audit.jsonl");
+    let opening_digest = digest_string(&g.opening_hash);
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .receipts([(RESUME_SEQ, g.resume_hash), (6, WRONG_HASH_55)]);
+    let report = report_of(vec![g.dir.clone()], verifier);
+    let expected = vec![
+        unlocated(
+            K::ReceiptMismatch,
+            Some(6),
+            format!(
+                "receipt seq 6 hash {WRONG_HASH_55_DIGEST}: hash differs (record {opening_digest})"
+            ),
+        ),
+        located(
+            K::Resumed,
+            live,
+            2,
+            RESUME_SEQ,
+            resumed_detail(0, TRAIL_GENESIS_DIGEST, "0..=5", 0),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "G10_above");
 }
 
 // =====================================================================
@@ -1531,7 +1583,6 @@ fn g11_shipped_only_opening_cannot_confirm_gap() {
             .collect::<Vec<u8>>(),
     )
     .unwrap();
-    let resume_digest = digest_string(&resume.hash());
     let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
         .receipts([(RESUME_SEQ, resume.hash()), (4, WRONG_HASH_55)]);
     let sealed = segment_path(&d.0, 0);
@@ -1569,6 +1620,439 @@ fn g11_shipped_only_opening_cannot_confirm_gap() {
         unlocated(K::UncoveredTail, None, "records seq 7..=7".to_owned()),
     ];
     assert_findings(report.findings(), &expected, "G11");
-    let _ = resume_digest;
+    drop(d);
+}
+
+// =====================================================================
+// G12 - ACCEPTANCE. Ruling 13-V7-d1 point 8 (per-gap
+// `lost_records`): two resumes on one trail where the first has an
+// untrusted opening (candidate dropped by `signatures::trusted`;
+// ruling 13-V5-d1 point 8) and the second is trusted and
+// confirmed. The count map keys `lost_records=<n>` by each gap's
+// resume `(seq, hash)`; a candidate absent from the gap list keeps
+// `lost_records=0`, and the trusted resume's gap gets its own
+// per-gap count, so a receipt inside the second gap is not
+// attributed to the first resume. Hand-built because the writer
+// never signs with an untrusted key.
+// =====================================================================
+#[test]
+fn g12_untrusted_first_resume_keeps_zero_while_trusted_second_counts() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let cp2 = signed_cp(2, e1.hash(), &mmr1);
+    let mmr2 = pushed(&mmr1, &cp2);
+    // Resume 1: untrusted opening at seq 6 (0x44 key), resume at
+    // seq 7. The structural check passes (opening is a checkpoint
+    // linking to cp2), but `signatures::trusted` fails and
+    // `build_gaps` drops the candidate, so its jump keeps its
+    // ordinary `SeqGap 3..=5` and no `LostRecord` can fall inside
+    // its would-be gap.
+    let other = untrusted_signer();
+    let open1 = sign_as(&other, 6, cp2.hash(), &mmr2);
+    let res1 = resume_decl(&open1, 2, cp2.hash(), GAP_HIGH);
+    let mmr_after_r1 = pushed(&pushed(&mmr2, &open1), &res1);
+    // Resume 2: trusted opening at seq 11 (fixture key), resume at
+    // seq 12, lost_through=10. Its gap `8..=10` is confirmed when
+    // the receipt at `(12, res2.hash())` is supplied.
+    let open2 = signed_cp(11, res1.hash(), &mmr_after_r1);
+    let res2 = resume_decl(&open2, RESUME_SEQ, res1.hash(), 10);
+    put_segment(&d.0, 0, &[&cp0, &e1, &cp2], &[]);
+    std::fs::write(
+        d.0.join("audit.jsonl"),
+        [open1.clone(), res1.clone(), open2.clone(), res2.clone()]
+            .iter()
+            .flat_map(line_bytes)
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    let res1_digest = digest_string(&res1.hash());
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey())).receipts([
+        (1, e1.hash()),
+        (12, res2.hash()),
+        (4, WRONG_HASH_55),
+        (9, WRONG_HASH_55),
+    ]);
+    let report = report_of(vec![d.0.clone()], verifier);
+    let live = d.0.join("audit.jsonl");
+    let res1_resumed_detail = format!(
+        "operator=operator reason=incident head=2:{CP2_DIGEST} \
+         gap=3..=5 lost_records=0 structural=valid"
+    );
+    let res2_resumed_detail = format!(
+        "operator=operator reason=incident head=7:{res1_digest} \
+         gap=8..=10 lost_records=1 structural=valid"
+    );
+    let res1_digest_hex = digest_string(&res1.hash());
+    let expected = vec![
+        unlocated(
+            K::ReceiptMismatch,
+            Some(4),
+            format!("receipt seq 4 hash {WRONG_HASH_55_DIGEST}: no record"),
+        ),
+        located(
+            K::SeqGap,
+            live.clone(),
+            1,
+            6,
+            "missing seq 3..=5".to_owned(),
+        ),
+        located(
+            K::UntrustedKey,
+            live.clone(),
+            1,
+            6,
+            format!(
+                "key {UNTRUSTED_KEY_HEX} not listed for trail {}",
+                hex(&TRAIL)
+            ),
+        ),
+        located(
+            K::NoReceipt,
+            live.clone(),
+            2,
+            RESUME_SEQ,
+            format!("no receipt for seq {RESUME_SEQ} hash {res1_digest_hex}"),
+        ),
+        located(K::Resumed, live.clone(), 2, RESUME_SEQ, res1_resumed_detail),
+        lost(9, "receipt", WRONG_HASH_55_DIGEST, 8, 10),
+        located(K::Resumed, live, 4, 12, res2_resumed_detail),
+        unlocated(K::UncoveredTail, None, "records seq 12..=12".to_owned()),
+    ];
+    assert_findings(report.findings(), &expected, "G12");
+    drop(d);
+}
+
+// =====================================================================
+// G13 - ACCEPTANCE. Ruling 13-V7-d1 point 8 confirmation path: a
+// receipt confirms a gap only when the shared match rule's outcome
+// is Matched, which includes passing `Classifier::set_aside`. Under
+// `.end_before(<opening line>, Some(opening))`, `E = opening_seq`,
+// so a receipt at the resume record's `seq` (above `E`) is
+// `OutOfRange` and MUST NOT confirm the gap; a receipt inside the
+// gap then stays `ReceiptMismatch "no record"`, and the `Resumed`
+// detail keeps `lost_records=0`.
+// =====================================================================
+#[test]
+fn g13_end_before_sets_aside_resume_receipt_so_gap_stays_unconfirmed() {
+    let fx = non_genesis();
+    let live = fx.dir.join("audit.jsonl");
+    let opening_text = std::fs::read_to_string(&live).unwrap();
+    let opening_line = opening_text.lines().next().unwrap();
+    let opening_cp = crate::audit::Checkpoint::parse(opening_line).unwrap();
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .end_before(opening_line, Some(opening_cp))
+        .unwrap()
+        .receipts([
+            (1, fx.e1.hash()),
+            (4, WRONG_HASH_55),
+            (RESUME_SEQ, fx.resume_hash),
+        ]);
+    let report = report_of(vec![fx.dir.clone()], verifier);
+    let expected = vec![
+        unlocated(
+            K::ReceiptMismatch,
+            Some(4),
+            format!("receipt seq 4 hash {WRONG_HASH_55_DIGEST}: no record"),
+        ),
+        located(
+            K::TrailEnded,
+            live.clone(),
+            1,
+            6,
+            "end_before seq 6: records seq 6..=8 at or above the end".to_owned(),
+        ),
+        unlocated(
+            K::OutOfRange,
+            Some(RESUME_SEQ),
+            format!(
+                "receipt seq {RESUME_SEQ} hash {}: above end seq 6",
+                digest_string(&fx.resume_hash)
+            ),
+        ),
+        located(
+            K::Resumed,
+            live,
+            2,
+            RESUME_SEQ,
+            resumed_detail(2, CP2_DIGEST, "3..=5", 0),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "G13");
+}
+
+// =====================================================================
+// G13b - ACCEPTANCE. Second layout for the set-aside confirmation
+// rule (ruling 13-V7-d1 point 8): same `.end_before` on the opening
+// but with NO end anchor, so the resume receipt above `E` is
+// `UnanchoredEnd` (error) rather than `OutOfRange` (info). The gap
+// still stays unconfirmed and the in-gap waiver keeps
+// `ReceiptMismatch "no record"`.
+// =====================================================================
+#[test]
+fn g13b_end_before_unanchored_set_aside_resume_receipt_stays_unconfirmed() {
+    let fx = non_genesis();
+    let live = fx.dir.join("audit.jsonl");
+    let opening_text = std::fs::read_to_string(&live).unwrap();
+    let opening_line = opening_text.lines().next().unwrap();
+    let verifier = Verifier::new(trust_with_key(fixture_pubkey()))
+        .end_before(opening_line, None)
+        .unwrap()
+        .receipts([(1, fx.e1.hash()), (RESUME_SEQ, fx.resume_hash)])
+        .waive(4, WRONG_HASH_55, "orphan")
+        .unwrap();
+    let report = report_of(vec![fx.dir.clone()], verifier);
+    let expected = vec![
+        unlocated(
+            K::ReceiptMismatch,
+            Some(4),
+            format!("waive seq 4 hash {WRONG_HASH_55_DIGEST}: no record"),
+        ),
+        unlocated(
+            K::UnanchoredEnd,
+            Some(6),
+            "end_before seq 6: no end anchor".to_owned(),
+        ),
+        located(
+            K::TrailEnded,
+            live.clone(),
+            1,
+            6,
+            "end_before seq 6: records seq 6..=8 at or above the end".to_owned(),
+        ),
+        unlocated(
+            K::UnanchoredEnd,
+            Some(RESUME_SEQ),
+            format!(
+                "receipt seq {RESUME_SEQ} hash {}: above end seq 6",
+                digest_string(&fx.resume_hash)
+            ),
+        ),
+        located(
+            K::Resumed,
+            live,
+            2,
+            RESUME_SEQ,
+            resumed_detail(2, CP2_DIGEST, "3..=5", 0),
+        ),
+    ];
+    assert_findings(report.findings(), &expected, "G13b");
+}
+
+// =====================================================================
+// G14 - REGRESSION. Trust filter (ruling 13-V5-d1 point 8) pairs
+// the hash equality with the trusted predicate on the same copy:
+// an untrusted native opening at the opening `seq` is NOT rescued
+// by a different, trusted shipped copy at that `seq`. Fork at seq
+// 6 (`SeqConflict`), the shipped-trusted copy covers the tail
+// (`UncoveredTail` starts at the resume seq), the candidate is
+// dropped so the jump keeps its `SeqGap 3..=5`, and no
+// `LostRecord` can fall in its would-be gap. Hand-built because
+// the writer never signs with an untrusted key.
+// =====================================================================
+#[test]
+fn g14_untrusted_native_opening_trusted_shipped_copy_does_not_confirm() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let cp2 = signed_cp(2, e1.hash(), &mmr1);
+    let mmr2 = pushed(&mmr1, &cp2);
+    put_segment(&d.0, 0, &[&cp0, &e1, &cp2], &[]);
+    // Native opening at seq 6: untrusted key, correct previous and
+    // `mmr_size = 3` so the fold matches it (structural check and
+    // fold filter both pass), only the trust filter drops it.
+    let other = untrusted_signer();
+    let opening = sign_as(&other, 6, cp2.hash(), &mmr2);
+    let resume = resume_decl(&opening, 2, cp2.hash(), GAP_HIGH);
+    std::fs::write(
+        d.0.join("audit.jsonl"),
+        [opening.clone(), resume.clone()]
+            .iter()
+            .flat_map(line_bytes)
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    // Shipped (Collector-style) decoy at seq 6: trusted key, SAME
+    // `previous` so the chain check passes, DIFFERENT MMR fields
+    // so its hash differs from the native opening. Fold does not
+    // run on shipped inputs (ruling 13-V4-d7; #224).
+    let shipped_decoy = signed_cp(6, cp2.hash(), &mmr0);
+    let shipped = d.0.join("collector.jsonl");
+    std::fs::write(&shipped, line_bytes(&shipped_decoy)).unwrap();
+    let verifier =
+        Verifier::new(trust_with_key(fixture_pubkey())).receipts([(RESUME_SEQ, resume.hash())]);
+    let sealed = segment_path(&d.0, 0);
+    let report = report_of(vec![d.0.clone(), shipped.clone()], verifier);
+    let live = d.0.join("audit.jsonl");
+    // SeqConflict renders the distinct hashes in `BTreeMap` byte
+    // order (`engine::check`), so pair the two hashes and sort them
+    // once for the literal detail.
+    let mut sorted_hashes = [opening.hash(), shipped_decoy.hash()];
+    sorted_hashes.sort();
+    let [first_hash, second_hash] = sorted_hashes;
+    let expected = vec![
+        located(
+            K::NoReceipt,
+            sealed,
+            2,
+            1,
+            format!("no receipt for seq 1 hash {E1_DIGEST}"),
+        ),
+        located(
+            K::SeqConflict,
+            live.clone(),
+            1,
+            6,
+            format!(
+                "conflicting hashes: {}, {}",
+                digest_string(&first_hash),
+                digest_string(&second_hash),
+            ),
+        ),
+        located(
+            K::SeqGap,
+            live.clone(),
+            1,
+            6,
+            "missing seq 3..=5".to_owned(),
+        ),
+        located(
+            K::UntrustedKey,
+            live.clone(),
+            1,
+            6,
+            format!(
+                "key {UNTRUSTED_KEY_HEX} not listed for trail {}",
+                hex(&TRAIL)
+            ),
+        ),
+        located(
+            K::Resumed,
+            live,
+            2,
+            RESUME_SEQ,
+            format!(
+                "operator=operator reason=incident head=2:{CP2_DIGEST} \
+                 gap=3..=5 lost_records=0 structural=valid"
+            ),
+        ),
+        unlocated(K::UncoveredTail, None, "records seq 7..=7".to_owned()),
+    ];
+    assert_findings(report.findings(), &expected, "G14");
+    drop(d);
+}
+
+// =====================================================================
+// G14b - REGRESSION. Second layout for the paired hash+trust check
+// (ruling 13-V5-d1 point 8): the shipped copy carries a DIFFERENT
+// `previous` from the native opening, so the trusted shipped-only
+// copy at the opening `seq` neither links to cp2 nor matches the
+// native opening's hash. The candidate is still dropped, the jump
+// keeps its `SeqGap 3..=5`, and the gap stays unconfirmed. Pairs
+// with G14 (same `previous`, different MMR) to pin the hash-vs-
+// trust pairing across two shapes of different-hash decoys.
+// =====================================================================
+#[test]
+fn g14b_different_previous_trusted_shipped_copy_does_not_confirm() {
+    let d = Temp::new();
+    let cp0 = signed_cp(0, Record::genesis(&TRAIL), &Mmr::new());
+    let mmr0 = seeded(&cp0);
+    let e1 = entry_rec(1, cp0.hash());
+    let mmr1 = pushed(&mmr0, &e1);
+    let cp2 = signed_cp(2, e1.hash(), &mmr1);
+    let mmr2 = pushed(&mmr1, &cp2);
+    put_segment(&d.0, 0, &[&cp0, &e1, &cp2], &[]);
+    // Native opening at seq 6: untrusted key, `previous = cp2`,
+    // honest MMR. Fold matches, structural check passes, trust
+    // filter drops.
+    let other = untrusted_signer();
+    let opening = sign_as(&other, 6, cp2.hash(), &mmr2);
+    let resume = resume_decl(&opening, 2, cp2.hash(), GAP_HIGH);
+    std::fs::write(
+        d.0.join("audit.jsonl"),
+        [opening.clone(), resume.clone()]
+            .iter()
+            .flat_map(line_bytes)
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    // Shipped trusted decoy at seq 6: trusted key, DIFFERENT
+    // `previous` (`e1.hash()` instead of `cp2.hash()`) and the
+    // same honest MMR, so its hash differs from the native opening
+    // and `ChainBroken` fires for the decoy's broken link.
+    let shipped_decoy = signed_cp(6, e1.hash(), &mmr2);
+    let shipped = d.0.join("collector.jsonl");
+    std::fs::write(&shipped, line_bytes(&shipped_decoy)).unwrap();
+    let verifier =
+        Verifier::new(trust_with_key(fixture_pubkey())).receipts([(RESUME_SEQ, resume.hash())]);
+    let sealed = segment_path(&d.0, 0);
+    let report = report_of(vec![d.0.clone(), shipped.clone()], verifier);
+    let live = d.0.join("audit.jsonl");
+    let mut sorted_hashes = [opening.hash(), shipped_decoy.hash()];
+    sorted_hashes.sort();
+    let [first_hash, second_hash] = sorted_hashes;
+    let expected = vec![
+        located(
+            K::NoReceipt,
+            sealed,
+            2,
+            1,
+            format!("no receipt for seq 1 hash {E1_DIGEST}"),
+        ),
+        located(
+            K::SeqConflict,
+            live.clone(),
+            1,
+            6,
+            format!(
+                "conflicting hashes: {}, {}",
+                digest_string(&first_hash),
+                digest_string(&second_hash),
+            ),
+        ),
+        located(
+            K::SeqGap,
+            live.clone(),
+            1,
+            6,
+            "missing seq 3..=5".to_owned(),
+        ),
+        located(
+            K::UntrustedKey,
+            live.clone(),
+            1,
+            6,
+            format!(
+                "key {UNTRUSTED_KEY_HEX} not listed for trail {}",
+                hex(&TRAIL)
+            ),
+        ),
+        located(
+            K::ChainBroken,
+            shipped.clone(),
+            1,
+            6,
+            format!(
+                "expected previous {CP2_DIGEST}, found {}",
+                digest_string(&e1.hash()),
+            ),
+        ),
+        located(
+            K::Resumed,
+            live,
+            2,
+            RESUME_SEQ,
+            format!(
+                "operator=operator reason=incident head=2:{CP2_DIGEST} \
+                 gap=3..=5 lost_records=0 structural=valid"
+            ),
+        ),
+        unlocated(K::UncoveredTail, None, "records seq 7..=7".to_owned()),
+    ];
+    assert_findings(report.findings(), &expected, "G14b");
     drop(d);
 }

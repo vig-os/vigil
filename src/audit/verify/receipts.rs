@@ -340,12 +340,14 @@ fn mismatch(
     (record_hash != hash).then(|| format!("hash differs (record {})", digest_string(&record_hash)))
 }
 
-/// `true` iff the shared match rule accepts `(seq, hash)` against the
-/// verified set (ruling 13-V7-d1 point 4): one unforked record at
-/// `seq` whose hash equals `hash`. One definition for both
-/// [`match_one`] (used by every receipt, waiver and `from`) and
-/// [`super::engine::build_gaps`] (resume-gap confirmation, point 8),
-/// so the receipt-side match and gap confirmation never drift.
+/// `true` iff the shared match rule accepts `(seq, hash)` against
+/// the verified set (ruling 13-V7-d1 point 4): one unforked record
+/// at `seq` whose hash equals `hash`. Mirrors [`mismatch`] (the
+/// private helper [`match_one`] consults for its first-failing
+/// `ReceiptMismatch` detail), so [`super::engine::check`] can fold
+/// the same match rule into its matched-receipts pre-pass for
+/// resume-gap confirmation (point 8) without drifting from the
+/// real receipts loop.
 pub(super) fn matches(
     seq: u64,
     hash: [u8; 32],

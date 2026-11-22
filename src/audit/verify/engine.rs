@@ -491,14 +491,41 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     let mut fold_findings: Vec<Finding> = Vec::new();
     let matched_openings = fold::check_runs(&collection, trail, &mut fold_findings);
     let pending_resumes = filter_candidates(resume::candidates(&declarations), &matched_openings);
+    // Ruling 13-V7-d1 point 8: a receipt confirms a gap only when
+    // `receipts::match_one`'s outcome for it would be Matched --
+    // both in range and matching the record under the shared match
+    // rule. A bare classifier built from the start and end bounds
+    // (no gaps yet) runs the same `set_aside` the real pass will,
+    // so a receipt above `end_before`'s last-line `seq` or below
+    // an accepted start never confirms. The shared `receipts::matches`
+    // is the one match rule, and a gap for a candidate the trust or
+    // fold filter dropped is absent from the gap list below, so
+    // nothing keys off a dropped candidate.
+    let bare_position = position::Classifier::new(
+        accepted_start.and(start),
+        trail,
+        anchors,
+        end_ctx,
+        Vec::new(),
+    );
+    let confirmed_receipts: BTreeSet<(u64, [u8; 32])> =
+        receipt_set.map_or_else(BTreeSet::new, |rs| {
+            rs.receipts
+                .iter()
+                .filter(|&&(seq, hash)| {
+                    bare_position.set_aside(seq, "").is_none()
+                        && receipts::matches(seq, hash, &groups, &conflicting_seqs)
+                })
+                .copied()
+                .collect()
+        });
     let gaps = build_gaps(
         &pending_resumes,
         trail,
         trust,
         anchors,
-        receipt_set,
+        &confirmed_receipts,
         &groups,
-        &conflicting_seqs,
     );
     let position = position::Classifier::new(
         accepted_start.and(start),
@@ -743,14 +770,15 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // `Resumed`) so same-key tie-break order is preserved across
     // moves of `fold::check_runs`.
     findings.append(&mut fold_findings);
-    // Ruling 13-V7-d1 point 8: for each trust-and-fold-kept
-    // candidate, count the `LostRecord` findings whose `seq` lies in
-    // that gap's range, and thread the counts into the `Resumed`
-    // detail (`lost_records=<n>`). Resume declarations whose
-    // candidate was dropped by the trust or fold filter, and
-    // malformed declarations, keep `lost_records=0`. Anchors and
+    // Ruling 13-V7-d1 point 8: for each gap in the classifier's
+    // list, count the `LostRecord` findings whose `seq` lies in
+    // that gap's range, keyed by the gap's resume `(seq, hash)`.
+    // Reading the bounds and the key from the gap itself keeps the
+    // two consumers aligned: a candidate the trust or fold filter
+    // dropped is absent from the gap list and from the count map,
+    // and its `Resumed` detail keeps `lost_records=0`. Anchors and
     // pins arrive with later work in #13.
-    let lost_counts = count_lost_records(&findings, &pending_resumes, &gaps);
+    let lost_counts = count_lost_records(&findings, &gaps);
     emit_resumed(&declarations, &lost_counts, &mut findings);
     let first_seq = groups.first_key_value().map(|(&s, _)| s);
     let last_seq = groups.last_key_value().map(|(&s, _)| s);
@@ -888,14 +916,17 @@ pub(super) fn filter_candidates_for_test(collection: &Collection, trail: [u8; 16
 /// candidates (rulings 13-V4-d10 point 4, 13-V5-d1 point 8 and
 /// 13-V7-d1 points 7-9). The trust filter runs here (point 8): a
 /// candidate whose opening checkpoint does not pass
-/// [`signatures::trusted`] is dropped, so its jump keeps its ordinary
-/// `SeqGap` and nothing inside it can be `LostRecord`.
-/// `opening_anchored` applies ruling 13-V6-d1 point 2: an input
-/// anchor on the verified trail at the opening's `(seq, hash)`
-/// anchors the gap for a later #13 step. Confirmation (point 8) matches the
-/// gap's resume `(seq, hash)` against the receipt set under the
-/// shared match rule: the record exists in the verified set, the
-/// `seq` is not forked, and the receipt's hash equals the record's.
+/// [`signatures::trusted`] (on the same `(seq, hash)` the candidate
+/// names) is dropped, so a trusted record with a different hash at
+/// the opening's `seq` never rescues a forged opening; its jump
+/// keeps its ordinary `SeqGap` and nothing inside can be
+/// `LostRecord`. `opening_anchored` applies ruling 13-V6-d1 point 2:
+/// an input anchor on the verified trail at the opening's
+/// `(seq, hash)` anchors the gap for a later #13 step. Confirmation
+/// (point 8) uses the shared matched-receipts set the caller built
+/// through [`receipts::matches`] and [`position::Classifier::set_aside`],
+/// so a receipt above the end or below an accepted start never
+/// confirms a gap and never drifts from the real receipts pass.
 /// A shipped-only opening is never a candidate (13-V4-d7; spike
 /// #224), so a Collector copy cannot confirm a gap through this
 /// filter.
@@ -904,12 +935,9 @@ fn build_gaps(
     trail: [u8; 16],
     trust: &TrustPolicy,
     anchors: &[Checkpoint],
-    receipt_set: Option<&receipts::Inputs<'_>>,
+    confirmed_receipts: &BTreeSet<(u64, [u8; 32])>,
     groups: &BTreeMap<u64, Vec<Located<'_>>>,
-    conflicting_seqs: &BTreeSet<u64>,
 ) -> Vec<position::Gap> {
-    let receipts: Option<&std::collections::BTreeSet<(u64, [u8; 32])>> =
-        receipt_set.map(|r| r.receipts);
     let mut out = Vec::new();
     for c in candidates {
         // Ruling 13-V5-d1 point 8: trust the opening checkpoint by
@@ -917,7 +945,10 @@ fn build_gaps(
         // record at the opening `(seq, hash)`. A shipped-only
         // opening could appear here only via a fold match, which
         // 13-V4-d7 excludes; iterating the groups' copies covers
-        // both native and (future) shipped cases.
+        // both native and (future) shipped cases. The hash equality
+        // and the trust check run together so a trusted copy with
+        // a different hash at the opening's `seq` does not rescue a
+        // forged opening.
         let opening_trusted = groups.get(&c.opening_seq).is_some_and(|copies| {
             copies
                 .iter()
@@ -929,18 +960,7 @@ fn build_gaps(
         let opening_anchored = anchors
             .iter()
             .any(|a| a.trail() == trail && a.seq() == c.opening_seq && a.hash() == c.opening_hash);
-        // Confirmation (point 8): the receipt set carries a receipt
-        // whose `(seq, hash)` is the gap's resume `(seq, hash)` AND
-        // the verified set accepts it under the shared match rule
-        // (`receipts::matches`, the one rule `receipts::match_one`
-        // runs for every receipt). Walking the receipt set keeps the
-        // match path symmetric with the receipts loop that runs later
-        // -- the same receipt `match_one` will accept at reconciliation
-        // is the one that confirms the gap here.
-        let confirmed = receipts.is_some_and(|set| {
-            set.contains(&(c.resume_seq, c.resume_hash))
-                && receipts::matches(c.resume_seq, c.resume_hash, groups, conflicting_seqs)
-        });
+        let confirmed = confirmed_receipts.contains(&(c.resume_seq, c.resume_hash));
         let low = if c.is_genesis { 0 } else { c.head_seq + 1 };
         out.push(position::Gap {
             low,
@@ -948,33 +968,33 @@ fn build_gaps(
             is_genesis: c.is_genesis,
             confirmed,
             opening_anchored,
+            resume_seq: c.resume_seq,
+            resume_hash: c.resume_hash,
         });
     }
     out
 }
 
 /// Ruling 13-V7-d1 point 8: count every `LostRecord` finding whose
-/// `seq` lies in a candidate's gap, keyed by the gap's resume
-/// `(seq, hash)`, so [`emit_resumed`] can fill the `lost_records=<n>`
-/// slot. The gap bounds come from the gap list the classifier was
-/// built with, never recomputed here, so the two consumers agree on
-/// `low..=high`. A candidate absent from the gap list -- dropped by
-/// the trust or fold filter -- is absent here, and its `Resumed`
-/// detail keeps `lost_records=0`.
+/// `seq` lies in a gap, keyed by that gap's resume `(seq, hash)` on
+/// the gap itself, so [`emit_resumed`] can fill the
+/// `lost_records=<n>` slot. The bounds and the key both come from
+/// the classifier's gap list, so a candidate the trust or fold
+/// filter dropped is absent from both and its `Resumed` detail
+/// keeps `lost_records=0`.
 fn count_lost_records(
     findings: &[Finding],
-    candidates: &[resume::ResumeCandidate],
     gaps: &[position::Gap],
 ) -> BTreeMap<(u64, [u8; 32]), u64> {
     let mut out: BTreeMap<(u64, [u8; 32]), u64> = BTreeMap::new();
-    for (c, g) in candidates.iter().zip(gaps.iter()) {
+    for g in gaps {
         let n = findings
             .iter()
             .filter(|f| {
                 f.kind() == K::LostRecord && f.seq().is_some_and(|s| s >= g.low && s <= g.high)
             })
             .count() as u64;
-        out.insert((c.resume_seq, c.resume_hash), n);
+        out.insert((g.resume_seq, g.resume_hash), n);
     }
     out
 }
