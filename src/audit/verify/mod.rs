@@ -14,6 +14,7 @@ pub(crate) mod lines;
 mod position;
 mod receipts;
 mod resume;
+mod review;
 mod revocation;
 mod signatures;
 mod stale;
@@ -62,6 +63,23 @@ pub struct Finding {
     detail: String,
     accepted_kind: Option<FindingKind>,
     run_digest: Option<[u8; 32]>,
+    /// Trailing [`FindingKind::TornWrite`] pin (ADR-0005 decision 11
+    /// "What pins each kind"): the `seq` of the last complete record
+    /// before the gap in its file (`None` on a trailing gap with no
+    /// record before it in the file: FORK 3 of ruling 13-V8-d1
+    /// point 5, so no `accept TornWrite` line can match it). Set on
+    /// the trailing `TornWrite` only; left `None` on every other
+    /// finding (attested `TornWrite` included, since decision 11
+    /// permits accepting only a trailing gap). Carried internally,
+    /// without a public accessor, so [`review::check`] matches on
+    /// the same `(seq, gap digest)` the line names without changing
+    /// the public API.
+    pin_seq: Option<u64>,
+    /// Trailing [`FindingKind::TornWrite`] gap digest (the same
+    /// digest that appears in the finding's detail), mirrored
+    /// internally so [`review::check`] matches it without parsing
+    /// the detail string.
+    pin_hash: Option<[u8; 32]>,
 }
 impl Finding {
     pub(crate) fn new(
@@ -79,13 +97,53 @@ impl Finding {
             detail,
             accepted_kind: None,
             run_digest: None,
+            pin_seq: None,
+            pin_hash: None,
         }
     }
-    #[cfg_attr(not(test), expect(dead_code, reason = "review promotion, #13 V8"))]
+    #[cfg(test)]
     pub(crate) fn accepted(mut self, kind: FindingKind) -> Self {
         assert_eq!(self.kind, FindingKind::Accepted);
         self.accepted_kind = Some(kind);
         self
+    }
+    /// Carries the trailing `TornWrite`'s pin (ADR-0005 decision 11
+    /// "What pins each kind"): `pin_seq` is the `seq` of the last
+    /// complete record before the gap in its file (`None` on a
+    /// file-start trailing gap, which cannot be accepted by ruling
+    /// 13-V8-d1 FORK 3); `pin_hash` is the gap digest the detail
+    /// reports. Panics on any kind other than `TornWrite` so a
+    /// pin is never attached to the wrong finding.
+    pub(crate) fn with_pin(mut self, pin_seq: Option<u64>, pin_hash: [u8; 32]) -> Self {
+        assert_eq!(self.kind, FindingKind::TornWrite);
+        self.pin_seq = pin_seq;
+        self.pin_hash = Some(pin_hash);
+        self
+    }
+    /// Replaces the finding in place with its `Accepted` form
+    /// (ADR-0005 decision 11 "A match replaces the warning"; ruling
+    /// 13-V8-d1 point 3): the kind becomes [`FindingKind::Accepted`],
+    /// `accepted_kind` is set to the original kind, and the detail
+    /// becomes `accepted by <by>: <reason>; was: <original detail>`.
+    /// File, line and `seq` are preserved so the finding stays
+    /// where a reader would look for it; the internal pin fields
+    /// (only set on a trailing `TornWrite` in the first place) are
+    /// cleared because they are no longer a pin after promotion.
+    pub(crate) fn promote_to_accepted(&mut self, by: &str, reason: &str) {
+        assert!(self.accepted_kind.is_none());
+        let original_kind = self.kind;
+        let original_detail = std::mem::take(&mut self.detail);
+        self.kind = FindingKind::Accepted;
+        self.accepted_kind = Some(original_kind);
+        self.detail = format!("accepted by {by}: {reason}; was: {original_detail}");
+        self.pin_seq = None;
+        self.pin_hash = None;
+    }
+    pub(in crate::audit::verify) fn pin_seq(&self) -> Option<u64> {
+        self.pin_seq
+    }
+    pub(in crate::audit::verify) fn pin_hash(&self) -> Option<[u8; 32]> {
+        self.pin_hash
     }
     /// Sets a run's `blake3` digest on its `SegmentStructure`
     /// finding. Consumed by `verify::fold::check_runs` (#13 V4a) for
@@ -304,6 +362,8 @@ mod position_tests;
 #[cfg(test)]
 mod receipts_tests;
 #[cfg(test)]
+mod review_tests;
+#[cfg(test)]
 mod revocation_tests;
 #[cfg(test)]
 mod rule2_tests;
@@ -402,9 +462,35 @@ pub struct Verifier {
     waivers: std::collections::BTreeMap<u64, ([u8; 32], String)>,
     receipts_from: Option<(u64, [u8; 32], String)>,
     receipts_live: bool,
+    /// Review-file `accept` lines (ADR-0005 decision 11 "Review
+    /// file"; ruling 13-V8-d1). Grouped by `seq` so the engine's
+    /// per-seq review pass runs in `seq` order; each inner vec
+    /// holds one entry per acceptable kind at that `seq` and the
+    /// duplicate-check at registration (point 2) refuses two lines
+    /// for one `(kind, seq)`. The hash is the record's hash for
+    /// `Resumed`/`ClockWentBackwards`/`DuplicateRecord` and the gap
+    /// digest for a trailing `TornWrite`; each entry carries the
+    /// one-token `by` field and the validated reason the match
+    /// details carry. [`FindingKind`] is `#[non_exhaustive]` and
+    /// implements no `Ord`, so a `BTreeMap<(FindingKind, u64), …>`
+    /// cannot key by the pair directly.
+    accepts: AcceptMap,
     #[cfg(test)]
     now_override: Option<SystemTime>,
 }
+
+/// One `accept` line (ruling 13-V8-d1 point 2): the hash is the
+/// record's hash (`Resumed`/`ClockWentBackwards`/`DuplicateRecord`)
+/// or the gap digest (a trailing `TornWrite`), `by` is one
+/// validated token and the reason is a non-empty single line.
+pub(crate) type AcceptEntry = (FindingKind, [u8; 32], String, String);
+
+/// The review-file accept set grouped by `seq` so the engine's
+/// per-seq review pass runs in `seq` order; each inner vec holds
+/// one entry per acceptable kind at that `seq`. See [`Verifier`]'s
+/// `accepts` field for the registration and duplicate-check
+/// semantics.
+pub(crate) type AcceptMap = std::collections::BTreeMap<u64, Vec<AcceptEntry>>;
 
 /// Non-empty, single-line reason check for waivers and the `from`
 /// input (ruling 13-V7-d1 point 6). Otherwise `InvalidConfig` with
@@ -448,6 +534,7 @@ impl Verifier {
             waivers: std::collections::BTreeMap::new(),
             receipts_from: None,
             receipts_live: false,
+            accepts: AcceptMap::new(),
             #[cfg(test)]
             now_override: None,
         }
@@ -980,6 +1067,99 @@ impl Verifier {
         self.receipts_live = on;
         Ok(self)
     }
+    /// Accepts one honest warning the verifier will keep reporting
+    /// so a recorded human sign-off clears it (ADR-0005 decision 11
+    /// "Review file"; ruling 13-V8-d1). A matching warning becomes
+    /// [`FindingKind::Accepted`] (info) with detail `accepted by
+    /// <by>: <reason>; was: <original detail>`, keeping the
+    /// finding's original file, line and `seq`.
+    ///
+    /// **Acceptable kinds**: [`FindingKind::TornWrite`],
+    /// [`FindingKind::Resumed`], [`FindingKind::ClockWentBackwards`]
+    /// and [`FindingKind::DuplicateRecord`]. Any other kind is
+    /// `InvalidConfig` (an error finding is never acceptable by an
+    /// `accept` line; an info needs no acceptance; `UncoveredTail`
+    /// and `Unreconciled` clear by themselves).
+    ///
+    /// **Pins**. For `Resumed`, `ClockWentBackwards` and
+    /// `DuplicateRecord`: `seq` is the record's `seq` and `hash` is
+    /// the record's hash. For `TornWrite`: `seq` is the `seq` of the
+    /// last complete record before the gap in its file and `hash`
+    /// is the gap digest the finding reports. Only a **trailing**
+    /// `TornWrite` can be accepted; an attested-but-uncovered one
+    /// clears with the next trusted checkpoint, so a line naming it
+    /// is [`FindingKind::AcceptUnused`]. A trailing `TornWrite`
+    /// with no record before the gap in its file has no pin and
+    /// cannot be accepted (ruling 13-V8-d1 point 5).
+    ///
+    /// **Outcomes**. A line with no record at its `seq` on the
+    /// verified trail, or at a forked `seq` (fail-closed, like
+    /// receipts), is [`FindingKind::AcceptMismatch`]. For
+    /// non-`TornWrite` kinds, a record whose hash differs is
+    /// `AcceptMismatch`. For `TornWrite`, a line whose gap digest
+    /// matches no trailing `TornWrite` finding at its `seq` is
+    /// [`FindingKind::AcceptUnused`]; an otherwise matching line
+    /// whose gap carries the "no crash outcome" mark is
+    /// `AcceptMismatch`. A line below an accepted
+    /// [`Self::start_from`] or above the end of a bounded batch is
+    /// set aside through the shared position classifier
+    /// ([`FindingKind::OutOfRange`] / [`FindingKind::UnanchoredStart`] /
+    /// [`FindingKind::UnanchoredEnd`]). A line inside a confirmed
+    /// resume gap is [`FindingKind::LostRecord`].
+    ///
+    /// **What this cannot detect**. Someone who accepts tampering:
+    /// the report lists every acceptance as `Accepted`, with the
+    /// `by` token and the reason, so the decision is attributable.
+    /// Anyone who can write the review file can accept warnings;
+    /// no error can be cleared through this route.
+    ///
+    /// # Errors
+    /// Returns [`InvalidConfig`](AuditErrorKind::InvalidConfig) when
+    /// `kind` is not one of the four acceptable warnings, when `by`
+    /// is empty or holds any ASCII whitespace or control byte,
+    /// when `reason` fails the shared single-line reason check
+    /// (empty or containing LF/CR), or when a second `accept` for
+    /// the same `(kind, seq)` is registered.
+    pub fn accept(
+        mut self,
+        kind: FindingKind,
+        seq: u64,
+        hash: [u8; 32],
+        by: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<Self, AuditError> {
+        use FindingKind::{ClockWentBackwards, DuplicateRecord, Resumed, TornWrite};
+        if !matches!(
+            kind,
+            TornWrite | Resumed | ClockWentBackwards | DuplicateRecord
+        ) {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                format!("accept kind {kind:?} is not acceptable"),
+            ));
+        }
+        let by = by.into();
+        if by.is_empty()
+            || by
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                "accept by must be a single token (no whitespace or control bytes)",
+            ));
+        }
+        let reason = validate_reason(reason.into(), "accept reason")?;
+        let entries = self.accepts.entry(seq).or_default();
+        if entries.iter().any(|(k, _, _, _)| *k == kind) {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidConfig,
+                format!("duplicate accept for {kind:?} seq {seq}"),
+            ));
+        }
+        entries.push((kind, hash, by, reason));
+        Ok(self)
+    }
 
     /// Expands a directory's vigil files and verifies its confirmed snapshot.
     /// See [`verify`] for review limitations and error semantics.
@@ -1059,6 +1239,7 @@ impl Verifier {
                 start: self.start.as_ref(),
                 end_ctx: end_ctx.as_ref(),
                 receipts: receipt_inputs.as_ref(),
+                accepts: &self.accepts,
                 now: self.now(),
             },
         ))

@@ -198,6 +198,7 @@ pub fn vigil::audit::TrustPolicyBuilder::build(self) -> core::result::Result<vig
 pub fn vigil::audit::TrustPolicyBuilder::trail(self, id: [u8; 16]) -> vigil::audit::TrailTrust
 pub struct vigil::audit::Verifier
 impl vigil::audit::Verifier
+pub fn vigil::audit::Verifier::accept(self, kind: vigil::audit::FindingKind, seq: u64, hash: [u8; 32], by: impl core::convert::Into<alloc::string::String>, reason: impl core::convert::Into<alloc::string::String>) -> core::result::Result<Self, vigil::audit::AuditError>
 pub fn vigil::audit::Verifier::anchor(self, anchor: vigil::audit::Checkpoint) -> Self
 pub fn vigil::audit::Verifier::end_before(self, archive_record: &str, end_anchor: core::option::Option<vigil::audit::Checkpoint>) -> core::result::Result<Self, vigil::audit::AuditError>
 pub fn vigil::audit::Verifier::max_age(self, max_age: core::time::Duration) -> core::result::Result<Self, vigil::audit::AuditError>

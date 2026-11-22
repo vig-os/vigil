@@ -22,6 +22,7 @@ fn trust_trail() -> crate::audit::TrustPolicy {
         .unwrap()
 }
 fn check(collection: Collection, trail: [u8; 16]) -> Report {
+    let accepts = crate::audit::verify::AcceptMap::new();
     super::check(
         collection,
         trail,
@@ -32,6 +33,7 @@ fn check(collection: Collection, trail: [u8; 16]) -> Report {
             start: None,
             end_ctx: None,
             receipts: None,
+            accepts: &accepts,
             now: std::time::SystemTime::now(),
         },
     )

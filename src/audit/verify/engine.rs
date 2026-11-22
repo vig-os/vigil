@@ -26,7 +26,7 @@
 use super::{
     Finding, Report, anchors, end, end_before, fold,
     input::{Collection, Input, LineContent, Summary},
-    position, receipts, resume, revocation, signatures, stale, start,
+    position, receipts, resume, review, revocation, signatures, stale, start,
 };
 use crate::audit::{Checkpoint, FindingKind as K, Record, TrustPolicy, digest_string, hex};
 use std::{
@@ -209,7 +209,15 @@ fn file_findings(
             s.len,
             digest_string(&s.digest)
         );
-        findings.push(finding(K::TornWrite, path, Some(first), None, d));
+        // Ruling 13-V8-d1 points 2 and 5 (ADR-0005 decision 11
+        // "What pins each kind"): the pin is the `seq` of the last
+        // complete record before the gap in its file plus the gap
+        // digest; `u64::MAX` marks a file-start gap with no record
+        // before it (FORK 3), so the pin's `seq` is `None` and no
+        // `accept TornWrite` line can match it.
+        let pin_seq = (s.after != u64::MAX).then_some(s.after);
+        findings
+            .push(finding(K::TornWrite, path, Some(first), None, d).with_pin(pin_seq, s.digest));
     }
 }
 
@@ -376,6 +384,13 @@ pub(super) struct Policy<'a> {
     /// `Some(inputs)` turns it on. Every bundle carries raw blake3
     /// bytes so no hex parsing lives in `engine::check`.
     pub(super) receipts: Option<&'a receipts::Inputs<'a>>,
+    /// Review-file `accept` lines (ADR-0005 decision 11 "Review
+    /// file"; ruling 13-V8-d1). Grouped by `seq` so the review pass
+    /// runs in `seq` order; each inner vec holds one entry per
+    /// kind at that `seq` and the registration check refuses two
+    /// lines for one `(kind, seq)`. See
+    /// [`crate::audit::Verifier::accept`] for the pin semantics.
+    pub(super) accepts: &'a super::AcceptMap,
     pub(super) now: SystemTime,
 }
 
@@ -387,6 +402,7 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         start,
         end_ctx,
         receipts: receipt_set,
+        accepts,
         now,
     } = policy;
     let mut findings = Vec::new();
@@ -780,6 +796,19 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // and its `Resumed` detail keeps `lost_records=0`.
     let lost_counts = count_lost_records(&findings, &gaps);
     emit_resumed(&declarations, &lost_counts, &mut findings);
+    // ADR-0005 decision 11 "Review file"; ruling 13-V8-d1: match
+    // each `accept` line against the reported warnings once every
+    // warning is in `findings` (TornWrite, Resumed, ClockWentBackwards
+    // and DuplicateRecord). The shared classifier and the receipt
+    // match rule stay the single owners of set-aside, LostRecord,
+    // no-record and forked-seq (ruling 13-V8-d1 points 2, 6 and 8).
+    review::check(
+        accepts,
+        &groups,
+        &conflicting_seqs,
+        &position,
+        &mut findings,
+    );
     let first_seq = groups.first_key_value().map(|(&s, _)| s);
     let last_seq = groups.last_key_value().map(|(&s, _)| s);
     // Ruling 13-V5-d1 point 6: list records above `covered_through`
