@@ -1,16 +1,20 @@
 //! Anchor check for the offline verifier (ADR-0005 decision 10;
-//! rulings 13-V6-d1 points 1-2, 13-V6-d3 point 4 and 13-V6-d7
-//! clarification 13-V6-d7a). Each distinct `(trail, seq, hash)`
-//! anchor yields at most one finding, taken from the first failing
-//! step in this order: trail differs, then below the start (through
-//! [`super::position::Classifier::set_aside`]), no record, seq is
-//! forked, hash differs. The end anchor is never set aside: it
-//! skips the position step and always goes through the rule
-//! (ruling 13-V6-d7a). The rule and the details are on
+//! rulings 13-V6-d1 points 1-2, 13-V6-d3 point 4, 13-V6-d7
+//! clarification 13-V6-d7a and 13-V7-d1 point 8). Each distinct
+//! `(trail, seq, hash)` anchor yields at most one finding, taken
+//! from the first failing step in this order: trail differs, then
+//! below the start / above the end (through
+//! [`super::position::Classifier::set_aside`]), then inside a
+//! confirmed gap whose opening checkpoint is anchored (through
+//! [`super::position::Classifier::lost_record_anchored`]), then no
+//! record, seq is forked, hash differs. The end anchor is never set
+//! aside: it skips the position step and always goes through the
+//! rule (ruling 13-V6-d7a). The rule and the details are on
 //! [`crate::audit::Verifier::anchor`] and the finding kinds
 //! ([`crate::audit::FindingKind::AnchorMismatch`],
 //! [`crate::audit::FindingKind::OutOfRange`],
-//! [`crate::audit::FindingKind::UnanchoredStart`]).
+//! [`crate::audit::FindingKind::UnanchoredStart`],
+//! [`crate::audit::FindingKind::LostRecord`]).
 
 use super::{Finding, input::Summary, position::Classifier};
 use crate::audit::{Checkpoint, FindingKind as K, digest_string};
@@ -110,6 +114,15 @@ fn evaluate(
     }
     if let Some(p) = position
         && let Some(finding) = p.set_aside(anchor.seq(), &prefix)
+    {
+        return Some(finding);
+    }
+    // Ruling 13-V7-d1 point 8: inside a confirmed gap whose opening
+    // is anchored under the shared anchor rule, the anchor's
+    // ordinary mismatch check is replaced by one `LostRecord`
+    // (info). Authoritative rule on `Verifier::anchor`.
+    if let Some(p) = position
+        && let Some(finding) = p.lost_record_anchored(anchor.seq(), &prefix)
     {
         return Some(finding);
     }

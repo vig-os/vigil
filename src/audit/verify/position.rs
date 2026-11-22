@@ -4,10 +4,12 @@
 //! call from the accepted start, the anchors, the end-record
 //! context and every trust-and-fold-kept resume candidate; consumed
 //! by [`super::anchors`], [`super::revocation`] and [`super::end`]
-//! through [`Classifier::set_aside`] (below-start / above-end) and
-//! by [`super::receipts`] through [`Classifier::lost_record`]
-//! (inside a confirmed resume gap). See
-//! [`crate::audit::Verifier::start_from`],
+//! through [`Classifier::set_aside`] (below-start / above-end), by
+//! [`super::receipts`] through [`Classifier::lost_record`] (inside a
+//! confirmed resume gap), and by [`super::anchors`] and
+//! [`super::revocation`] through [`Classifier::lost_record_anchored`]
+//! (inside a confirmed gap whose opening checkpoint is itself
+//! anchored). See [`crate::audit::Verifier::start_from`],
 //! [`crate::audit::Verifier::end_before`] and
 //! [`crate::audit::Verifier::receipts`] for the rules.
 
@@ -22,17 +24,18 @@ use std::fmt::Display;
 /// `confirmed` is `true` when a receipt matches the resume's
 /// `(seq, hash)` under the shared match rule (13-V7-d1 point 8);
 /// it gates `LostRecord` emission and the genesis-gap suppression
-/// (point 7 exception). `opening_anchored` is `true` when an input
-/// anchor's `(trail, seq, hash)` equals the opening checkpoint
-/// (ruling 13-V6-d1 point 2); the next #13 step will consume it
-/// to demote anchors and pins inside a gap -- here anchors and
-/// pins keep their current findings. `resume_seq` and `resume_hash`
-/// identify the gap's resume record for the `lost_records=<n>`
-/// counter (ruling 13-V7-d1 point 8): the count is keyed by the
-/// resume `(seq, hash)` on the gap itself, so a candidate the
-/// trust or fold filter dropped (absent here) keeps its
-/// `lost_records=0` without the two consumers risking a zip
-/// alignment.
+/// (point 7 exception). `opening_anchored` is `true` when the
+/// opening checkpoint is anchored under the shared
+/// [`crate::audit::Verifier::anchor`] rule (ruling 13-V6-d1
+/// point 2): an input anchor's `(trail, seq, hash)` equals the
+/// opening's and the anchor itself matches, so a forked opening is
+/// never anchored. Together with `confirmed` it gates the anchor-
+/// and-pin `LostRecord` demotion inside a gap. `resume_seq` and
+/// `resume_hash` identify the gap's resume record for the
+/// `lost_records=<n>` counter: the count is keyed by the resume
+/// `(seq, hash)` on the gap itself, so a candidate the trust or
+/// fold filter dropped (absent here) keeps its `lost_records=0`
+/// without the two consumers risking a zip alignment.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Gap {
     pub(super) low: u64,
@@ -214,13 +217,29 @@ impl Classifier {
                 low,
                 high,
                 ..
-            } => Some(Finding::new(
-                K::LostRecord,
-                None,
-                None,
-                Some(seq),
-                format!("{subject}: lost in gap {low}..={high}"),
-            )),
+            } => Some(lost_record_finding(seq, low, high, subject)),
+            _ => None,
+        }
+    }
+
+    /// One unlocated [`K::LostRecord`] finding when `seq` is inside a
+    /// confirmed resume candidate gap whose opening checkpoint is
+    /// also anchored under the shared anchor rule; `None` otherwise.
+    /// The rule and its reason are on
+    /// [`crate::audit::Verifier::anchor`]. Consumed by
+    /// [`super::anchors::evaluate`] and [`super::revocation::check`]
+    /// for anchors and `through=` pins. Detail grammar matches
+    /// [`Self::lost_record`]'s (`<subject>: lost in gap <a>..=<b>`),
+    /// with subjects `anchor seq <a> hash <hex>` and
+    /// `key <64 hex> through=<b>`.
+    pub(super) fn lost_record_anchored(&self, seq: u64, subject: impl Display) -> Option<Finding> {
+        match self.classify(seq) {
+            Position::Gap {
+                confirmed: true,
+                opening_anchored: true,
+                low,
+                high,
+            } => Some(lost_record_finding(seq, low, high, subject)),
             _ => None,
         }
     }
@@ -283,6 +302,22 @@ impl Classifier {
             Position::InRange | Position::BelowStart { .. } | Position::Gap { .. } => None,
         }
     }
+}
+
+/// Builds the one unlocated [`K::LostRecord`] finding shared by
+/// [`Classifier::lost_record`] and
+/// [`Classifier::lost_record_anchored`] so the detail grammar
+/// (`<subject>: lost in gap <a>..=<b>`, unlocated at `seq`) lives in
+/// one place (ruling 13-V7-d1 points 8-9; ADR-0005 decision 5
+/// "Receipts lost with a resume").
+fn lost_record_finding(seq: u64, low: u64, high: u64, subject: impl Display) -> Finding {
+    Finding::new(
+        K::LostRecord,
+        None,
+        None,
+        Some(seq),
+        format!("{subject}: lost in gap {low}..={high}"),
+    )
 }
 
 /// Builds the one unlocated above-end finding, shared by
