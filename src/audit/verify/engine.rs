@@ -833,11 +833,15 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // that gap's `lost_records=<n>` (decision 5).
     let remaining_accepts = review::classify_positions(accepts, &position, &mut findings);
     // ADR-0005 decision 11 `accept-run`; ruling 13-V8-d1 points 2,
-    // 7 and 8: phase 1 for `accept-run` runs the same position
-    // classifier as `accept`, with the point-8 override driven by
-    // the run index -- a line is set aside under the start rule
-    // only when a run in the index closes at the accepted start
-    // and the line pins that run's resume record.
+    // 7 and 8, clarification 13-V8-d1a: phase 1 for `accept-run`
+    // runs the same position classifier as `accept`, with the
+    // point-8 override driven by the record at `start + 1` --
+    // a line is set aside under the start rule only when an
+    // accepted start exists, the line's `seq` is start + 1, and
+    // the verified set holds there one unforked
+    // `vigil.audit.resume` record whose hash equals the line's
+    // and whose opening is the start. The run such a line closes
+    // lies wholly below the start and is never in the run index.
     let remaining_runs = review::classify_run_positions(accepts_run, &position, &mut findings);
     // Ruling 13-V7-d1 point 8: for each gap in the classifier's
     // list, count the `LostRecord` findings whose `seq` lies in
