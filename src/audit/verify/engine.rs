@@ -500,8 +500,13 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
         &groups,
         &conflicting_seqs,
     );
-    let position =
-        position::Classifier::new(accepted_start.and(start), trail, anchors, end_ctx, gaps);
+    let position = position::Classifier::new(
+        accepted_start.and(start),
+        trail,
+        anchors,
+        end_ctx,
+        gaps.clone(),
+    );
     // Ruling 13-V5-d5: evaluate the section's `end=` once. A match
     // grants the tail exemption, confirms bounds at or below `s`,
     // and promotes 13-V5-d2 repairs at or below `s`; a mismatch
@@ -745,7 +750,7 @@ pub(super) fn check(collection: Collection, trail: [u8; 16], policy: Policy<'_>)
     // candidate was dropped by the trust or fold filter, and
     // malformed declarations, keep `lost_records=0`. Anchors and
     // pins arrive with later work in #13.
-    let lost_counts = count_lost_records(&findings, &pending_resumes);
+    let lost_counts = count_lost_records(&findings, &pending_resumes, &gaps);
     emit_resumed(&declarations, &lost_counts, &mut findings);
     let first_seq = groups.first_key_value().map(|(&s, _)| s);
     let last_seq = groups.last_key_value().map(|(&s, _)| s);
@@ -924,15 +929,17 @@ fn build_gaps(
         let opening_anchored = anchors
             .iter()
             .any(|a| a.trail() == trail && a.seq() == c.opening_seq && a.hash() == c.opening_hash);
-        // Confirmation (point 8): the receipt set carries the
-        // gap's resume `(seq, hash)` AND the verified set holds
-        // exactly one unforked record at `resume_seq` with that
-        // hash. Reuses `receipts::mismatch` so the match rule lives
-        // in one place.
+        // Confirmation (point 8): the receipt set carries a receipt
+        // whose `(seq, hash)` is the gap's resume `(seq, hash)` AND
+        // the verified set accepts it under the shared match rule
+        // (`receipts::matches`, the one rule `receipts::match_one`
+        // runs for every receipt). Walking the receipt set keeps the
+        // match path symmetric with the receipts loop that runs later
+        // -- the same receipt `match_one` will accept at reconciliation
+        // is the one that confirms the gap here.
         let confirmed = receipts.is_some_and(|set| {
             set.contains(&(c.resume_seq, c.resume_hash))
-                && receipts::mismatch(c.resume_seq, c.resume_hash, groups, conflicting_seqs)
-                    .is_none()
+                && receipts::matches(c.resume_seq, c.resume_hash, groups, conflicting_seqs)
         });
         let low = if c.is_genesis { 0 } else { c.head_seq + 1 };
         out.push(position::Gap {
@@ -947,21 +954,25 @@ fn build_gaps(
 }
 
 /// Ruling 13-V7-d1 point 8: count every `LostRecord` finding whose
-/// `seq` lies in a candidate gap, keyed by the gap's resume
+/// `seq` lies in a candidate's gap, keyed by the gap's resume
 /// `(seq, hash)`, so [`emit_resumed`] can fill the `lost_records=<n>`
-/// slot. A candidate dropped by the trust or fold filter is absent
-/// here, and its `Resumed` detail keeps `lost_records=0`.
+/// slot. The gap bounds come from the gap list the classifier was
+/// built with, never recomputed here, so the two consumers agree on
+/// `low..=high`. A candidate absent from the gap list -- dropped by
+/// the trust or fold filter -- is absent here, and its `Resumed`
+/// detail keeps `lost_records=0`.
 fn count_lost_records(
     findings: &[Finding],
     candidates: &[resume::ResumeCandidate],
+    gaps: &[position::Gap],
 ) -> BTreeMap<(u64, [u8; 32]), u64> {
     let mut out: BTreeMap<(u64, [u8; 32]), u64> = BTreeMap::new();
-    for c in candidates {
-        let low = if c.is_genesis { 0 } else { c.head_seq + 1 };
-        let high = c.lost_through;
+    for (c, g) in candidates.iter().zip(gaps.iter()) {
         let n = findings
             .iter()
-            .filter(|f| f.kind() == K::LostRecord && f.seq().is_some_and(|s| s >= low && s <= high))
+            .filter(|f| {
+                f.kind() == K::LostRecord && f.seq().is_some_and(|s| s >= g.low && s <= g.high)
+            })
             .count() as u64;
         out.insert((c.resume_seq, c.resume_hash), n);
     }

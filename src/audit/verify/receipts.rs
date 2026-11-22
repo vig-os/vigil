@@ -322,9 +322,9 @@ fn match_one(
 /// the `ReceiptMismatch` detail, or `None` when the verified set
 /// holds exactly one record at `seq` and its hash equals the
 /// receipt's hash (ruling 13-V7-d1 point 4). The crate-private
-/// visibility is reused by [`super::engine::build_gaps`] for resume-
-/// gap confirmation (point 8), so the match rule lives in one place.
-pub(super) fn mismatch(
+/// visibility is reused by [`matches`] so the match rule lives in
+/// one place.
+fn mismatch(
     seq: u64,
     hash: [u8; 32],
     groups: &BTreeMap<u64, Vec<Located<'_>>>,
@@ -338,4 +338,19 @@ pub(super) fn mismatch(
     }
     let record_hash = copies[0].1.hash;
     (record_hash != hash).then(|| format!("hash differs (record {})", digest_string(&record_hash)))
+}
+
+/// `true` iff the shared match rule accepts `(seq, hash)` against the
+/// verified set (ruling 13-V7-d1 point 4): one unforked record at
+/// `seq` whose hash equals `hash`. One definition for both
+/// [`match_one`] (used by every receipt, waiver and `from`) and
+/// [`super::engine::build_gaps`] (resume-gap confirmation, point 8),
+/// so the receipt-side match and gap confirmation never drift.
+pub(super) fn matches(
+    seq: u64,
+    hash: [u8; 32],
+    groups: &BTreeMap<u64, Vec<Located<'_>>>,
+    conflicting_seqs: &BTreeSet<u64>,
+) -> bool {
+    mismatch(seq, hash, groups, conflicting_seqs).is_none()
 }
