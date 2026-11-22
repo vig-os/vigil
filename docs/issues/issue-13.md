@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-09T13:22:04Z
-updated: 2026-11-21T01:50:33Z
+updated: 2026-11-22T05:35:52Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/13
-comments: 51
+comments: 52
 labels: feature, security, priority:medium, area:testing, effort:medium
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-21T09:17:34.241Z
+synced: 2026-11-22T09:27:08.484Z
 ---
 
 # [Issue 13]: [feat(audit): verify API/CLI and tamper tests](https://github.com/vig-os/vigil/issues/13)
@@ -1286,5 +1286,40 @@ _Posted on November 21, 2026 at 01:50 AM_
 1. **"Never above the highest receipt" counts all reconciliation evidence.** Evidence means matched receipts, matched waivers and a matched `from`. The cut is `min(first unreconciled seq, highest evidence seq + 1)`, where a matched `from` at `s` counts as evidence at `s`. Without this, a deployment that adopted receipts late (`from` only) would see its exempted history reported as `Unreconciled`. That would contradict decision 5's late-adoption rule ("records up to and including that one are not reconciled"). With no evidence at all, the whole range is `Unreconciled`, as decision 5 says.
 2. **A checkpoint above the highest evidence is `Unreconciled`.** This applies in live mode. Checkpoints need no receipt, but the cut never rises above the evidence. So a running trail whose newest line is a checkpoint not yet given as a receipt is reported once as `Unreconciled` (info). The operator can include the checkpoint receipts that `close()` and `checkpoint()` return (decision 9). This is intended, and the `receipts_live` rustdoc must say so.
 3. **The cut is computed without overflow.** A receipt at `u64::MAX` must not wrap or panic. Compare with `seq <= highest` rather than `seq < highest + 1`.
+
+
+---
+
+# [Comment #52]() by [gerchowl]()
+
+_Posted on November 22, 2026 at 05:35 AM_
+
+**Ruling 13-V8-d1 (#13 V8): the review file, `accept` and `accept-run`**
+
+A design check at dev `31d2aa3` found that `Accepted`, `AcceptMismatch` and `AcceptUnused` are declared but never emitted, and that no `accept` or `accept_run` builder exists. ADR-0005 decision 11 "Review file" (~l.828–860) fixes most of the rules: the acceptable kinds, the pins, replace-not-add, the outcomes, the start and gap rules, `accept Resumed` confirmation, the `accept-run` matching rule and items 1–5. This ruling settles the points it leaves open.
+
+1. **Split.** Four serial PRs, each ≤ ~200 non-test lines:
+   - **V8a**: `accept` and the three outcomes.
+   - **V8b**: `accept Resumed` confirms gaps, in addition to receipts (V7d).
+   - **V8c**: `accept_run` and items 1–3.
+   - **V8d**: items 4, 5(a) and 5(b), plus the 13-d2 B half of the span vector.
+
+   Review-file parsing and exit 2 arrive with the `verify` CLI (C1).
+2. **API and grammar.**
+   - `accept(self, kind: FindingKind, seq: u64, hash: [u8; 32], reviewer: impl Into<String>, reason: impl Into<String>) -> Result<Self, AuditError>`.
+   - `accept_run(self, seq, hash, run_digest, reviewer, reason) -> Result<…>`.
+   - **Reviewer:** one token, meaning non-empty with no ASCII whitespace and no control bytes.
+   - **Reason:** validated with the existing `validate_reason`.
+   - **Kinds:** only the five acceptable warnings (`TornWrite`, `Resumed`, `ClockWentBackwards`, `DuplicateRecord`, `OperatorText`). Any other kind is `InvalidConfig`.
+   - **Duplicates:** two `accept` lines for one `(kind, seq)`, or two `accept_run` lines for one `seq`, are `InvalidConfig`.
+   - **Subjects:** `accept <Kind> seq <s> hash <hex>` and `accept-run seq <s> hash <hex>`. These are used by `set_aside`, `LostRecord` and `AcceptMismatch`.
+3. **`Accepted` (FORK 1).** The accepted finding keeps its original file, line and `seq`, and `accepted_kind()` returns the original kind. Its detail is exactly `accepted by <reviewer>: <reason>; was: <original detail>`. The original evidence is never lost, and the finding stays where a reader would look for it.
+4. **An accepted run (FORK 2).** `run_digest()` is `None` on the `Accepted` finding, as decision 11 says ("None for every other finding"). The digest survives in the `was:` part of the detail.
+5. **A `TornWrite` with no record before the gap in its file (FORK 3)** has no pin, because decision 11 pins it by "the `seq` of the last complete record before the gap in its file". It cannot be accepted and stays a warning. The `TornWrite` rustdoc states this limit. V8a carries the pin `seq` on the trailing `TornWrite` internally, so matching uses the same `(seq, gap digest)` the line names.
+6. **A forked `seq` (FORK 4) fails closed.** An `accept` or `accept-run` line naming a forked `seq` is `AcceptMismatch "… seq is forked"`, as for receipts (13-V7-d1 point 4).
+7. **`accept-run` inside a confirmed gap (FORK 5)** is `LostRecord`, like every other input there (decision 5, "Receipts lost with a resume": "the same for waivers, `from`, `accept`"). Inside an unconfirmed gap it is `AcceptMismatch "… no record"`.
+8. **Start and end.**
+   - A line below the start or above `E` goes through `set_aside` with its subject.
+   - When a run's closing opening checkpoint is itself the start, the `accept-run` line is set aside under the start rule (`OutOfRange` or `UnanchoredStart`), even though the resume record's `seq` is in range. The run lies below the start.
 
 
