@@ -2,18 +2,18 @@
 type: issue
 state: open
 created: 2026-10-09T13:22:04Z
-updated: 2026-11-22T05:35:52Z
+updated: 2026-11-22T13:19:30Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/vigil/issues/13
-comments: 52
+comments: 53
 labels: feature, security, priority:medium, area:testing, effort:medium
 assignees: none
 milestone: 0.3.0 — audit trail
 projects: none
 parent: none
 children: none
-synced: 2026-11-22T09:27:08.484Z
+synced: 2026-11-23T10:23:52.066Z
 ---
 
 # [Issue 13]: [feat(audit): verify API/CLI and tamper tests](https://github.com/vig-os/vigil/issues/13)
@@ -1321,5 +1321,25 @@ A design check at dev `31d2aa3` found that `Accepted`, `AcceptMismatch` and `Acc
 8. **Start and end.**
    - A line below the start or above `E` goes through `set_aside` with its subject.
    - When a run's closing opening checkpoint is itself the start, the `accept-run` line is set aside under the start rule (`OutOfRange` or `UnanchoredStart`), even though the resume record's `seq` is in range. The run lies below the start.
+
+
+---
+
+# [Comment #53]() by [gerchowl]()
+
+_Posted on November 22, 2026 at 01:19 PM_
+
+**Ruling 13-V8-d1, clarification of point 8 (#13 V8c): an `accept-run` line for a run that closes at the start**
+
+An accepted start is the lowest record in the verified set. So a run that closes at the start (its closing opening checkpoint *is* the start) has all its segments below the start. Those segments are never in the verified files and never in the run index. Point 8 is therefore decided from the record **after** the start, not from the run index:
+
+1. An `accept-run` line is set aside under the start rule (`OutOfRange` with an anchored start, `UnanchoredStart` otherwise, with subject `accept-run seq <s> hash <hex>`) exactly when all three of these hold:
+   - an accepted start exists;
+   - the line's `seq` is the start's `seq` + 1;
+   - the verified set holds, at that `seq`, one unforked `vigil.audit.resume` record whose hash equals the line's hash, and which follows the start as its opening (the `resume`'s opening checkpoint is the start).
+
+   The run it closes then lies wholly below the start.
+2. **Every other line goes through normal matching.** That includes a line at start + 1 whose record is not a resume record, has another hash, or is absent. Normal matching gives `AcceptMismatch`, so a bogus line never clears an error.
+3. **One decision point.** This decision lives in `position.rs` next to `set_aside`, built with `set_aside`'s builder. The run index is not consulted for it.
 
 
