@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-10-09T14:07:47Z
-updated: 2026-11-18T16:25:45Z
+updated: 2026-11-27T02:22:34Z
 author: renovate[bot]
 author_url: https://github.com/renovate[bot]
 url: https://github.com/vig-os/vigil/issues/20
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-11-19T09:58:14.718Z
+synced: 2026-11-27T10:35:52.884Z
 ---
 
 # [Issue 20]: [Dependency Dashboard](https://github.com/vig-os/vigil/issues/20)
@@ -24,6 +24,7 @@ This issue lists Renovate updates and detected dependencies. Read the [Dependenc
 
 The following updates are currently rate-limited. To force their creation now, click on a checkbox below.
 
+ - [ ] <!-- unlimit-branch=renovate/blake3-1.x-lockfile -->build(cargo): update rust crate blake3 to v1.8.8
  - [ ] <!-- unlimit-branch=renovate/zeroize-1.x-lockfile -->build(cargo): update rust crate zeroize to v1.9.2
  - [ ] <!-- unlimit-branch=renovate/syn-3.x -->build(cargo): update rust crate syn to v3
  - [ ] <!-- create-all-rate-limited-prs -->🔐 **Create all rate-limited PRs at once** 🔐
@@ -53,7 +54,7 @@ The following updates have all been created. To force a retry/rebase of any, cli
 
  - `getrandom 0.3` → [Updates: `0.4`]
  - `base64 0.22` → [Updates: `0.23`]
- - `blake3 1`
+ - `blake3 1` → [Updates: `lock file @ 1.8.8`]
  - `ed25519-dalek 2` → [Updates: `3`]
  - `zeroize 1` → [Updates: `lock file @ 1.9.2`]
  - `opentelemetry 0.33` → [Updates: `lock file @ 0.33.1`]
